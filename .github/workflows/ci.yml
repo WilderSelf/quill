@@ -86,8 +86,8 @@ jobs:
       - name: Generate a sample PDF/X-1a file
         run: |
           set -euo pipefail
-          cargo run -p cli -- synth-icc /tmp/cmyk.icc
-          cargo run -p cli -- export --output /tmp/sample.pdf --icc /tmp/cmyk.icc --pdfx x1a
+          cargo run -p quill-cli -- synth-icc /tmp/cmyk.icc
+          cargo run -p quill-cli -- export --output /tmp/sample.pdf --icc /tmp/cmyk.icc --pdfx x1a
 
       - name: veraPDF PDF/X-1a validation
         run: |
