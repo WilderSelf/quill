@@ -3,7 +3,8 @@ name: planner
 description: Optional read-only planner for the /ship pipeline. Given a task, produces a written implementation plan (acceptance criteria, files to touch, test strategy) without writing code. Use for heavy or ambiguous tasks.
 tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit, NotebookEdit
-model: inherit
+model: opus
+effort: medium
 color: blue
 ---
 
