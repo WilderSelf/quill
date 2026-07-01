@@ -1,0 +1,11 @@
+[package]
+name = "quill-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The editor UI (`egui` shell + Skia document canvas) arrives in a later spec-driven commit.
+[dependencies]
+quill-core-model = { workspace = true }
