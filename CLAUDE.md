@@ -113,3 +113,14 @@ CI), plus periodic real test-uploads to DriveThruRPG/Lulu/IngramSpark. Color cod
   time. **`/curate`** — dedupe/condense this file (200-line budget), flag contradictions,
   archive stale skills. User-scope config, the permission model, and a disabled reflection Stop
   hook are documented in `~/.claude/settings.reference.md`.
+- **`/handoff`** — writes/refreshes the untracked `HANDOFF.md` session-bridge doc for resuming
+  work in a fresh session; re-verifies live external state (repo/CI/GitHub settings) rather
+  than restating the previous handoff's claims. Project-scoped: `.claude/skills/handoff/`.
+- **`/wrap [task]`** — chains `/ship` (if `task` given) → `/reflect` → `/curate` → `/handoff` as
+  one invocation instead of four, loading shared config once instead of per-phase. Keeps each
+  phase's own approval gates. User-scoped: `~/.claude/skills/wrap/`.
+- **Merge behavior — any PR in this repo, not just `/ship`'s**: the branch-protection gate on
+  `main` is confirmed live (3 required CI contexts, `allow_auto_merge`, admin token — see PR #4).
+  Every PR opened here auto-enables `gh pr merge --auto --squash --delete-branch` once that gate
+  is verified — no confirmation asked per PR. Re-verify the gate rather than assuming it's still
+  live if branch protection could plausibly have changed.
