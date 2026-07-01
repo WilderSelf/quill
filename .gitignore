@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# Local Claude Code settings (machine-local; project agents/skills/rules ARE tracked)
+.claude/settings.local.json
+
 # Editor / OS
 .DS_Store
 *.swp

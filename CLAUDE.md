@@ -101,3 +101,15 @@ The acceptance test for any export change is external validation, not just unit 
 `veraPDF` (PDF/X profile) and a Ghostscript preflight on generated PDFs (golden-file tests in
 CI), plus periodic real test-uploads to DriveThruRPG/Lulu/IngramSpark. Color code
 (`color` crate) needs unit tests on ICC round-trips and ink-coverage math.
+
+## Automation & learning (Claude Code)
+
+- **`/ship <task>`** — autonomous plan→merge cycle: plan → `feat/<slug>` branch → implement →
+  validate (fmt/clippy/build/test, bounded to 5 attempts) → `reviewer` subagent → PR →
+  auto-merge deferring to CI. Blocked ⇒ draft PR, never a forced merge. Merge gate = GitHub
+  branch protection + CI, not the permission list. Reviewer/planner live in `.claude/agents/`.
+- **`/reflect`** — after a session or `/ship` cycle, promotes learnings into the right home
+  (this file, `.claude/rules/`, a skill, an agent, or a hook), one human-approved change at a
+  time. **`/curate`** — dedupe/condense this file (200-line budget), flag contradictions,
+  archive stale skills. User-scope config, the permission model, and a disabled reflection Stop
+  hook are documented in `~/.claude/settings.reference.md`.
