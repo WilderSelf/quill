@@ -3,7 +3,8 @@ name: reviewer
 description: Isolated, read-only code reviewer for the /ship pipeline. Critiques a diff against its plan and repo conventions and returns blocking/non-blocking findings. Cannot edit code.
 tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit, NotebookEdit
-model: inherit
+model: opus
+effort: high
 color: purple
 ---
 
