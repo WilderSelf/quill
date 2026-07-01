@@ -1,15 +1,29 @@
-//! Press-ready PDF/X export and preflight. See `specs/0001-pdf-x-export.md`.
+//! Press-ready PDF/X export and preflight. See `specs/0001-pdf-x-export.md` (preflight) and
+//! `specs/0002-pdf-byte-generation.md` (byte generation).
 //!
-//! Preflight (validating a document against the DriveThruRPG print spec) is implemented and
-//! tested here. The PDF byte generation itself (via `pdf-writer` + `subsetter`, with CMYK
-//! conversion through `lcms2`) lands in a subsequent spec-driven commit; [`export`] currently
-//! returns [`ExportError::NotImplemented`] once a document passes preflight.
+//! [`preflight`] validates a document against the DriveThruRPG/PDF-X requirements. [`export`]
+//! then writes a real **PDF/X-1a:2001** file via `pdf-writer` (object graph) + `subsetter`
+//! (embedded subset font), with `lcms2` validating the ICC OutputIntent. The writer internals
+//! live in the `writer`/`fonts`/`images`/`icc`/`xmp`/`geom` modules.
 
 use std::io::Write;
 
 use quill_color::{within_ink_limit, MAX_INK_COVERAGE_PCT};
 use quill_core_model::{Block, Color, Document, DEFAULT_BLEED_PT};
 use thiserror::Error;
+
+mod fonts;
+mod geom;
+mod icc;
+mod images;
+mod writer;
+mod xmp;
+
+/// Synthesize a minimal, structurally valid CMYK output-class ICC profile.
+///
+/// Intended for tests and tooling (CI generates one to pass to `export` via `--icc`) so no
+/// licensed vendor profile has to be bundled. See [`icc::synth_cmyk_profile`].
+pub use icc::synth_cmyk_profile;
 
 /// Target PDF/X conformance level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +65,8 @@ pub enum CheckId {
     ImageResolution,
     InkCoverage,
     OutputIntent,
+    /// The supplied ICC OutputIntent profile is not a CMYK output-class profile.
+    IccProfileInvalid,
 }
 
 /// Severity of a preflight finding.
@@ -94,8 +110,10 @@ impl PreflightReport {
 pub enum ExportError {
     #[error("preflight failed with {0} error(s); pass force to override")]
     PreflightFailed(usize),
-    #[error("PDF/X byte generation is not implemented yet (see specs/0001-pdf-x-export.md)")]
-    NotImplemented,
+    #[error("font embedding failed: {0}")]
+    Font(String),
+    #[error("ICC OutputIntent error: {0}")]
+    Icc(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -185,19 +203,28 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
             CheckId::OutputIntent,
             "no ICC OutputIntent profile provided".into(),
         );
+    } else if let Ok(bytes) = std::fs::read(&opts.output_intent_icc) {
+        // The path is present and readable: validate its contents. A missing/unreadable file is
+        // left to export time (so a bare `preflight` with a placeholder path behaves as before);
+        // only a readable-but-wrong profile is a preflight failure here.
+        if let Err(msg) = icc::check_icc(&bytes) {
+            push_error(
+                &mut report,
+                CheckId::IccProfileInvalid,
+                format!("ICC '{}': {msg}", opts.output_intent_icc),
+            );
+        }
     }
 
     report
 }
 
-/// Export a document as PDF/X. Runs preflight first (unless `opts.force`).
-///
-/// PDF byte generation is not yet implemented; a clean document therefore reaches
-/// [`ExportError::NotImplemented`]. See the module docs and spec 0001.
+/// Export a document as press-ready PDF/X-1a:2001. Runs preflight first (unless `opts.force`),
+/// lays the document out, then writes real PDF bytes to `out`. See spec 0002.
 pub fn export(
     doc: &Document,
     opts: &ExportOptions,
-    _out: &mut impl Write,
+    out: &mut impl Write,
 ) -> Result<(), ExportError> {
     if !opts.force {
         let report = preflight(doc, opts);
@@ -205,7 +232,8 @@ pub fn export(
             return Err(ExportError::PreflightFailed(report.error_count()));
         }
     }
-    Err(ExportError::NotImplemented)
+    let pages = quill_layout_engine::lay_out(doc);
+    writer::write_pdf(doc, opts, &pages, out)
 }
 
 #[cfg(test)]
@@ -293,15 +321,86 @@ mod tests {
     #[test]
     fn export_refuses_when_preflight_fails() {
         let mut sink = Vec::new();
-        // Default opts have no ICC -> preflight fails -> export refuses before NotImplemented.
+        // Default opts have no ICC -> preflight fails -> export refuses, writes nothing.
         let e = export(&Document::sample(), &ExportOptions::default(), &mut sink).unwrap_err();
         assert!(matches!(e, ExportError::PreflightFailed(_)));
+        assert!(sink.is_empty());
+    }
+
+    /// Write the synthesized CMYK profile to a temp file and return options pointing at it.
+    fn opts_with_real_icc(tag: &str) -> (ExportOptions, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("quill_test_{tag}.icc"));
+        std::fs::write(&path, synth_cmyk_profile()).unwrap();
+        (
+            ExportOptions {
+                output_intent_icc: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            path,
+        )
     }
 
     #[test]
-    fn export_reaches_not_implemented_when_clean() {
+    fn export_writes_pdfx_bytes_on_clean_document() {
+        let (opts, path) = opts_with_real_icc("clean");
+        let mut buf = Vec::new();
+        export(&Document::sample(), &opts, &mut buf).expect("export should succeed");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!buf.is_empty());
+        // PDF/X-1a:2001 pins the header to 1.3.
+        assert!(buf.starts_with(b"%PDF-1.3"), "wrong PDF header");
+        assert!(buf.ends_with(b"%%EOF\n") || buf.ends_with(b"%%EOF"));
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("GTS_PDFX"),
+            "missing PDF/X OutputIntent marker"
+        );
+        assert!(
+            text.contains("/CIDFontType2"),
+            "missing embedded composite font"
+        );
+        assert!(text.contains("Identity-H"), "missing Identity-H encoding");
+    }
+
+    #[test]
+    fn export_places_bundled_grayscale_image() {
+        let (opts, path) = opts_with_real_icc("image");
+        // Point an asset at the bundled test image (absolute path) and reference it.
+        let mut doc = Document::sample();
+        let img_path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test_gray.png");
+        doc.assets = vec![Asset {
+            id: "pic".into(),
+            path: img_path.into(),
+            dpi: 300.0,
+            line_art: false,
+        }];
+        doc.content.push(Block::Image {
+            asset: "pic".into(),
+        });
+
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("export with image should succeed");
+        let _ = std::fs::remove_file(&path);
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("/Subtype /Image") || text.contains("/Subtype/Image"));
+        assert!(
+            text.contains("DeviceGray"),
+            "image must be DeviceGray for X-1a"
+        );
+    }
+
+    #[test]
+    fn export_refuses_unreadable_icc_even_when_preflight_forced() {
+        // force=true skips preflight, but the writer still needs a valid ICC to embed.
+        let opts = ExportOptions {
+            output_intent_icc: "definitely/missing.icc".into(),
+            force: true,
+            ..Default::default()
+        };
         let mut sink = Vec::new();
-        let e = export(&Document::sample(), &opts_with_icc(), &mut sink).unwrap_err();
-        assert!(matches!(e, ExportError::NotImplemented));
+        let e = export(&Document::sample(), &opts, &mut sink).unwrap_err();
+        assert!(matches!(e, ExportError::Icc(_)));
     }
 }
