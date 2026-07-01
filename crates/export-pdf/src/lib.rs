@@ -64,6 +64,9 @@ pub struct ExportOptions {
     pub bleed_pt: f32,
     /// Export even if preflight fails.
     pub force: bool,
+    /// Path to a user-supplied TrueType (`.ttf`) font to embed. `None` embeds the bundled
+    /// Source Serif 4. See `specs/0004-user-font-embedding.md`.
+    pub font_path: Option<String>,
 }
 
 impl Default for ExportOptions {
@@ -73,6 +76,7 @@ impl Default for ExportOptions {
             output_intent_icc: String::new(),
             bleed_pt: DEFAULT_BLEED_PT,
             force: false,
+            font_path: None,
         }
     }
 }
@@ -461,5 +465,42 @@ mod tests {
         let mut sink = Vec::new();
         let e = export(&Document::sample(), &opts, &mut sink).unwrap_err();
         assert!(matches!(e, ExportError::Icc(_)));
+    }
+
+    /// Spec 0004: a user-supplied `font_path` is embedded instead of the bundled default, with a
+    /// BaseFont name derived from that file. Exercised with the bundled ttf on disk so no extra
+    /// fixture is needed; the derived name ("SourceSerif…") proves the derive path ran.
+    #[test]
+    fn export_embeds_user_supplied_font() {
+        let (mut opts, icc_path) = opts_with_real_icc("userfont");
+        opts.font_path = Some(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/SourceSerif4-Regular.ttf"
+            )
+            .into(),
+        );
+        let mut buf = Vec::new();
+        export(&Document::sample(), &opts, &mut buf).expect("user-font export should succeed");
+        let _ = std::fs::remove_file(&icc_path);
+
+        assert!(!buf.is_empty());
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("/CIDFontType2"), "font not embedded");
+        assert!(
+            text.contains("SourceSerif"),
+            "BaseFont should reflect the supplied font's own name"
+        );
+    }
+
+    #[test]
+    fn export_fails_on_unreadable_font() {
+        let (mut opts, icc_path) = opts_with_real_icc("missingfont");
+        opts.font_path = Some("definitely/missing.ttf".into());
+        let mut sink = Vec::new();
+        let e = export(&Document::sample(), &opts, &mut sink).unwrap_err();
+        let _ = std::fs::remove_file(&icc_path);
+        assert!(matches!(e, ExportError::Font(_)));
+        assert!(sink.is_empty(), "nothing should be written on font failure");
     }
 }

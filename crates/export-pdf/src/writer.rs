@@ -44,7 +44,14 @@ pub fn write_pdf(
 ) -> Result<(), ExportError> {
     // --- Inputs: font subset, ICC bytes, images -------------------------------------------
     let used_chars = collect_chars(pages);
-    let font = fonts::build(&used_chars)?;
+    let font = match &opts.font_path {
+        Some(path) => {
+            let program = std::fs::read(path)
+                .map_err(|e| ExportError::Font(format!("reading font '{path}': {e}")))?;
+            fonts::build_from_bytes(&program, None, &used_chars)?
+        }
+        None => fonts::build(&used_chars)?,
+    };
 
     let icc_bytes = std::fs::read(&opts.output_intent_icc)
         .map_err(|e| ExportError::Icc(format!("reading '{}': {e}", opts.output_intent_icc)))?;
@@ -284,14 +291,14 @@ fn write_font(
     {
         let mut fd = pdf.font_descriptor(descriptor_id);
         fd.name(Name(base));
-        fd.flags(FontFlags::SERIF | FontFlags::NON_SYMBOLIC);
+        fd.flags(FontFlags::from_bits_retain(font.flags.bits()));
         fd.bbox(Rect::new(
             font.bbox[0],
             font.bbox[1],
             font.bbox[2],
             font.bbox[3],
         ));
-        fd.italic_angle(0.0);
+        fd.italic_angle(font.italic_angle);
         fd.ascent(font.ascent);
         fd.descent(font.descent);
         fd.cap_height(font.cap_height);
