@@ -1,7 +1,7 @@
 # 0002 — Real PDF/X byte generation
 
 - **Milestone:** M0
-- **Status:** in-progress
+- **Status:** implemented
 - **Crates:** `quill-export-pdf` (owner), `quill-layout-engine`, `quill-text-layout`,
   `quill-color`, `quill-core-model`, `quill-cli`
 
