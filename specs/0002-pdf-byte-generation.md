@@ -1,9 +1,22 @@
 # 0002 — Real PDF/X byte generation
 
 - **Milestone:** M0
-- **Status:** draft
+- **Status:** in-progress
 - **Crates:** `quill-export-pdf` (owner), `quill-layout-engine`, `quill-text-layout`,
   `quill-color`, `quill-core-model`, `quill-cli`
+
+> **Implementation notes (as landed):**
+> - **Bundled font:** Liberation Serif (SIL OFL-1.1), a `glyf`-based TrueType — matches the
+>   CIDFontType2/FontFile2 path. (Source Serif 4's Adobe distribution is CFF/OTF; the network was
+>   unavailable to fetch a `glyf` build, so the locally-available OFL serif was used. Swappable.)
+> - **Subsetter GIDs:** `subsetter` 0.2.x **remaps** glyph IDs (it does not preserve them). The
+>   content stream is encoded with the *remapped* GIDs and `CIDToGIDMap` is `/Identity`; a
+>   GID-consistency unit test guards this (the failure veraPDF cannot see).
+> - **ICC synthesis:** built via the safe `lcms2` API (`Profile::new_placeholder` + CMYK/Output
+>   class + `desc`/`cprt`/`wtpt`), exposed as `quill export`'s `synth-icc` subcommand for CI.
+> - **veraPDF/Ghostscript are unavailable locally** (no Java, no network); the `pdfx-conformance`
+>   CI job is the compliance gate. Local tests assert structure (header 1.3, OutputIntent,
+>   CIDFontType2, TrimBox/BleedBox, XMP) as a proxy.
 
 ## Goal
 

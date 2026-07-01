@@ -6,9 +6,17 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# PDF byte generation (`pdf-writer`, `subsetter`) and ICC conversion (`lcms2`) arrive in a
-# later spec-driven commit; preflight is implemented now. See specs/0001-pdf-x-export.md.
+# PDF/X-1a byte generation (spec 0002): pdf-writer emits the object graph, subsetter+ttf-parser
+# embed a subset TrueType font, lcms2 validates/synthesizes the ICC OutputIntent, png+flate2
+# handle image XObjects. See specs/0002-pdf-byte-generation.md.
 [dependencies]
 quill-core-model = { workspace = true }
 quill-color = { workspace = true }
+quill-layout-engine = { workspace = true }
 thiserror = { workspace = true }
+pdf-writer = { workspace = true }
+subsetter = { workspace = true }
+ttf-parser = { workspace = true }
+lcms2 = { workspace = true }
+png = { workspace = true }
+flate2 = { workspace = true }

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use quill_core_model::Document;
 use quill_export_pdf::{
-    export, preflight, ExportError, ExportOptions, PdfxVersion, PreflightReport, Severity,
+    export, preflight, synth_cmyk_profile, ExportOptions, PdfxVersion, PreflightReport, Severity,
 };
 
 #[derive(Parser)]
@@ -28,6 +28,11 @@ enum Command {
     Preflight(DocArgs),
     /// Export a document to press-ready PDF/X (preflight + write).
     Export(ExportArgs),
+    /// Write a synthesized CMYK OutputIntent ICC profile (for testing/CI; not a real press profile).
+    SynthIcc {
+        /// Output path for the `.icc` file.
+        output: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -144,7 +149,7 @@ fn main() -> ExitCode {
             match export(&doc, &opts, &mut bytes) {
                 Ok(()) => match std::fs::write(&args.output, &bytes) {
                     Ok(()) => {
-                        println!("wrote {}", args.output);
+                        println!("wrote {} ({} bytes)", args.output, bytes.len());
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
@@ -152,16 +157,22 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 },
-                // The pipeline ran and preflight passed; byte generation is still pending.
-                Err(ExportError::NotImplemented) => {
-                    println!("preflight ok; PDF writing not implemented yet (spec 0001).");
-                    ExitCode::SUCCESS
-                }
                 Err(e) => {
                     eprintln!("export failed: {e}");
                     ExitCode::FAILURE
                 }
             }
         }
+
+        Command::SynthIcc { output } => match std::fs::write(&output, synth_cmyk_profile()) {
+            Ok(()) => {
+                println!("wrote {output}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error writing {output}: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }

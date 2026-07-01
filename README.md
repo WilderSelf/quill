@@ -47,3 +47,11 @@ Dual-licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
 in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
 without any additional terms or conditions.
+
+### Bundled fonts
+
+`crates/export-pdf/assets/LiberationSerif-Regular.ttf` is **Liberation Serif**, licensed under
+the [SIL Open Font License, Version 1.1](crates/export-pdf/assets/LiberationSerif-LICENSE.txt)
+(Digitized data © 2010 Google Corporation; © 2012 Red Hat, Inc.). It ships as a data asset used
+as the default embeddable body font for PDF/X export; the OFL is compatible with the project's
+MIT/Apache-2.0 code license.
