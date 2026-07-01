@@ -35,3 +35,74 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features
+
+  # Validates that a generated PDF is actually PDF/X-1a-conformant, per spec 0002. Linux-only and
+  # separate from the fast fmt/clippy/test matrix because it installs Ghostscript + veraPDF.
+  pdfx-conformance:
+    name: PDF/X-1a conformance (veraPDF + Ghostscript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Ghostscript
+        run: sudo apt-get update && sudo apt-get install -y ghostscript
+
+      - name: Cache veraPDF
+        id: cache-verapdf
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/verapdf
+          key: verapdf-greenfield-1.26
+
+      - name: Install veraPDF
+        if: steps.cache-verapdf.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o verapdf-installer.zip https://software.verapdf.org/releases/verapdf-installer.zip
+          unzip -q verapdf-installer.zip -d verapdf-installer
+          INSTALLER="$(find verapdf-installer -name 'verapdf-install' | head -1)"
+          cat > auto-install.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+          <AutomatedInstallation langpack="eng">
+            <com.izforge.izpack.panels.htmlhello.HTMLHelloPanel id="welcome"/>
+            <com.izforge.izpack.panels.target.TargetPanel id="install_dir">
+              <installpath>/home/runner/verapdf</installpath>
+            </com.izforge.izpack.panels.target.TargetPanel>
+            <com.izforge.izpack.panels.packs.PacksPanel id="sdk_pack_select"/>
+            <com.izforge.izpack.panels.install.InstallPanel id="install"/>
+            <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
+          </AutomatedInstallation>
+          XML
+          "$INSTALLER" auto-install.xml
+
+      - name: Generate a sample PDF/X-1a file
+        run: |
+          set -euo pipefail
+          cargo run -p cli -- synth-icc /tmp/cmyk.icc
+          cargo run -p cli -- export --output /tmp/sample.pdf --icc /tmp/cmyk.icc --pdfx x1a
+
+      - name: veraPDF PDF/X-1a validation
+        run: |
+          set -euo pipefail
+          /home/runner/verapdf/verapdf --format json --flavour 1a /tmp/sample.pdf > /tmp/verapdf.json || true
+          cat /tmp/verapdf.json
+          python3 - <<'PY'
+          import json, sys
+          data = json.load(open("/tmp/verapdf.json"))
+          job = data["report"]["jobs"][0]
+          compliant = job["validationResult"]["compliant"]
+          print("compliant:", compliant)
+          sys.exit(0 if compliant else 1)
+          PY
+
+      - name: Ghostscript PDF/X preflight
+        run: |
+          set -euo pipefail
+          gs -dPDFX -dBATCH -dNOPAUSE -dNOOUTERSAVE -sColorConversionStrategy=CMYK -sDEVICE=pdfwrite -o /tmp/gs-out.pdf /tmp/sample.pdf
+          echo "Ghostscript -dPDFX pass completed."
