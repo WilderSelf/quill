@@ -1,7 +1,9 @@
 # 0001 — Press-ready PDF/X export
 
 - **Milestone:** M0
-- **Status:** draft
+- **Status:** implemented — preflight landed with this spec; byte generation in
+  [spec 0002](0002-pdf-byte-generation.md); the "PDF/X-1a **or** PDF/X-3 (selectable)"
+  requirement (#1) is completed by [spec 0003](0003-pdf-x3-output.md).
 - **Crates:** `quill-export-pdf` (owner), `quill-color`, `quill-core-model`, `quill-cli`
 
 ## Goal

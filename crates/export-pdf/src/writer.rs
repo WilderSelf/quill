@@ -1,9 +1,11 @@
-//! Assembles the PDF/X-1a:2001 object graph (writer §1-4).
+//! Assembles the PDF/X object graph (writer §1-4) for the level selected in [`ExportOptions`]
+//! (PDF/X-1a:2001 or PDF/X-3:2002).
 //!
 //! Consumes laid-out pages plus the document and writes bytes: catalog + pages tree, one page per
 //! `LaidOutPage` (`MediaBox == BleedBox`, centered `TrimBox`), an embedded subset font, grayscale
-//! image XObjects, the ICC `OutputIntent`, and the XMP identification packet. PDF/X-1a pins the
-//! header to **PDF 1.3**.
+//! image XObjects, the ICC `OutputIntent`, and the XMP identification packet. Both X-1a:2001 and
+//! X-3:2002 pin the header to **PDF 1.3**; the only per-level difference the trivial layout
+//! reaches is the `GTS_PDFX*` identification strings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -122,15 +124,20 @@ pub fn write_pdf(
         info.creator(TextStr("Quill"));
         info.producer(TextStr("Quill export-pdf"));
         info.trapped(TrappingStatus::NotTrapped);
-        info.pair(Name(b"GTS_PDFXVersion"), Str(b"PDF/X-1a:2001"));
-        info.pair(Name(b"GTS_PDFXConformance"), Str(b"PDF/X-1a:2001"));
+        info.pair(
+            Name(b"GTS_PDFXVersion"),
+            Str(opts.version.identifier().as_bytes()),
+        );
+        if let Some(conf) = opts.version.conformance() {
+            info.pair(Name(b"GTS_PDFXConformance"), Str(conf.as_bytes()));
+        }
         info.finish();
     }
 
     // XMP metadata packet (uncompressed).
     let id_hex = doc_id_hex(doc);
     {
-        let xmp = crate::xmp::build_xmp(&doc.metadata.title, &id_hex, &id_hex);
+        let xmp = crate::xmp::build_xmp(opts.version, &doc.metadata.title, &id_hex, &id_hex);
         let mut s = pdf.stream(xmp_id, &xmp);
         s.pair(Name(b"Type"), Name(b"Metadata"));
         s.pair(Name(b"Subtype"), Name(b"XML"));
