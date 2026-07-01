@@ -14,9 +14,10 @@
 >   GID-consistency unit test guards this (the failure veraPDF cannot see).
 > - **ICC synthesis:** built via the safe `lcms2` API (`Profile::new_placeholder` + CMYK/Output
 >   class + `desc`/`cprt`/`wtpt`), exposed as `quill export`'s `synth-icc` subcommand for CI.
-> - **veraPDF/Ghostscript are unavailable locally** (no Java, no network); the `pdfx-conformance`
->   CI job is the compliance gate. Local tests assert structure (header 1.3, OutputIntent,
->   CIDFontType2, TrimBox/BleedBox, XMP) as a proxy.
+> - **PDF/X-1a has no free certified validator** (veraPDF does PDF/A, not PDF/X). The CI job runs
+>   a Ghostscript well-formedness gate; the export-pdf unit tests assert the PDF/X structure
+>   (header 1.3, OutputIntent, CIDFontType2, TrimBox/BleedBox, XMP) and are the real gate.
+>   Certified conformance is the manual POD upload (spec 0001) / commercial preflight.
 
 ## Goal
 
@@ -103,17 +104,29 @@ fn lay_out(doc: &Document) -> Vec<LaidOutPage>   // now paginates instead of ret
 
 ## CI verification
 
-Add a new **Linux-only** job (separate from the existing fmt/clippy/test matrix) that:
+> **Correction (as implemented):** veraPDF validates **PDF/A** and **PDF/UA**, *not* PDF/X — its
+> `--flavour 1a` is PDF/A-1a (ISO 19005-1), a different standard. There is **no free, scriptable
+> tool that certifies PDF/X-1a**; certified checking is Adobe Acrobat Preflight / callas
+> pdfToolbox (commercial) or the manual DriveThruRPG upload (spec 0001). The CI job was therefore
+> built around Ghostscript, not veraPDF.
+
+A **Linux-only** job (separate from the fmt/clippy/test matrix) that:
 - installs Ghostscript (`apt-get install -y ghostscript`);
-- installs veraPDF via its unattended install4j installer, cached across runs;
-- runs `quill export` on `Document::sample()` with the synthesized test ICC profile;
-- asserts `verapdf --format json --flavour 1a <file>` reports `compliant`;
-- asserts a Ghostscript `-sDEVICE=pdfwrite -dPDFX` pass completes with no errors.
+- runs `quill synth-icc` + `quill export` on `Document::sample()` and checks the file is a
+  non-empty `%PDF-1.3`;
+- **gate:** fully interprets the PDF with Ghostscript (`-sDEVICE=nullpage -dPDFSTOPONERROR`) — a
+  malformed file fails the build;
+- **informational:** a Ghostscript `-dPDFX -sDEVICE=pdfwrite` re-distill, logged (not gated,
+  since it re-distills rather than validates).
+
+The detailed PDF/X-1a object structure (OutputIntent, embedded CIDFontType2, `TrimBox`/`BleedBox`,
+XMP identification, no transparency) is asserted by the **export-pdf unit tests**, which are the
+real structural gate; the Ghostscript job is a well-formedness smoke test.
 
 ## Acceptance criteria
 
-- `export()` on `Document::sample()` with a valid `--icc` produces a file that passes both
-  checks above in CI (golden-file test, not just unit tests).
+- `export()` on `Document::sample()` with a valid `--icc` produces a non-empty PDF that Ghostscript
+  interprets without error in CI, and whose PDF/X structure the unit tests assert.
 - Unit tests cover: pagination boundary (content that exactly fills one page vs. overflows to a
   second), image placement sizing from `dpi`, the new `IccProfileInvalid` check (valid CMYK
   profile passes, an RGB or display-class profile fails), and binding-edge bleed asymmetry for
