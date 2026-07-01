@@ -1,0 +1,103 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app for
+semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
+must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
+
+**Status: greenfield / pre-implementation.** There is no code yet. The authoritative design
+is the approved plan at `~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before
+making architectural decisions. This file summarizes the parts that shape day-to-day work.
+
+## Non-negotiable constraints (these drive every design choice)
+
+- **Press output is the reason the product exists.** Exports must be valid **PDF/X-1a:2001 or
+  PDF/X-3:2002**: CMYK color only for color content (no RGB/Lab/spot), grayscale for B&W
+  interiors, all fonts embedded/subset, 0.125" bleed on the three non-binding edges, 300 dpi
+  images (600 dpi line art), **≤240% total ink coverage**, ICC OutputIntent, no crop marks.
+  A preflight step must validate against this spec before export.
+- **500 pages, art-heavy, must stay smooth.** The primary competitor (Affinity Publisher) is
+  documented to collapse on long docs. Performance is a feature, benchmark-gated in CI.
+- **Permissive license (MIT/Apache-2.0 dual).** Every dependency must be permissive-compatible.
+  Deliberately avoid GPL-only deps (no Qt; avoid FreeType by using pure-Rust font crates).
+- **Hybrid paradigm.** Easy structured-content authoring (Homebrewery-like on-ramp) that flows
+  into a real frame/master-page layout engine (InDesign-like ceiling). Both, not either.
+
+## Architecture
+
+Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testable headless
+(via `cli`) before any UI exists**. Data flows: `core-model` (document) → `text-layout` +
+`layout-engine` (positioned content) → `color` (CMYK/ICC) → `export-pdf` (PDF/X) / `render`
+(screen).
+
+| Crate | Responsibility |
+|---|---|
+| `core-model` | Document tree; open, versioned `.tpub` file format (zip + JSON/TOML manifest + linked `assets/`, `fonts/`). Two linked views: semantic content and layout. |
+| `text-layout` | Shaping (`rustybuzz`), **custom Knuth-Plass line breaking** for press-quality justification, hyphenation, bidi. |
+| `layout-engine` | Frames, text threading, master pages, layers, baseline grid. **Incremental & dependency-tracked.** |
+| `color` | `lcms2`: ICC, RGB→CMYK, grayscale, soft-proof, **ink-coverage (240%) enforcement**. |
+| `render` | On-screen viewport (`skia-safe`, GPU) + **linked-image downsampled proxy cache**. |
+| `export-pdf` | **The differentiator.** PDF/X writer on `pdf-writer` + `subsetter`; preflight. |
+| `components-ttrpg` | Stat blocks, random tables, reusable snippets — portable, first-class objects. |
+| `app` | `egui` shell + Skia document canvas. |
+| `cli` | Headless render/export; drives M0 and CI. |
+
+### Decisions that are easy to get wrong
+
+- **Do NOT use Skia's built-in PDF backend for export.** It is RGB-oriented and cannot meet
+  PDF/X-1a. Screen rendering uses Skia; press export uses the dedicated `export-pdf` writer.
+- **Images are linked, not embedded, with cached downsampled proxies.** Never composite
+  full-res on screen — full-res is only touched at export. This is the core perf strategy.
+- **Layout is incremental.** Editing one text thread must re-flow only affected pages, never
+  the whole document. Baseline-grid snapping is per-frame/local — avoid global grid recompute.
+- **Pure-Rust font stack** (`rustybuzz`, `ttf-parser`, `fontdb`) — chosen partly to keep the
+  dependency graph permissive (no FreeType/GPL).
+- **Mine Typst (Apache-2.0)** for reusable crates (`pdf-writer`, `subsetter`, `ttf-parser`) and
+  for its incremental-layout approach.
+
+## Milestone order (build the risky/differentiating part first)
+
+**M0** press-output spike (headless PDF/X export, proven with veraPDF + a real POD upload) →
+**M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
+TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. Currently at **M0**.
+
+## Planning: spec-driven development
+
+Non-trivial work starts with a **spec, not code**. Write or update a markdown spec under
+`specs/` (what the feature must do, inputs/outputs, acceptance criteria, edge cases) and agree
+it before implementing. Code and tests are written to satisfy the spec; the spec is the source
+of truth and is revised when behavior changes. `specs/README.md` indexes the specs. Commits
+and PRs should reference the spec they implement.
+
+## Commands
+
+**Toolchain (install once — Rust is not preinstalled in this environment):**
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+> The cargo commands below are the intended workflow; several only become meaningful once the
+> M0 workspace is scaffolded. Standard cargo workspace:
+
+```bash
+cargo build                      # build all crates
+cargo test                       # run all tests
+cargo test -p <crate>            # test one crate, e.g. -p export-pdf
+cargo test -p <crate> <name>     # run a single test by name substring
+cargo run -p cli -- <args>       # headless render/export (primary M0 entrypoint)
+cargo bench                      # perf harness (500-page synthetic doc; gates M1+)
+cargo clippy --all-targets       # lint
+cargo fmt                        # format
+```
+
+## Verifying press output
+
+The acceptance test for any export change is external validation, not just unit tests:
+`veraPDF` (PDF/X profile) and a Ghostscript preflight on generated PDFs (golden-file tests in
+CI), plus periodic real test-uploads to DriveThruRPG/Lulu/IngramSpark. Color code
+(`color` crate) needs unit tests on ICC round-trips and ink-coverage math.
