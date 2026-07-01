@@ -1,0 +1,14 @@
+[package]
+name = "quill-export-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# PDF byte generation (`pdf-writer`, `subsetter`) and ICC conversion (`lcms2`) arrive in a
+# later spec-driven commit; preflight is implemented now. See specs/0001-pdf-x-export.md.
+[dependencies]
+quill-core-model = { workspace = true }
+quill-color = { workspace = true }
+thiserror = { workspace = true }
