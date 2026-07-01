@@ -5,6 +5,9 @@
 # Local Claude Code settings (machine-local; project agents/skills/rules ARE tracked)
 .claude/settings.local.json
 
+# Session-bridge doc for resuming work (see .claude/skills/handoff) — ephemeral, never tracked
+/HANDOFF.md
+
 # Editor / OS
 .DS_Store
 *.swp

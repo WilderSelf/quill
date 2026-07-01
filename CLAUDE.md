@@ -113,3 +113,9 @@ CI), plus periodic real test-uploads to DriveThruRPG/Lulu/IngramSpark. Color cod
   time. **`/curate`** — dedupe/condense this file (200-line budget), flag contradictions,
   archive stale skills. User-scope config, the permission model, and a disabled reflection Stop
   hook are documented in `~/.claude/settings.reference.md`.
+- **`/handoff`** — writes/refreshes the untracked `HANDOFF.md` session-bridge doc for resuming
+  work in a fresh session; re-verifies live external state (repo/CI/GitHub settings) rather
+  than restating the previous handoff's claims. Project-scoped: `.claude/skills/handoff/`.
+- **`/wrap [task]`** — chains `/ship` (if `task` given) → `/reflect` → `/curate` → `/handoff` as
+  one invocation instead of four, loading shared config once instead of per-phase. Keeps each
+  phase's own approval gates. User-scoped: `~/.claude/skills/wrap/`.
