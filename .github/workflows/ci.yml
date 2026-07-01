@@ -67,7 +67,9 @@ jobs:
           curl -fsSL -o verapdf-installer.zip https://software.verapdf.org/releases/verapdf-installer.zip
           unzip -q verapdf-installer.zip -d verapdf-installer
           INSTALLER="$(find verapdf-installer -name 'verapdf-install' | head -1)"
-          cat > auto-install.xml <<'XML'
+          # The installer `cd`s into its own dir before launching Java, so the answer file must be
+          # an ABSOLUTE path ($RUNNER_TEMP), not relative to the workspace.
+          cat > "$RUNNER_TEMP/auto-install.xml" <<'XML'
           <?xml version="1.0" encoding="UTF-8" standalone="no"?>
           <AutomatedInstallation langpack="eng">
             <com.izforge.izpack.panels.htmlhello.HTMLHelloPanel id="welcome"/>
@@ -79,7 +81,7 @@ jobs:
             <com.izforge.izpack.panels.finish.FinishPanel id="finish"/>
           </AutomatedInstallation>
           XML
-          "$INSTALLER" auto-install.xml
+          "$INSTALLER" "$RUNNER_TEMP/auto-install.xml"
 
       - name: Generate a sample PDF/X-1a file
         run: |
