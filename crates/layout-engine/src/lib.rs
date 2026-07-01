@@ -6,14 +6,21 @@
 //! crates compile and the export pipeline has something to consume. Uses `quill-text-layout`
 //! for line breaking.
 
-use quill_core_model::{Block, Document, Rect};
+use quill_core_model::{Block, Color, Document, Rect};
 use quill_text_layout::greedy_break;
 
 /// A block positioned on a page.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlacedBlock {
-    Text { frame: Rect, lines: Vec<String> },
-    Image { frame: Rect, asset_id: String },
+    Text {
+        frame: Rect,
+        lines: Vec<String>,
+        color: Color,
+    },
+    Image {
+        frame: Rect,
+        asset_id: String,
+    },
 }
 
 /// A laid-out page.
@@ -40,7 +47,7 @@ pub fn lay_out(doc: &Document) -> Vec<LaidOutPage> {
 
     for block in &doc.content {
         match block {
-            Block::Heading { text, .. } | Block::Body { text, .. } => {
+            Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
                 let lines = greedy_break(text, max_chars);
                 let height = lines.len() as f32 * APPROX_LINE_HEIGHT_PT;
 
@@ -59,6 +66,7 @@ pub fn lay_out(doc: &Document) -> Vec<LaidOutPage> {
                         h_pt: height,
                     },
                     lines,
+                    color: *color,
                 });
                 y += height;
             }

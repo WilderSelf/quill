@@ -13,7 +13,7 @@ use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, TrappingStatus};
 use pdf_writer::writers::OutputIntent;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
-use quill_core_model::Document;
+use quill_core_model::{Color, Document};
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 
 use crate::{fonts, geom, icc, images, ExportError, ExportOptions};
@@ -311,12 +311,21 @@ fn render_page(
     let mut content = Content::new();
     for block in &page.blocks {
         match block {
-            PlacedBlock::Text { frame, lines } => {
+            PlacedBlock::Text {
+                frame,
+                lines,
+                color,
+            } => {
                 content.begin_text();
                 content.set_font(Name(b"F0"), FONT_SIZE_PT);
-                // The layout dropped per-block color; M0 renders text black (legal DeviceGray).
-                // Threading authored Cmyk/Gray through PlacedBlock is a fast-follow.
-                content.set_fill_gray(0.0);
+                // Emit the authored press-legal fill color. Preflight rejects RGB before export,
+                // so `Rgb` is unreachable here; fall back to black (rather than panicking) so a
+                // `--force` export can never abort mid-stream.
+                match color {
+                    Color::Gray { v } => content.set_fill_gray(*v),
+                    Color::Cmyk { c, m, y, k } => content.set_fill_cmyk(*c, *m, *y, *k),
+                    Color::Rgb { .. } => content.set_fill_gray(0.0),
+                };
                 let ascent = font.ascent_pt(FONT_SIZE_PT);
                 for (li, line) in lines.iter().enumerate() {
                     let top_y = frame.y_pt + ascent + li as f32 * LINE_HEIGHT_PT;
@@ -370,4 +379,59 @@ fn doc_id_hex(doc: &Document) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quill_core_model::PageSetup;
+
+    /// Build a one-page layout holding a single text block with the given fill color, render it,
+    /// and return the (uncompressed) content-stream bytes as a lossy string. Unlike the finished
+    /// PDF, `render_page` output is not FlateDecode'd, so fill operators are directly greppable.
+    fn render_text_color(color: Color) -> String {
+        let setup = PageSetup::default();
+        let g = geom::page_geom(&setup, 0);
+        let mut chars = BTreeSet::new();
+        chars.insert('H');
+        chars.insert('i');
+        let font = fonts::build(&chars).expect("build bundled font");
+        let page = LaidOutPage {
+            blocks: vec![PlacedBlock::Text {
+                frame: quill_core_model::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: setup.trim.w_pt,
+                    h_pt: LINE_HEIGHT_PT,
+                },
+                lines: vec!["Hi".to_string()],
+                color,
+            }],
+        };
+        let content = render_page(&page, &g, &font, &BTreeMap::new());
+        String::from_utf8_lossy(&content).into_owned()
+    }
+
+    #[test]
+    fn text_emits_cmyk_fill_operator() {
+        let s = render_text_color(Color::Cmyk {
+            c: 0.1,
+            m: 0.2,
+            y: 0.3,
+            k: 0.4,
+        });
+        assert!(
+            s.contains("0.1 0.2 0.3 0.4 k"),
+            "expected CMYK fill operator, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn text_emits_gray_fill_operator() {
+        let s = render_text_color(Color::Gray { v: 0.5 });
+        assert!(
+            s.contains("0.5 g"),
+            "expected grayscale fill operator, got:\n{s}"
+        );
+    }
 }
