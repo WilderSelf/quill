@@ -35,3 +35,46 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features
+
+  # Structural preflight of the generated PDF, per spec 0002. NOTE: no free tool *certifies*
+  # PDF/X-1a — veraPDF validates PDF/A and PDF/UA, not PDF/X (its `--flavour 1a` is PDF/A-1a). So
+  # this runs Ghostscript as a structural smoke test; the detailed PDF/X object structure
+  # (OutputIntent, CIDFontType2, TrimBox/BleedBox, XMP identification) is asserted by the
+  # export-pdf unit tests, and certified PDF/X validation is the manual DriveThruRPG upload
+  # (spec 0001) or a commercial preflight (Acrobat / callas pdfToolbox).
+  pdf-preflight:
+    name: PDF preflight (Ghostscript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Ghostscript
+        run: sudo apt-get update && sudo apt-get install -y ghostscript
+
+      - name: Generate a sample PDF/X-1a file
+        run: |
+          set -euo pipefail
+          cargo run -p quill-cli -- synth-icc /tmp/cmyk.icc
+          cargo run -p quill-cli -- export --output /tmp/sample.pdf --icc /tmp/cmyk.icc --pdfx x1a
+          test -s /tmp/sample.pdf
+          head -c 8 /tmp/sample.pdf | grep -q '%PDF-1.3'
+
+      - name: Ghostscript parse check (gate)
+        run: |
+          set -euo pipefail
+          # Fully interpret the PDF; a malformed file makes Ghostscript exit non-zero.
+          gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample.pdf
+          echo "Ghostscript interpreted the PDF with no errors."
+
+      - name: Ghostscript PDF/X re-distill (informational)
+        run: |
+          set +e
+          gs -dPDFX -dBATCH -dNOPAUSE -dNOOUTERSAVE -sColorConversionStrategy=CMYK \
+            -sDEVICE=pdfwrite -o /tmp/gs-out.pdf /tmp/sample.pdf 2>&1 | tee /tmp/gs.log
+          echo "(informational: Ghostscript PDF/X re-distill log above)"

@@ -50,8 +50,9 @@ without any additional terms or conditions.
 
 ### Bundled fonts
 
-`crates/export-pdf/assets/LiberationSerif-Regular.ttf` is **Liberation Serif**, licensed under
-the [SIL Open Font License, Version 1.1](crates/export-pdf/assets/LiberationSerif-LICENSE.txt)
-(Digitized data © 2010 Google Corporation; © 2012 Red Hat, Inc.). It ships as a data asset used
-as the default embeddable body font for PDF/X export; the OFL is compatible with the project's
-MIT/Apache-2.0 code license.
+`crates/export-pdf/assets/SourceSerif4-Regular.ttf` is **Source Serif 4** (a static `glyf`
+instance), licensed under the
+[SIL Open Font License, Version 1.1](crates/export-pdf/assets/SourceSerif4-LICENSE.txt)
+(© 2014 The Source Serif 4 Project Authors). It ships as a data asset used as the default
+embeddable body font for PDF/X export; the OFL is compatible with the project's MIT/Apache-2.0
+code license.

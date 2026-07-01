@@ -1,7 +1,8 @@
 //! Font subsetting and composite-font embedding (spec 0002 req 3).
 //!
-//! One bundled OFL TrueType font (Liberation Serif, SIL OFL-1.1) is subset to only the glyphs a
-//! document uses and embedded as a Type0/CIDFontType2 composite font with Identity-H encoding.
+//! One bundled OFL TrueType font (Source Serif 4, SIL OFL-1.1, `glyf` outlines) is subset to only
+//! the glyphs a document uses and embedded as a Type0/CIDFontType2 composite font with Identity-H
+//! encoding.
 //!
 //! The `subsetter` crate **remaps** glyph IDs to a compact range (0 = `.notdef`, then contiguous)
 //! — it does not preserve original GIDs. So the content stream is encoded with the *remapped*
@@ -17,8 +18,11 @@ use ttf_parser::{Face, GlyphId};
 use crate::ExportError;
 
 /// The bundled font program (full file; subset at export time). SIL OFL-1.1 — see
-/// `assets/LiberationSerif-LICENSE.txt`.
-const FONT_TTF: &[u8] = include_bytes!("../assets/LiberationSerif-Regular.ttf");
+/// `assets/SourceSerif4-LICENSE.txt`.
+const FONT_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-Regular.ttf");
+
+/// PostScript-style family name embedded after the subset tag (`ABCDEF+<NAME>`).
+const FONT_NAME: &str = "SourceSerif4";
 
 /// A subset font ready to embed, plus everything needed to encode text against it.
 pub struct EmbeddedFont {
@@ -101,7 +105,7 @@ pub fn build(chars: &BTreeSet<char>) -> Result<EmbeddedFont, ExportError> {
         .unwrap_or(ascent * 0.7);
 
     Ok(EmbeddedFont {
-        base_font: format!("{}+LiberationSerif", subset_tag(&used_orig)),
+        base_font: format!("{}+{FONT_NAME}", subset_tag(&used_orig)),
         subset,
         widths,
         bbox,
@@ -148,8 +152,8 @@ mod tests {
         assert!(font.widths.len() >= 2); // notdef + at least one real glyph
         assert!(font.widths.iter().all(|w| w.is_finite() && *w >= 0.0));
         assert!(font.ascent > 0.0 && font.descent < 0.0);
-        assert!(font.base_font.ends_with("+LiberationSerif"));
-        assert_eq!(font.base_font.len(), 6 + 1 + "LiberationSerif".len());
+        assert!(font.base_font.ends_with("+SourceSerif4"));
+        assert_eq!(font.base_font.len(), 6 + 1 + FONT_NAME.len());
     }
 
     #[test]
