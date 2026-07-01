@@ -6,9 +6,9 @@
   `quill-color`, `quill-core-model`, `quill-cli`
 
 > **Implementation notes (as landed):**
-> - **Bundled font:** Liberation Serif (SIL OFL-1.1), a `glyf`-based TrueType — matches the
->   CIDFontType2/FontFile2 path. (Source Serif 4's Adobe distribution is CFF/OTF; the network was
->   unavailable to fetch a `glyf` build, so the locally-available OFL serif was used. Swappable.)
+> - **Bundled font:** Source Serif 4 (SIL OFL-1.1), a static `glyf` TrueType instance — matches
+>   the CIDFontType2/FontFile2 path. (Adobe's Source Serif distribution is CFF/OTF; the bundled
+>   file is the static `glyf` build served by Google Fonts / fontsource.)
 > - **Subsetter GIDs:** `subsetter` 0.2.x **remaps** glyph IDs (it does not preserve them). The
 >   content stream is encoded with the *remapped* GIDs and `CIDToGIDMap` is `/Identity`; a
 >   GID-consistency unit test guards this (the failure veraPDF cannot see).
