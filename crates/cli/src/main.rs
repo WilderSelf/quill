@@ -69,6 +69,9 @@ struct ExportArgs {
     /// ICC profile for the PDF/X OutputIntent.
     #[arg(long)]
     icc: String,
+    /// TrueType (.ttf) font to embed; defaults to the bundled Source Serif 4.
+    #[arg(long)]
+    font: Option<String>,
     /// Export even if preflight fails.
     #[arg(long)]
     force: bool,
@@ -140,6 +143,7 @@ fn main() -> ExitCode {
             let opts = ExportOptions {
                 version: args.pdfx.into(),
                 output_intent_icc: args.icc,
+                font_path: args.font,
                 force: args.force,
                 ..Default::default()
             };
