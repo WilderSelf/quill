@@ -1,0 +1,10 @@
+[package]
+name = "quill-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The GPU canvas (`skia-safe`, evaluating `vello`) arrives in a later spec-driven commit.
+[dependencies]

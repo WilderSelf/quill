@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/WilderSelf/quill"
+authors = ["Daniel Foster <danielfoster25@gmail.com>"]
+rust-version = "1.75"
+
+# Shared dependency versions. Heavy native-backed crates (skia-safe, lcms2, rustybuzz,
+# pdf-writer, subsetter, egui, ...) are intentionally NOT added yet — they arrive in later
+# spec-driven commits so the scaffold stays fast to build and CI stays green. See specs/.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates (path deps within the workspace).
+quill-core-model = { path = "crates/core-model" }
+quill-text-layout = { path = "crates/text-layout" }
+quill-layout-engine = { path = "crates/layout-engine" }
+quill-color = { path = "crates/color" }
+quill-render = { path = "crates/render" }
+quill-export-pdf = { path = "crates/export-pdf" }
+quill-components-ttrpg = { path = "crates/components-ttrpg" }
+
+[profile.release]
+lto = "thin"

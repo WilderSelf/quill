@@ -1,0 +1,16 @@
+[package]
+name = "quill-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "quill"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+quill-core-model = { workspace = true }
+quill-export-pdf = { workspace = true }

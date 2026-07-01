@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# Local Claude Code settings
+.claude/
+
 # Editor / OS
 .DS_Store
 *.swp
