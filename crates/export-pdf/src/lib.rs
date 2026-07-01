@@ -2,9 +2,10 @@
 //! `specs/0002-pdf-byte-generation.md` (byte generation).
 //!
 //! [`preflight`] validates a document against the DriveThruRPG/PDF-X requirements. [`export`]
-//! then writes a real **PDF/X-1a:2001** file via `pdf-writer` (object graph) + `subsetter`
-//! (embedded subset font), with `lcms2` validating the ICC OutputIntent. The writer internals
-//! live in the `writer`/`fonts`/`images`/`icc`/`xmp`/`geom` modules.
+//! then writes a real **PDF/X-1a:2001** or **PDF/X-3:2002** file (selected via
+//! [`ExportOptions::version`]) through `pdf-writer` (object graph) + `subsetter` (embedded subset
+//! font), with `lcms2` validating the ICC OutputIntent. The writer internals live in the
+//! `writer`/`fonts`/`images`/`icc`/`xmp`/`geom` modules.
 
 use std::io::Write;
 
@@ -32,6 +33,26 @@ pub enum PdfxVersion {
     X1a2001,
     /// PDF/X-3:2002 — allows color-managed content with an output intent.
     X3_2002,
+}
+
+impl PdfxVersion {
+    /// The `GTS_PDFXVersion` identifier string for this conformance level, written into both the
+    /// document info dict and the XMP identification packet.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            PdfxVersion::X1a2001 => "PDF/X-1a:2001",
+            PdfxVersion::X3_2002 => "PDF/X-3:2002",
+        }
+    }
+
+    /// The `GTS_PDFXConformance` string, if the level defines one. PDF/X-1a carries it; PDF/X-3
+    /// (ISO 15930-3) defines only `GTS_PDFXVersion`, so the conformance key is omitted for X-3.
+    pub fn conformance(self) -> Option<&'static str> {
+        match self {
+            PdfxVersion::X1a2001 => Some("PDF/X-1a:2001"),
+            PdfxVersion::X3_2002 => None,
+        }
+    }
 }
 
 /// Options controlling an export.
@@ -219,8 +240,9 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     report
 }
 
-/// Export a document as press-ready PDF/X-1a:2001. Runs preflight first (unless `opts.force`),
-/// lays the document out, then writes real PDF bytes to `out`. See spec 0002.
+/// Export a document as press-ready PDF/X at the level in `opts.version` (X-1a:2001 or
+/// X-3:2002). Runs preflight first (unless `opts.force`), lays the document out, then writes real
+/// PDF bytes to `out`. See specs 0002 (byte generation) and 0003 (X-3 selection).
 pub fn export(
     doc: &Document,
     opts: &ExportOptions,
@@ -361,6 +383,43 @@ mod tests {
             "missing embedded composite font"
         );
         assert!(text.contains("Identity-H"), "missing Identity-H encoding");
+        // The default level is X-1a: both the info dict and the XMP identify it as such.
+        assert!(text.contains("PDF/X-1a:2001"), "missing X-1a identifier");
+        assert!(
+            !text.contains("PDF/X-3"),
+            "unexpected X-3 identifier in X-1a export"
+        );
+    }
+
+    #[test]
+    fn export_writes_pdfx3_identifier() {
+        let (mut opts, path) = opts_with_real_icc("x3");
+        opts.version = PdfxVersion::X3_2002;
+        let mut buf = Vec::new();
+        export(&Document::sample(), &opts, &mut buf).expect("X-3 export should succeed");
+        let _ = std::fs::remove_file(&path);
+
+        let text = String::from_utf8_lossy(&buf);
+        // X-3:2002 identifier is present (info dict + XMP) and no X-1a string leaks through.
+        assert!(
+            text.contains("PDF/X-3:2002"),
+            "missing PDF/X-3:2002 identifier"
+        );
+        assert!(
+            !text.contains("PDF/X-1a"),
+            "X-3 export must not identify as X-1a"
+        );
+        // X-3:2002 defines no GTS_PDFXConformance key.
+        assert!(
+            !text.contains("GTS_PDFXConformance"),
+            "X-3 must omit GTS_PDFXConformance"
+        );
+        // Still a valid PDF/X shell: PDF 1.3 header + OutputIntent.
+        assert!(buf.starts_with(b"%PDF-1.3"), "wrong PDF header");
+        assert!(
+            text.contains("GTS_PDFX"),
+            "missing PDF/X OutputIntent marker"
+        );
     }
 
     #[test]

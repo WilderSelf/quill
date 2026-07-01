@@ -57,20 +57,28 @@ jobs:
       - name: Install Ghostscript
         run: sudo apt-get update && sudo apt-get install -y ghostscript
 
-      - name: Generate a sample PDF/X-1a file
+      - name: Generate sample PDF/X-1a and PDF/X-3 files
         run: |
           set -euo pipefail
           cargo run -p quill-cli -- synth-icc /tmp/cmyk.icc
           cargo run -p quill-cli -- export --output /tmp/sample.pdf --icc /tmp/cmyk.icc --pdfx x1a
+          cargo run -p quill-cli -- export --output /tmp/sample-x3.pdf --icc /tmp/cmyk.icc --pdfx x3
           test -s /tmp/sample.pdf
+          test -s /tmp/sample-x3.pdf
           head -c 8 /tmp/sample.pdf | grep -q '%PDF-1.3'
+          head -c 8 /tmp/sample-x3.pdf | grep -q '%PDF-1.3'
+          # The X-3 file must actually identify as X-3 (guards the writer against silently
+          # emitting X-1a identifiers for --pdfx x3 — the bug spec 0003 fixed).
+          grep -aq 'PDF/X-3:2002' /tmp/sample-x3.pdf
+          ! grep -aq 'PDF/X-1a' /tmp/sample-x3.pdf
 
       - name: Ghostscript parse check (gate)
         run: |
           set -euo pipefail
-          # Fully interpret the PDF; a malformed file makes Ghostscript exit non-zero.
+          # Fully interpret each PDF; a malformed file makes Ghostscript exit non-zero.
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample.pdf
-          echo "Ghostscript interpreted the PDF with no errors."
+          gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample-x3.pdf
+          echo "Ghostscript interpreted both PDFs with no errors."
 
       - name: Ghostscript PDF/X re-distill (informational)
         run: |

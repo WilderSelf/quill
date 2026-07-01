@@ -10,7 +10,8 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 
 | # | Spec | Milestone | Status |
 |---|------|-----------|--------|
-| 0001 | [Press-ready PDF/X export](0001-pdf-x-export.md) | M0 | draft |
+| 0001 | [Press-ready PDF/X export](0001-pdf-x-export.md) | M0 | implemented |
 | 0002 | [Real PDF/X byte generation](0002-pdf-byte-generation.md) | M0 | implemented |
+| 0003 | [PDF/X-3:2002 output](0003-pdf-x3-output.md) | M0 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
