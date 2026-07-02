@@ -1,8 +1,12 @@
-//! Font subsetting and composite-font embedding (spec 0002 req 3, spec 0004 user fonts).
+//! Font subsetting and composite-font embedding (spec 0002 req 3, spec 0004 user fonts, spec 0011
+//! CFF fonts).
 //!
-//! A font program — either the bundled OFL font (Source Serif 4, SIL OFL-1.1, `glyf` outlines) or
-//! a user-supplied TrueType file — is subset to only the glyphs a document uses and embedded as a
-//! Type0/CIDFontType2 composite font with Identity-H encoding. See `specs/0004-user-font-embedding.md`.
+//! A font program — the bundled OFL font (Source Serif 4, SIL OFL-1.1, `glyf` outlines) or a
+//! user-supplied file — is subset to only the glyphs a document uses and embedded as a Type0
+//! composite font with Identity-H encoding. The descendant-font flavour follows the outlines
+//! ([`OutlineKind`]): TrueType embeds `glyf` as `FontFile2` under `CIDFontType2`, while CFF (`.otf`)
+//! embeds the bare `CFF ` table as `FontFile3` under `CIDFontType0`. See
+//! `specs/0004-user-font-embedding.md` and `specs/0011-cff-font-embedding.md`.
 //!
 //! The `subsetter` crate **remaps** glyph IDs to a compact range (0 = `.notdef`, then contiguous)
 //! — it does not preserve original GIDs. So the content stream is encoded with the *remapped*
@@ -14,9 +18,21 @@ use std::collections::{BTreeSet, HashMap};
 
 use pdf_writer::types::FontFlags;
 use subsetter::GlyphRemapper;
-use ttf_parser::{Face, GlyphId, Permissions};
+use ttf_parser::{Face, GlyphId, Permissions, RawFace, Tag};
 
 use crate::ExportError;
+
+/// Which outline flavour a font program carries — this decides the PDF embedding path.
+///
+/// TrueType (`glyf`) embeds the whole subset sfnt as `FontFile2` under a `CIDFontType2` descendant.
+/// CFF embeds the bare `CFF ` table as `FontFile3` (`/Subtype /CIDFontType0C`) under a
+/// `CIDFontType0` descendant — the only PDF 1.3-legal form (the `FontFile3 /Subtype /OpenType`
+/// wrapper is PDF 1.6+). See `specs/0011-cff-font-embedding.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineKind {
+    TrueType,
+    Cff,
+}
 
 /// The bundled font program (full file; subset at export time). SIL OFL-1.1 — see
 /// `assets/SourceSerif4-LICENSE.txt`.
@@ -30,8 +46,12 @@ const FONT_NAME: &str = "SourceSerif4";
 pub struct EmbeddedFont {
     /// PostScript name with a subset tag, e.g. `ABCDEF+LiberationSerif`.
     pub base_font: String,
-    /// The subset TrueType program (uncompressed; the writer flate-compresses it).
+    /// The font program the writer embeds (uncompressed; the writer flate-compresses it). For
+    /// [`OutlineKind::TrueType`] this is the subset sfnt (embedded as `FontFile2`); for
+    /// [`OutlineKind::Cff`] this is the bare `CFF ` table (embedded as `FontFile3`).
     pub subset: Vec<u8>,
+    /// Outline flavour of `subset`, selecting the writer's embedding path.
+    pub outlines: OutlineKind,
     /// Glyph advance widths in new-GID order, scaled to the PDF 1000-unit em.
     pub widths: Vec<f32>,
     /// Font bounding box `[x_min, y_min, x_max, y_max]` in 1000-unit em.
@@ -75,11 +95,13 @@ pub fn build(chars: &BTreeSet<char>) -> Result<EmbeddedFont, ExportError> {
     Ok(font)
 }
 
-/// Subset and measure an arbitrary TrueType (`glyf`) font `program` for the given `chars`.
+/// Subset and measure an arbitrary TrueType (`glyf`) or CFF (`.otf`) font `program` for the given
+/// `chars`. The outline flavour ([`OutlineKind`]) is detected and recorded so the writer picks the
+/// matching PDF embedding path (spec 0011).
 ///
 /// `name_override` pins the embedded family name (used for the bundled font); when `None`, the
 /// name is derived from the font's own `name` table and sanitised to a valid PDF name. Rejects
-/// CFF/OpenType-CFF programs and fonts whose `OS/2` `fsType` forbids embedding.
+/// fonts with neither outline table and fonts whose `OS/2` `fsType` forbids embedding.
 pub fn build_from_bytes(
     program: &[u8],
     name_override: Option<&str>,
@@ -87,7 +109,7 @@ pub fn build_from_bytes(
 ) -> Result<EmbeddedFont, ExportError> {
     let face = Face::parse(program, 0).map_err(|e| ExportError::Font(format!("parse: {e}")))?;
     let tables = face.tables();
-    check_outline_format(tables.glyf.is_some(), tables.cff.is_some())?;
+    let outlines = outline_kind(tables.glyf.is_some(), tables.cff.is_some())?;
     check_embeddable(face.permissions())?;
 
     let name = match name_override {
@@ -106,10 +128,19 @@ pub fn build_from_bytes(
         char_orig.push((ch, gid));
     }
 
-    // Remap to a compact GID range (always includes .notdef = 0), then subset.
+    // Remap to a compact GID range (always includes .notdef = 0), then subset. `subsetter` always
+    // returns an sfnt wrapper (subset `glyf` or `CFF ` table inside), converting SID-keyed CFF to
+    // CID-keyed with an identity GID=CID map — so the remapped GID is usable directly as the CID.
     let remapper = GlyphRemapper::new_from_glyphs_sorted(&used_orig);
-    let subset = subsetter::subset(program, 0, &remapper)
+    let subset_sfnt = subsetter::subset(program, 0, &remapper)
         .map_err(|e| ExportError::Font(format!("subset: {e}")))?;
+
+    // TrueType embeds the whole subset sfnt as FontFile2; CFF embeds the bare `CFF ` table as
+    // FontFile3/CIDFontType0C (PDF 1.3 forbids the FontFile3 OpenType wrapper). See spec 0011.
+    let subset = match outlines {
+        OutlineKind::TrueType => subset_sfnt,
+        OutlineKind::Cff => extract_cff_table(&subset_sfnt)?,
+    };
 
     // Widths in new-GID order: remapped_gids() yields old GIDs ordered by their new GID.
     let widths: Vec<f32> = remapper
@@ -140,6 +171,7 @@ pub fn build_from_bytes(
     Ok(EmbeddedFont {
         base_font: format!("{}+{name}", subset_tag(&used_orig)),
         subset,
+        outlines,
         widths,
         bbox,
         ascent,
@@ -152,18 +184,31 @@ pub fn build_from_bytes(
     })
 }
 
-/// Require TrueType (`glyf`) outlines. CFF/OpenType-CFF is a named fast-follow (needs a different
-/// `FontFile3`/`CIDFontType0` writer path), so it is rejected with a clear message.
-fn check_outline_format(has_glyf: bool, has_cff: bool) -> Result<(), ExportError> {
+/// Classify a font's outline flavour. `glyf` wins when both tables are present (a rare but legal
+/// combination); a CFF-only font selects the `FontFile3`/`CIDFontType0` path (spec 0011). A font
+/// with neither outline table cannot be embedded.
+fn outline_kind(has_glyf: bool, has_cff: bool) -> Result<OutlineKind, ExportError> {
     if has_glyf {
-        return Ok(());
-    }
-    let msg = if has_cff {
-        "OpenType/CFF fonts (.otf) are not yet supported; supply a TrueType (.ttf) font"
+        Ok(OutlineKind::TrueType)
+    } else if has_cff {
+        Ok(OutlineKind::Cff)
     } else {
-        "font has no TrueType (glyf) outlines"
-    };
-    Err(ExportError::Font(msg.into()))
+        Err(ExportError::Font(
+            "font has no TrueType (glyf) or CFF outlines".into(),
+        ))
+    }
+}
+
+/// Pull the raw `CFF ` table bytes out of the subset sfnt that `subsetter` produced. PDF/X output
+/// is PDF 1.3, where `FontFile3` must carry a bare CFF (`/Subtype /CIDFontType0C`) — the sfnt-
+/// wrapped `/Subtype /OpenType` form is PDF 1.6+. `subsetter` always keeps a `CFF ` table for a
+/// CFF input, so a missing table here is an internal invariant break, not a user-input error.
+fn extract_cff_table(subset_sfnt: &[u8]) -> Result<Vec<u8>, ExportError> {
+    let raw = RawFace::parse(subset_sfnt, 0)
+        .map_err(|e| ExportError::Font(format!("subset parse: {e}")))?;
+    raw.table(Tag::from_bytes(b"CFF "))
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| ExportError::Font("subset sfnt is missing its CFF table".into()))
 }
 
 /// Reject fonts whose `OS/2` `fsType` marks them *Restricted License* embedding. A missing/
@@ -332,13 +377,62 @@ mod tests {
         assert_eq!(font.flags.bits(), FontFlags::NON_SYMBOLIC.bits());
     }
 
+    /// A synthetic CFF-outline OTF fixture (built from scratch with fontTools — no third-party
+    /// outlines, so no license encumbrance; see the plan). Glyphs: .notdef + A–E + space.
+    const TEST_CFF_OTF: &[u8] = include_bytes!("../assets/test-cff.otf");
+
     #[test]
-    fn outline_format_guard() {
-        assert!(check_outline_format(true, false).is_ok()); // TrueType
-        assert!(check_outline_format(true, true).is_ok()); // glyf wins if both present
-        let cff = check_outline_format(false, true).unwrap_err();
-        assert!(matches!(cff, ExportError::Font(m) if m.contains("CFF")));
-        assert!(check_outline_format(false, false).is_err()); // no outlines at all
+    fn outline_kind_classifies() {
+        assert_eq!(outline_kind(true, false).unwrap(), OutlineKind::TrueType);
+        assert_eq!(outline_kind(true, true).unwrap(), OutlineKind::TrueType); // glyf wins
+        assert_eq!(outline_kind(false, true).unwrap(), OutlineKind::Cff);
+        assert!(outline_kind(false, false).is_err()); // no outlines at all
+    }
+
+    #[test]
+    fn bundled_font_is_truetype() {
+        let font = build(&charset("The Dungeon")).unwrap();
+        assert_eq!(font.outlines, OutlineKind::TrueType);
+    }
+
+    /// The CFF path: an `.otf` embeds as a bare `CFF ` table, not a subset sfnt. A CFF program
+    /// begins with its header (major version `0x01`); a subset sfnt would begin with the sfnt tag
+    /// (`00 01 00 00` for TrueType or `OTTO` for OpenType). Guards the FontFile3/CIDFontType0C path.
+    #[test]
+    fn cff_embeds_bare_table() {
+        let font = build_from_bytes(TEST_CFF_OTF, None, &charset("ABC")).unwrap();
+        assert_eq!(font.outlines, OutlineKind::Cff);
+        assert!(font.subset.len() >= 4, "CFF program too short to inspect");
+        assert_eq!(
+            font.subset[0], 0x01,
+            "CFF program must start with major version 1"
+        );
+        assert_ne!(
+            &font.subset[..4],
+            b"OTTO",
+            "must be bare CFF, not an sfnt wrapper"
+        );
+        assert_ne!(&font.subset[..4], &[0x00, 0x01, 0x00, 0x00]);
+        assert!(font.widths.len() >= 2); // notdef + at least one real glyph
+        assert!(font.base_font.contains("QuillTestCFF"));
+    }
+
+    /// The GID↔glyph invariant (see [`gids_are_consistent`]) must also hold on the CFF path: the
+    /// width recorded for a char's subset GID equals the original face's advance for that char.
+    #[test]
+    fn cff_gids_are_consistent() {
+        let face = Face::parse(TEST_CFF_OTF, 0).unwrap();
+        let scale = 1000.0 / face.units_per_em() as f32;
+        let font = build_from_bytes(TEST_CFF_OTF, None, &charset("ABCDE")).unwrap();
+        for ch in "ABCDE".chars() {
+            let new_gid = font.char_to_gid[&ch] as usize;
+            let orig_gid = face.glyph_index(ch).unwrap().0;
+            let orig_w = face.glyph_hor_advance(GlyphId(orig_gid)).unwrap() as f32 * scale;
+            assert!(
+                (font.widths[new_gid] - orig_w).abs() < 0.01,
+                "width mismatch for '{ch}': subset gid {new_gid}"
+            );
+        }
     }
 
     #[test]

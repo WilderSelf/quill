@@ -69,7 +69,7 @@ struct ExportArgs {
     /// ICC profile for the PDF/X OutputIntent.
     #[arg(long)]
     icc: String,
-    /// TrueType (.ttf) font to embed; defaults to the bundled Source Serif 4.
+    /// TrueType (.ttf) or CFF OpenType (.otf) font to embed; defaults to the bundled Source Serif 4.
     #[arg(long)]
     font: Option<String>,
     /// Export even if preflight fails.

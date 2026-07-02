@@ -270,7 +270,12 @@ fn write_output_intent(mut oi: OutputIntent<'_>, icc_id: Ref) {
     oi.finish();
 }
 
-/// Emit the Type0 → CIDFontType2 → FontDescriptor → FontFile2 chain.
+/// Emit the Type0 → CIDFont → FontDescriptor → FontFile chain. The descendant-font subtype and the
+/// embedded font stream depend on the outline flavour (spec 0011):
+/// - **TrueType** (`glyf`): `CIDFontType2` + `CIDToGIDMap /Identity`, program in `FontFile2` with
+///   a `Length1` (the sfnt byte length).
+/// - **CFF**: `CIDFontType0` (no `CIDToGIDMap` — it is meaningful only for `CIDFontType2`), bare
+///   `CFF ` table in `FontFile3` tagged `/Subtype /CIDFontType0C`, no `Length1`.
 fn write_font(
     pdf: &mut Pdf,
     font: &fonts::EmbeddedFont,
@@ -280,6 +285,7 @@ fn write_font(
     fontfile_id: Ref,
 ) {
     let base = font.base_font.as_bytes();
+    let is_cff = font.outlines == fonts::OutlineKind::Cff;
     {
         let mut t0 = pdf.type0_font(type0_id);
         t0.base_font(Name(base));
@@ -289,7 +295,11 @@ fn write_font(
     }
     {
         let mut cid = pdf.cid_font(cid_id);
-        cid.subtype(CidFontType::Type2);
+        cid.subtype(if is_cff {
+            CidFontType::Type0
+        } else {
+            CidFontType::Type2
+        });
         cid.base_font(Name(base));
         cid.system_info(SystemInfo {
             registry: Str(b"Adobe"),
@@ -297,7 +307,10 @@ fn write_font(
             supplement: 0,
         });
         cid.font_descriptor(descriptor_id);
-        cid.cid_to_gid_map_predefined(Name(b"Identity"));
+        // CIDToGIDMap applies only to CIDFontType2; CIDFontType0 maps CID→glyph via the CFF charset.
+        if !is_cff {
+            cid.cid_to_gid_map_predefined(Name(b"Identity"));
+        }
         cid.widths().consecutive(0, font.widths.iter().copied());
         cid.finish();
     }
@@ -316,14 +329,23 @@ fn write_font(
         fd.descent(font.descent);
         fd.cap_height(font.cap_height);
         fd.stem_v(font.stem_v);
-        fd.font_file2(fontfile_id);
+        if is_cff {
+            fd.font_file3(fontfile_id);
+        } else {
+            fd.font_file2(fontfile_id);
+        }
         fd.finish();
     }
     {
         let compressed = deflate(&font.subset);
         let mut s = pdf.stream(fontfile_id, &compressed);
         s.filter(Filter::FlateDecode);
-        s.pair(Name(b"Length1"), font.subset.len() as i32);
+        if is_cff {
+            // FontFile3 identifies the embedded program by its /Subtype; bare CFF is CIDFontType0C.
+            s.pair(Name(b"Subtype"), Name(b"CIDFontType0C"));
+        } else {
+            s.pair(Name(b"Length1"), font.subset.len() as i32);
+        }
         s.finish();
     }
 }
