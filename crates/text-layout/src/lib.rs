@@ -1,12 +1,17 @@
 //! Text shaping and line breaking.
 //!
-//! Increment 1 of spec 0015 replaces the character-count stand-in with real **width-based**
-//! greedy line breaking: words are packed onto a line while the line's *measured* advance stays
-//! within the frame width. Widths come from a [`CharMetrics`] implementation supplied by the
-//! caller (the embedded font in the export path; [`MonospaceMetrics`] in tests) — see
-//! `specs/0015-text-metrics-line-breaking.md` for why metrics are passed in rather than stored on
-//! the document. Press-quality Knuth-Plass justification, hyphenation, and shaping (`rustybuzz`)
-//! arrive in later spec-driven increments.
+//! Spec 0015 replaced the character-count stand-in with real **width-based** greedy line breaking:
+//! words are packed onto a line while the line's *measured* advance stays within the frame width.
+//!
+//! Spec 0016 (increment 1) moves the measurement unit from the individual character to the whole
+//! **run**: [`break_by_width`] now measures each prospective line through a [`RunMetrics`]
+//! implementation, so once a real shaper is wired the width test captures kerning and ligatures
+//! *across* the line rather than summing isolated per-char advances. The per-char [`CharMetrics`]
+//! trait stays as the fallback seam and as what a monospace test double implements. This first part
+//! of increment 1 introduces the seam at parity — [`MonospaceRunMetrics`] and the export font's
+//! run measurement both reproduce the per-char sum exactly, so no line break moves. The
+//! `rustybuzz`-backed [`RunMetrics`] that actually shapes lands in the follow-up. Press-quality
+//! Knuth-Plass justification and hyphenation arrive in later spec-driven increments.
 
 /// Body/heading font size, in points. Shared by the layout engine (to measure and to reserve row
 /// height) and the writer (to set the font size), so text is measured at the size it is drawn.
@@ -36,42 +41,67 @@ impl CharMetrics for MonospaceMetrics {
     }
 }
 
-/// Measured advance of `s` at `size_pt` under `metrics`, in points (sum of per-char advances; no
-/// kerning/shaping in increment 1).
-fn measure(s: &str, size_pt: f32, metrics: &impl CharMetrics) -> f32 {
-    s.chars().map(|ch| metrics.advance_pt(ch, size_pt)).sum()
+/// Measures the shaped advance width of a whole **run** (a string at a size), in points.
+///
+/// This is the seam a real shaper plugs into: unlike [`CharMetrics`], which measures one codepoint
+/// in isolation, `measure_run` sees the whole string, so a `rustybuzz`-backed implementation can
+/// account for kerning pairs and ligatures across the run (spec 0016). The per-char `CharMetrics`
+/// trait remains for the monospace stub and as a fallback; a run with no kerning measures identically
+/// under either.
+pub trait RunMetrics {
+    /// Total shaped advance width of `text` at `size_pt`, in points.
+    fn measure_run(&self, text: &str, size_pt: f32) -> f32;
+}
+
+/// A fixed-advance run-metrics stub: `width = em_ratio * size_pt * text.chars().count()`.
+///
+/// Deterministic and font-free, it reproduces the per-char monospace sum exactly — so line breaking
+/// under it is byte-for-byte identical to spec 0015's per-char breaker (no shaping means no change).
+/// The no-shaper fallback and the test double.
+#[derive(Debug, Clone, Copy)]
+pub struct MonospaceRunMetrics {
+    /// Advance as a fraction of the em (e.g. `0.6` ≈ a typical monospace figure width).
+    pub em_ratio: f32,
+}
+
+impl RunMetrics for MonospaceRunMetrics {
+    fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
+        self.em_ratio * size_pt * text.chars().count() as f32
+    }
 }
 
 /// Break `text` into lines whose measured advance fits within `max_width_pt`, using a greedy
 /// word-based strategy at `size_pt` under `metrics`.
 ///
-/// A word is appended to the current line while the measured advance of `current + " " + word`
-/// stays `<= max_width_pt`; otherwise a new line starts. A word wider than `max_width_pt` on its
-/// own is placed alone (it overflows — breaking oversized words / hyphenation is deferred).
-/// Whitespace is normalized to single spaces between words; empty text yields no lines.
+/// A word is appended to the current line while the **whole prospective line** `current + " " + word`
+/// measures `<= max_width_pt` under [`RunMetrics::measure_run`] — measuring the entire candidate (not
+/// the incremental word) is what lets a real shaper count kerning/ligatures across the joining space.
+/// Otherwise a new line starts. A word wider than `max_width_pt` on its own is placed alone (it
+/// overflows — breaking oversized words / hyphenation is deferred). Whitespace is normalized to
+/// single spaces between words; empty text yields no lines.
 pub fn break_by_width(
     text: &str,
     max_width_pt: f32,
     size_pt: f32,
-    metrics: &impl CharMetrics,
+    metrics: &impl RunMetrics,
 ) -> Vec<String> {
-    let space = metrics.advance_pt(' ', size_pt);
     let mut lines = Vec::new();
     let mut current = String::new();
-    let mut current_w = 0.0f32;
     for word in text.split_whitespace() {
-        let word_w = measure(word, size_pt, metrics);
         if current.is_empty() {
             current.push_str(word);
-            current_w = word_w;
-        } else if current_w + space + word_w <= max_width_pt {
-            current.push(' ');
-            current.push_str(word);
-            current_w += space + word_w;
+            continue;
+        }
+        // Measure the full candidate line so cross-word shaping is captured once a shaper exists.
+        let mut candidate = String::with_capacity(current.len() + 1 + word.len());
+        candidate.push_str(&current);
+        candidate.push(' ');
+        candidate.push_str(word);
+        if metrics.measure_run(&candidate, size_pt) <= max_width_pt {
+            current = candidate;
         } else {
             lines.push(std::mem::take(&mut current));
             current.push_str(word);
-            current_w = word_w;
         }
     }
     if !current.is_empty() {
@@ -85,8 +115,10 @@ mod tests {
     use super::*;
 
     /// `em_ratio` chosen so 10 pt text advances 6 pt/char — matching the old `APPROX_CHAR_WIDTH_PT`
-    /// stand-in, so these tests read against a familiar 6-pt-per-character grid.
-    const MONO: MonospaceMetrics = MonospaceMetrics { em_ratio: 0.6 };
+    /// stand-in, so these tests read against a familiar 6-pt-per-character grid. `MONO` measures runs
+    /// (drives `break_by_width`); the per-char `MonospaceMetrics` sibling is exercised inline by
+    /// `monospace_metrics_scales_with_size`.
+    const MONO: MonospaceRunMetrics = MonospaceRunMetrics { em_ratio: 0.6 };
     const SIZE: f32 = BODY_FONT_SIZE_PT; // 10.0 → 6 pt/char under MONO
 
     #[test]
@@ -139,5 +171,15 @@ mod tests {
         let m = MonospaceMetrics { em_ratio: 0.5 };
         assert_eq!(m.advance_pt('W', 20.0), 10.0);
         assert_eq!(m.advance_pt('.', 20.0), 10.0); // width is char-independent for the stub
+    }
+
+    #[test]
+    fn monospace_run_metrics_is_char_count_times_em() {
+        let m = MonospaceRunMetrics { em_ratio: 0.5 };
+        // 4 chars × 0.5 em × 20 pt = 40 pt; empty run is zero-width.
+        assert_eq!(m.measure_run("WXYZ", 20.0), 40.0);
+        assert_eq!(m.measure_run("", 20.0), 0.0);
+        // The joining space counts: "ab cd" is 5 chars → 5 × 6 pt = 30 pt at SIZE under MONO.
+        assert_eq!(MONO.measure_run("ab cd", SIZE), 30.0);
     }
 }

@@ -96,6 +96,18 @@ impl quill_text_layout::CharMetrics for EmbeddedFont {
     }
 }
 
+/// Run measurement for line breaking (spec 0016 increment 1). This part-1 implementation is the
+/// per-char sum of [`CharMetrics::advance_pt`] — kerning/ligature-free, so measured widths (and thus
+/// every line break, page break, and exported byte) are identical to spec 0015. The `rustybuzz`-
+/// backed shaper that replaces this body with real shaping lands in the follow-up increment; the
+/// seam here keeps the export path building against `RunMetrics` in the meantime.
+impl quill_text_layout::RunMetrics for EmbeddedFont {
+    fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
+        use quill_text_layout::CharMetrics;
+        text.chars().map(|ch| self.advance_pt(ch, size_pt)).sum()
+    }
+}
+
 /// Subset and measure the **bundled** font for exactly the `chars` a document uses.
 ///
 /// A thin wrapper over [`build_from_bytes`] that pins the name (`SourceSerif4`) and adds the
@@ -459,6 +471,22 @@ mod tests {
         // An un-built char falls back to widths[0] (.notdef).
         let expect_notdef = font.widths[0] * 12.0 / 1000.0;
         assert!((font.advance_pt('\u{2603}', 12.0) - expect_notdef).abs() < 0.001);
+    }
+
+    /// Spec 0016 (increment 1, part 1): the run measurement seam is at parity — `measure_run(s)`
+    /// equals the sum of `advance_pt` over `s`'s chars, so line breaking is unchanged until the
+    /// rustybuzz shaper replaces this body.
+    #[test]
+    fn measure_run_equals_per_char_sum() {
+        use quill_text_layout::{CharMetrics, RunMetrics};
+        let font = build(&charset("The Dungeon")).unwrap();
+        for s in ["The", "Dungeon", "The Dungeon", ""] {
+            let per_char: f32 = s.chars().map(|ch| font.advance_pt(ch, 11.0)).sum();
+            assert!(
+                (font.measure_run(s, 11.0) - per_char).abs() < 1e-4,
+                "measure_run should equal the per-char sum for {s:?}"
+            );
+        }
     }
 
     #[test]

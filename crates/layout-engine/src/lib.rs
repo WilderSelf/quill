@@ -7,7 +7,7 @@
 //! for line breaking.
 
 use quill_core_model::{Asset, Block, Color, Document, Rect};
-use quill_text_layout::{break_by_width, CharMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
+use quill_text_layout::{break_by_width, RunMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
 
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
@@ -52,8 +52,9 @@ pub struct LaidOutPage {
 /// past `doc.page_setup.trim.h_pt`. Returns at least one page (even if the document is empty).
 ///
 /// Text is broken to fit the frame width using the caller-supplied `metrics` (the embedded font in
-/// the export path) at [`BODY_FONT_SIZE_PT`] — see `specs/0015-text-metrics-line-breaking.md`.
-pub fn lay_out(doc: &Document, metrics: &impl CharMetrics) -> Vec<LaidOutPage> {
+/// the export path) at [`BODY_FONT_SIZE_PT`] — see `specs/0015-text-metrics-line-breaking.md` and
+/// spec 0016 for the shift to run-based measurement.
+pub fn lay_out(doc: &Document, metrics: &impl RunMetrics) -> Vec<LaidOutPage> {
     let width = doc.page_setup.trim.w_pt;
     let page_h = doc.page_setup.trim.h_pt;
 
@@ -125,11 +126,11 @@ pub fn lay_out(doc: &Document, metrics: &impl CharMetrics) -> Vec<LaidOutPage> {
 mod tests {
     use super::*;
     use quill_core_model::{Asset, Block, Color, Document, Metadata, PageSetup, Size};
-    use quill_text_layout::MonospaceMetrics;
+    use quill_text_layout::MonospaceRunMetrics;
 
     /// 0.6 em × 10 pt = 6 pt/char, matching the old `APPROX_CHAR_WIDTH_PT` stand-in so these
     /// pagination tests keep their familiar per-character arithmetic.
-    const MONO: MonospaceMetrics = MonospaceMetrics { em_ratio: 0.6 };
+    const MONO: MonospaceRunMetrics = MonospaceRunMetrics { em_ratio: 0.6 };
 
     #[test]
     fn lays_out_sample_into_one_page() {
