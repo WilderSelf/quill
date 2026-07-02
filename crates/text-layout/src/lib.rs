@@ -25,7 +25,15 @@
 //! and [`Alignment::Left`] leaves everything ragged. The resolved adjustment ([`Line::space_adjust_pt`])
 //! is the classic adjustment ratio expressed in points; because every inter-word glue here is
 //! identical, filling a line of `spaces` gaps to width `L` reduces to adding `(L − W) / spaces` per gap.
-//! Hyphenation arrives in a later spec-driven increment.
+//!
+//! Spec 0018 (increment 1) generalizes the breaker from a box/glue model to a box/glue/**penalty**
+//! item stream and introduces the [`Hyphenator`] seam: each legal in-word break point becomes a
+//! *flagged penalty* (cost [`HYPHEN_PENALTY`], materializing a hyphen glyph on break) that Knuth-Plass
+//! can choose alongside inter-word glue. The hyphenator-aware entry points are
+//! [`break_paragraph_hyphenated`] / [`justify_paragraph_hyphenated`]; the original
+//! [`break_paragraph`] / [`justify_paragraph`] are now thin wrappers passing [`NoHyphenator`], so with
+//! no hyphenator every word is a single box and breaking is byte-identical to spec 0017 (parity). Real
+//! en-US patterns (`hypher`) and the rendered hyphen arrive in increment 2.
 
 /// Body/heading font size, in points. Shared by the layout engine (to measure and to reserve row
 /// height) and the writer (to set the font size), so text is measured at the size it is drawn.
@@ -41,6 +49,15 @@ pub const LINE_PENALTY: f32 = 10.0;
 /// Badness ceiling. A near-empty line's cubic badness would explode; TeX caps "infinitely bad"
 /// at 10000 (spec 0017's "clamped to a ceiling for the near-infinite single-word case").
 const BADNESS_CEIL: f32 = 10_000.0;
+
+/// Cost of ending a line at a hyphenation break — TeX's `\hyphenpenalty` (spec 0018). Added as `p²`
+/// to the line's demerits so total-fit only hyphenates when it meaningfully tightens the paragraph.
+pub const HYPHEN_PENALTY: f32 = 50.0;
+
+/// Extra demerit when two consecutive lines both end at a flagged (hyphen) break — TeX's
+/// `\doublehyphendemerits` (spec 0018). Discourages "hyphen ladders" (three-plus hyphenated lines
+/// in a row).
+pub const DOUBLE_HYPHEN_DEMERIT: f32 = 10_000.0;
 
 /// Per-character advance-width metrics. Implemented by the export crate over the embedded font;
 /// [`MonospaceMetrics`] is a deterministic stub for tests and headless fallback.
@@ -92,6 +109,30 @@ impl RunMetrics for MonospaceRunMetrics {
     }
 }
 
+/// Supplies the legal in-word break points a line breaker may hyphenate at (spec 0018).
+///
+/// This is the seam a real Knuth-Liang hyphenator (`hypher`, increment 2) plugs into. Increment 1 is
+/// trait-only and dependency-free: [`NoHyphenator`] never hyphenates (parity with spec 0017), and a
+/// deterministic stub exercises the penalty machinery in tests.
+pub trait Hyphenator {
+    /// Byte offsets **inside** `word` at which a hyphen may be inserted: strictly interior
+    /// (`0 < off < word.len()`), ascending, on `char` boundaries. Empty = do not hyphenate. The
+    /// breaker defensively ignores any offset violating these rules, so a loose implementation cannot
+    /// corrupt a line.
+    fn hyphenate(&self, word: &str) -> Vec<usize>;
+}
+
+/// The parity default: never hyphenates, so every word is a single box and breaking stays
+/// byte-identical to spec 0017.
+#[derive(Debug, Clone, Copy)]
+pub struct NoHyphenator;
+
+impl Hyphenator for NoHyphenator {
+    fn hyphenate(&self, _word: &str) -> Vec<usize> {
+        Vec::new()
+    }
+}
+
 /// Break `text` into lines whose measured advance fits within `max_width_pt`, using a greedy
 /// word-based strategy at `size_pt` under `metrics`.
 ///
@@ -132,43 +173,62 @@ pub fn break_by_width(
     lines
 }
 
-/// Break `text` into lines using **Knuth-Plass total-fit** (spec 0017, increment 1): all
-/// breakpoints in the paragraph are chosen together to minimize the sum of per-line *demerits*,
-/// rather than greedily stuffing each line ([`break_by_width`]). The returned shape is identical —
-/// a `Vec<String>` of ragged, left-aligned lines — so the writer is unchanged; only *which words
-/// land on which line* differs. Justified rendering (stretching inter-word space) is increment 2.
+/// Break `text` into lines using **Knuth-Plass total-fit** (spec 0017): all breakpoints in the
+/// paragraph are chosen together to minimize the sum of per-line *demerits*, rather than greedily
+/// stuffing each line ([`break_by_width`]). Returns a `Vec<String>` of ragged, left-aligned lines.
 ///
-/// # Model
-///
-/// The paragraph becomes a box/glue item stream measured under `metrics` at `size_pt`: each word is
-/// a **box** of width `measure_run(word)`, each inter-word space a **glue** of natural width
-/// `g = measure_run(" ")` with `stretch = g/2`, `shrink = g/3`. A candidate line spanning a run of
-/// words has natural width `W = Σ box + Σ interior glue`, total stretch `Y`, total shrink `Z`, against
-/// target `L = max_width_pt`:
-///
-/// - **Adjustment ratio** `r`: `0` if `Y = Z = 0`; `(L−W)/Y` if `W ≤ L`; `(L−W)/Z` if `W > L`.
-/// - **Feasible** iff `r ≥ −1` (a line cannot shrink past its shrink). An over-wide single word has
-///   `Z = 0` and `W > L`, so it is infeasible.
-/// - **Badness** `b(r) = 100·|r|³`, clamped to [`BADNESS_CEIL`]. The paragraph's last line is not
-///   penalized for being short: badness is `0` when it fits (`W ≤ L`).
-/// - **Demerits** `= (LINE_PENALTY + b)²`.
-///
-/// Total-fit returns the feasible breaking of least summed demerits. Ties break deterministically by
-/// **fewest lines**, then the **lexicographically earliest line-start sequence**, so identical input
-/// always yields identical lines.
-///
-/// # Degenerate & fallback behavior (parity with [`break_by_width`])
-///
-/// Whitespace is normalized to single spaces; empty text yields no lines; text that fits yields one
-/// line. If *no* fully-feasible breaking exists — some word is wider than `max_width_pt` and forces an
-/// overflow line — this **falls back to the greedy [`break_by_width`] result** rather than failing:
-/// laying text out (even overflowing) is always recoverable. `break_by_width` is retained as this
-/// fallback and as the parity oracle.
+/// This is the parity entry point: it never hyphenates (delegates to [`break_paragraph_hyphenated`]
+/// with [`NoHyphenator`]), so its output is byte-identical to before spec 0018.
 pub fn break_paragraph(
     text: &str,
     max_width_pt: f32,
     size_pt: f32,
     metrics: &impl RunMetrics,
+) -> Vec<String> {
+    break_paragraph_hyphenated(text, max_width_pt, size_pt, metrics, &NoHyphenator)
+}
+
+/// Knuth-Plass total-fit line breaking over a box/glue/**penalty** item stream (spec 0018,
+/// increment 1). Generalizes [`break_paragraph`] so that `hyphenator`'s legal in-word break points
+/// become flagged penalties the breaker may choose alongside inter-word glue. The returned shape is
+/// unchanged — a `Vec<String>` of ragged, left-aligned lines — but a line that ends at a hyphenation
+/// break emits a trailing `-`, and the next line begins with the word's remainder (no leading space).
+///
+/// # Item stream
+///
+/// The paragraph is measured under `metrics` at `size_pt` into items:
+///
+/// - **Box** — a run of a word between hyphenation points, width `measure_run(segment)`. A word with
+///   no break points is a single box (spec 0017); a word with `k` interior offsets is `k + 1` boxes
+///   separated by penalties.
+/// - **Glue** — one inter-word space: natural `g = measure_run(" ")`, `stretch = g/2`, `shrink = g/3`.
+/// - **Penalty** — a flagged hyphenation break of cost [`HYPHEN_PENALTY`] whose width
+///   `measure_run("-")` is added to a line's natural width **only if the line breaks there**.
+///
+/// With [`NoHyphenator`] there are no penalties, every word is one box, and both the breakpoints and
+/// the reconstructed strings are byte-identical to spec 0017 (parity).
+///
+/// # Cost
+///
+/// Per-line badness (adjustment ratio `r`, `b(r) = 100·|r|³` clamped to [`BADNESS_CEIL`], last line
+/// free when it fits, feasibility `r ≥ −1`) is spec 0017 unchanged. Demerits extend it in the classic
+/// TeX way: a line ending at a hyphen penalty adds `HYPHEN_PENALTY²`, and two consecutive flagged
+/// lines add [`DOUBLE_HYPHEN_DEMERIT`]. The DP accumulates in `f64`; ties break by **fewest lines**
+/// then the **lexicographically earliest line-start sequence**, so identical input yields identical
+/// lines.
+///
+/// # Fallback
+///
+/// Whitespace is normalized; empty text yields no lines. If *no* fully-feasible breaking exists (a
+/// word wider than `max_width_pt` with no usable hyphenation point forces an overflow), this falls
+/// back to the greedy [`break_by_width`] result rather than failing — laying text out, even
+/// overflowing, is always recoverable.
+pub fn break_paragraph_hyphenated(
+    text: &str,
+    max_width_pt: f32,
+    size_pt: f32,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
 ) -> Vec<String> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
@@ -179,122 +239,210 @@ pub fn break_paragraph(
     let g = metrics.measure_run(" ", size_pt);
     let stretch = g / 2.0;
     let shrink = g / 3.0;
+    let hyphen_w = metrics.measure_run("-", size_pt);
 
-    // Prefix sums of box widths so a line's natural box total is O(1): box_prefix[k] = Σ_{i<k} box_i.
-    let mut box_prefix = Vec::with_capacity(words.len() + 1);
-    box_prefix.push(0.0f32);
-    for &w in &words {
-        let prev = *box_prefix.last().unwrap();
-        box_prefix.push(prev + metrics.measure_run(w, size_pt));
+    // Build the box/glue/penalty item stream. A word splits at its (validated) hyphenation offsets
+    // into segment boxes separated by flagged penalties; inter-word glue joins words.
+    enum Item<'a> {
+        Boxed { text: &'a str, width: f32 },
+        Glue,
+        Penalty,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    for (wi, &word) in words.iter().enumerate() {
+        if wi > 0 {
+            items.push(Item::Glue);
+        }
+        let mut prev = 0usize;
+        for off in hyphenator.hyphenate(word) {
+            // Defensively ignore offsets that are not strictly-interior ascending char boundaries.
+            if off <= prev || off >= word.len() || !word.is_char_boundary(off) {
+                continue;
+            }
+            let seg = &word[prev..off];
+            items.push(Item::Boxed {
+                text: seg,
+                width: metrics.measure_run(seg, size_pt),
+            });
+            items.push(Item::Penalty);
+            prev = off;
+        }
+        let seg = &word[prev..];
+        items.push(Item::Boxed {
+            text: seg,
+            width: metrics.measure_run(seg, size_pt),
+        });
     }
 
-    // Demerits of the line covering words[i..=j] (0-based, inclusive). `None` if infeasible.
-    // Returned as `f64`: a ceiling-badness line squares to ≈ 1e8, where `f32`'s ulp (~8) is coarse
-    // enough to mask the small demerit differences total-fit must compare in the all-bad regime, so
-    // the DP accumulates in `f64` to stay exactly optimal there too.
-    let line_cost = |i: usize, j: usize, is_last: bool| -> Option<f64> {
-        let glues = (j - i) as f32; // interior glue count
-        let natural = (box_prefix[j + 1] - box_prefix[i]) + glues * g;
-        let y = glues * stretch;
-        let z = glues * shrink;
+    // Prefix sums so a line's natural/stretch/shrink over items[s..e] is O(1). Penalty width is 0
+    // here (it only materializes when a line *breaks* at the penalty — added via `extra_w` below).
+    let n_items = items.len();
+    let mut wsum = vec![0.0f32; n_items + 1];
+    let mut ysum = vec![0.0f32; n_items + 1];
+    let mut zsum = vec![0.0f32; n_items + 1];
+    for (i, it) in items.iter().enumerate() {
+        let (w, y, z) = match it {
+            Item::Boxed { width, .. } => (*width, 0.0, 0.0),
+            Item::Glue => (g, stretch, shrink),
+            Item::Penalty => (0.0, 0.0, 0.0),
+        };
+        wsum[i + 1] = wsum[i] + w;
+        ysum[i + 1] = ysum[i] + y;
+        zsum[i + 1] = zsum[i] + z;
+    }
+
+    // Spec-0017 badness → `(LINE_PENALTY + b)²` for the line spanning items[s..e], with `extra_w`
+    // added to the natural width (the hyphen when breaking at a penalty). `None` if infeasible.
+    // `f64`: a ceiling-badness line squares to ≈ 1e8, where `f32`'s ulp is coarse enough to mask the
+    // small differences total-fit compares in the all-bad regime.
+    let base_demerits = |s: usize, e: usize, extra_w: f32, is_last: bool| -> Option<f64> {
+        let natural = (wsum[e] - wsum[s]) + extra_w;
+        let y = ysum[e] - ysum[s];
+        let z = zsum[e] - zsum[s];
         let badness = if is_last && natural <= l {
-            // Last line is not penalized for being short — its trailing glue stretches freely.
             0.0
         } else if natural > l {
-            // Overfull: must shrink. Infeasible if it shrinks past its shrink (r < −1) or has none.
             if z <= 0.0 {
-                return None; // an over-wide single word: r < −1 unavoidable → breaking infeasible
+                return None; // over-wide with no shrink: r < −1 unavoidable → infeasible
             }
-            let r = (l - natural) / z; // r < 0
+            let r = (l - natural) / z;
             if r < -1.0 {
                 return None;
             }
             (100.0 * r.abs().powi(3)).min(BADNESS_CEIL)
         } else if y > 0.0 {
-            // Underfull with glue to stretch.
-            let r = (l - natural) / y; // r ≥ 0
+            let r = (l - natural) / y;
             (100.0 * r.powi(3)).min(BADNESS_CEIL)
         } else if (l - natural).abs() < f32::EPSILON {
-            0.0 // single word filling the frame exactly (Y = Z = 0, r = 0)
+            0.0
         } else {
-            // Underfull single word with no glue to stretch: cannot be justified → the near-infinite
-            // single-word case the badness ceiling exists for (spec 0017). Total-fit thus avoids
-            // stranding a lone short word on an interior line, keeping the paragraph balanced.
-            BADNESS_CEIL
+            BADNESS_CEIL // underfull line with no glue to stretch (a lone short segment)
         };
         let d = f64::from(LINE_PENALTY + badness);
         Some(d * d)
     };
 
-    // Total-fit DP over word prefixes. best[k] = the least-cost breaking of the first k words, with
-    // a break after word k−1. `starts` records each line's first-word index (for reconstruction and
-    // the lexicographic tie-break). best[0] is the empty prefix.
+    // Total-fit DP over legal breakpoints (glue + penalty item indices, plus a forced terminal at
+    // end-of-stream). best[s] = least-cost breaking whose next line starts at item index `s`.
+    // `starts` records each line's first-item index; `ended_flagged` drives the double-hyphen rule.
     #[derive(Clone)]
     struct Node {
         demerits: f64,
         lines: usize,
         starts: Vec<usize>,
+        ended_flagged: bool,
     }
-    let n = words.len();
-    let mut best: Vec<Option<Node>> = vec![None; n + 1];
+    let is_better = |cand: &Node, cur: &Option<Node>| -> bool {
+        match cur {
+            None => true,
+            Some(c) => {
+                let eps = 1e-6;
+                if cand.demerits < c.demerits - eps {
+                    true
+                } else if cand.demerits > c.demerits + eps {
+                    false
+                } else if cand.lines != c.lines {
+                    cand.lines < c.lines
+                } else {
+                    cand.starts < c.starts
+                }
+            }
+        }
+    };
+
+    let mut best: Vec<Option<Node>> = vec![None; n_items + 1];
     best[0] = Some(Node {
         demerits: 0.0,
         lines: 0,
         starts: Vec::new(),
+        ended_flagged: false,
     });
 
-    for k in 1..=n {
-        let is_last = k == n;
-        for i in 0..k {
-            let Some(prev) = best[i].clone() else {
+    // Interior breakpoints, processed in increasing item order so every reachable line-start `s ≤ e`
+    // is finalized before `e` reads it (a line s..e ends at e; the next line starts at e+1 > e).
+    for e in 0..n_items {
+        let (extra_w, flagged) = match &items[e] {
+            Item::Glue => (0.0, false),
+            Item::Penalty => (hyphen_w, true),
+            Item::Boxed { .. } => continue, // a box is never a line end
+        };
+        for s in 0..=e {
+            let Some(prev) = best[s].clone() else {
                 continue;
             };
-            let Some(cost) = line_cost(i, k - 1, is_last) else {
+            let Some(base) = base_demerits(s, e, extra_w, false) else {
                 continue;
             };
+            let mut d = prev.demerits + base;
+            if flagged {
+                d += f64::from(HYPHEN_PENALTY) * f64::from(HYPHEN_PENALTY);
+                if prev.ended_flagged {
+                    d += f64::from(DOUBLE_HYPHEN_DEMERIT);
+                }
+            }
             let mut starts = prev.starts.clone();
-            starts.push(i);
+            starts.push(s);
             let cand = Node {
-                demerits: prev.demerits + cost,
+                demerits: d,
                 lines: prev.lines + 1,
                 starts,
+                ended_flagged: flagged,
             };
-            let better = match &best[k] {
-                None => true,
-                Some(cur) => {
-                    // Absolute tolerance: with f64 accumulation, genuinely-equal breakings differ by
-                    // at most a few ulps (≈ 1e-8 at these magnitudes), while the smallest meaningful
-                    // demerit gap is ≫ 1e-6 — so this treats only true ties as ties, then applies the
-                    // deterministic tie-break (fewest lines, then earliest line-start sequence).
-                    let eps = 1e-6;
-                    if cand.demerits < cur.demerits - eps {
-                        true
-                    } else if cand.demerits > cur.demerits + eps {
-                        false
-                    } else if cand.lines != cur.lines {
-                        cand.lines < cur.lines
-                    } else {
-                        cand.starts < cur.starts
-                    }
-                }
-            };
-            if better {
-                best[k] = Some(cand);
+            if is_better(&cand, &best[e + 1]) {
+                best[e + 1] = Some(cand);
             }
         }
     }
 
-    // No fully-feasible breaking (an over-wide word forced every line infeasible) → greedy fallback.
-    let Some(solution) = best[n].take() else {
+    // Forced terminal line: from any reachable start to end-of-stream, never flagged, last line free.
+    let mut solution: Option<Node> = None;
+    for (s, slot) in best.iter().enumerate() {
+        let Some(prev) = slot.clone() else {
+            continue;
+        };
+        let Some(base) = base_demerits(s, n_items, 0.0, true) else {
+            continue;
+        };
+        let mut starts = prev.starts.clone();
+        starts.push(s);
+        let cand = Node {
+            demerits: prev.demerits + base,
+            lines: prev.lines + 1,
+            starts,
+            ended_flagged: false,
+        };
+        if is_better(&cand, &solution) {
+            solution = Some(cand);
+        }
+    }
+
+    // No fully-feasible breaking (an over-wide, unbreakable word) → greedy fallback.
+    let Some(solution) = solution else {
         return break_by_width(text, max_width_pt, size_pt, metrics);
     };
 
-    // Reconstruct lines: consecutive start indices delimit each line's word range; the last runs to n.
+    // Reconstruct each line's string. A line runs from its start item to just before the next line's
+    // start (the break item); the last line runs to end-of-stream. Boxes concatenate, glue emits a
+    // space, an un-taken interior penalty emits nothing, and a line that ends at a penalty gets a `-`.
     let starts = solution.starts;
     let mut lines = Vec::with_capacity(starts.len());
     for (idx, &from) in starts.iter().enumerate() {
-        let to = starts.get(idx + 1).copied().unwrap_or(n);
-        lines.push(words[from..to].join(" "));
+        let (content_end, ends_at_penalty) = match starts.get(idx + 1) {
+            Some(&next) => (next - 1, matches!(items[next - 1], Item::Penalty)),
+            None => (n_items, false),
+        };
+        let mut line = String::new();
+        for it in &items[from..content_end] {
+            match it {
+                Item::Boxed { text, .. } => line.push_str(text),
+                Item::Glue => line.push(' '),
+                Item::Penalty => {}
+            }
+        }
+        if ends_at_penalty {
+            line.push('-');
+        }
+        lines.push(line);
     }
     lines
 }
@@ -324,19 +472,9 @@ pub struct Line {
     pub space_adjust_pt: f32,
 }
 
-/// Break `text` with [`break_paragraph`] (Knuth-Plass total-fit), then **resolve each line's
-/// inter-word adjustment** for `align` (spec 0017, increment 2). The breakpoints are unchanged from
-/// increment 1; this only decides how much to stretch/shrink each line's spaces at render time.
-///
-/// For [`Alignment::Justified`], every line except the paragraph's last is stretched or shrunk to
-/// fill `max_width_pt`: with `spaces` interior gaps of natural width `W`, the per-gap add is
-/// `(L − W) / spaces` (all glues are identical, so the classic adjustment ratio collapses to an even
-/// split). The last line and any single-word line keep natural spacing (`0.0`). [`Alignment::Left`]
-/// leaves every line ragged.
-///
-/// **Fallback:** if any word is wider than `max_width_pt`, `break_paragraph` falls back to a greedy
-/// breaking whose overflow line cannot be justified without over-shrinking; the whole paragraph is
-/// then rendered ragged (`0.0` everywhere) — laying out visibly beats corrupting the spacing.
+/// Break `text` with [`break_paragraph`] (Knuth-Plass total-fit, no hyphenation), then **resolve each
+/// line's inter-word adjustment** for `align` (spec 0017, increment 2). The parity entry point —
+/// delegates to [`justify_paragraph_hyphenated`] with [`NoHyphenator`].
 pub fn justify_paragraph(
     text: &str,
     max_width_pt: f32,
@@ -344,7 +482,34 @@ pub fn justify_paragraph(
     align: Alignment,
     metrics: &impl RunMetrics,
 ) -> Vec<Line> {
-    let lines = break_paragraph(text, max_width_pt, size_pt, metrics);
+    justify_paragraph_hyphenated(text, max_width_pt, size_pt, align, metrics, &NoHyphenator)
+}
+
+/// Break `text` with [`break_paragraph_hyphenated`] (Knuth-Plass total-fit over the box/glue/penalty
+/// item stream, spec 0018), then **resolve each line's inter-word adjustment** for `align`. The
+/// breakpoints are unchanged from the breaker; this only decides how much to stretch/shrink each
+/// line's spaces at render time.
+///
+/// For [`Alignment::Justified`], every line except the paragraph's last is stretched or shrunk to
+/// fill `max_width_pt`: with `spaces` interior gaps of natural width `W`, the per-gap add is
+/// `(L − W) / spaces` (all glues are identical, so the classic adjustment ratio collapses to an even
+/// split). A hyphenated line's natural width `W` includes its trailing hyphen (it is part of the
+/// measured text), so such a line still fills the frame exactly. The last line and any single-word
+/// line keep natural spacing (`0.0`). [`Alignment::Left`] leaves every line ragged.
+///
+/// **Fallback:** if any word is wider than `max_width_pt`, the breaker falls back to a greedy breaking
+/// whose overflow line cannot be justified without over-shrinking; the whole paragraph is then
+/// rendered ragged (`0.0` everywhere) — laying out visibly beats corrupting the spacing. (Breaking an
+/// over-wide word at a hyphenation point to narrow this fallback is spec 0018 increment 2.)
+pub fn justify_paragraph_hyphenated(
+    text: &str,
+    max_width_pt: f32,
+    size_pt: f32,
+    align: Alignment,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<Line> {
+    let lines = break_paragraph_hyphenated(text, max_width_pt, size_pt, metrics, hyphenator);
 
     // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
     // would need to shrink past its glue, so justifying it would push spaces negative).
@@ -372,6 +537,7 @@ pub fn justify_paragraph(
             let space_adjust_pt = if idx == last || spaces == 0 {
                 0.0
             } else {
+                // `measure_run` counts a trailing hyphen, so a hyphenated line fills the frame too.
                 let natural = metrics.measure_run(&text, size_pt);
                 (max_width_pt - natural) / spaces as f32
             };
@@ -386,6 +552,166 @@ pub fn justify_paragraph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- spec 0018 increment 1: penalty item stream + Hyphenator seam ------------------------------
+
+    /// Deterministic test hyphenator: breaks only the crafted words it knows, at fixed byte offsets.
+    /// Mirrors how a real `hypher`-backed hyphenator will report interior break points (increment 2).
+    struct Stub;
+    impl Hyphenator for Stub {
+        fn hyphenate(&self, word: &str) -> Vec<usize> {
+            match word {
+                "defgh" => vec![2],                       // de-fgh
+                "bbbbbbbb" | "dddddddd" => vec![2, 4, 6], // every 2 chars
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    /// Recompute a hyphenated breaking's total demerits from the rendered lines, mirroring
+    /// `break_paragraph_hyphenated`'s cost model (a trailing `-` marks a flagged line; `measure_run`
+    /// counts the hyphen in the natural width). `apply_double` toggles the double-hyphen term so a
+    /// test can show that term is exactly what flips the optimum.
+    fn hy_demerits(lines: &[&str], l: f32, apply_double: bool) -> f64 {
+        let g = MONO.measure_run(" ", SIZE);
+        let (stretch, shrink) = (g / 2.0, g / 3.0);
+        let last = lines.len().saturating_sub(1);
+        let mut prev_flagged = false;
+        let mut total = 0.0f64;
+        for (idx, line) in lines.iter().enumerate() {
+            let flagged = line.ends_with('-');
+            let glues = line.split_whitespace().count().saturating_sub(1) as f32;
+            let natural = MONO.measure_run(line, SIZE); // counts a trailing '-'
+            let is_last = idx == last;
+            let badness = if is_last && natural <= l {
+                0.0
+            } else if natural > l {
+                let r = (l - natural) / (glues * shrink);
+                assert!(r >= -1.0, "test breaking has an infeasible line");
+                (100.0 * r.abs().powi(3)).min(BADNESS_CEIL)
+            } else if glues > 0.0 {
+                let r = (l - natural) / (glues * stretch);
+                (100.0 * r.powi(3)).min(BADNESS_CEIL)
+            } else if (l - natural).abs() < f32::EPSILON {
+                0.0
+            } else {
+                BADNESS_CEIL
+            };
+            let d = f64::from(LINE_PENALTY + badness);
+            let mut cost = d * d;
+            if flagged {
+                cost += f64::from(HYPHEN_PENALTY) * f64::from(HYPHEN_PENALTY);
+                if prev_flagged && apply_double {
+                    cost += f64::from(DOUBLE_HYPHEN_DEMERIT);
+                }
+            }
+            total += cost;
+            prev_flagged = flagged;
+        }
+        total
+    }
+
+    #[test]
+    fn no_hyphenator_is_parity_with_spec_0017() {
+        // With NoHyphenator every word is a single box, so the item-stream DP must reproduce the
+        // exact spec-0017 line strings. These expectations are pinned independently of the breaker
+        // (mirroring the hand-computed spec-0017 cases), so this guards parity by output rather than
+        // by delegating to the wrapper.
+        let cases: [(&str, f32, &[&str]); 4] = [
+            ("an ox in the mud", 69.0, &["an ox in the", "mud"]),
+            ("abc def ghi", 42.0, &["abc def", "ghi"]),
+            ("fox a fox ox", 47.0, &["fox a", "fox ox"]),
+            ("a elephantine cat", 30.0, &["a", "elephantine", "cat"]), // greedy-fallback path
+        ];
+        for (text, l, expected) in cases {
+            assert_eq!(
+                break_paragraph_hyphenated(text, l, SIZE, &MONO, &NoHyphenator),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn penalty_break_tightens_the_fit() {
+        // "abc defgh" at L = 42 (7 chars). Without hyphenation the only feasible breaking strands
+        // "abc" alone (a lone short box → badness ceiling); hyphenating "defgh" at offset 2 fills
+        // line 1 exactly:
+        //   hyph  ["abc de-", "fgh"]  line1 = abc18 + glue6 + de12 + hyphen6 = 42 = L (badness 0),
+        //                             + HYPHEN_PENALTY² = 100 + 2500 = 2600; last "fgh" free = 100.
+        //   plain ["abc", "defgh"]    line1 lone "abc" = badness ceiling → (10 + 10000)² ≈ 1.0e8.
+        const L: f32 = 42.0;
+        let hy = break_paragraph_hyphenated("abc defgh", L, SIZE, &MONO, &Stub);
+        let plain = break_paragraph("abc defgh", L, SIZE, &MONO);
+        assert_eq!(hy, vec!["abc de-".to_string(), "fgh".to_string()]);
+        assert_eq!(plain, vec!["abc".to_string(), "defgh".to_string()]);
+        // The broken line ends in a hyphen whose width is counted in the (frame-filling) line.
+        assert!(hy[0].ends_with('-'));
+        assert!((MONO.measure_run(&hy[0], SIZE) - L).abs() < 1e-3);
+        // Total demerits (including HYPHEN_PENALTY²) are far lower than the non-hyphenated breaking.
+        let plain_ref: Vec<&str> = plain.iter().map(String::as_str).collect();
+        let hy_ref: Vec<&str> = hy.iter().map(String::as_str).collect();
+        assert!(hy_demerits(&hy_ref, L, true) < hy_demerits(&plain_ref, L, true));
+    }
+
+    #[test]
+    fn double_hyphen_demerit_breaks_a_hyphen_ladder() {
+        // "aa bbbbbbbb cccc dddddddd" at L = 69, both 8-char words hyphenatable every 2 chars.
+        // Without \doublehyphendemerits the optimum is a two-consecutive-hyphen ladder; the
+        // double-hyphen term (10000) flips it to a breaking with a single, non-adjacent hyphen.
+        // Both are feasible; the chosen one has higher *base* demerits but wins once the term applies
+        // (all numbers brute-force-verified against an exhaustive breaker):
+        //   chosen ["aa bbbbbbbb", "cccc dddd-", "dddd"]    → ≈ 7 358 800 (1 hyphen, no ladder)
+        //   ladder ["aa bbbbbb-", "bb cccc dd-", "dddddd"]  → base ≈ 7 349 706 (2 adjacent hyphens)
+        // (last line is free in both, so the differing remainder does not affect the comparison.)
+        const L: f32 = 69.0;
+        let chosen = ["aa bbbbbbbb", "cccc dddd-", "dddd"];
+        let ladder = ["aa bbbbbb-", "bb cccc dd-", "dddddd"];
+
+        let got = break_paragraph_hyphenated("aa bbbbbbbb cccc dddddddd", L, SIZE, &MONO, &Stub);
+        assert_eq!(got, chosen);
+
+        // Without the double-hyphen term the ladder is cheaper; with it, the chosen breaking wins.
+        assert!(hy_demerits(&ladder, L, false) < hy_demerits(&chosen, L, false));
+        assert!(hy_demerits(&chosen, L, true) < hy_demerits(&ladder, L, true));
+        // The chosen breaking never has two consecutive hyphenated lines.
+        assert!(!(chosen[0].ends_with('-') && chosen[1].ends_with('-')));
+    }
+
+    #[test]
+    fn hyphenated_breaking_is_deterministic() {
+        let text = "abc defgh abc defgh abc defgh";
+        let first = break_paragraph_hyphenated(text, 54.0, SIZE, &MONO, &Stub);
+        for _ in 0..8 {
+            assert_eq!(
+                break_paragraph_hyphenated(text, 54.0, SIZE, &MONO, &Stub),
+                first
+            );
+        }
+    }
+
+    #[test]
+    fn justified_hyphenated_line_fills_the_frame() {
+        // The double-hyphen paragraph, justified: the interior hyphenated line "cccc dddd-" is
+        // underfull (natural 60 < 69) and stretches to fill the frame — proving the hyphen's width
+        // is counted (natural includes the trailing '-').
+        const L: f32 = 69.0;
+        let lines = justify_paragraph_hyphenated(
+            "aa bbbbbbbb cccc dddddddd",
+            L,
+            SIZE,
+            Alignment::Justified,
+            &MONO,
+            &Stub,
+        );
+        assert_eq!(lines[1].text, "cccc dddd-");
+        assert!(
+            (lines[1].space_adjust_pt - 9.0).abs() < 1e-4,
+            "adjust = {}",
+            lines[1].space_adjust_pt
+        );
+        let filled = MONO.measure_run(&lines[1].text, SIZE) + lines[1].space_adjust_pt; // 1 gap
+        assert!((filled - L).abs() < 1e-3);
+    }
 
     /// `em_ratio` chosen so 10 pt text advances 6 pt/char — matching the old `APPROX_CHAR_WIDTH_PT`
     /// stand-in, so these tests read against a familiar 6-pt-per-character grid. `MONO` measures runs
