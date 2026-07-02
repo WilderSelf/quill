@@ -8,9 +8,12 @@ An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app fo
 semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
 must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
 
-**Status: M0 in progress.** The headless PDF/X export pipeline is implemented and green
-(crates scaffolded; implemented specs tracked in `specs/README.md`); M0's export core is
-feature-complete and fast-follows continue. The authoritative design is the approved plan at
+**Status: M0 code-complete (headless PDF/X export).** The headless PDF/X export pipeline is
+implemented and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
+remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
+IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
+tables). Next is the **M1** editing + text-layout arc (shaping, Knuth-Plass justification,
+hyphenation), which begins with a new spec. The authoritative design is the approved plan at
 `~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before making architectural
 decisions. This file summarizes the parts that shape day-to-day work.
 
