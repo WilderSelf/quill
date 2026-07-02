@@ -1,7 +1,7 @@
 # 0019 — Text frames + threading
 
 - **Milestone:** M1
-- **Status:** in-progress (increment 1 — explicit content `Frame` seam, at parity)
+- **Status:** in-progress (increment 2 — threading across a thread's frames)
 - **Crates:** `quill-layout-engine` (owner), `quill-core-model`, `quill-export-pdf`
 
 ## Problem
@@ -99,12 +99,59 @@ pub fn lay_out(doc, metrics, hyphenator) -> Vec<LaidOutPage> {
 }
 ```
 
+## Behavior (increment 2 — threading)
+
+Increment 1 flows content into one frame, paginating vertically. Increment 2 generalizes that to an
+ordered **thread** of frames: content that overflows the current frame continues into the next frame
+in the thread, and onto a new page — restarting at the thread's first frame — once the thread's
+frames are exhausted.
+
+### `Thread`
+
+```rust
+/// An ordered chain of frames that content flows through. Content fills frames[0]; a block that
+/// overflows continues into the next frame in the thread, and onto a new page (restarting at
+/// frames[0]) once the thread's frames are exhausted.
+pub struct Thread {
+    pub frames: Vec<Frame>,
+}
+```
+
+### `lay_out_in_thread` (layout-engine)
+
+```rust
+pub fn lay_out_in_thread(
+    content: &[Block],
+    assets: &[Asset],
+    thread: &Thread,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<LaidOutPage>
+```
+
+- **Fill order:** blocks fill `frames[0]` top-to-bottom, then `frames[1]`, … on the *same page*.
+- **Frame advance:** a block that would pass the current frame's bottom edge (and the frame already
+  has content) continues into the next frame in the thread; the cursor resets to that frame's top.
+- **Page advance:** overflowing the **last** frame pushes the page and restarts at `frames[0]` on a
+  fresh page (the same thread geometry is repeated per page).
+- **Oversized block:** a block taller than a frame is placed in an otherwise-empty frame rather than
+  skipping through every frame/page — the incr. 1 "already has content" guard, now measured per
+  frame. The placement loop is therefore bounded to ≤ 2 iterations per block.
+- **Width per frame:** text wrapping and image sizing use the frame the block lands in, so a
+  block that advances into a narrower frame re-wraps to that width.
+
+`lay_out_in_frame` becomes a thin wrapper over a single-frame thread, so `lay_out` (→ export) is
+unchanged — **no export-output change and no golden regeneration this increment.** Multi-frame page
+layouts only reach export once `lay_out` itself is given a multi-frame thread, which rides with the
+`PageSetup`/model change named in the non-goals below.
+
 ## Inputs / outputs
 
-- **Input:** a slice of `Block`s + `Asset`s, a `Frame`, a `RunMetrics`, and a `Hyphenator`.
-- **Output:** `Vec<LaidOutPage>` whose `PlacedBlock` frames are positioned within the given frame.
-  For `Frame::full_page` this is byte-identical to the current `lay_out` — **no export-output change
-  this increment.**
+- **Input (incr. 1):** a slice of `Block`s + `Asset`s, a `Frame`, a `RunMetrics`, and a
+  `Hyphenator`. **(incr. 2)** the `Frame` becomes a `Thread` (a one-frame thread == incr. 1).
+- **Output:** `Vec<LaidOutPage>` whose `PlacedBlock` frames are positioned within the given
+  frame/thread. For `Frame::full_page` / a single full-page thread this is byte-identical to the
+  current `lay_out` — **no export-output change this increment.**
 
 ## Acceptance criteria
 
@@ -122,11 +169,20 @@ pub fn lay_out(doc, metrics, hyphenator) -> Vec<LaidOutPage> {
   measured against the frame's bottom edge).
 - Full workspace green (`fmt`, `clippy --all-targets --all-features -D warnings`, `build`, `test`).
 
+### Acceptance criteria (increment 2 — threading)
+
+- **Parity:** a single-frame `Thread` returns exactly what `lay_out_in_frame` returns for that
+  frame, so `lay_out` (and the export golden gate) is unchanged.
+- **Overflow chains into the next frame on the same page:** content that overflows the first frame
+  of a two-frame thread continues into the second frame on the *same page* (blocks appear at both
+  frames' x-coordinates, one page) rather than spilling to a new page.
+- **New page only after the last frame fills:** content that overflows *both* frames spills to a
+  second page whose first block restarts at the first frame's origin.
+- **Landed-frame geometry:** a block that overflowed into a later frame carries that frame's x and
+  width, not the earlier frame's.
+
 ## Non-goals (named follow-up increments)
 
-- **Threading — increment 2.** Multiple frames per page and overflow chaining from one frame to the
-  next (and onto the next page when a thread's frames are exhausted). This increment lays out into
-  exactly one frame geometry, repeated per page on overflow — it does not chain distinct frames.
 - **Frames in the document model.** `Frame` lives in `layout-engine` and is derived from
   `PageSetup`; it is **not** yet a serialized `.tpub` field. Persisting author-defined frames
   (position, size, thread membership) into `core-model` is a later increment — it is a real

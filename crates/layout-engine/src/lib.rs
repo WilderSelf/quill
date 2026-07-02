@@ -41,6 +41,19 @@ impl Frame {
     }
 }
 
+/// An ordered chain of [`Frame`]s that content flows through — a *thread* (spec 0019 incr. 2).
+///
+/// Content fills `frames[0]` top-to-bottom; a block that overflows the current frame continues into
+/// the **next** frame in the thread (two columns on a page, a story that runs box-to-box), and onto
+/// a new page — restarting at `frames[0]` — once the thread's frames are exhausted. A single-frame
+/// thread reproduces the incr. 1 [`lay_out_in_frame`] behavior exactly (parity), so the same set of
+/// frames is repeated per page on overflow. The frames live in `layout-engine` and are supplied by
+/// the caller; persisting author-defined threads into the `.tpub` model is a later increment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thread {
+    pub frames: Vec<Frame>,
+}
+
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
 ///
@@ -108,12 +121,12 @@ pub fn lay_out(
     )
 }
 
-/// Flow `content` into a single [`Frame`], paginating vertically. Text wraps to the frame width,
-/// blocks are positioned at the frame origin (`frame.rect.x_pt` / `frame.rect.y_pt + local_y`), and
-/// a block overflows to a new page when it would pass the frame's bottom edge — see spec 0019.
+/// Flow `content` into a single [`Frame`], paginating vertically. Equivalent to
+/// [`lay_out_in_thread`] over a one-frame thread: text wraps to the frame width, blocks are
+/// positioned at the frame origin, and a block overflows to a new page (repeating the same frame
+/// geometry) when it would pass the frame's bottom edge — see spec 0019.
 ///
-/// Each page repeats the same frame geometry (origin + size); threading distinct frames is a
-/// follow-up (spec 0019 incr. 2). `assets` resolves [`Block::Image`] ids; unknown ids are skipped.
+/// `assets` resolves [`Block::Image`] ids; unknown ids are skipped.
 pub fn lay_out_in_frame(
     content: &[Block],
     assets: &[Asset],
@@ -121,83 +134,173 @@ pub fn lay_out_in_frame(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    let origin_x = frame.rect.x_pt;
-    let origin_y = frame.rect.y_pt;
-    let width = frame.rect.w_pt;
-    // Absolute y at which content overflows: the frame's bottom edge.
-    let bottom = origin_y + frame.rect.h_pt;
+    lay_out_in_thread(
+        content,
+        assets,
+        &Thread {
+            frames: vec![*frame],
+        },
+        metrics,
+        hyphenator,
+    )
+}
+
+/// The intrinsic size of a block once broken/measured for a given frame width, plus the payload
+/// needed to place it. Re-computed against each candidate frame the block is tried in, since both
+/// text wrapping and image sizing depend on the frame width (spec 0019 incr. 2).
+enum Measured {
+    Text {
+        lines: Vec<Line>,
+        color: Color,
+    },
+    Image {
+        asset_id: String,
+        /// The sized placement width (spec 0009), which may be narrower than the frame.
+        width: f32,
+    },
+}
+
+/// Break/size `block` against a frame of `width` points, returning the placement payload and its
+/// height. `None` means "skip this block" — currently only an unresolved [`Block::Image`] id.
+///
+/// Called once per candidate frame in [`lay_out_in_thread`]'s placement loop so a block that
+/// advances into a different-width frame re-wraps (text) / re-fits (image) to that frame's width.
+fn measure_block(
+    block: &Block,
+    width: f32,
+    assets: &[Asset],
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Option<(Measured, f32)> {
+    match block {
+        Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
+            // Body text is justified for press-quality even spacing; headings stay ragged-left
+            // (a heading is typically one short line, where justification would do nothing anyway —
+            // its single line is the paragraph's last, which is never justified).
+            let align = match block {
+                Block::Heading { .. } => Alignment::Left,
+                _ => Alignment::Justified,
+            };
+            let lines = justify_paragraph_hyphenated(
+                text,
+                width,
+                BODY_FONT_SIZE_PT,
+                align,
+                metrics,
+                hyphenator,
+            );
+            let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
+            Some((
+                Measured::Text {
+                    lines,
+                    color: *color,
+                },
+                height,
+            ))
+        }
+        Block::Image { asset } => {
+            // Resolve the asset id. If not found, skip this block (no panic).
+            let asset_rec = assets.iter().find(|a| &a.id == asset)?;
+            // Size the image at its true aspect ratio, scaling down to fit the frame width when
+            // wider. See spec 0009.
+            let (w, h) = image_size(asset_rec, width);
+            Some((
+                Measured::Image {
+                    asset_id: asset.clone(),
+                    width: w,
+                },
+                h,
+            ))
+        }
+    }
+}
+
+/// Flow `content` through a [`Thread`]'s frames, paginating across frames and then pages
+/// (spec 0019 incr. 2). Content fills the first frame top-to-bottom; a block that overflows the
+/// current frame continues into the next frame in the thread, and onto a fresh page — restarting at
+/// the first frame — once the thread's frames are exhausted.
+///
+/// An oversized block (taller than a frame) is placed in an otherwise-empty frame rather than
+/// skipping forever — the same "already has content" guard incr. 1 used, now measured per frame. A
+/// single-frame thread is exactly [`lay_out_in_frame`] (parity). `assets` resolves [`Block::Image`]
+/// ids; unknown ids are skipped. A thread must have at least one frame.
+pub fn lay_out_in_thread(
+    content: &[Block],
+    assets: &[Asset],
+    thread: &Thread,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<LaidOutPage> {
+    assert!(
+        !thread.frames.is_empty(),
+        "a thread must have at least one frame"
+    );
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut page = LaidOutPage::default();
-    // Cursor is an absolute y, starting at the frame top and reset there on each new page.
-    let mut y: f32 = origin_y;
+    // Which frame in the thread the cursor is currently filling.
+    let mut frame_idx: usize = 0;
+    // Absolute y cursor, starting at the current frame's top and reset there on each frame advance.
+    let mut y: f32 = thread.frames[0].rect.y_pt;
+    // Whether the *current* frame has received a block yet — mirrors incr. 1's page-empty guard,
+    // now per frame so an oversized block is placed rather than skipped through every frame/page.
+    let mut frame_empty = true;
 
     for block in content {
-        match block {
-            Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
-                // Body text is justified for press-quality even spacing; headings stay ragged-left
-                // (a heading is typically one short line, where justification would do nothing
-                // anyway — its single line is the paragraph's last, which is never justified).
-                let align = match block {
-                    Block::Heading { .. } => Alignment::Left,
-                    _ => Alignment::Justified,
-                };
-                let lines = justify_paragraph_hyphenated(
-                    text,
-                    width,
-                    BODY_FONT_SIZE_PT,
-                    align,
-                    metrics,
-                    hyphenator,
-                );
-                let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
+        // Advance frames / pages until the block fits, then place it. The block is re-measured
+        // against each candidate frame's width (wrapping/sizing depend on it), so a block that
+        // advances into a narrower frame re-wraps to that width rather than keeping a stale
+        // measurement. Bounded to <= 2 iterations: after one advance the new frame is empty, so the
+        // next iteration places (the `frame_empty` guard also places an oversized block rather than
+        // looping past every frame).
+        loop {
+            let frame = thread.frames[frame_idx];
+            let Some((measured, height)) =
+                measure_block(block, frame.rect.w_pt, assets, metrics, hyphenator)
+            else {
+                break; // unresolved image asset → skip this block (no panic)
+            };
+            let bottom = frame.rect.y_pt + frame.rect.h_pt;
 
-                // If this block doesn't fit (and the page already has content), start a new page.
-                if y + height > bottom && !page.blocks.is_empty() {
-                    pages.push(page);
+            if y + height > bottom && !frame_empty {
+                // Doesn't fit and the current frame has content → move on before placing.
+                if frame_idx + 1 < thread.frames.len() {
+                    frame_idx += 1; // next frame in the thread, same page
+                } else {
+                    pages.push(page); // thread exhausted → new page, back to the first frame
                     page = LaidOutPage::default();
-                    y = origin_y;
+                    frame_idx = 0;
                 }
+                y = thread.frames[frame_idx].rect.y_pt;
+                frame_empty = true;
+                continue; // re-measure against the frame it moved into
+            }
 
-                page.blocks.push(PlacedBlock::Text {
+            let placed = match measured {
+                Measured::Text { lines, color } => PlacedBlock::Text {
                     frame: Rect {
-                        x_pt: origin_x,
+                        x_pt: frame.rect.x_pt,
+                        y_pt: y,
+                        w_pt: frame.rect.w_pt,
+                        h_pt: height,
+                    },
+                    lines,
+                    color,
+                },
+                Measured::Image { asset_id, width } => PlacedBlock::Image {
+                    frame: Rect {
+                        x_pt: frame.rect.x_pt,
                         y_pt: y,
                         w_pt: width,
                         h_pt: height,
                     },
-                    lines,
-                    color: *color,
-                });
-                y += height;
-            }
-            Block::Image { asset } => {
-                // Resolve the asset id. If not found, skip this block (no panic).
-                let Some(asset_rec) = assets.iter().find(|a| &a.id == asset) else {
-                    continue;
-                };
-
-                // Size the image from its pixel dimensions and DPI at its true aspect ratio,
-                // scaling down to fit the frame width when wider. See spec 0009.
-                let (w, h) = image_size(asset_rec, width);
-
-                if y + h > bottom && !page.blocks.is_empty() {
-                    pages.push(page);
-                    page = LaidOutPage::default();
-                    y = origin_y;
-                }
-
-                page.blocks.push(PlacedBlock::Image {
-                    frame: Rect {
-                        x_pt: origin_x,
-                        y_pt: y,
-                        w_pt: w,
-                        h_pt: h,
-                    },
-                    asset_id: asset.clone(),
-                });
-                y += h;
-            }
+                    asset_id,
+                },
+            };
+            page.blocks.push(placed);
+            y += height;
+            frame_empty = false;
+            break;
         }
     }
 
@@ -511,6 +614,206 @@ mod tests {
             short.len() >= 2,
             "a 60 pt frame must paginate 20 lines, got {}",
             short.len()
+        );
+    }
+
+    /// Two side-by-side columns on a 432×648 page: a left frame and a right frame, each `w` wide and
+    /// `h` tall at the top of the page. Used by the threading tests.
+    fn two_column_thread(w: f32, h: f32) -> Thread {
+        Thread {
+            frames: vec![
+                Frame {
+                    rect: Rect {
+                        x_pt: 0.0,
+                        y_pt: 0.0,
+                        w_pt: w,
+                        h_pt: h,
+                    },
+                },
+                Frame {
+                    rect: Rect {
+                        x_pt: 216.0,
+                        y_pt: 0.0,
+                        w_pt: w,
+                        h_pt: h,
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn single_frame_thread_matches_lay_out_in_frame() {
+        // Parity: a one-frame thread is exactly the incr. 1 single-frame path, so lay_out (and thus
+        // export output) is unchanged by threading.
+        let doc = Document::sample();
+        let frame = Frame::full_page(&doc.page_setup);
+        let via_frame = lay_out_in_frame(&doc.content, &doc.assets, &frame, &MONO, &NoHyphenator);
+        let via_thread = lay_out_in_thread(
+            &doc.content,
+            &doc.assets,
+            &Thread {
+                frames: vec![frame],
+            },
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(via_frame, via_thread);
+    }
+
+    #[test]
+    fn overflow_chains_into_next_frame_on_same_page() {
+        // Two 96 pt-tall columns (8 lines each) side by side. 12 single-line blocks overflow the
+        // left column (8 lines) and must continue into the RIGHT column on the SAME page — not spill
+        // to a second page (12 <= 16 lines of capacity).
+        let content: Vec<Block> = (0..12)
+            .map(|i| Block::Body {
+                text: format!("L{i}"),
+                color: Color::Gray { v: 0.0 },
+            })
+            .collect();
+        let thread = two_column_thread(216.0, 96.0);
+        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+
+        assert_eq!(
+            pages.len(),
+            1,
+            "12 lines fit two 8-line columns on one page"
+        );
+        let xs: Vec<f32> = pages[0]
+            .blocks
+            .iter()
+            .map(|b| match b {
+                PlacedBlock::Text { frame, .. } => frame.x_pt,
+                PlacedBlock::Image { frame, .. } => frame.x_pt,
+            })
+            .collect();
+        assert!(
+            xs.contains(&0.0),
+            "some blocks land in the left column (x=0)"
+        );
+        assert!(
+            xs.contains(&216.0),
+            "overflow continues into the right column (x=216)"
+        );
+    }
+
+    #[test]
+    fn new_page_only_after_last_frame_fills() {
+        // Two 96 pt-tall columns = 16 lines of capacity per page. 20 single-line blocks overflow
+        // BOTH columns and must spill to a second page, restarting at the first (left) frame.
+        let content: Vec<Block> = (0..20)
+            .map(|i| Block::Body {
+                text: format!("L{i}"),
+                color: Color::Gray { v: 0.0 },
+            })
+            .collect();
+        let thread = two_column_thread(216.0, 96.0);
+        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+
+        assert!(
+            pages.len() >= 2,
+            "20 lines exceed two 8-line columns, got {} pages",
+            pages.len()
+        );
+        // Page 2's first block restarts at the first frame's origin (left column, y=0).
+        match &pages[1].blocks[0] {
+            PlacedBlock::Text { frame, .. } => {
+                assert_eq!(frame.x_pt, 0.0, "page 2 restarts in the left column");
+                assert_eq!(frame.y_pt, 0.0, "page 2 restarts at the frame top");
+            }
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_column_blocks_carry_right_frame_x() {
+        // Every block that overflowed into the right column must carry that frame's x (216), never
+        // the left frame's — proving placement uses the frame the block actually landed in.
+        let content: Vec<Block> = (0..12)
+            .map(|i| Block::Body {
+                text: format!("L{i}"),
+                color: Color::Gray { v: 0.0 },
+            })
+            .collect();
+        let thread = two_column_thread(216.0, 96.0);
+        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+        let right: Vec<&Rect> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, .. } if frame.x_pt == 216.0 => Some(frame),
+                _ => None,
+            })
+            .collect();
+        assert!(!right.is_empty(), "some blocks landed in the right column");
+        assert!(
+            right.iter().all(|f| f.w_pt == 216.0),
+            "right-column blocks wrap to the right frame's width"
+        );
+    }
+
+    #[test]
+    fn advanced_block_rewraps_to_landed_frame_width() {
+        // A block that overflows a WIDE frame into a NARROWER next frame must re-wrap to the narrow
+        // width — not keep the wide measurement (spec 0019 incr. 2, "width per frame"). Frame A is a
+        // full-width, 1-line-tall box; frame B is narrow. The first block fills A exactly; the
+        // second overflows into B and must break to multiple lines at B's width (a stale wide
+        // measurement would place it as a single line spilling past B's right edge).
+        let thread = Thread {
+            frames: vec![
+                Frame {
+                    rect: Rect {
+                        x_pt: 0.0,
+                        y_pt: 0.0,
+                        w_pt: 432.0,
+                        h_pt: BODY_LINE_HEIGHT_PT, // holds exactly one line
+                    },
+                },
+                Frame {
+                    rect: Rect {
+                        x_pt: 216.0,
+                        y_pt: 0.0,
+                        w_pt: 60.0, // 10 chars/line under MONO (6 pt/char)
+                        h_pt: 400.0,
+                    },
+                },
+            ],
+        };
+        // "alpha beta gamma delta" = 22 chars: one line at 432 pt, but cannot fit in fewer than 3
+        // lines of 10 chars, so it must wrap to >= 2 lines in frame B.
+        let content = vec![
+            Block::Body {
+                text: "first".into(),
+                color: Color::Gray { v: 0.0 },
+            },
+            Block::Body {
+                text: "alpha beta gamma delta".into(),
+                color: Color::Gray { v: 0.0 },
+            },
+        ];
+        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+
+        // The second block lands in the narrow frame B (x = 216).
+        let (frame, lines) = pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PlacedBlock::Text { frame, lines, .. } if frame.x_pt == 216.0 => {
+                    Some((frame, lines))
+                }
+                _ => None,
+            })
+            .expect("second block landed in the narrow frame");
+        assert_eq!(frame.w_pt, 60.0, "carries the landed (narrow) frame width");
+        assert!(
+            lines.len() >= 2,
+            "re-wrapped to the narrow frame width, got {} line(s)",
+            lines.len()
+        );
+        assert!(
+            (frame.h_pt - lines.len() as f32 * BODY_LINE_HEIGHT_PT).abs() < 0.01,
+            "height matches the re-wrapped line count (not the stale 1-line height)"
         );
     }
 
