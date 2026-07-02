@@ -144,11 +144,35 @@ mod tests {
 
     #[test]
     fn lays_out_sample_into_one_page() {
-        // Document::sample() has 2 short text blocks + asset "map1" (referenced by no Block::Image
-        // in the sample, so no image block is placed). Content fits well within one page.
+        // Document::sample() has 2 text blocks (a short heading + a body paragraph that wraps to
+        // a few lines) + asset "map1" (referenced by no Block::Image in the sample, so no image
+        // block is placed). Content still fits well within one page.
         let pages = lay_out(&Document::sample(), &MONO);
         assert!(!pages.is_empty());
         assert!(!pages[0].blocks.is_empty());
+    }
+
+    #[test]
+    fn sample_body_wraps_and_justifies() {
+        // The CI Ghostscript preflight exports Document::sample() and parses its content stream to
+        // exercise the justified-`TJ` path (spec 0017 incr. 2). That only happens if the sample's
+        // body paragraph wraps to >= 2 lines, giving an interior line a non-zero adjustment. Guard
+        // that invariant here so shortening the sample text can't silently drop the CI coverage.
+        let pages = lay_out(&Document::sample(), &MONO);
+        // The sample leads with a short heading, then the body paragraph; look for any text block
+        // that both wraps (>= 2 lines) and carries a justified (non-zero-adjustment) interior line.
+        let wrapped_justified = pages
+            .iter()
+            .flat_map(|p| &p.blocks)
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .any(|lines| lines.len() >= 2 && lines.iter().any(|l| l.space_adjust_pt != 0.0));
+        assert!(
+            wrapped_justified,
+            "sample must contain a wrapped, justified paragraph so CI parses a justified TJ"
+        );
     }
 
     /// The lines of the first `PlacedBlock::Text` found across `pages`.

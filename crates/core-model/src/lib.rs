@@ -152,7 +152,14 @@ impl Document {
                     color: Color::Gray { v: 0.0 },
                 },
                 Block::Body {
-                    text: "A dank corridor stretches into darkness.".into(),
+                    // Long enough to wrap to >= 2 lines under the default 432 pt frame at
+                    // BODY_FONT_SIZE_PT, so the first (interior) line is justified — the CI
+                    // Ghostscript preflight then parses a positioned `TJ` operator (spec 0017 incr. 2),
+                    // not just a ragged single-line `Tj`.
+                    text: "A dank corridor stretches into darkness, its cold stone walls slick with \
+                           creeping moss, while the slow steady drip of water echoes from the unseen \
+                           depths somewhere far ahead in the gloom."
+                        .into(),
                     color: Color::Cmyk {
                         c: 0.0,
                         m: 0.0,
