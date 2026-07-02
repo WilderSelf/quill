@@ -89,7 +89,14 @@ pub enum CheckId {
     Bleed,
     ImageResolution,
     InkCoverage,
+    /// No crop, printer, or registration marks in the file (spec 0001 req #7). Quill's writer
+    /// emits none and the document model cannot express any, so this is a structural invariant
+    /// that never produces a finding — it exists to complete the 1:1 requirement→check mapping.
+    Marks,
     OutputIntent,
+    /// Live transparency (image alpha) is flattened for PDF/X (spec 0001 req #9). Emitted as a
+    /// `Warning` when an asset declares an alpha channel that export will drop.
+    Transparency,
     /// The supplied ICC OutputIntent profile is not a CMYK output-class profile.
     IccProfileInvalid,
 }
@@ -147,6 +154,14 @@ fn push_error(report: &mut PreflightReport, check: CheckId, message: String) {
     report.findings.push(Finding {
         check,
         severity: Severity::Error,
+        message,
+    });
+}
+
+fn push_warning(report: &mut PreflightReport, check: CheckId, message: String) {
+    report.findings.push(Finding {
+        check,
+        severity: Severity::Warning,
         message,
     });
 }
@@ -241,6 +256,28 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
         }
     }
 
+    // Transparency: PDF/X-1a:2001 and PDF/X-3:2002 both forbid live transparency, so export
+    // flattens image alpha to opaque (see `images.rs`). Warn — not fail — when an asset declares
+    // an alpha channel, since the flattened output is still conformant; the author just should
+    // know it happened.
+    for asset in &doc.assets {
+        if asset.has_alpha {
+            push_warning(
+                &mut report,
+                CheckId::Transparency,
+                format!(
+                    "asset '{}' has an alpha channel; it will be flattened to opaque for PDF/X",
+                    asset.id
+                ),
+            );
+        }
+    }
+
+    // Marks (spec 0001 req #7): no crop/printer/registration marks. Quill's writer emits none and
+    // the document model has no field that could request them, so there is nothing to flag. This
+    // check is a structural invariant with no failing input by design — present to complete the
+    // 1:1 requirement→check mapping; it never pushes a finding.
+
     report
 }
 
@@ -311,6 +348,7 @@ mod tests {
             path: "assets/blurry.png".into(),
             dpi: 299.0,
             line_art: false,
+            has_alpha: false,
         }];
         let report = preflight(&doc, &opts_with_icc());
         assert!(report
@@ -327,6 +365,7 @@ mod tests {
             path: "assets/ink.png".into(),
             dpi: 400.0,
             line_art: true,
+            has_alpha: false,
         }];
         let report = preflight(&doc, &opts_with_icc());
         assert!(report
@@ -342,6 +381,46 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.check == CheckId::OutputIntent));
+    }
+
+    #[test]
+    fn transparency_asset_warns_but_passes() {
+        // An asset declaring an alpha channel yields a Transparency *warning* (spec 0001 req #9);
+        // export still succeeds because Quill flattens it, so preflight still passes.
+        let mut doc = Document::sample();
+        doc.assets = vec![Asset {
+            id: "glow".into(),
+            path: "assets/glow.png".into(),
+            dpi: 300.0,
+            line_art: false,
+            has_alpha: true,
+        }];
+        let report = preflight(&doc, &opts_with_icc());
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == CheckId::Transparency)
+            .expect("expected a Transparency finding");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(report.passed(), "a warning must not fail preflight");
+    }
+
+    #[test]
+    fn opaque_assets_have_no_transparency_finding() {
+        // The sample's asset has no alpha, so nothing is flagged.
+        let report = preflight(&Document::sample(), &opts_with_icc());
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.check == CheckId::Transparency));
+    }
+
+    #[test]
+    fn clean_document_emits_no_marks_finding() {
+        // Marks is a structural invariant: Quill emits no marks and the model can't request any,
+        // so no document ever produces a Marks finding.
+        let report = preflight(&Document::sample(), &opts_with_icc());
+        assert!(!report.findings.iter().any(|f| f.check == CheckId::Marks));
     }
 
     #[test]
@@ -437,6 +516,7 @@ mod tests {
             path: img_path.into(),
             dpi: 300.0,
             line_art: false,
+            has_alpha: false,
         }];
         doc.content.push(Block::Image {
             asset: "pic".into(),
@@ -475,6 +555,7 @@ mod tests {
             path: png_path.to_string_lossy().into_owned(),
             dpi: 300.0,
             line_art: false,
+            has_alpha: false,
         }];
         doc.content.push(Block::Image {
             asset: "pic".into(),

@@ -213,6 +213,7 @@ mod tests {
                 path: "assets/img1.png".into(),
                 dpi: 300.0,
                 line_art: false,
+                has_alpha: false,
             }],
             fonts_embeddable: false,
         };

@@ -3,7 +3,9 @@
 - **Milestone:** M0
 - **Status:** implemented — preflight landed with this spec; byte generation in
   [spec 0002](0002-pdf-byte-generation.md); the "PDF/X-1a **or** PDF/X-3 (selectable)"
-  requirement (#1) is completed by [spec 0003](0003-pdf-x3-output.md).
+  requirement (#1) is completed by [spec 0003](0003-pdf-x3-output.md); the `Marks` (#7) and
+  `Transparency` (#9) preflight checks are completed by
+  [spec 0007](0007-preflight-marks-transparency.md).
 - **Crates:** `quill-export-pdf` (owner), `quill-color`, `quill-core-model`, `quill-cli`
 
 ## Goal

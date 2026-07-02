@@ -85,6 +85,10 @@ pub struct Asset {
     /// True for bilevel line art (600 dpi threshold instead of 300).
     #[serde(default)]
     pub line_art: bool,
+    /// True if the linked image carries an alpha channel. PDF/X forbids live transparency, so
+    /// export flattens it (alpha is dropped); preflight warns when this will happen.
+    #[serde(default)]
+    pub has_alpha: bool,
 }
 
 /// A semantic content block — the "easy" authoring layer.
@@ -152,6 +156,7 @@ impl Document {
                 path: "assets/map1.png".into(),
                 dpi: 300.0,
                 line_art: false,
+                has_alpha: false,
             }],
             fonts_embeddable: true,
         }
