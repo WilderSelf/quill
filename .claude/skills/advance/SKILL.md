@@ -1,6 +1,6 @@
 ---
 name: advance
-description: Autonomously advance the project by ONE atomic increment — reconcile repo/PR/spec state on a cold start, select the next M0 increment, ship it via /ship (plan→PR→CI-gated auto-merge), then exit with a status token. Stops cleanly on any blocker. Use when the user runs /advance, or as the body of the recurring self-driving scheduled task. Explicit-invoke only.
+description: Autonomously advance the project by ONE atomic increment — reconcile repo/PR/spec state on a cold start, select the next increment of the active milestone, ship it via /ship (plan→PR→CI-gated auto-merge), then exit with a status token. Stops cleanly on any blocker. Use when the user runs /advance, or as the body of the recurring self-driving scheduled task. Explicit-invoke only.
 disable-model-invocation: true
 ---
 
@@ -62,14 +62,18 @@ Read `specs/README.md`, the milestone table, and recent history:
 git log --oneline -15
 ```
 
-Pick the **smallest independently shippable** next piece of **M0**, favouring specs marked
-`accepted`/`in-progress` and the next unimplemented fast-follow. Then gate on stop-and-ask:
+Pick the **smallest independently shippable** next piece of the **current milestone (M1** — M0 is
+code-complete; the M1 text-layout arc is authorized and open, starting with spec 0016), favouring
+specs marked `accepted`/`in-progress` and the next unimplemented fast-follow. Then gate on
+stop-and-ask:
 
 - Needs a **net-new spec** or an **architectural decision** not already in the approved plan
   (`~/.claude/plans/i-want-to-create-prancy-bee.md`) or an existing spec →
-  `STATUS: BLOCKED:needs-spec:<short-desc>`. Do not invent product scope autonomously.
-- **All M0 work is implemented** / the next work crosses into **M1** →
-  `STATUS: BLOCKED:milestone-boundary-M0-complete`. M1 needs the user back in the loop.
+  `STATUS: BLOCKED:needs-spec:<short-desc>`. Do not invent product scope autonomously. (M1 is less
+  spec-bound than M0 — lean toward this stop when the next piece isn't already specced.)
+- The next work crosses into the next **unentered** milestone (**M1 → M2**) →
+  `STATUS: BLOCKED:milestone-boundary-<current>-complete`. The new milestone needs the user back in
+  the loop. (M0→M1 has already been authorized by the user; that boundary no longer blocks.)
 - Selection is **ambiguous or low-confidence** → `STATUS: BLOCKED:ambiguous-next-<short-desc>`.
 - A **clear fast-follow with an existing/derivable spec** → append/refine the spec entry under
   `specs/` if needed, then continue. Check `git log` and open PRs to be sure it isn't already done
@@ -164,4 +168,6 @@ findings), then the final status line. Exactly one of:
 - **Never** push to `main`, force-push, `--admin`-merge, or enable `--auto` on an unverified gate.
 - **Never switch branches over a dirty shared tree.** Uncommitted changes you didn't make belong to
   a concurrent session → `BLOCKED:dirty-tree` (see §1a).
-- **Milestone-aware.** M0→M1 is an unconditional `BLOCKED` stop.
+- **Milestone-aware.** Crossing into the next **unentered** milestone is an unconditional `BLOCKED`
+  stop (currently **M1 → M2**); the new milestone needs the user back in the loop. M0→M1 has been
+  authorized and no longer blocks — M1 is the active milestone.
