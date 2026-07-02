@@ -198,6 +198,8 @@ mod tests {
         let asset = Asset {
             id: "x".into(),
             path: "does-not-exist.png".into(),
+            px_w: 600,
+            px_h: 600,
             dpi: 300.0,
             line_art: false,
             has_alpha: false,

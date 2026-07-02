@@ -80,7 +80,17 @@ impl Default for PageSetup {
 pub struct Asset {
     pub id: String,
     pub path: String,
-    /// Effective resolution at placed size, in dots per inch.
+    /// Pixel dimensions of the source image. Used by the layout engine to place the image at its
+    /// true aspect ratio and physical size (`pt = px / dpi * 72`). See `specs/0009-image-sizing.md`.
+    /// `0` means "unknown" — the layout engine falls back to a square, full-width placeholder.
+    #[serde(default)]
+    pub px_w: u32,
+    /// See [`Asset::px_w`].
+    #[serde(default)]
+    pub px_h: u32,
+    /// Native (source) resolution of the image, in dots per inch. Combined with `px_w`/`px_h`
+    /// it determines the placed size (`pt = px / dpi * 72`; see spec 0009). Preflight's
+    /// `ImageResolution` check gates on this value.
     pub dpi: f32,
     /// True for bilevel line art (600 dpi threshold instead of 300).
     #[serde(default)]
@@ -154,6 +164,8 @@ impl Document {
             assets: vec![Asset {
                 id: "map1".into(),
                 path: "assets/map1.png".into(),
+                px_w: 1500,
+                px_h: 1200,
                 dpi: 300.0,
                 line_art: false,
                 has_alpha: false,
