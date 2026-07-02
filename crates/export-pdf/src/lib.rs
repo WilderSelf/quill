@@ -15,6 +15,7 @@ use thiserror::Error;
 
 mod fonts;
 mod geom;
+mod hyphenate;
 mod icc;
 mod images;
 mod writer;
@@ -300,20 +301,28 @@ pub fn export(
     let used_chars = collect_doc_chars(doc);
     let font = build_font(opts, &used_chars)?;
     let shaper = font.shaper();
-    let pages = quill_layout_engine::lay_out(doc, &shaper);
+    // Real en-US hyphenation (spec 0018 incr. 2): words break at legal syllable points, tightening
+    // lines and splitting over-wide words. Built once (stateless), passed to the layout pass.
+    let hyphenator = hyphenate::HypherHyphenator;
+    let pages = quill_layout_engine::lay_out(doc, &shaper, &hyphenator);
     writer::write_pdf(doc, opts, &pages, &font, out)
 }
 
 /// Every character the font must carry: the document's text-block chars (headings + body) plus a
-/// literal space.
+/// literal space and a literal hyphen.
 ///
 /// The space is inserted unconditionally because `break_by_width` normalizes *all* inter-word
 /// whitespace to `U+0020` — so a document that separates words only with tabs/newlines still
 /// renders (and is measured) with the real space glyph rather than `.notdef`. Without this, the
 /// space glyph could be missing from the subset even though every laid-out line uses it.
+///
+/// The hyphen (`U+002D`) is inserted unconditionally for the same reason (spec 0018 incr. 2):
+/// hyphenation can introduce a trailing `-` on a broken line even when the source text contains no
+/// literal hyphen, so the subset must always carry a real hyphen glyph rather than emit `.notdef`.
 fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
     let mut set = std::collections::BTreeSet::new();
     set.insert(' ');
+    set.insert('-');
     for block in &doc.content {
         if let Block::Heading { text, .. } | Block::Body { text, .. } = block {
             set.extend(text.chars());
@@ -372,6 +381,29 @@ mod tests {
         assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
         let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
         assert_ne!(gid, 0, "' ' must map to a real glyph, not .notdef");
+    }
+
+    /// Spec 0018 incr. 2: hyphenation can add a trailing `-` to a broken line even when the source
+    /// text has no literal hyphen, so the subset must always carry a real hyphen glyph — otherwise
+    /// the rendered hyphen would be `.notdef`. Mirrors the space-glyph guarantee above.
+    #[test]
+    fn hyphen_glyph_is_subset_even_without_literal_hyphen() {
+        let doc = {
+            let mut d = Document::sample();
+            d.content = vec![Block::Body {
+                text: "alpha beta gamma".into(), // no literal U+002D
+                color: Color::Gray { v: 0.0 },
+            }];
+            d
+        };
+        let chars = collect_doc_chars(&doc);
+        assert!(chars.contains(&'-'), "hyphen must always be collected");
+
+        let font = build_font(&ExportOptions::default(), &chars).expect("build bundled font");
+        let encoded = font.encode_line("-");
+        assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
+        let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
+        assert_ne!(gid, 0, "'-' must map to a real glyph, not .notdef");
     }
 
     #[test]

@@ -8,7 +8,8 @@
 
 use quill_core_model::{Asset, Block, Color, Document, Rect};
 use quill_text_layout::{
-    justify_paragraph, Alignment, Line, RunMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT,
+    justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics, BODY_FONT_SIZE_PT,
+    BODY_LINE_HEIGHT_PT,
 };
 
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
@@ -57,7 +58,15 @@ pub struct LaidOutPage {
 /// Text is broken to fit the frame width using the caller-supplied `metrics` (the embedded font in
 /// the export path) at [`BODY_FONT_SIZE_PT`] — see `specs/0015-text-metrics-line-breaking.md` and
 /// spec 0016 for the shift to run-based measurement.
-pub fn lay_out(doc: &Document, metrics: &impl RunMetrics) -> Vec<LaidOutPage> {
+///
+/// `hyphenator` supplies the legal in-word break points (spec 0018): the export path passes an
+/// en-US `hypher`-backed hyphenator so long words break at syllable boundaries; tests pass
+/// [`quill_text_layout::NoHyphenator`] for the spec-0017 parity path.
+pub fn lay_out(
+    doc: &Document,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<LaidOutPage> {
     let width = doc.page_setup.trim.w_pt;
     let page_h = doc.page_setup.trim.h_pt;
 
@@ -75,7 +84,14 @@ pub fn lay_out(doc: &Document, metrics: &impl RunMetrics) -> Vec<LaidOutPage> {
                     Block::Heading { .. } => Alignment::Left,
                     _ => Alignment::Justified,
                 };
-                let lines = justify_paragraph(text, width, BODY_FONT_SIZE_PT, align, metrics);
+                let lines = justify_paragraph_hyphenated(
+                    text,
+                    width,
+                    BODY_FONT_SIZE_PT,
+                    align,
+                    metrics,
+                    hyphenator,
+                );
                 let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
 
                 // If this block doesn't fit (and the page already has content), start a new page.
@@ -136,7 +152,7 @@ pub fn lay_out(doc: &Document, metrics: &impl RunMetrics) -> Vec<LaidOutPage> {
 mod tests {
     use super::*;
     use quill_core_model::{Asset, Block, Color, Document, Metadata, PageSetup, Size};
-    use quill_text_layout::MonospaceRunMetrics;
+    use quill_text_layout::{Hyphenator, MonospaceRunMetrics, NoHyphenator};
 
     /// 0.6 em × 10 pt = 6 pt/char, matching the old `APPROX_CHAR_WIDTH_PT` stand-in so these
     /// pagination tests keep their familiar per-character arithmetic.
@@ -147,7 +163,7 @@ mod tests {
         // Document::sample() has 2 text blocks (a short heading + a body paragraph that wraps to
         // a few lines) + asset "map1" (referenced by no Block::Image in the sample, so no image
         // block is placed). Content still fits well within one page.
-        let pages = lay_out(&Document::sample(), &MONO);
+        let pages = lay_out(&Document::sample(), &MONO, &NoHyphenator);
         assert!(!pages.is_empty());
         assert!(!pages[0].blocks.is_empty());
     }
@@ -158,7 +174,7 @@ mod tests {
         // exercise the justified-`TJ` path (spec 0017 incr. 2). That only happens if the sample's
         // body paragraph wraps to >= 2 lines, giving an interior line a non-zero adjustment. Guard
         // that invariant here so shortening the sample text can't silently drop the CI coverage.
-        let pages = lay_out(&Document::sample(), &MONO);
+        let pages = lay_out(&Document::sample(), &MONO, &NoHyphenator);
         // The sample leads with a short heading, then the body paragraph; look for any text block
         // that both wraps (>= 2 lines) and carries a justified (non-zero-adjustment) interior line.
         let wrapped_justified = pages
@@ -187,6 +203,49 @@ mod tests {
             .expect("a text block")
     }
 
+    /// Breaks the crafted long word in `lay_out_threads_the_hyphenator` in half; nothing else.
+    struct HalfStub;
+    impl Hyphenator for HalfStub {
+        fn hyphenate(&self, word: &str) -> Vec<usize> {
+            if word.len() == 100 {
+                vec![50]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[test]
+    fn lay_out_threads_the_hyphenator() {
+        // Proves `lay_out` actually passes its hyphenator down to the breaker (spec 0018 incr. 2).
+        // A single 100-char word (600 pt under MONO) overflows the 432 pt frame with NoHyphenator
+        // (one long line, no hyphen). With HalfStub it splits at offset 50 — the first line ends in
+        // a rendered hyphen — so the two paths must differ.
+        let doc = doc_with_blocks(vec![Block::Body {
+            text: "z".repeat(100),
+            color: Color::Gray { v: 0.0 },
+        }]);
+
+        let plain = first_text_lines(&lay_out(&doc, &MONO, &NoHyphenator));
+        let hyphenated = first_text_lines(&lay_out(&doc, &MONO, &HalfStub));
+
+        assert_eq!(
+            plain.len(),
+            1,
+            "no hyphenation → the word overflows on one line"
+        );
+        assert!(!plain[0].text.ends_with('-'));
+        assert_eq!(
+            hyphenated.len(),
+            2,
+            "HalfStub splits the word across two lines"
+        );
+        assert!(
+            hyphenated[0].text.ends_with('-'),
+            "the broken line renders a trailing hyphen"
+        );
+    }
+
     #[test]
     fn body_is_justified_headings_are_ragged() {
         // A paragraph long enough to wrap under the 432 pt frame (72 chars/line at 6 pt/char under
@@ -205,8 +264,8 @@ mod tests {
             color: Color::Gray { v: 0.0 },
         }]);
 
-        let body_lines = first_text_lines(&lay_out(&body, &MONO));
-        let heading_lines = first_text_lines(&lay_out(&heading, &MONO));
+        let body_lines = first_text_lines(&lay_out(&body, &MONO, &NoHyphenator));
+        let heading_lines = first_text_lines(&lay_out(&heading, &MONO, &NoHyphenator));
 
         assert!(body_lines.len() >= 2, "body should wrap to >= 2 lines");
         assert!(
@@ -247,7 +306,7 @@ mod tests {
             })
             .collect();
         let doc = doc_with_blocks(blocks);
-        let pages = lay_out(&doc, &MONO);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
         assert!(
             pages.len() >= 2,
             "expected at least 2 pages, got {}",
@@ -269,7 +328,7 @@ mod tests {
         // Exactly lines_per_page blocks → fits on one page.
         let exact_blocks: Vec<Block> = (0..lines_per_page).map(make_block).collect();
         let doc_exact = doc_with_blocks(exact_blocks);
-        let pages_exact = lay_out(&doc_exact, &MONO);
+        let pages_exact = lay_out(&doc_exact, &MONO, &NoHyphenator);
         assert_eq!(
             pages_exact.len(),
             1,
@@ -280,7 +339,7 @@ mod tests {
         // One extra block → must spill to a second page.
         let overflow_blocks: Vec<Block> = (0..=lines_per_page).map(make_block).collect();
         let doc_overflow = doc_with_blocks(overflow_blocks);
-        let pages_overflow = lay_out(&doc_overflow, &MONO);
+        let pages_overflow = lay_out(&doc_overflow, &MONO, &NoHyphenator);
         assert!(
             pages_overflow.len() >= 2,
             "expected >= 2 pages after overflow, got {}",
@@ -324,7 +383,7 @@ mod tests {
             fonts_embeddable: false,
         };
 
-        let pages = lay_out(&doc, &MONO);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
 
         // Collect all image blocks across all pages.
         let image_blocks: Vec<&PlacedBlock> = pages

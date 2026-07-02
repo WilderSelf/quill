@@ -27,6 +27,12 @@ ttf-parser = "0.25"
 # rustybuzz 0.20 pins ttf-parser 0.25 — the SAME version subsetter needs (checked by cargo tree -d).
 # Shapes runs for kerning/ligature-aware measurement (spec 0016); permissive (MIT/Apache-2.0).
 rustybuzz = "0.20"
+# Knuth-Liang hyphenation (spec 0018). Typst's crate: MIT/Apache-2.0, zero transitive deps
+# (patterns embedded as no_std data). english-only trims the other 49 language tables; en-US is
+# the first-cut scope. Checked permissive + no-new-transitive-dep by `cargo tree`.
+# `alloc` guards the >45-byte-word path (without it `hyphenate` panics on a long word); `english`
+# is the only language table pulled in. Both keep export panic-free and the dep graph minimal.
+hypher = { version = "0.1", default-features = false, features = ["english", "alloc"] }
 lcms2 = "6"
 png = "0.18"
 # default-features off drops the rayon parallel-decode path — the export decode loop is already

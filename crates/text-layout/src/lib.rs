@@ -32,8 +32,13 @@
 //! can choose alongside inter-word glue. The hyphenator-aware entry points are
 //! [`break_paragraph_hyphenated`] / [`justify_paragraph_hyphenated`]; the original
 //! [`break_paragraph`] / [`justify_paragraph`] are now thin wrappers passing [`NoHyphenator`], so with
-//! no hyphenator every word is a single box and breaking is byte-identical to spec 0017 (parity). Real
-//! en-US patterns (`hypher`) and the rendered hyphen arrive in increment 2.
+//! no hyphenator every word is a single box and breaking is byte-identical to spec 0017 (parity).
+//!
+//! Spec 0018 (increment 2) supplies the real patterns: the export crate implements the [`Hyphenator`]
+//! trait over `hypher` (Knuth-Liang en-US) and threads it through `lay_out`, so long words break at
+//! syllable points (rendering a trailing `-`) and an over-wide word with a legal break splits across
+//! lines instead of overflowing — narrowing the greedy fallback to the genuinely unbreakable case.
+//! The algorithm here is unchanged; only which [`Hyphenator`] the pipeline passes moved.
 
 /// Body/heading font size, in points. Shared by the layout engine (to measure and to reserve row
 /// height) and the writer (to set the font size), so text is measured at the size it is drawn.
@@ -687,6 +692,34 @@ mod tests {
                 first
             );
         }
+    }
+
+    #[test]
+    fn over_wide_word_splits_at_hyphenation_point_instead_of_overflowing() {
+        // A single word wider than the frame that HAS a hyphenation point must break across lines
+        // rather than overflow (spec 0018 incr. 2 narrows the greedy fallback). "bbbbbbbb" = 8 chars
+        // = 48 pt > L = 30 pt; Stub breaks it every 2 chars. The only feasible optimum packs two
+        // 2-char segments per line: line 1 = "bbbb-" (4·6 + hyphen 6 = 30 = L, badness 0), last line
+        // = "bbbb" (24 pt, free). The greedy fallback would strand the whole 48 pt word on one
+        // overflowing line — this must NOT happen.
+        const L: f32 = 30.0;
+        let hy = break_paragraph_hyphenated("bbbbbbbb", L, SIZE, &MONO, &Stub);
+        assert_eq!(hy, vec!["bbbb-".to_string(), "bbbb".to_string()]);
+        // It is the DP result, not the greedy overflow fallback.
+        assert_ne!(hy, break_by_width("bbbbbbbb", L, SIZE, &MONO));
+        // No line overflows the frame (the hyphen width is counted on the broken line).
+        assert!(hy.iter().all(|l| MONO.measure_run(l, SIZE) <= L + 1e-3));
+    }
+
+    #[test]
+    fn unbreakable_over_wide_word_still_falls_back_to_greedy() {
+        // A word wider than the frame with NO hyphenation point (Stub returns nothing for it) has no
+        // feasible breaking, so the greedy fallback still lays it out (overflowing) rather than
+        // panicking or emptying — the spec-0017 principle survives, just with a narrowed surface.
+        const L: f32 = 30.0;
+        let hy = break_paragraph_hyphenated("elephantine", L, SIZE, &MONO, &Stub);
+        assert_eq!(hy, break_by_width("elephantine", L, SIZE, &MONO));
+        assert_eq!(hy, vec!["elephantine".to_string()]);
     }
 
     #[test]
