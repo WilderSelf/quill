@@ -62,22 +62,34 @@ Read `specs/README.md`, the milestone table, and recent history:
 git log --oneline -15
 ```
 
-Pick the **smallest independently shippable** next piece of the **current milestone (M1** — M0 is
-code-complete; the M1 text-layout arc is authorized and open, starting with spec 0016), favouring
-specs marked `accepted`/`in-progress` and the next unimplemented fast-follow. Then gate on
-stop-and-ask:
+**The approved plan is the authorization boundary — not the set of spec files that happen to exist
+yet.** M0 is code-complete; the project is in **M1**, whose scope the approved plan
+(`~/.claude/plans/i-want-to-create-prancy-bee.md`) fixes up front: *text frames + threading,
+paragraph/character styles, master pages, linked-image proxy cache, incremental layout* (plus the
+`.claude/plans/*` increment plans). Within that boundary you **decompose and execute without
+stopping for per-increment approval — the plan *is* the approval.** (This is the documented
+autonomous-agent pattern: bounded autonomy through an up-front constraint, *not* a runtime approval
+gate at every step.) Pick the **smallest independently shippable** next piece of the current
+milestone, favouring specs marked `accepted`/`in-progress` and the next unimplemented step of the
+arc. First `git log`/open-PR check so you don't redo resolved work. Then classify the piece:
 
-- Needs a **net-new spec** or an **architectural decision** not already in the approved plan
-  (`~/.claude/plans/i-want-to-create-prancy-bee.md`) or an existing spec →
-  `STATUS: BLOCKED:needs-spec:<short-desc>`. Do not invent product scope autonomously. (M1 is less
-  spec-bound than M0 — lean toward this stop when the next piece isn't already specced.)
-- The next work crosses into the next **unentered** milestone (**M1 → M2**) →
-  `STATUS: BLOCKED:milestone-boundary-<current>-complete`. The new milestone needs the user back in
-  the loop. (M0→M1 has already been authorized by the user; that boundary no longer blocks.)
+- **In the approved plan (or a fast-follow of an accepted spec), but no spec file yet** → this is
+  authorized work whose spec just hasn't been written. **Author it as step 0 of the increment:**
+  write `specs/00NN-<slug>.md` — deriving behaviour + acceptance criteria from the plan, and citing
+  the plan line it satisfies — add its row to `specs/README.md` as `in-progress`, then continue to
+  SHIP (§3). Writing a plan-authorized spec **is executing the plan**; do **not**
+  `BLOCKED:needs-spec` here. (E.g. `0019-text-frames-threading` is enumerated in the plan → write it
+  and proceed. Next free number is 0019; 0015 is the in-progress M0 text-metrics spec, 0016–0018 are
+  the shipped M1 shaping/Knuth-Plass/hyphenation specs.)
+- **Genuinely outside every approved plan** (net-new product scope nothing covers) **or needs an
+  architectural decision the plan leaves open** (a real fork — data-model change, new dependency,
+  new colorspace-intent semantics) → `STATUS: BLOCKED:needs-spec:<short-desc>` (or
+  `BLOCKED:arch-decision:<short-desc>`). This is the *true* boundary: don't invent scope, don't
+  silently decide architecture.
+- Next work crosses into the next **unentered** milestone (**M1 → M2**) →
+  `STATUS: BLOCKED:milestone-boundary-<current>-complete`. (M0→M1 is already authorized; it no longer
+  blocks.)
 - Selection is **ambiguous or low-confidence** → `STATUS: BLOCKED:ambiguous-next-<short-desc>`.
-- A **clear fast-follow with an existing/derivable spec** → append/refine the spec entry under
-  `specs/` if needed, then continue. Check `git log` and open PRs to be sure it isn't already done
-  (redoing resolved work is a documented failure mode).
 
 ## 3. SHIP it — execute the `/ship` pipeline INLINE (do not Skill-invoke it)
 

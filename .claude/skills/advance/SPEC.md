@@ -118,7 +118,13 @@ was prose the model was "supposed to obey." Enforcement must be structural:
    working tree is **shared across sessions**; uncommitted changes this run didn't make belong to a
    concurrent session, and switching branches over them corrupts their state → `BLOCKED:dirty-tree`.
    This is the *first* check, before any branch switch (see SKILL §1a).
-2. Next task needs a **net-new spec or an architectural decision** not in the approved plan.
+2. Next task is **genuinely outside every approved plan** (net-new product scope) **or needs an
+   architectural decision the plan leaves open** (a real fork). An increment that the approved plan
+   *does* enumerate but whose per-increment spec file simply hasn't been written yet is **not** this
+   condition — the plan is the authorization, so `/advance` **authors the derived spec and proceeds**
+   (SKILL §2). Blocking on a merely-absent spec is the miscalibration this replaces (quill#43): it
+   halted every M1 increment because M1's specs are written just-in-time. Bounded autonomy = the plan
+   defines the boundary up front; block only at the boundary, not at each unwritten spec.
 3. `/ship` validation/CI can't reach green within its bounded attempts (draft PR left open).
 4. **Branch-protection gate missing or changed** — never enable `--auto` ungated; never `--admin`.
 5. A **blocked-class action** would be required (destructive / external-publish e.g. POD upload /
