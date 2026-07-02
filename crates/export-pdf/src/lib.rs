@@ -64,8 +64,8 @@ pub struct ExportOptions {
     pub bleed_pt: f32,
     /// Export even if preflight fails.
     pub force: bool,
-    /// Path to a user-supplied TrueType (`.ttf`) font to embed. `None` embeds the bundled
-    /// Source Serif 4. See `specs/0004-user-font-embedding.md`.
+    /// Path to a user-supplied TrueType (`.ttf`) or CFF OpenType (`.otf`) font to embed. `None`
+    /// embeds the bundled Source Serif 4. See specs 0004 (user fonts) and 0011 (CFF).
     pub font_path: Option<String>,
 }
 
@@ -652,6 +652,44 @@ mod tests {
         assert!(
             text.contains("SourceSerif"),
             "BaseFont should reflect the supplied font's own name"
+        );
+    }
+
+    /// Spec 0011: a CFF-outline `.otf` embeds as a `CIDFontType0` descendant with its bare `CFF `
+    /// table in a `FontFile3` (`/Subtype /CIDFontType0C`) — the only PDF 1.3-legal CFF form. The
+    /// TrueType markers (`/CIDFontType2`, `/FontFile2`, `/CIDToGIDMap`) must be absent, and the
+    /// synthetic fixture's own name proves the CFF program was parsed. Ghostscript's CI
+    /// well-formedness gate then confirms the bytes are valid.
+    #[test]
+    fn export_embeds_cff_otf_font() {
+        let (mut opts, icc_path) = opts_with_real_icc("cfffont");
+        opts.font_path = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test-cff.otf").into());
+        let mut buf = Vec::new();
+        export(&Document::sample(), &opts, &mut buf).expect("CFF-font export should succeed");
+        let _ = std::fs::remove_file(&icc_path);
+
+        assert!(buf.starts_with(b"%PDF-1.3"), "wrong PDF header");
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("/CIDFontType0C"),
+            "CFF not embedded as FontFile3/CIDFontType0C"
+        );
+        assert!(text.contains("/FontFile3"), "missing FontFile3");
+        assert!(
+            text.contains("QuillTestCFF"),
+            "BaseFont should reflect the CFF font's name"
+        );
+        assert!(
+            !text.contains("/CIDFontType2"),
+            "CFF export must not use CIDFontType2"
+        );
+        assert!(
+            !text.contains("/FontFile2"),
+            "CFF export must not use FontFile2"
+        );
+        assert!(
+            !text.contains("/CIDToGIDMap"),
+            "CIDFontType0 must omit CIDToGIDMap"
         );
     }
 
