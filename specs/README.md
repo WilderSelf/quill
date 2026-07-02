@@ -25,6 +25,6 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0013 | [Bleed single source of truth](0013-bleed-single-source.md) | M0 | implemented |
 | 0015 | [Real width-based line breaking (font metrics)](0015-text-metrics-line-breaking.md) | M0 | in-progress |
 | 0016 | [Rustybuzz text shaping (kerning/ligature measurement)](0016-rustybuzz-shaping.md) | M1 | implemented |
-| 0017 | [Knuth-Plass optimal line breaking](0017-knuth-plass-line-breaking.md) | M1 | accepted |
+| 0017 | [Knuth-Plass optimal line breaking](0017-knuth-plass-line-breaking.md) | M1 | in-progress |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).

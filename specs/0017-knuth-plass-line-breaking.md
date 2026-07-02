@@ -1,7 +1,8 @@
 # 0017 — Knuth-Plass optimal line breaking
 
 - **Milestone:** M1
-- **Status:** accepted (multi-increment; increment 1 = the optimal breaker, ragged output)
+- **Status:** in-progress (increment 1 — the optimal breaker, ragged output — implemented;
+  increment 2 = justified rendering, deferred)
 - **Crates:** `quill-text-layout` (owner), `quill-layout-engine`, `quill-export-pdf`
 
 ## Problem
@@ -72,7 +73,12 @@ interior glue:
   `W > L` (shrink, `r < 0`).
 - **Feasible** iff `r ≥ −1` (a line cannot shrink past its available shrink). A line with `r < −1`
   is infeasible and cannot be part of a breaking.
-- **Badness** `b(r) = 100 · |r|³` (clamped to a ceiling for the near-infinite single-word case).
+- **Badness** `b(r) = 100 · |r|³` (clamped to a ceiling — `BADNESS_CEIL = 10000`, TeX's
+  "infinitely bad"). The `r = 0` when `Y = Z = 0` rule covers a single word that *fills the frame
+  exactly* (`W = L`). A single word that is **underfull** (`W < L`) has no glue to stretch and so
+  cannot be justified: it is the *near-infinite single-word case* the ceiling exists for — its
+  badness is `BADNESS_CEIL`, not `0`. This is what keeps total-fit from stranding a lone short word
+  on an interior line (the last line, being free, may still be a short single word).
 - **Demerits** of a line `= (LINE_PENALTY + b(r))²`, with `LINE_PENALTY` a named constant
   (default `10`, TeX's `\linepenalty`).
 
