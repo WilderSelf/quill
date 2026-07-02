@@ -61,17 +61,26 @@ Pick the **smallest independently shippable** next piece of **M0**, favouring sp
   `specs/` if needed, then continue. Check `git log` and open PRs to be sure it isn't already done
   (redoing resolved work is a documented failure mode).
 
-## 3. SHIP it
+## 3. SHIP it — execute the `/ship` pipeline INLINE (do not Skill-invoke it)
 
-Invoke **`/ship <the selected increment>`**. Do not reimplement its pipeline. `/ship` will:
-plan → `feat/<slug>` branch → implement (scoped) → validate (hard cap 5 attempts) → `reviewer`
-subagent → conventional commit + push → `gh pr create` → verify branch protection → enable
-`--auto --squash --delete-branch` when the gate is confirmed live.
+`/ship` is `disable-model-invocation: true`, so **you cannot launch it via the Skill tool** — that
+fails with "cannot be used with Skill tool." Since you *are* the main agent, **execute its
+documented pipeline directly.** Read `~/.claude/skills/ship/SKILL.md` and perform its steps as your
+own, treating it as the single source of truth (don't paraphrase a divergent pipeline):
 
-Honour `/ship`'s own stop behaviour: if it stops at the 5-attempt cap it leaves a **draft PR** with
-the blocker in the body → `STATUS: BLOCKED:ship-validate-cap:<slug>`. If the **branch-protection
-gate is absent/unverifiable**, `/ship` leaves the PR open without `--auto` →
-`STATUS: BLOCKED:gate-missing-pr-#<n>` (never enable `--auto` ungated, never `--admin`).
+plan (`.claude/plans/<slug>.md`) → `feat/<slug>` branch → implement (scoped) → validate to green
+(`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build`,
+`cargo test`) **hard cap 5 attempts** → dispatch the `reviewer` subagent (Agent tool) and address
+blocking findings → conventional commit + push → `gh pr create` → verify branch protection
+(`gh api repos/{owner}/{repo}/branches/main/protection`) → `gh pr merge --auto --squash
+--delete-branch` **only when the gate is confirmed live**.
+
+Honour `/ship`'s stop behaviour exactly: if validation can't reach green within the **5-attempt
+cap**, commit WIP, push, open a **draft PR** with the failing command + error in the body →
+`STATUS: BLOCKED:ship-validate-cap:<slug>`. If the **branch-protection gate is
+absent/unverifiable** (403/404), leave the PR open **without** `--auto` →
+`STATUS: BLOCKED:gate-missing-pr-#<n>`. Never enable `--auto` ungated, never `--admin`, never merge
+red or draft.
 
 ## 4. Bounded fix-forward (only for a reconciled red PR from §1)
 
@@ -84,13 +93,17 @@ At most **one** attempt: pull the branch, read the failing check's log
 **Escalation cap:** if this run has already produced 3 consecutive failures (across §3/§4), stop:
 `STATUS: BLOCKED:escalation-3-consecutive`.
 
-## 5. WRAP tail
+## 5. WRAP tail — defer to the user, do not run autonomously
 
-Only after a successful ship whose PR is green + auto-merging (or already merged): run the wrap
-learning tail — `/reflect` then `/curate` — to promote any learnings and keep config lean. Skip if
-`/ship` ended blocked (a blocked ship still carries signal, but don't run cleanup on a red tree).
-Keep each phase's own human-approval gate. Do **not** run `/handoff` here — that's the user's
-session-bridge tool, not part of the per-increment loop.
+`/reflect` and `/curate` are `disable-model-invocation: true` **and interactive** — they promote
+learnings and prune config **one human-approved change at a time**, so they cannot be driven
+autonomously (and can't be Skill-invoked either). **Do not attempt them in an autonomous run.**
+Instead, when an increment merges, note in the exit summary that the user should run **`/wrap`**
+(or `/reflect` + `/curate`) at their convenience to capture learnings. Do **not** run `/handoff` —
+that's the user's session-bridge tool, not part of the per-increment loop.
+
+The Layer 2 quality gates (`/code-review`, `/security-review`, `/simplify`) are a *different* case:
+those are model-invocable and **may** be run via the Skill tool on the periodic cadence.
 
 ## 6. EXIT
 

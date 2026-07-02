@@ -37,6 +37,14 @@ filesystem audit. Consequences that shape the design:
 - **`/ship` runs on Sonnet 4.6** (opusplan auto-downshifts on exiting plan mode; a skill cannot
   pin the main-loop model). For correctness-critical export work, a human may manually `/model`
   to Opus before a hands-off session. Subagents *can* pin a model.
+- **`disable-model-invocation` skills cannot be Skill-invoked by the agent.** `/ship`, `/reflect`,
+  `/curate`, `/wrap` are all user-invocation-only; calling them via the Skill tool fails
+  ("cannot be used with Skill tool"). So `/advance` **executes `/ship`'s pipeline inline** as the
+  main agent (reading `~/.claude/skills/ship/SKILL.md` as the source of truth), and **defers
+  `/reflect`+`/curate` to the user** — they are interactive one-change-at-a-time tools that can't
+  run autonomously. The Layer 2 gates (`/code-review`, `/security-review`, `/simplify`) *are*
+  model-invocable and may be run via the Skill tool. (Learned from the first `/advance` run,
+  quill#22.)
 
 ## Architecture — concentric layers, atomic unit at the center
 
@@ -123,7 +131,8 @@ was prose the model was "supposed to obey." Enforcement must be structural:
   (draft PR if mid-flight), never force-merging or pushing to `main`.
 - It is idempotent: re-running after a completed increment selects the *next* one, not a redo;
   re-running with an open blocking PR reports the blocker rather than starting new work.
-- It reuses `/ship` for the plan→PR→auto-merge machinery rather than reimplementing it.
+- It executes `/ship`'s documented pipeline inline (not via the Skill tool) rather than
+  maintaining a divergent copy, and defers `/reflect`+`/curate` to the user.
 
 ## Build order (each its own atomic increment)
 
