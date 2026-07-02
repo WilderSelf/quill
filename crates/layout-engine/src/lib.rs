@@ -7,7 +7,7 @@
 //! for line breaking.
 
 use quill_core_model::{Asset, Block, Color, Document, Rect};
-use quill_text_layout::greedy_break;
+use quill_text_layout::{break_by_width, CharMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
 
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
@@ -48,17 +48,14 @@ pub struct LaidOutPage {
     pub blocks: Vec<PlacedBlock>,
 }
 
-/// Rough stand-in for glyph advance until real shaping lands, in points per character.
-const APPROX_CHAR_WIDTH_PT: f32 = 6.0;
-/// Rough stand-in for line height, in points.
-const APPROX_LINE_HEIGHT_PT: f32 = 12.0;
-
 /// Lay a document out into pages. Paginates: starts a new page when a block would push `y`
 /// past `doc.page_setup.trim.h_pt`. Returns at least one page (even if the document is empty).
-pub fn lay_out(doc: &Document) -> Vec<LaidOutPage> {
+///
+/// Text is broken to fit the frame width using the caller-supplied `metrics` (the embedded font in
+/// the export path) at [`BODY_FONT_SIZE_PT`] — see `specs/0015-text-metrics-line-breaking.md`.
+pub fn lay_out(doc: &Document, metrics: &impl CharMetrics) -> Vec<LaidOutPage> {
     let width = doc.page_setup.trim.w_pt;
     let page_h = doc.page_setup.trim.h_pt;
-    let max_chars = (width / APPROX_CHAR_WIDTH_PT).max(1.0) as usize;
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut page = LaidOutPage::default();
@@ -67,8 +64,8 @@ pub fn lay_out(doc: &Document) -> Vec<LaidOutPage> {
     for block in &doc.content {
         match block {
             Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
-                let lines = greedy_break(text, max_chars);
-                let height = lines.len() as f32 * APPROX_LINE_HEIGHT_PT;
+                let lines = break_by_width(text, width, BODY_FONT_SIZE_PT, metrics);
+                let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
 
                 // If this block doesn't fit (and the page already has content), start a new page.
                 if y + height > page_h && !page.blocks.is_empty() {
@@ -128,12 +125,17 @@ pub fn lay_out(doc: &Document) -> Vec<LaidOutPage> {
 mod tests {
     use super::*;
     use quill_core_model::{Asset, Block, Color, Document, Metadata, PageSetup, Size};
+    use quill_text_layout::MonospaceMetrics;
+
+    /// 0.6 em × 10 pt = 6 pt/char, matching the old `APPROX_CHAR_WIDTH_PT` stand-in so these
+    /// pagination tests keep their familiar per-character arithmetic.
+    const MONO: MonospaceMetrics = MonospaceMetrics { em_ratio: 0.6 };
 
     #[test]
     fn lays_out_sample_into_one_page() {
         // Document::sample() has 2 short text blocks + asset "map1" (referenced by no Block::Image
         // in the sample, so no image block is placed). Content fits well within one page.
-        let pages = lay_out(&Document::sample());
+        let pages = lay_out(&Document::sample(), &MONO);
         assert!(!pages.is_empty());
         assert!(!pages[0].blocks.is_empty());
     }
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn paginates_when_content_overflows() {
-        // Each Body block produces 1 line = APPROX_LINE_HEIGHT_PT (12 pt).
+        // Each Body block produces 1 line = BODY_LINE_HEIGHT_PT (12 pt).
         // Page height is 648 pt → 54 lines fit. Push 100 blocks to guarantee overflow.
         let blocks: Vec<Block> = (0..100)
             .map(|i| Block::Body {
@@ -161,7 +163,7 @@ mod tests {
             })
             .collect();
         let doc = doc_with_blocks(blocks);
-        let pages = lay_out(&doc);
+        let pages = lay_out(&doc, &MONO);
         assert!(
             pages.len() >= 2,
             "expected at least 2 pages, got {}",
@@ -173,7 +175,7 @@ mod tests {
     fn boundary_exactly_one_page_then_spills() {
         // Compute how many single-line blocks fill one page exactly.
         let page_h = PageSetup::default().trim.h_pt; // 648.0
-        let lines_per_page = (page_h / APPROX_LINE_HEIGHT_PT).floor() as usize; // 54
+        let lines_per_page = (page_h / BODY_LINE_HEIGHT_PT).floor() as usize; // 54
 
         let make_block = |i: usize| Block::Body {
             text: format!("L{i}"),
@@ -183,7 +185,7 @@ mod tests {
         // Exactly lines_per_page blocks → fits on one page.
         let exact_blocks: Vec<Block> = (0..lines_per_page).map(make_block).collect();
         let doc_exact = doc_with_blocks(exact_blocks);
-        let pages_exact = lay_out(&doc_exact);
+        let pages_exact = lay_out(&doc_exact, &MONO);
         assert_eq!(
             pages_exact.len(),
             1,
@@ -194,7 +196,7 @@ mod tests {
         // One extra block → must spill to a second page.
         let overflow_blocks: Vec<Block> = (0..=lines_per_page).map(make_block).collect();
         let doc_overflow = doc_with_blocks(overflow_blocks);
-        let pages_overflow = lay_out(&doc_overflow);
+        let pages_overflow = lay_out(&doc_overflow, &MONO);
         assert!(
             pages_overflow.len() >= 2,
             "expected >= 2 pages after overflow, got {}",
@@ -238,7 +240,7 @@ mod tests {
             fonts_embeddable: false,
         };
 
-        let pages = lay_out(&doc);
+        let pages = lay_out(&doc, &MONO);
 
         // Collect all image blocks across all pages.
         let image_blocks: Vec<&PlacedBlock> = pages

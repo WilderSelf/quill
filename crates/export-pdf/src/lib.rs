@@ -293,8 +293,46 @@ pub fn export(
             return Err(ExportError::PreflightFailed(report.error_count()));
         }
     }
-    let pages = quill_layout_engine::lay_out(doc);
-    writer::write_pdf(doc, opts, &pages, out)
+    // Build the embedded font once, up front: it is both the source of glyph advances the layout
+    // engine measures with (spec 0015) and the subset the writer embeds.
+    let used_chars = collect_doc_chars(doc);
+    let font = build_font(opts, &used_chars)?;
+    let pages = quill_layout_engine::lay_out(doc, &font);
+    writer::write_pdf(doc, opts, &pages, &font, out)
+}
+
+/// Every character the font must carry: the document's text-block chars (headings + body) plus a
+/// literal space.
+///
+/// The space is inserted unconditionally because `break_by_width` normalizes *all* inter-word
+/// whitespace to `U+0020` — so a document that separates words only with tabs/newlines still
+/// renders (and is measured) with the real space glyph rather than `.notdef`. Without this, the
+/// space glyph could be missing from the subset even though every laid-out line uses it.
+fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
+    let mut set = std::collections::BTreeSet::new();
+    set.insert(' ');
+    for block in &doc.content {
+        if let Block::Heading { text, .. } | Block::Body { text, .. } = block {
+            set.extend(text.chars());
+        }
+    }
+    set
+}
+
+/// Subset and measure the font for `chars`: a user-supplied `font_path` (spec 0004/0011) or the
+/// bundled Source Serif 4.
+fn build_font(
+    opts: &ExportOptions,
+    chars: &std::collections::BTreeSet<char>,
+) -> Result<fonts::EmbeddedFont, ExportError> {
+    match &opts.font_path {
+        Some(path) => {
+            let program = std::fs::read(path)
+                .map_err(|e| ExportError::Font(format!("reading font '{path}': {e}")))?;
+            fonts::build_from_bytes(&program, None, chars)
+        }
+        None => fonts::build(chars),
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +345,30 @@ mod tests {
             output_intent_icc: "profiles/cmyk.icc".into(),
             ..Default::default()
         }
+    }
+
+    /// Regression (spec 0015 review): `break_by_width` normalizes inter-word whitespace to a literal
+    /// space, so the font must always subset `' '` — even when the source separates words only with
+    /// tabs/newlines. Otherwise the space renders as `.notdef` and is mis-measured. The bundled font
+    /// must map `' '` to a real (non-`.notdef`) glyph.
+    #[test]
+    fn space_glyph_is_subset_even_without_literal_space() {
+        let doc = {
+            let mut d = Document::sample();
+            d.content = vec![Block::Body {
+                text: "alpha\tbeta\ngamma".into(), // no literal U+0020
+                color: Color::Gray { v: 0.0 },
+            }];
+            d
+        };
+        let chars = collect_doc_chars(&doc);
+        assert!(chars.contains(&' '), "space must always be collected");
+
+        let font = build_font(&ExportOptions::default(), &chars).expect("build bundled font");
+        let encoded = font.encode_line(" ");
+        assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
+        let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
+        assert_ne!(gid, 0, "' ' must map to a real glyph, not .notdef");
     }
 
     #[test]

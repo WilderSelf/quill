@@ -85,6 +85,17 @@ impl EmbeddedFont {
     }
 }
 
+/// Real per-glyph advances drive line breaking (spec 0015): the layout engine measures text with
+/// this font's own `hmtx` widths, so a line that "fits" renders within the frame. An unknown char
+/// maps to `.notdef` (GID 0) and uses its advance — the same fallback as [`EmbeddedFont::encode_line`].
+impl quill_text_layout::CharMetrics for EmbeddedFont {
+    fn advance_pt(&self, ch: char, size_pt: f32) -> f32 {
+        let gid = self.char_to_gid.get(&ch).copied().unwrap_or(0) as usize;
+        let em = self.widths.get(gid).copied().unwrap_or(0.0); // 1000-unit em
+        em * size_pt / 1000.0
+    }
+}
+
 /// Subset and measure the **bundled** font for exactly the `chars` a document uses.
 ///
 /// A thin wrapper over [`build_from_bytes`] that pins the name (`SourceSerif4`) and adds the
@@ -433,6 +444,21 @@ mod tests {
                 "width mismatch for '{ch}': subset gid {new_gid}"
             );
         }
+    }
+
+    /// Spec 0015: `CharMetrics::advance_pt` returns a char's real advance, and falls back to the
+    /// `.notdef` (GID 0) advance for a char outside the subset — mirroring `encode_line`'s fallback.
+    #[test]
+    fn advance_pt_measures_and_falls_back_to_notdef() {
+        use quill_text_layout::CharMetrics;
+        let font = build(&charset("Ao")).unwrap();
+        // A built char measures to its own glyph's advance at the given size.
+        let a_gid = font.char_to_gid[&'A'] as usize;
+        let expect_a = font.widths[a_gid] * 12.0 / 1000.0;
+        assert!((font.advance_pt('A', 12.0) - expect_a).abs() < 0.001);
+        // An un-built char falls back to widths[0] (.notdef).
+        let expect_notdef = font.widths[0] * 12.0 / 1000.0;
+        assert!((font.advance_pt('\u{2603}', 12.0) - expect_notdef).abs() < 0.001);
     }
 
     #[test]
