@@ -1,4 +1,4 @@
-//! Linked-image resolution and decoding for export (spec 0002 reqs 2, 7; spec 0005).
+//! Linked-image resolution and decoding for export (spec 0002 reqs 2, 7; spec 0005; spec 0008).
 //!
 //! Grayscale inputs decode to 8-bit `/DeviceGray` (unambiguously legal, no ICC transform). Color
 //! (RGB/RGBA) inputs are converted to 8-bit CMYK via [`RgbToCmyk`] and emitted as `/DeviceCMYK`,
@@ -6,6 +6,13 @@
 //! of being desaturated. A missing or undecodable asset returns `None` and is skipped by the
 //! writer rather than failing the whole export. Alpha is dropped (no `/SMask`), preserving the
 //! "no transparency" invariant.
+//!
+//! Both **PNG** and **JPEG** inputs are supported; the format is picked from the leading magic
+//! bytes. JPEG is *decoded to pixels and re-embedded as CMYK/gray*, **not** passed through as a
+//! `/DCTDecode` stream: a typical author JPEG is YCbCr→RGB, and embedding it verbatim would yield
+//! a `/DeviceRGB` image that violates PDF/X-1a's CMYK-only rule (req #2). Decoding routes JPEG
+//! through the same [`RgbToCmyk`] converter (and its ≤240% ink clamp) as PNG, so the writer,
+//! color, and preflight layers are format-agnostic. See specs/0008-jpeg-image-input.md.
 
 use std::path::Path;
 
@@ -31,15 +38,27 @@ pub enum Pixels {
 /// Resolve `asset.path` against `base_dir` and decode it, converting color via `cmyk`.
 ///
 /// Returns `None` (skip, don't fail) if the file is missing, unreadable, or in a format we don't
-/// handle for M0 (anything but 8-bit Gray/GrayAlpha/RGB/RGBA).
+/// handle for M0 (anything but 8-bit Gray/GrayAlpha/RGB/RGBA PNG or 8-bit gray/RGB JPEG).
 pub fn resolve(asset: &Asset, base_dir: &Path, cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     let path = base_dir.join(&asset.path);
     let bytes = std::fs::read(&path).ok()?;
     decode(&bytes, cmyk)
 }
 
-/// Decode PNG bytes: grayscale stays gray, color is converted to CMYK via `cmyk`.
+/// Decode PNG or JPEG bytes, dispatched on the leading magic bytes. Grayscale stays gray; color is
+/// converted to CMYK via `cmyk`. Unknown/unsupported formats return `None` (skip, don't fail).
 pub fn decode(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        decode_png(bytes, cmyk)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        decode_jpeg(bytes, cmyk)
+    } else {
+        None
+    }
+}
+
+/// Decode PNG bytes: grayscale stays gray, color is converted to CMYK via `cmyk`.
+fn decode_png(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     use png::{BitDepth, ColorType};
 
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
@@ -77,11 +96,40 @@ pub fn decode(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     })
 }
 
+/// Decode baseline/progressive JPEG bytes: 8-bit grayscale (`L8`) stays gray, 8-bit RGB (`RGB24`)
+/// is converted to CMYK via `cmyk` (reusing the ≤240% ink clamp). `CMYK32` and `L16` inputs are
+/// skipped (`None`) for M0 — CMYK JPEGs carry the Adobe-APP14 inversion wrinkle (spec 0008
+/// non-goal). A decode error also returns `None` (skip, don't fail the export).
+fn decode_jpeg(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
+    use jpeg_decoder::PixelFormat;
+
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let data = decoder.decode().ok()?;
+    let info = decoder.info()?; // populated once decode() succeeds
+
+    let (w, h) = (info.width as u32, info.height as u32);
+    let pixels = match info.pixel_format {
+        PixelFormat::L8 => Pixels::Gray(data),
+        PixelFormat::RGB24 => Pixels::Cmyk(cmyk.convert(&data)),
+        PixelFormat::CMYK32 | PixelFormat::L16 => return None, // deferred by spec 0008
+    };
+    Some(DecodedImage {
+        width: w,
+        height: h,
+        pixels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TEST_PNG: &[u8] = include_bytes!("../assets/test_gray.png");
+    // Tiny 8x8 JPEG fixtures (JPEG is lossy + decode-only in `jpeg-decoder`, so unlike the PNG
+    // tests these are committed rather than synthesized in-memory). Grayscale is single-component
+    // (decodes L8); the color one is a solid-red YCbCr JPEG (decodes RGB24).
+    const TEST_JPEG_GRAY: &[u8] = include_bytes!("../assets/test_gray.jpg");
+    const TEST_JPEG_RGB: &[u8] = include_bytes!("../assets/test_rgb.jpg");
 
     /// A converter with no real profile → deterministic naive fallback (fine for tests).
     fn naive_converter() -> RgbToCmyk {
@@ -160,5 +208,47 @@ mod tests {
     #[test]
     fn garbage_bytes_decode_to_none() {
         assert!(decode(b"not a png", &naive_converter()).is_none());
+    }
+
+    // --- JPEG input (spec 0008). JPEG is lossy, so assert structure, not exact pixel bytes. ---
+
+    #[test]
+    fn decodes_grayscale_jpeg_to_gray() {
+        let img = decode(TEST_JPEG_GRAY, &naive_converter()).expect("decode gray jpeg");
+        assert_eq!((img.width, img.height), (8, 8));
+        match img.pixels {
+            Pixels::Gray(g) => assert_eq!(g.len(), 8 * 8, "one byte per pixel"),
+            Pixels::Cmyk(_) => panic!("grayscale JPEG must decode to Gray"),
+        }
+    }
+
+    #[test]
+    fn decodes_rgb_jpeg_to_clamped_cmyk() {
+        let img = decode(TEST_JPEG_RGB, &naive_converter()).expect("decode rgb jpeg");
+        assert_eq!((img.width, img.height), (8, 8));
+        match img.pixels {
+            Pixels::Cmyk(c) => {
+                assert_eq!(c.len(), 8 * 8 * 4, "four bytes per pixel");
+                for px in c.chunks_exact(4) {
+                    let sum: u16 = px.iter().map(|&v| v as u16).sum();
+                    assert!(sum <= 612, "jpeg pixel exceeds 240% ink: {px:?} = {sum}");
+                }
+            }
+            Pixels::Gray(_) => panic!("RGB JPEG must decode to Cmyk"),
+        }
+    }
+
+    #[test]
+    fn png_dispatch_is_unchanged_by_sniffer() {
+        // The magic-byte sniffer must still route a real PNG through the PNG path.
+        let img = decode(TEST_PNG, &naive_converter()).expect("decode png via sniffer");
+        assert!(matches!(img.pixels, Pixels::Gray(_)));
+    }
+
+    #[test]
+    fn truncated_jpeg_decodes_to_none() {
+        // Valid JPEG magic but a truncated body → decode error → skip, not panic/fail.
+        let truncated = &TEST_JPEG_RGB[..TEST_JPEG_RGB.len() / 2];
+        assert!(decode(truncated, &naive_converter()).is_none());
     }
 }
