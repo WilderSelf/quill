@@ -57,8 +57,9 @@ enum PdfxVersion { X1a2001, X3_2002 }
 struct ExportOptions {
     version: PdfxVersion,
     output_intent_icc: PathBuf,   // e.g. a CMYK profile such as a FOGRA/GRACoL ICC
-    bleed_pt: f32,                // default 9.0 (0.125 in)
     force: bool,                  // export even if preflight fails
+    // Bleed is NOT an export option — it lives on the document (`page_setup.bleed_pt`,
+    // default 9.0 / 0.125 in) and is the single source of truth preflight validates. See spec 0013.
 }
 
 fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport

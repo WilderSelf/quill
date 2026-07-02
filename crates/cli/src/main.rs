@@ -145,7 +145,6 @@ fn main() -> ExitCode {
                 output_intent_icc: args.icc,
                 font_path: args.font,
                 force: args.force,
-                ..Default::default()
             };
             print_report(&preflight(&doc, &opts));
 

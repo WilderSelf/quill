@@ -61,7 +61,6 @@ pub struct ExportOptions {
     pub version: PdfxVersion,
     /// Path to the ICC profile used as the PDF/X OutputIntent (e.g. a CMYK press profile).
     pub output_intent_icc: String,
-    pub bleed_pt: f32,
     /// Export even if preflight fails.
     pub force: bool,
     /// Path to a user-supplied TrueType (`.ttf`) or CFF OpenType (`.otf`) font to embed. `None`
@@ -74,7 +73,6 @@ impl Default for ExportOptions {
         Self {
             version: PdfxVersion::X1a2001,
             output_intent_icc: String::new(),
-            bleed_pt: DEFAULT_BLEED_PT,
             force: false,
             font_path: None,
         }
@@ -209,15 +207,15 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
         );
     }
 
-    // Bleed must be at least the required 0.125in on outside edges.
-    if opts.bleed_pt + f32::EPSILON < DEFAULT_BLEED_PT {
+    // Bleed must be at least the required 0.125in on outside edges. Validate the document's own
+    // `page_setup.bleed_pt` — the exact value `geom::page_geom` writes into the BleedBox — so
+    // preflight rejects the geometry export actually produces (spec 0013).
+    let bleed_pt = doc.page_setup.bleed_pt;
+    if bleed_pt + f32::EPSILON < DEFAULT_BLEED_PT {
         push_error(
             &mut report,
             CheckId::Bleed,
-            format!(
-                "bleed {}pt is below the required {DEFAULT_BLEED_PT}pt",
-                opts.bleed_pt
-            ),
+            format!("bleed {bleed_pt}pt is below the required {DEFAULT_BLEED_PT}pt"),
         );
     }
 
@@ -385,6 +383,50 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.check == CheckId::OutputIntent));
+    }
+
+    #[test]
+    fn insufficient_page_setup_bleed_fails_bleed_check() {
+        // A document whose own page_setup requests less than the required 9pt bleed must fail the
+        // Bleed check — because geometry writes exactly that (too-small) BleedBox (spec 0013).
+        let mut doc = Document::sample();
+        doc.page_setup.bleed_pt = 2.0;
+        let report = preflight(&doc, &opts_with_icc());
+        assert!(!report.passed());
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == CheckId::Bleed)
+            .expect("expected a Bleed finding");
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding.message.contains("2pt"),
+            "message should report the document's bleed value: {}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn adequate_page_setup_bleed_emits_no_bleed_finding() {
+        // The sample's page_setup bleed is the required 9pt, so no Bleed finding is produced.
+        let report = preflight(&Document::sample(), &opts_with_icc());
+        assert!(!report.findings.iter().any(|f| f.check == CheckId::Bleed));
+    }
+
+    #[test]
+    fn export_refuses_document_with_insufficient_bleed() {
+        // The reconciled Bleed check gates export: a too-small page_setup bleed blocks it (no force).
+        let (opts, path) = opts_with_real_icc("lowbleed");
+        let mut doc = Document::sample();
+        doc.page_setup.bleed_pt = 2.0;
+        let mut sink = Vec::new();
+        let e = export(&doc, &opts, &mut sink).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(e, ExportError::PreflightFailed(_)));
+        assert!(
+            sink.is_empty(),
+            "nothing should be written when preflight fails"
+        );
     }
 
     #[test]
