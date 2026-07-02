@@ -39,12 +39,15 @@ filesystem audit. Consequences that shape the design:
   to Opus before a hands-off session. Subagents *can* pin a model.
 - **`disable-model-invocation` skills cannot be Skill-invoked by the agent.** `/ship`, `/reflect`,
   `/curate`, `/wrap` are all user-invocation-only; calling them via the Skill tool fails
-  ("cannot be used with Skill tool"). So `/advance` **executes `/ship`'s pipeline inline** as the
-  main agent (reading `~/.claude/skills/ship/SKILL.md` as the source of truth), and **defers
-  `/reflect`+`/curate` to the user** — they are interactive one-change-at-a-time tools that can't
-  run autonomously. The Layer 2 gates (`/code-review`, `/security-review`, `/simplify`) *are*
-  model-invocable and may be run via the Skill tool. (Learned from the first `/advance` run,
-  quill#22.)
+  ("cannot be used with Skill tool"). So `/advance` **executes their pipelines inline** as the main
+  agent (reading each skill's `SKILL.md` as the source of truth): `/ship` for the increment (§3),
+  and `/reflect`+`/curate` for the wrap tail (§5). The wrap tail **runs autonomously and
+  auto-applies** — the user has authorized auto-accepting proposals, so `/advance` no longer defers
+  learning-capture back to the user (earlier design did; superseded). It stays judicious — promote
+  only durable learnings, and surface (never auto-resolve) contradictions/architectural calls. The
+  Layer 2 gates (`/code-review`, `/security-review`, `/simplify`) *are* model-invocable and may be
+  run via the Skill tool. (Learned from the first `/advance` run, quill#22; wrap-autonomy added
+  after the user authorized auto-accept.)
 
 ## Architecture — concentric layers, atomic unit at the center
 
@@ -138,7 +141,8 @@ was prose the model was "supposed to obey." Enforcement must be structural:
 - It is idempotent: re-running after a completed increment selects the *next* one, not a redo;
   re-running with an open blocking PR reports the blocker rather than starting new work.
 - It executes `/ship`'s documented pipeline inline (not via the Skill tool) rather than
-  maintaining a divergent copy, and defers `/reflect`+`/curate` to the user.
+  maintaining a divergent copy, and runs `/reflect`+`/curate` inline **autonomously**, auto-applying
+  learnings to memory/config (surfacing, not auto-resolving, contradictions/architectural calls).
 
 ## Build order (each its own atomic increment)
 
