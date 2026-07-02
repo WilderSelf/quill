@@ -293,11 +293,14 @@ pub fn export(
             return Err(ExportError::PreflightFailed(report.error_count()));
         }
     }
-    // Build the embedded font once, up front: it is both the source of glyph advances the layout
-    // engine measures with (spec 0015) and the subset the writer embeds.
+    // Build the embedded font once, up front: it is both the subset the writer embeds and the
+    // source of shaped advances the layout engine measures with. The shaping context (spec 0016)
+    // parses a rustybuzz face over the font once and is shared by the layout pass; the same `font`
+    // is then embedded by the writer.
     let used_chars = collect_doc_chars(doc);
     let font = build_font(opts, &used_chars)?;
-    let pages = quill_layout_engine::lay_out(doc, &font);
+    let shaper = font.shaper();
+    let pages = quill_layout_engine::lay_out(doc, &shaper);
     writer::write_pdf(doc, opts, &pages, &font, out)
 }
 

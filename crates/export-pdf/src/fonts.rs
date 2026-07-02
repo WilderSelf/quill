@@ -66,6 +66,12 @@ pub struct EmbeddedFont {
     pub flags: FontFlags,
     /// Character → remapped (subset) glyph id, for content-stream encoding.
     char_to_gid: HashMap<char, u16>,
+    /// The **original** (un-subset) font program, retained so [`EmbeddedFont::shaper`] can build a
+    /// `rustybuzz::Face` over the full cmap/GPOS for kerning/ligature-aware measurement (spec 0016).
+    /// Advances are identical between original and subset, so measured widths match the embedded
+    /// subset; the subset itself can't be reshaped (its GIDs are remapped, and a CFF subset is a
+    /// bare table, not a face).
+    program: Vec<u8>,
 }
 
 impl EmbeddedFont {
@@ -83,11 +89,23 @@ impl EmbeddedFont {
     pub fn ascent_pt(&self, size_pt: f32) -> f32 {
         self.ascent * size_pt / 1000.0
     }
+
+    /// Build a [`ShapingContext`] over this font's original program — the `rustybuzz::Face` is
+    /// parsed **once** here and reused for every run the layout pass measures (spec 0016 "Wiring",
+    /// mirroring spec 0015's build-once metrics). The context borrows `self`, so it is short-lived:
+    /// `export()` builds it, lays out with it, then embeds the same font.
+    pub fn shaper(&self) -> ShapingContext<'_> {
+        ShapingContext {
+            font: self,
+            face: rustybuzz::Face::from_slice(&self.program, 0),
+        }
+    }
 }
 
-/// Real per-glyph advances drive line breaking (spec 0015): the layout engine measures text with
-/// this font's own `hmtx` widths, so a line that "fits" renders within the frame. An unknown char
-/// maps to `.notdef` (GID 0) and uses its advance — the same fallback as [`EmbeddedFont::encode_line`].
+/// Per-glyph `hmtx` advances (spec 0015). Line breaking now measures through [`ShapingContext`]
+/// (spec 0016), but this per-char advance stays as its **fallback** (when shaping is unavailable)
+/// and as the anchor a single-glyph run is checked against. An unknown char maps to `.notdef`
+/// (GID 0) and uses its advance — the same fallback as [`EmbeddedFont::encode_line`].
 impl quill_text_layout::CharMetrics for EmbeddedFont {
     fn advance_pt(&self, ch: char, size_pt: f32) -> f32 {
         let gid = self.char_to_gid.get(&ch).copied().unwrap_or(0) as usize;
@@ -96,15 +114,41 @@ impl quill_text_layout::CharMetrics for EmbeddedFont {
     }
 }
 
-/// Run measurement for line breaking (spec 0016 increment 1). This part-1 implementation is the
-/// per-char sum of [`CharMetrics::advance_pt`] — kerning/ligature-free, so measured widths (and thus
-/// every line break, page break, and exported byte) are identical to spec 0015. The `rustybuzz`-
-/// backed shaper that replaces this body with real shaping lands in the follow-up increment; the
-/// seam here keeps the export path building against `RunMetrics` in the meantime.
-impl quill_text_layout::RunMetrics for EmbeddedFont {
+/// Run measurement backed by real `rustybuzz` shaping (spec 0016 increment 1): kerning and
+/// ligatures are accounted for across the whole run, unlike the per-char [`CharMetrics`] sum. This
+/// is the `RunMetrics` implementation the export path measures line breaks with; only measurement
+/// changes this increment — the drawn content stream is unchanged.
+pub struct ShapingContext<'a> {
+    /// The font whose advances back the fallback path (and whose program the face was built from).
+    font: &'a EmbeddedFont,
+    /// The shaping face over `font.program`. `None` only if rustybuzz can't parse a program that
+    /// `ttf_parser` already accepted (not expected in practice) — then we degrade gracefully to the
+    /// per-char sum rather than panic.
+    face: Option<rustybuzz::Face<'a>>,
+}
+
+impl quill_text_layout::RunMetrics for ShapingContext<'_> {
     fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
         use quill_text_layout::CharMetrics;
-        text.chars().map(|ch| self.advance_pt(ch, size_pt)).sum()
+        let Some(face) = &self.face else {
+            // Degrade to the kerning-free per-char sum (spec 0015 behavior) if shaping is unavailable.
+            return text
+                .chars()
+                .map(|ch| self.font.advance_pt(ch, size_pt))
+                .sum();
+        };
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        buffer.set_direction(rustybuzz::Direction::LeftToRight);
+        // Increment 1 is LTR, single default script/language; complex-script itemization is a
+        // named follow-up. Sum shaped x-advances (font units) and scale to points.
+        let shaped = rustybuzz::shape(face, &[], buffer);
+        let units: i32 = shaped
+            .glyph_positions()
+            .iter()
+            .map(|pos| pos.x_advance)
+            .sum();
+        units as f32 * size_pt / face.units_per_em() as f32
     }
 }
 
@@ -204,6 +248,7 @@ pub fn build_from_bytes(
         italic_angle: face.italic_angle(),
         flags,
         char_to_gid,
+        program: program.to_vec(),
     })
 }
 
@@ -473,20 +518,40 @@ mod tests {
         assert!((font.advance_pt('\u{2603}', 12.0) - expect_notdef).abs() < 0.001);
     }
 
-    /// Spec 0016 (increment 1, part 1): the run measurement seam is at parity — `measure_run(s)`
-    /// equals the sum of `advance_pt` over `s`'s chars, so line breaking is unchanged until the
-    /// rustybuzz shaper replaces this body.
+    /// Spec 0016 (increment 1, part 2): a single-glyph run has no kern pair or ligature, so shaped
+    /// measurement equals the per-char advance — the parity anchor that the whole-string equality of
+    /// part 1 becomes once real shaping is wired (kern pairs now differ, tested below).
     #[test]
-    fn measure_run_equals_per_char_sum() {
+    fn single_glyph_run_equals_advance_pt() {
         use quill_text_layout::{CharMetrics, RunMetrics};
-        let font = build(&charset("The Dungeon")).unwrap();
-        for s in ["The", "Dungeon", "The Dungeon", ""] {
-            let per_char: f32 = s.chars().map(|ch| font.advance_pt(ch, 11.0)).sum();
+        let font = build(&charset("AVo ")).unwrap();
+        let shaper = font.shaper();
+        for ch in ['A', 'V', 'o', ' '] {
+            let shaped = shaper.measure_run(&ch.to_string(), 11.0);
+            let per_char = font.advance_pt(ch, 11.0);
             assert!(
-                (font.measure_run(s, 11.0) - per_char).abs() < 1e-4,
-                "measure_run should equal the per-char sum for {s:?}"
+                (shaped - per_char).abs() < 1e-4,
+                "single-glyph shaped width should equal advance_pt for {ch:?}: {shaped} vs {per_char}"
             );
         }
+        // Empty run measures to zero.
+        assert_eq!(shaper.measure_run("", 11.0), 0.0);
+    }
+
+    /// Spec 0016 acceptance: a run containing a real negative kern pair (`AV` in the bundled Source
+    /// Serif 4) measures **strictly narrower** under rustybuzz shaping than the spec-0015 per-char
+    /// sum of the same characters — proving kerning is now reflected in line-break measurement.
+    #[test]
+    fn shaped_kern_pair_is_narrower_than_per_char_sum() {
+        use quill_text_layout::{CharMetrics, RunMetrics};
+        let font = build(&charset("AV")).unwrap();
+        let shaper = font.shaper();
+        let shaped = shaper.measure_run("AV", 11.0);
+        let per_char = font.advance_pt('A', 11.0) + font.advance_pt('V', 11.0);
+        assert!(
+            shaped + 1e-4 < per_char,
+            "AV should shape tighter than the per-char sum: shaped={shaped} sum={per_char}"
+        );
     }
 
     #[test]
