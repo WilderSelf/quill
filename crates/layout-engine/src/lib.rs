@@ -7,7 +7,7 @@
 //! for line breaking.
 
 use quill_core_model::{Asset, Block, Color, Document, Rect};
-use quill_text_layout::{break_by_width, RunMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
+use quill_text_layout::{break_paragraph, RunMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
 
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
@@ -65,7 +65,7 @@ pub fn lay_out(doc: &Document, metrics: &impl RunMetrics) -> Vec<LaidOutPage> {
     for block in &doc.content {
         match block {
             Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
-                let lines = break_by_width(text, width, BODY_FONT_SIZE_PT, metrics);
+                let lines = break_paragraph(text, width, BODY_FONT_SIZE_PT, metrics);
                 let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
 
                 // If this block doesn't fit (and the page already has content), start a new page.
