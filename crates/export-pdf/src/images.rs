@@ -152,6 +152,7 @@ mod tests {
             path: "does-not-exist.png".into(),
             dpi: 300.0,
             line_art: false,
+            has_alpha: false,
         };
         assert!(resolve(&asset, Path::new("/nonexistent"), &naive_converter()).is_none());
     }
