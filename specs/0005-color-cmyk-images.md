@@ -85,6 +85,7 @@ pub fn decode(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage>;
 - **JPEG / `DCTDecode`** decode (the `png` crate can't; skipped as today).
 - **Per-pixel ink-coverage enforcement/clamping** (≤240%) on images — a well-behaved OutputIntent
   profile with GCR/UCR bounds totals; genuine clamping is its own spec.
+  **Implemented in [spec 0006](0006-image-ink-clamping.md).**
 - **ICC-accurate numeric conversion validated in CI** — no free tool certifies PDF/X and CI has no
   B2A-equipped profile, so numeric fidelity is proven via the project's periodic real-profile/POD
   uploads; CI proves structural correctness (`/DeviceCMYK`, 4 components) and fallback numerics.
