@@ -10,13 +10,15 @@
 //! Both **PNG** and **JPEG** inputs are supported; the format is picked from the leading magic
 //! bytes. JPEG is *decoded to pixels and re-embedded as CMYK/gray*, **not** passed through as a
 //! `/DCTDecode` stream: a typical author JPEG is YCbCr→RGB, and embedding it verbatim would yield
-//! a `/DeviceRGB` image that violates PDF/X-1a's CMYK-only rule (req #2). Decoding routes JPEG
+//! a `/DeviceRGB` image that violates PDF/X-1a's CMYK-only rule (req #2). Decoding routes RGB JPEG
 //! through the same [`RgbToCmyk`] converter (and its ≤240% ink clamp) as PNG, so the writer,
-//! color, and preflight layers are format-agnostic. See specs/0008-jpeg-image-input.md.
+//! color, and preflight layers are format-agnostic. A **CMYK JPEG** (already CMYK) is embedded
+//! directly as `/DeviceCMYK` after the same ink clamp, but only in the unambiguous Adobe-APP14
+//! transform-0 case — see specs/0008-jpeg-image-input.md and specs/0012-cmyk-jpeg-input.md.
 
 use std::path::Path;
 
-use quill_color::RgbToCmyk;
+use quill_color::{clamp_cmyk_u8, RgbToCmyk};
 use quill_core_model::Asset;
 
 /// A decoded image, ready to embed. Grayscale is one byte per pixel (`/DeviceGray`); CMYK is four
@@ -39,7 +41,8 @@ pub enum Pixels {
 ///
 /// Returns `None` (skip, don't fail) if the file is missing, unreadable, or in a format we don't
 /// handle for M0. PNG of any bit depth or color type (grayscale, RGB, palette, 16-bit) is
-/// normalized and decoded; JPEG handles 8-bit gray/RGB (CMYK/16-bit JPEG remain deferred).
+/// normalized and decoded; JPEG handles 8-bit gray/RGB and Adobe transform-0 CMYK (YCCK/16-bit
+/// JPEG remain deferred).
 pub fn resolve(asset: &Asset, base_dir: &Path, cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     let path = base_dir.join(&asset.path);
     let bytes = std::fs::read(&path).ok()?;
@@ -104,9 +107,13 @@ fn decode_png(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
 }
 
 /// Decode baseline/progressive JPEG bytes: 8-bit grayscale (`L8`) stays gray, 8-bit RGB (`RGB24`)
-/// is converted to CMYK via `cmyk` (reusing the ≤240% ink clamp). `CMYK32` and `L16` inputs are
-/// skipped (`None`) for M0 — CMYK JPEGs carry the Adobe-APP14 inversion wrinkle (spec 0008
-/// non-goal). A decode error also returns `None` (skip, don't fail the export).
+/// is converted to CMYK via `cmyk` (reusing the ≤240% ink clamp). A **CMYK JPEG** (`CMYK32`) is
+/// accepted only when it carries an Adobe APP14 marker with color-transform `0` (spec 0012): such a
+/// file stores CMYK inverted, so `jpeg-decoder` returns true ink directly and we embed it as
+/// `/DeviceCMYK` after clamping to ≤240% ink. YCCK / markerless / ambiguous CMYK JPEGs, and `L16`,
+/// are skipped (`None`) — `jpeg-decoder`'s YCCK output is `[R,G,B,255-K]`, unusable as CMYK, and
+/// emitting wrong color to a press file is worse than a visibly-missing image. A decode error also
+/// returns `None` (skip, don't fail the export).
 fn decode_jpeg(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     use jpeg_decoder::PixelFormat;
 
@@ -118,13 +125,57 @@ fn decode_jpeg(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     let pixels = match info.pixel_format {
         PixelFormat::L8 => Pixels::Gray(data),
         PixelFormat::RGB24 => Pixels::Cmyk(cmyk.convert(&data)),
-        PixelFormat::CMYK32 | PixelFormat::L16 => return None, // deferred by spec 0008
+        // Only Adobe transform-0 CMYK is unambiguous true-ink CMYK; anything else is skipped.
+        PixelFormat::CMYK32 if adobe_transform(bytes) == Some(0) => {
+            let clamped = data
+                .chunks_exact(4)
+                .flat_map(|p| clamp_cmyk_u8(p[0], p[1], p[2], p[3]))
+                .collect();
+            Pixels::Cmyk(clamped)
+        }
+        PixelFormat::CMYK32 | PixelFormat::L16 => return None, // deferred (specs 0008, 0012)
     };
     Some(DecodedImage {
         width: w,
         height: h,
         pixels,
     })
+}
+
+/// Read the Adobe APP14 color-transform byte from a JPEG, if present.
+///
+/// Scans marker segments for `FF EE` whose payload begins `Adobe\0`; returns the transform byte
+/// (payload index 11: `0` = none/CMYK-or-RGB, `1` = YCbCr, `2` = YCCK). Returns `None` when there is
+/// no such marker. `jpeg-decoder` consumes this internally but does not expose it, so the CMYK JPEG
+/// path (spec 0012) re-reads it to accept only the unambiguous transform-0 case.
+fn adobe_transform(bytes: &[u8]) -> Option<u8> {
+    // JPEG is a sequence of `FF <marker> [<len_hi> <len_lo> <payload...>]` segments after the SOI.
+    let mut i = 2; // skip SOI (FF D8)
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            return None; // not at a marker boundary; give up rather than misparse
+        }
+        let marker = bytes[i + 1];
+        // Standalone markers (RSTn, EOI, TEM) carry no length; SOS begins entropy data. (SOI was
+        // already consumed by the `i = 2` skip above.)
+        if marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        if marker == 0xDA {
+            return None; // reached scan data without finding APP14
+        }
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if len < 2 {
+            return None;
+        }
+        let payload = bytes.get(i + 4..i + 2 + len)?;
+        if marker == 0xEE && payload.len() >= 12 && payload.starts_with(b"Adobe\0") {
+            return Some(payload[11]);
+        }
+        i += 2 + len;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -137,6 +188,10 @@ mod tests {
     // (decodes L8); the color one is a solid-red YCbCr JPEG (decodes RGB24).
     const TEST_JPEG_GRAY: &[u8] = include_bytes!("../assets/test_gray.jpg");
     const TEST_JPEG_RGB: &[u8] = include_bytes!("../assets/test_rgb.jpg");
+    // 8x8 CMYK JPEG, Adobe APP14 transform 0 (true-ink CMYK). Four quadrants: white, solid K,
+    // solid cyan, and a full rich-black (255,255,255,255) that pre-clamp sums to 1020 (>612).
+    // Generated out-of-tree with `jpeg-encoder` per the CLAUDE.md fixture convention (spec 0012).
+    const TEST_JPEG_CMYK: &[u8] = include_bytes!("../assets/test_cmyk.jpg");
 
     /// A converter with no real profile → deterministic naive fallback (fine for tests).
     fn naive_converter() -> RgbToCmyk {
@@ -314,5 +369,72 @@ mod tests {
         // Valid JPEG magic but a truncated body → decode error → skip, not panic/fail.
         let truncated = &TEST_JPEG_RGB[..TEST_JPEG_RGB.len() / 2];
         assert!(decode(truncated, &naive_converter()).is_none());
+    }
+
+    // --- CMYK JPEG input (spec 0012). Accepted only for Adobe APP14 transform 0. ---
+
+    #[test]
+    fn decodes_transform0_cmyk_jpeg_to_clamped_cmyk() {
+        let img = decode(TEST_JPEG_CMYK, &naive_converter()).expect("decode cmyk jpeg");
+        assert_eq!((img.width, img.height), (8, 8));
+        match img.pixels {
+            Pixels::Cmyk(c) => {
+                assert_eq!(c.len(), 8 * 8 * 4, "four bytes per pixel");
+                let sums = || {
+                    c.chunks_exact(4)
+                        .map(|px| px.iter().map(|&v| v as u16).sum::<u16>())
+                };
+                for (s, px) in sums().zip(c.chunks_exact(4)) {
+                    assert!(s <= 612, "cmyk jpeg pixel exceeds 240% ink: {px:?} = {s}");
+                }
+                // The rich-black quadrant (encoded 255,255,255,255 = 1020 pre-clamp) proves the
+                // ≤240% clamp actually fired: its clamped pixels sit at the 612 ceiling, whereas a
+                // naive pass-through would leave the max near 1020 (and trip the loop above).
+                assert_eq!(
+                    sums().max().unwrap(),
+                    612,
+                    "heavy-ink pixel should clamp to 612"
+                );
+            }
+            Pixels::Gray(_) => panic!("CMYK JPEG must decode to Cmyk"),
+        }
+    }
+
+    #[test]
+    fn non_transform0_cmyk_jpeg_is_skipped() {
+        // Flip the Adobe transform byte 0 → 2 (YCCK). jpeg-decoder still yields CMYK32, but the
+        // data is no longer true-ink CMYK, so the transform gate must skip it rather than mis-color.
+        let mut bytes = TEST_JPEG_CMYK.to_vec();
+        let sig = bytes
+            .windows(6)
+            .position(|w| w == b"Adobe\0")
+            .expect("Adobe marker");
+        bytes[sig + 11] = 2;
+        assert!(
+            decode(&bytes, &naive_converter()).is_none(),
+            "YCCK CMYK must be skipped"
+        );
+    }
+
+    #[test]
+    fn cmyk_jpeg_without_adobe_marker_is_skipped() {
+        // Corrupt the Adobe signature so no APP14 transform can be read → ambiguous → skip.
+        let mut bytes = TEST_JPEG_CMYK.to_vec();
+        let sig = bytes
+            .windows(6)
+            .position(|w| w == b"Adobe\0")
+            .expect("Adobe marker");
+        bytes[sig] = b'X';
+        assert!(
+            decode(&bytes, &naive_converter()).is_none(),
+            "markerless CMYK must be skipped"
+        );
+    }
+
+    #[test]
+    fn adobe_transform_reads_committed_fixture() {
+        assert_eq!(adobe_transform(TEST_JPEG_CMYK), Some(0));
+        // A file with no Adobe APP14 marker (the RGB JPEG has none) → None.
+        assert_eq!(adobe_transform(TEST_JPEG_RGB), None);
     }
 }

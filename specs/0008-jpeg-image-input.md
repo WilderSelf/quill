@@ -72,8 +72,9 @@ vs JPEG (new). The writer's image loop, the `RgbToCmyk` converter, preflight
 
 - **`/DCTDecode` passthrough / CMYK-JPEG re-encoding** to preserve compression (needs a CMYK-JPEG
   encoder).
-- **CMYK (`CMYK32`) and 16-bit (`L16`) JPEG input**, including the Adobe-APP14 inversion handling
-  that CMYK JPEGs require.
+- **CMYK (`CMYK32`) JPEG input** — the common Adobe-APP14 transform-0 case is now handled by
+  [spec 0012](0012-cmyk-jpeg-input.md); YCCK (transform 2) and **16-bit (`L16`)** JPEG input remain
+  deferred.
 - **Auto-deriving `Asset` pixel dimensions / true aspect-ratio sizing** in `layout-engine` (images
   are still placed as a full-width square) — shared with the PNG path, separate layout work.
 - **JPEG alpha** (JPEG has none) and **indexed/other** exotic inputs.
