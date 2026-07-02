@@ -8,9 +8,11 @@ An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app fo
 semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
 must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
 
-**Status: greenfield / pre-implementation.** There is no code yet. The authoritative design
-is the approved plan at `~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before
-making architectural decisions. This file summarizes the parts that shape day-to-day work.
+**Status: M0 in progress.** The headless PDF/X export pipeline is implemented and green
+(crates scaffolded; specs 0001–0006 done — see `specs/README.md`); M0's export core is
+feature-complete and fast-follows continue. The authoritative design is the approved plan at
+`~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before making architectural
+decisions. This file summarizes the parts that shape day-to-day work.
 
 ## Non-negotiable constraints (these drive every design choice)
 
