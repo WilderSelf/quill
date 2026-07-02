@@ -1,8 +1,17 @@
 # 0016 — Rustybuzz text shaping (kerning/ligature-aware measurement)
 
 - **Milestone:** M1
-- **Status:** accepted (increment 1 of a multi-part spec)
+- **Status:** in-progress (increment 1 of a multi-part spec; itself landing in two PRs)
 - **Crates:** `quill-text-layout` (owner), `quill-layout-engine`, `quill-export-pdf`
+
+> **Increment 1 lands in two PRs** (per CLAUDE.md "one atomic change per plan/turn"):
+> **1a — measurement seam (parity, no dependency):** introduces the `RunMetrics` trait +
+> `MonospaceRunMetrics` stub, rewrites `break_by_width` to measure whole candidate lines through
+> `measure_run`, and wires `lay_out`/`export` through `RunMetrics`. The export font implements
+> `RunMetrics` as the per-char sum of its advances, so output is byte-identical to spec 0015.
+> **1b — rustybuzz shaper:** adds `rustybuzz` and replaces the export font's `measure_run` body with
+> real shaping (kerning/ligatures), plus the kern-fixture acceptance test below. The acceptance
+> criteria that name `rustybuzz` and the kern pair are satisfied by **1b**.
 
 ## Problem
 
