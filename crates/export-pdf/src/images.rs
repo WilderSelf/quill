@@ -129,6 +129,23 @@ mod tests {
     }
 
     #[test]
+    fn color_pixels_are_clamped_to_ink_limit() {
+        // A dark saturated red maps well over 240% ink under the naive path; every emitted
+        // CMYK pixel must be clamped to the limit (spec 0006).
+        let png = rgb_png(1, 1, &[26, 0, 0]);
+        let img = decode(&png, &naive_converter()).expect("decode rgb png");
+        match img.pixels {
+            Pixels::Cmyk(c) => {
+                for px in c.chunks_exact(4) {
+                    let sum: u16 = px.iter().map(|&v| v as u16).sum();
+                    assert!(sum <= 612, "image pixel exceeds 240% ink: {px:?} = {sum}");
+                }
+            }
+            Pixels::Gray(_) => panic!("RGB PNG must decode to Cmyk"),
+        }
+    }
+
+    #[test]
     fn missing_file_is_skipped_not_fatal() {
         let asset = Asset {
             id: "x".into(),
