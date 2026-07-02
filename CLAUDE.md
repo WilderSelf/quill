@@ -59,6 +59,14 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
   dependency graph permissive (no FreeType/GPL).
 - **Mine Typst (Apache-2.0)** for reusable crates (`pdf-writer`, `subsetter`, `ttf-parser`) and
   for its incremental-layout approach.
+- **Prefer a visible failure over silent press-corruption.** When you can't be *certain* output
+  is press-correct, skip or reject loudly rather than emit possibly-wrong color/geometry. Two
+  shapes seen: an input you can't disambiguate (spec 0012 — a CMYK vs YCCK JPEG both decode to
+  `CMYK32`, so only the provably-safe Adobe transform-0 case is embedded, the rest skipped), and
+  a validator that reads a different field than the writer emits (spec 0013 — preflight must
+  validate the *same* `page_setup.bleed_pt` the BleedBox is built from; one source of truth per
+  checked property). A dropped image or a preflight error is recoverable; a mis-colored file
+  already uploaded to POD is not.
 
 ## Milestone order (build the risky/differentiating part first)
 
