@@ -617,6 +617,39 @@ mod tests {
     }
 
     #[test]
+    fn export_places_cmyk_jpeg_as_device_cmyk() {
+        // A linked CMYK JPEG (Adobe APP14 transform 0) must embed as DeviceCMYK, not be dropped
+        // (spec 0012). The bundled fixture is already CMYK, so it takes the direct-embed path.
+        let (opts, icc_path) = opts_with_real_icc("cmyk_jpeg");
+        let img_path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test_cmyk.jpg");
+
+        let mut doc = Document::sample();
+        doc.assets = vec![Asset {
+            id: "pic".into(),
+            path: img_path.into(),
+            px_w: 600,
+            px_h: 600,
+            dpi: 300.0,
+            line_art: false,
+            has_alpha: false,
+        }];
+        doc.content.push(Block::Image {
+            asset: "pic".into(),
+        });
+
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("export with cmyk jpeg should succeed");
+        let _ = std::fs::remove_file(&icc_path);
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("/Subtype /Image") || text.contains("/Subtype/Image"));
+        assert!(
+            text.contains("DeviceCMYK"),
+            "CMYK JPEG must be DeviceCMYK for PDF/X"
+        );
+    }
+
+    #[test]
     fn export_refuses_unreadable_icc_even_when_preflight_forced() {
         // force=true skips preflight, but the writer still needs a valid ICC to embed.
         let opts = ExportOptions {
