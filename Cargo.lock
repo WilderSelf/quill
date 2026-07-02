@@ -454,6 +454,7 @@ dependencies = [
 name = "quill-color"
 version = "0.0.0"
 dependencies = [
+ "lcms2",
  "quill-core-model",
 ]
 

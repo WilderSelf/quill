@@ -8,3 +8,4 @@ authors.workspace = true
 
 [dependencies]
 quill-core-model = { workspace = true }
+lcms2 = { workspace = true }

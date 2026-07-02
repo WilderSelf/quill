@@ -455,6 +455,45 @@ mod tests {
     }
 
     #[test]
+    fn export_places_color_image_as_device_cmyk() {
+        let (opts, icc_path) = opts_with_real_icc("color_image");
+
+        // Write a tiny RGB PNG to a temp file and reference it (color art path, spec 0005).
+        let png_path = std::env::temp_dir().join("quill_test_color.png");
+        {
+            let file = std::fs::File::create(&png_path).unwrap();
+            let mut enc = png::Encoder::new(file, 2, 1);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[10, 120, 240, 240, 120, 10]).unwrap();
+        }
+
+        let mut doc = Document::sample();
+        doc.assets = vec![Asset {
+            id: "pic".into(),
+            path: png_path.to_string_lossy().into_owned(),
+            dpi: 300.0,
+            line_art: false,
+        }];
+        doc.content.push(Block::Image {
+            asset: "pic".into(),
+        });
+
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("export with color image should succeed");
+        let _ = std::fs::remove_file(&icc_path);
+        let _ = std::fs::remove_file(&png_path);
+
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("/Subtype /Image") || text.contains("/Subtype/Image"));
+        assert!(
+            text.contains("DeviceCMYK"),
+            "color image must be DeviceCMYK for PDF/X"
+        );
+    }
+
+    #[test]
     fn export_refuses_unreadable_icc_even_when_preflight_forced() {
         // force=true skips preflight, but the writer still needs a valid ICC to embed.
         let opts = ExportOptions {
