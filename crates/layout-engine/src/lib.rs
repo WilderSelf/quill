@@ -6,8 +6,27 @@
 //! crates compile and the export pipeline has something to consume. Uses `quill-text-layout`
 //! for line breaking.
 
-use quill_core_model::{Block, Color, Document, Rect};
+use quill_core_model::{Asset, Block, Color, Document, Rect};
 use quill_text_layout::greedy_break;
+
+/// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
+/// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
+///
+/// Falls back to a square at `content_width` when pixel dimensions or DPI are unknown (`0`), so
+/// documents authored before pixel info was captured still lay out.
+fn image_size(asset: &Asset, content_width: f32) -> (f32, f32) {
+    if asset.px_w == 0 || asset.px_h == 0 || asset.dpi <= 0.0 {
+        return (content_width, content_width); // legacy square placeholder
+    }
+    let natural_w = asset.px_w as f32 / asset.dpi * 72.0;
+    let natural_h = asset.px_h as f32 / asset.dpi * 72.0;
+    if natural_w > content_width {
+        let scale = content_width / natural_w;
+        (content_width, natural_h * scale)
+    } else {
+        (natural_w, natural_h)
+    }
+}
 
 /// A block positioned on a page.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,16 +91,13 @@ pub fn lay_out(doc: &Document) -> Vec<LaidOutPage> {
             }
             Block::Image { asset } => {
                 // Resolve the asset id. If not found, skip this block (no panic).
-                let Some(_asset_rec) = doc.assets.iter().find(|a| &a.id == asset) else {
+                let Some(asset_rec) = doc.assets.iter().find(|a| &a.id == asset) else {
                     continue;
                 };
 
-                // Asset lacks pixel-dimension fields (px_w / px_h), so we cannot compute the
-                // true placed size via `w_pt = px_w / dpi * 72.0`. Real decode / sizing lands in
-                // the export-pdf PR. For now we use the full content width and treat the image as
-                // square (unknown aspect ratio).
-                let w = width;
-                let h = w; // square placeholder — no aspect ratio available yet
+                // Size the image from its pixel dimensions and DPI at its true aspect ratio,
+                // scaling down to fit the content width when wider. See spec 0009.
+                let (w, h) = image_size(asset_rec, width);
 
                 if y + h > page_h && !page.blocks.is_empty() {
                     pages.push(page);
@@ -211,6 +227,10 @@ mod tests {
             assets: vec![Asset {
                 id: asset_id.clone(),
                 path: "assets/img1.png".into(),
+                // 900×600 px at 300 dpi → natural 216×144 pt, both within the 432 pt content
+                // width, so placed at natural size with a 1.5 aspect ratio (not a square).
+                px_w: 900,
+                px_h: 600,
                 dpi: 300.0,
                 line_art: false,
                 has_alpha: false,
@@ -234,10 +254,54 @@ mod tests {
         );
 
         match &image_blocks[0] {
-            PlacedBlock::Image { asset_id: id, .. } => {
+            PlacedBlock::Image {
+                asset_id: id,
+                frame,
+            } => {
                 assert_eq!(id, &asset_id);
+                assert!((frame.w_pt - 216.0).abs() < 0.01, "w = {}", frame.w_pt);
+                assert!((frame.h_pt - 144.0).abs() < 0.01, "h = {}", frame.h_pt);
             }
             other => panic!("expected Image block, got {other:?}"),
         }
+    }
+
+    fn sized_asset(px_w: u32, px_h: u32, dpi: f32) -> Asset {
+        Asset {
+            id: "a".into(),
+            path: "a.png".into(),
+            px_w,
+            px_h,
+            dpi,
+            line_art: false,
+            has_alpha: false,
+        }
+    }
+
+    #[test]
+    fn wide_image_scales_down_to_content_width_preserving_aspect() {
+        let content_width = 432.0;
+        // 4000×2000 px at 300 dpi → natural 960×480 pt (wider than 432) → scaled to width 432,
+        // height 216, keeping the 2:1 aspect ratio.
+        let (w, h) = image_size(&sized_asset(4000, 2000, 300.0), content_width);
+        assert!((w - content_width).abs() < 0.01, "w = {w}");
+        assert!((h - 216.0).abs() < 0.01, "h = {h}");
+        assert!((w / h - 2.0).abs() < 0.001, "aspect = {}", w / h);
+    }
+
+    #[test]
+    fn small_image_placed_at_natural_size() {
+        // 300×450 px at 300 dpi → 72×108 pt, both within the content width → natural size.
+        let (w, h) = image_size(&sized_asset(300, 450, 300.0), 432.0);
+        assert!((w - 72.0).abs() < 0.01, "w = {w}");
+        assert!((h - 108.0).abs() < 0.01, "h = {h}");
+    }
+
+    #[test]
+    fn missing_pixel_dims_fall_back_to_square() {
+        let content_width = 432.0;
+        let (w, h) = image_size(&sized_asset(0, 0, 300.0), content_width);
+        assert_eq!(w, content_width);
+        assert_eq!(h, content_width);
     }
 }

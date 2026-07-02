@@ -18,5 +18,6 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0006 | [Per-pixel image ink-coverage clamping](0006-image-ink-clamping.md) | M0 | implemented |
 | 0007 | [Preflight: Marks & Transparency checks](0007-preflight-marks-transparency.md) | M0 | implemented |
 | 0008 | [JPEG image input](0008-jpeg-image-input.md) | M0 | implemented |
+| 0009 | [Image placement sizing (true aspect ratio)](0009-image-sizing.md) | M0 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).

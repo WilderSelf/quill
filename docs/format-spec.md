@@ -32,7 +32,7 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
   "spreads": [ { "pages": [ { "master": "...", "frames": [ ... ] } ] } ],
   "styles": { "paragraph": { ... }, "character": { ... } },
   "content": [ /* semantic blocks: headings, body, stat blocks, tables, random tables */ ],
-  "assets": [ { "id": "...", "path": "assets/....png", "dpi": 300 } ]
+  "assets": [ { "id": "...", "path": "assets/....png", "px_w": 1500, "px_h": 1200, "dpi": 300 } ]
 }
 ```
 

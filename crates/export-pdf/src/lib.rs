@@ -346,6 +346,8 @@ mod tests {
         doc.assets = vec![Asset {
             id: "blurry".into(),
             path: "assets/blurry.png".into(),
+            px_w: 600,
+            px_h: 600,
             dpi: 299.0,
             line_art: false,
             has_alpha: false,
@@ -363,6 +365,8 @@ mod tests {
         doc.assets = vec![Asset {
             id: "ink".into(),
             path: "assets/ink.png".into(),
+            px_w: 600,
+            px_h: 600,
             dpi: 400.0,
             line_art: true,
             has_alpha: false,
@@ -391,6 +395,8 @@ mod tests {
         doc.assets = vec![Asset {
             id: "glow".into(),
             path: "assets/glow.png".into(),
+            px_w: 600,
+            px_h: 600,
             dpi: 300.0,
             line_art: false,
             has_alpha: true,
@@ -514,6 +520,8 @@ mod tests {
         doc.assets = vec![Asset {
             id: "pic".into(),
             path: img_path.into(),
+            px_w: 600,
+            px_h: 600,
             dpi: 300.0,
             line_art: false,
             has_alpha: false,
@@ -553,6 +561,8 @@ mod tests {
         doc.assets = vec![Asset {
             id: "pic".into(),
             path: png_path.to_string_lossy().into_owned(),
+            px_w: 600,
+            px_h: 600,
             dpi: 300.0,
             line_art: false,
             has_alpha: false,
@@ -584,6 +594,8 @@ mod tests {
         doc.assets = vec![Asset {
             id: "pic".into(),
             path: img_path.into(),
+            px_w: 600,
+            px_h: 600,
             dpi: 300.0,
             line_art: false,
             has_alpha: false,
