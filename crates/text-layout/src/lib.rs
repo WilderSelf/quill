@@ -17,8 +17,15 @@
 //! together to minimize summed per-line demerits — a global balance greedy [`break_by_width`] cannot
 //! reach — while still returning ragged, left-aligned lines (the writer is unchanged; only *which
 //! words fall on which line* moves). `break_by_width` is retained as the fallback for the
-//! no-feasible-breaking case and as the parity oracle. Justified rendering and hyphenation arrive in
-//! later spec-driven increments.
+//! no-feasible-breaking case and as the parity oracle.
+//!
+//! Spec 0017 (increment 2) adds [`justify_paragraph`]: it keeps `break_paragraph`'s breakpoints but
+//! **resolves each line's inter-word adjustment** so the writer can stretch/shrink the spaces to fill
+//! the frame ([`Alignment::Justified`]) — the paragraph's last line and single-word lines stay ragged,
+//! and [`Alignment::Left`] leaves everything ragged. The resolved adjustment ([`Line::space_adjust_pt`])
+//! is the classic adjustment ratio expressed in points; because every inter-word glue here is
+//! identical, filling a line of `spaces` gaps to width `L` reduces to adding `(L − W) / spaces` per gap.
+//! Hyphenation arrives in a later spec-driven increment.
 
 /// Body/heading font size, in points. Shared by the layout engine (to measure and to reserve row
 /// height) and the writer (to set the font size), so text is measured at the size it is drawn.
@@ -292,6 +299,90 @@ pub fn break_paragraph(
     lines
 }
 
+/// Paragraph alignment (spec 0017, increment 2). Only the two modes this increment renders are
+/// present; `Right`/`Center` ride with a later increment (spec 0017 non-goal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    /// Stretch/shrink inter-word space so each line (except the paragraph's last) fills the frame.
+    Justified,
+    /// Ragged-right: words sit at their natural advances, no inter-word adjustment.
+    Left,
+}
+
+/// One laid-out line: its text plus the per-gap inter-word adjustment needed to justify it.
+///
+/// `space_adjust_pt` is the number of **points to add to each inter-word space** so the line fills
+/// the frame — positive stretches, negative shrinks, `0.0` leaves the natural spacing (a ragged
+/// last line, a single-word line, or [`Alignment::Left`]). The writer distributes it with a
+/// positioned `TJ` (word spacing / `Tw` is unusable: the export font is a Type0/Identity-H
+/// composite, and PDF word spacing applies only to single-byte code 32).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Line {
+    /// The line's words joined by single spaces (identical to what [`break_paragraph`] returns).
+    pub text: String,
+    /// Points to add to each inter-word gap to justify the line (see the struct docs).
+    pub space_adjust_pt: f32,
+}
+
+/// Break `text` with [`break_paragraph`] (Knuth-Plass total-fit), then **resolve each line's
+/// inter-word adjustment** for `align` (spec 0017, increment 2). The breakpoints are unchanged from
+/// increment 1; this only decides how much to stretch/shrink each line's spaces at render time.
+///
+/// For [`Alignment::Justified`], every line except the paragraph's last is stretched or shrunk to
+/// fill `max_width_pt`: with `spaces` interior gaps of natural width `W`, the per-gap add is
+/// `(L − W) / spaces` (all glues are identical, so the classic adjustment ratio collapses to an even
+/// split). The last line and any single-word line keep natural spacing (`0.0`). [`Alignment::Left`]
+/// leaves every line ragged.
+///
+/// **Fallback:** if any word is wider than `max_width_pt`, `break_paragraph` falls back to a greedy
+/// breaking whose overflow line cannot be justified without over-shrinking; the whole paragraph is
+/// then rendered ragged (`0.0` everywhere) — laying out visibly beats corrupting the spacing.
+pub fn justify_paragraph(
+    text: &str,
+    max_width_pt: f32,
+    size_pt: f32,
+    align: Alignment,
+    metrics: &impl RunMetrics,
+) -> Vec<Line> {
+    let lines = break_paragraph(text, max_width_pt, size_pt, metrics);
+
+    // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
+    // would need to shrink past its glue, so justifying it would push spaces negative).
+    let ragged = align == Alignment::Left
+        || text
+            .split_whitespace()
+            .any(|w| metrics.measure_run(w, size_pt) > max_width_pt);
+    if ragged {
+        return lines
+            .into_iter()
+            .map(|text| Line {
+                text,
+                space_adjust_pt: 0.0,
+            })
+            .collect();
+    }
+
+    let last = lines.len().saturating_sub(1);
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, text)| {
+            let spaces = text.split_whitespace().count().saturating_sub(1);
+            // Last line stays ragged; a single-word line has no gap to adjust.
+            let space_adjust_pt = if idx == last || spaces == 0 {
+                0.0
+            } else {
+                let natural = metrics.measure_run(&text, size_pt);
+                (max_width_pt - natural) / spaces as f32
+            };
+            Line {
+                text,
+                space_adjust_pt,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +582,102 @@ mod tests {
         // The alternative ["abc", "def ghi"] would strand "abc" (18 pt ≪ 42 pt) → CEIL badness.
         let lines = break_paragraph("abc def ghi", 42.0, SIZE, &MONO);
         assert_eq!(lines, vec!["abc def".to_string(), "ghi".to_string()]);
+    }
+
+    // --- spec 0017 increment 2: justified rendering (adjustment carried out of layout) -----------
+
+    /// The measured width of `line` under MONO plus the total inter-word adjustment `line` carries.
+    fn filled_width(line: &Line) -> f32 {
+        let spaces = line.text.split_whitespace().count().saturating_sub(1) as f32;
+        MONO.measure_run(&line.text, SIZE) + spaces * line.space_adjust_pt
+    }
+
+    #[test]
+    fn justified_interior_lines_fill_the_frame_last_stays_ragged() {
+        // Same crafted paragraph as the KP test: KP breaks "an ox in the mud" into
+        //   ["an ox in the", "mud"] at L = 69. Interior line "an ox in the" has W = 72 (overfull),
+        //   3 gaps → per-gap add = (69 − 72)/3 = −1.0 (mild shrink). Last line "mud" stays ragged.
+        const L: f32 = 69.0;
+        let lines = justify_paragraph("an ox in the mud", L, SIZE, Alignment::Justified, &MONO);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "an ox in the");
+        assert!(
+            (lines[0].space_adjust_pt - (-1.0)).abs() < 1e-4,
+            "adjust = {}",
+            lines[0].space_adjust_pt
+        );
+        // Interior line now fills the frame exactly; last line is untouched.
+        assert!((filled_width(&lines[0]) - L).abs() < 1e-3);
+        assert_eq!(lines[1].text, "mud");
+        assert_eq!(lines[1].space_adjust_pt, 0.0);
+    }
+
+    #[test]
+    fn justified_underfull_line_stretches() {
+        // "aa bb cc dd" then a trailing word forcing two lines. At L = 90, KP puts the first four
+        // 2-char words on line 1: W = 4·12 + 3·6 = 66, 3 gaps → add (90 − 66)/3 = +8.0 each.
+        let lines = justify_paragraph(
+            "aa bb cc dd eeeeeeeeeeeeee",
+            90.0,
+            SIZE,
+            Alignment::Justified,
+            &MONO,
+        );
+        assert_eq!(lines[0].text, "aa bb cc dd");
+        assert!(
+            (lines[0].space_adjust_pt - 8.0).abs() < 1e-4,
+            "adjust = {}",
+            lines[0].space_adjust_pt
+        );
+        assert!((filled_width(&lines[0]) - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn left_alignment_is_all_ragged() {
+        let lines = justify_paragraph("an ox in the mud", 69.0, SIZE, Alignment::Left, &MONO);
+        assert!(lines.iter().all(|l| l.space_adjust_pt == 0.0));
+        // Text/breakpoints match break_paragraph exactly.
+        let plain = break_paragraph("an ox in the mud", 69.0, SIZE, &MONO);
+        assert_eq!(
+            lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
+            plain
+        );
+    }
+
+    #[test]
+    fn single_word_line_is_not_justified() {
+        // One word wider than a narrow frame's other content still can't be justified (no gap).
+        let lines = justify_paragraph("hello", 1000.0, SIZE, Alignment::Justified, &MONO);
+        assert_eq!(
+            lines,
+            vec![Line {
+                text: "hello".to_string(),
+                space_adjust_pt: 0.0
+            }]
+        );
+    }
+
+    #[test]
+    fn fallback_paragraph_renders_ragged() {
+        // "elephantine" (66 pt) overflows L = 30 → break_paragraph falls back to greedy; justify
+        // must leave every line ragged rather than over-shrink the overflow line's neighbours.
+        let lines = justify_paragraph("a elephantine cat", 30.0, SIZE, Alignment::Justified, &MONO);
+        assert!(lines.iter().all(|l| l.space_adjust_pt == 0.0));
+        assert_eq!(
+            lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
+            break_by_width("a elephantine cat", 30.0, SIZE, &MONO)
+        );
+    }
+
+    #[test]
+    fn justify_is_deterministic() {
+        let text = "the balanced paragraph must break the same way each and every run without fail";
+        let first = justify_paragraph(text, 120.0, SIZE, Alignment::Justified, &MONO);
+        for _ in 0..8 {
+            assert_eq!(
+                justify_paragraph(text, 120.0, SIZE, Alignment::Justified, &MONO),
+                first
+            );
+        }
     }
 }

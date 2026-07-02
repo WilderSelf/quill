@@ -1,8 +1,8 @@
 # 0017 — Knuth-Plass optimal line breaking
 
 - **Milestone:** M1
-- **Status:** in-progress (increment 1 — the optimal breaker, ragged output — implemented;
-  increment 2 = justified rendering, deferred)
+- **Status:** implemented (increment 1 — the optimal breaker, ragged output; increment 2 —
+  justified rendering via positioned `TJ`, body justified / headings ragged, last line ragged)
 - **Crates:** `quill-text-layout` (owner), `quill-layout-engine`, `quill-export-pdf`
 
 ## Problem
@@ -150,11 +150,13 @@ Same signature shape as `break_by_width`, same normalization and degenerate beha
 
 ## Non-goals (named follow-up increments)
 
-- **Justified rendering (increment 2 of this spec).** Carry each line's adjustment ratio out of
-  layout and have the writer stretch/shrink inter-word space (word-spacing operator, e.g. `Tw`, or
-  positioned `TJ`) so justified lines fill the frame; last line of a paragraph stays ragged. This is
-  the increment that emits a new PDF operator and regenerates the golden. Alignment mode
-  (justified vs. ragged-left/right/centered) selection is part of this step.
+- **Justified rendering — DONE (increment 2 of this spec).** `justify_paragraph` carries each
+  line's adjustment out of layout (as `Line::space_adjust_pt`, the ratio in points) and the writer
+  stretches/shrinks inter-word space with a positioned `TJ` so justified lines fill the frame; the
+  paragraph's last line and single-word lines stay ragged. `Tw` word spacing is unusable here — the
+  export font is a Type0/Identity-H composite (2-byte codes) and PDF word spacing applies only to
+  single-byte code 32 — so the new operator is `TJ`. Alignment selection landed as `Alignment`
+  (`Justified` for body, `Left` for headings); `Right`/`Center` remain a later increment.
 - **Hyphenation** — intra-word breakpoints (hyphenation penalties in the item stream) and breaking
   oversized single words. Its own spec; KP's penalty slot is designed for it but it is not populated
   here.

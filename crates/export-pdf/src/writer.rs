@@ -25,7 +25,9 @@ use crate::{fonts, geom, icc, images, ExportError, ExportOptions};
 
 // Body/heading font size and line advance, in points. Shared with the layout engine (spec 0015)
 // so glyphs are measured and drawn at the same size and land on the rows layout reserved.
-use quill_text_layout::{BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT};
+use quill_text_layout::{
+    Line, BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT,
+};
 
 /// Monotonic indirect-reference allocator.
 struct Alloc(i32);
@@ -351,8 +353,7 @@ fn render_page(
                     let (x, y) = g.flip(frame.x_pt, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
-                    let encoded = font.encode_line(line);
-                    content.show(Str(&encoded));
+                    show_line(&mut content, font, line);
                 }
                 content.end_text();
             }
@@ -370,6 +371,42 @@ fn render_page(
         }
     }
     content.finish().as_slice().to_vec()
+}
+
+/// Show one laid-out line at the current text position, applying its justification adjustment
+/// (spec 0017, increment 2).
+///
+/// A ragged line (`space_adjust_pt == 0` — headings, last lines, single-word lines) is drawn as a
+/// single `Tj`, byte-for-byte as before. A justified line is drawn with a positioned `TJ`: each word
+/// (with its trailing space glyph, so the natural space advance is preserved) is shown in turn, and
+/// the extra `space_adjust_pt` is inserted between words as a `TJ` adjustment. `Tw` word spacing is
+/// unusable here — the font is a Type0/Identity-H composite (2-byte codes), and PDF word spacing
+/// applies only to single-byte code 32. The `TJ` `amount` is in thousandths of a text-space unit and
+/// is *subtracted* from the position, so a rightward (space-adding) shift of `space_adjust_pt` points
+/// at `FONT_SIZE_PT` is `-1000 · space_adjust_pt / FONT_SIZE_PT`.
+fn show_line(content: &mut Content, font: &fonts::EmbeddedFont, line: &Line) {
+    if line.space_adjust_pt == 0.0 {
+        content.show(Str(&font.encode_line(&line.text)));
+        return;
+    }
+    let amount = -1000.0 * line.space_adjust_pt / FONT_SIZE_PT;
+    let words: Vec<&str> = line.text.split(' ').collect();
+    let mut tj = content.show_positioned();
+    let mut items = tj.items();
+    let last = words.len() - 1;
+    for (i, word) in words.iter().enumerate() {
+        // Keep the natural space glyph on every word but the last, then add the adjustment; this
+        // preserves the measured space advance and only inserts the extra justification space.
+        let piece = if i == last {
+            (*word).to_string()
+        } else {
+            format!("{word} ")
+        };
+        items.show(Str(&font.encode_line(&piece)));
+        if i != last {
+            items.adjust(amount);
+        }
+    }
 }
 
 /// zlib-deflate for `/FlateDecode` streams.
@@ -423,12 +460,39 @@ mod tests {
                     w_pt: setup.trim.w_pt,
                     h_pt: LINE_HEIGHT_PT,
                 },
-                lines: vec!["Hi".to_string()],
+                lines: vec![Line {
+                    text: "Hi".to_string(),
+                    space_adjust_pt: 0.0,
+                }],
                 color,
             }],
         };
         let content = render_page(&page, &g, &font, &BTreeMap::new());
         String::from_utf8_lossy(&content).into_owned()
+    }
+
+    /// Render a single justified line and return the (uncompressed, greppable) content bytes.
+    fn render_justified_line(text: &str, space_adjust_pt: f32) -> Vec<u8> {
+        let setup = PageSetup::default();
+        let g = geom::page_geom(&setup, 0);
+        let chars: BTreeSet<char> = text.chars().collect();
+        let font = fonts::build(&chars).expect("build bundled font");
+        let page = LaidOutPage {
+            blocks: vec![PlacedBlock::Text {
+                frame: quill_core_model::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: setup.trim.w_pt,
+                    h_pt: LINE_HEIGHT_PT,
+                },
+                lines: vec![Line {
+                    text: text.to_string(),
+                    space_adjust_pt,
+                }],
+                color: Color::Gray { v: 0.0 },
+            }],
+        };
+        render_page(&page, &g, &font, &BTreeMap::new())
     }
 
     #[test]
@@ -451,6 +515,29 @@ mod tests {
         assert!(
             s.contains("0.5 g"),
             "expected grayscale fill operator, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn ragged_line_uses_a_single_show() {
+        // A line carrying no adjustment is drawn with `Tj`, not the positioned `TJ` (bytes unchanged
+        // from before increment 2 for headings / last lines / single-word lines).
+        let bytes = render_justified_line("ab cd", 0.0);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("Tj"), "expected a Tj show, got:\n{s}");
+        assert!(!s.contains("TJ"), "ragged line must not use TJ, got:\n{s}");
+    }
+
+    #[test]
+    fn justified_line_emits_positioned_tj_with_adjustment() {
+        // Two gaps, +3 pt each. amount = -1000 · 3 / FONT_SIZE_PT(10) = -300, an integer → "-300".
+        // The positive space-add is a *negative* TJ number (the amount is subtracted from position).
+        let bytes = render_justified_line("ab cd ef", 3.0);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("TJ"), "expected a positioned TJ, got:\n{s}");
+        assert!(
+            s.contains("-300"),
+            "expected the -300 TJ adjustment, got:\n{s}"
         );
     }
 }

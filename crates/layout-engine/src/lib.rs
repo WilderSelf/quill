@@ -7,7 +7,9 @@
 //! for line breaking.
 
 use quill_core_model::{Asset, Block, Color, Document, Rect};
-use quill_text_layout::{break_paragraph, RunMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
+use quill_text_layout::{
+    justify_paragraph, Alignment, Line, RunMetrics, BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT,
+};
 
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
@@ -33,7 +35,8 @@ fn image_size(asset: &Asset, content_width: f32) -> (f32, f32) {
 pub enum PlacedBlock {
     Text {
         frame: Rect,
-        lines: Vec<String>,
+        /// Broken lines, each carrying its inter-word justification adjustment (spec 0017 incr. 2).
+        lines: Vec<Line>,
         color: Color,
     },
     Image {
@@ -65,7 +68,14 @@ pub fn lay_out(doc: &Document, metrics: &impl RunMetrics) -> Vec<LaidOutPage> {
     for block in &doc.content {
         match block {
             Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
-                let lines = break_paragraph(text, width, BODY_FONT_SIZE_PT, metrics);
+                // Body text is justified for press-quality even spacing; headings stay ragged-left
+                // (a heading is typically one short line, where justification would do nothing
+                // anyway — its single line is the paragraph's last, which is never justified).
+                let align = match block {
+                    Block::Heading { .. } => Alignment::Left,
+                    _ => Alignment::Justified,
+                };
+                let lines = justify_paragraph(text, width, BODY_FONT_SIZE_PT, align, metrics);
                 let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
 
                 // If this block doesn't fit (and the page already has content), start a new page.
@@ -139,6 +149,55 @@ mod tests {
         let pages = lay_out(&Document::sample(), &MONO);
         assert!(!pages.is_empty());
         assert!(!pages[0].blocks.is_empty());
+    }
+
+    /// The lines of the first `PlacedBlock::Text` found across `pages`.
+    fn first_text_lines(pages: &[LaidOutPage]) -> Vec<Line> {
+        pages
+            .iter()
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match b {
+                PlacedBlock::Text { lines, .. } => Some(lines.clone()),
+                _ => None,
+            })
+            .expect("a text block")
+    }
+
+    #[test]
+    fn body_is_justified_headings_are_ragged() {
+        // A paragraph long enough to wrap under the 432 pt frame (72 chars/line at 6 pt/char under
+        // MONO) exercises the alignment wiring: as a Body it is justified (its underfull interior
+        // line stretches — non-zero adjust — while the last line stays ragged); the identical text
+        // as a Heading stays fully ragged (Alignment::Left). Spec 0017 increment 2.
+        let words =
+            "goblins raid the village at dusk stealing grain and copper coins from every trembling home nearby";
+        let body = doc_with_blocks(vec![Block::Body {
+            text: words.into(),
+            color: Color::Gray { v: 0.0 },
+        }]);
+        let heading = doc_with_blocks(vec![Block::Heading {
+            level: 1,
+            text: words.into(),
+            color: Color::Gray { v: 0.0 },
+        }]);
+
+        let body_lines = first_text_lines(&lay_out(&body, &MONO));
+        let heading_lines = first_text_lines(&lay_out(&heading, &MONO));
+
+        assert!(body_lines.len() >= 2, "body should wrap to >= 2 lines");
+        assert!(
+            body_lines.iter().any(|l| l.space_adjust_pt != 0.0),
+            "a justified body line should carry a non-zero adjustment"
+        );
+        assert_eq!(
+            body_lines.last().unwrap().space_adjust_pt,
+            0.0,
+            "the paragraph's last line stays ragged"
+        );
+        assert!(
+            heading_lines.iter().all(|l| l.space_adjust_pt == 0.0),
+            "headings are ragged-left (never justified)"
+        );
     }
 
     /// Build a minimal document from scratch with the given content blocks and default page setup.
