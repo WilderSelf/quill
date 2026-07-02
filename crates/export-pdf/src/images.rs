@@ -1,7 +1,7 @@
 //! Linked-image resolution and decoding for export (spec 0002 reqs 2, 7; spec 0005; spec 0008).
 //!
 //! Grayscale inputs decode to 8-bit `/DeviceGray` (unambiguously legal, no ICC transform). Color
-//! (RGB/RGBA) inputs are converted to 8-bit CMYK via [`RgbToCmyk`] and emitted as `/DeviceCMYK`,
+//! inputs are converted to 8-bit CMYK via [`RgbToCmyk`] and emitted as `/DeviceCMYK`,
 //! the only image color space PDF/X-1a permits — so an author's color art survives export instead
 //! of being desaturated. A missing or undecodable asset returns `None` and is skipped by the
 //! writer rather than failing the whole export. Alpha is dropped (no `/SMask`), preserving the
@@ -38,7 +38,8 @@ pub enum Pixels {
 /// Resolve `asset.path` against `base_dir` and decode it, converting color via `cmyk`.
 ///
 /// Returns `None` (skip, don't fail) if the file is missing, unreadable, or in a format we don't
-/// handle for M0 (anything but 8-bit Gray/GrayAlpha/RGB/RGBA PNG or 8-bit gray/RGB JPEG).
+/// handle for M0. PNG of any bit depth or color type (grayscale, RGB, palette, 16-bit) is
+/// normalized and decoded; JPEG handles 8-bit gray/RGB (CMYK/16-bit JPEG remain deferred).
 pub fn resolve(asset: &Asset, base_dir: &Path, cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     let path = base_dir.join(&asset.path);
     let bytes = std::fs::read(&path).ok()?;
@@ -58,16 +59,22 @@ pub fn decode(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
 }
 
 /// Decode PNG bytes: grayscale stays gray, color is converted to CMYK via `cmyk`.
+///
+/// Inputs are normalized to 8-bit color via `normalize_to_color8` (= `EXPAND | STRIP_16`): palette
+/// images expand to RGB(A), sub-8-bit grayscale expands to 8-bit, `tRNS` expands to an alpha
+/// channel, and 16-bit samples are stripped to 8-bit. Every PNG therefore reaches the Gray/RGB
+/// arms below and flows through the shared CMYK(+240% clamp) path (spec 0010).
 fn decode_png(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
     use png::{BitDepth, ColorType};
 
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
 
     if info.bit_depth != BitDepth::Eight {
-        return None; // M0 handles 8-bit inputs only.
+        return None; // defensive: normalization already forces 8-bit output.
     }
     let (w, h) = (info.width, info.height);
     let px = (w as usize) * (h as usize);
@@ -87,7 +94,7 @@ fn decode_png(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
                 .collect();
             Pixels::Cmyk(cmyk.convert(&rgb))
         }
-        ColorType::Indexed => return None, // not expanded; skip for M0
+        ColorType::Indexed => return None, // defensive: EXPAND already turns palette into RGB(A).
     };
     Some(DecodedImage {
         width: w,
@@ -147,6 +154,61 @@ mod tests {
             writer.write_image_data(rgb).expect("png data");
         }
         out
+    }
+
+    /// Encode a tiny indexed (palette) PNG in-memory.
+    fn indexed_png(width: u32, height: u32, palette_rgb: &[u8], indices: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, width, height);
+            enc.set_color(png::ColorType::Indexed);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_palette(palette_rgb.to_vec());
+            let mut writer = enc.write_header().expect("png header");
+            writer.write_image_data(indices).expect("png data");
+        }
+        out
+    }
+
+    /// Encode a tiny 16-bit grayscale PNG in-memory. `samples` are big-endian u16 bytes (PNG order).
+    fn gray16_png(width: u32, height: u32, samples_be: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, width, height);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Sixteen);
+            let mut writer = enc.write_header().expect("png header");
+            writer.write_image_data(samples_be).expect("png data");
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_indexed_png_to_cmyk() {
+        // 2x1 palette: index 0 = white, index 1 = black. EXPAND turns it into RGB, then CMYK.
+        let png = indexed_png(2, 1, &[255, 255, 255, 0, 0, 0], &[0, 1]);
+        let img = decode(&png, &naive_converter()).expect("decode indexed png");
+        assert_eq!((img.width, img.height), (2, 1));
+        match img.pixels {
+            Pixels::Cmyk(c) => {
+                assert_eq!(c.len(), 2 * 4, "4 bytes per pixel");
+                assert_eq!(&c[0..4], &[0, 0, 0, 0], "white → no ink");
+                assert_eq!(&c[4..8], &[0, 0, 0, 255], "black → solid K");
+            }
+            Pixels::Gray(_) => panic!("indexed PNG must decode to Cmyk"),
+        }
+    }
+
+    #[test]
+    fn decodes_16bit_grayscale_png() {
+        // 2x1 16-bit grayscale: 0xFFFF (white), 0x0000 (black). STRIP_16 keeps the high byte.
+        let png = gray16_png(2, 1, &[0xFF, 0xFF, 0x00, 0x00]);
+        let img = decode(&png, &naive_converter()).expect("decode 16-bit png");
+        assert_eq!((img.width, img.height), (2, 1));
+        match img.pixels {
+            Pixels::Gray(g) => assert_eq!(g, vec![255, 0], "16-bit stripped to 8-bit high byte"),
+            Pixels::Cmyk(_) => panic!("grayscale PNG must decode to Gray"),
+        }
     }
 
     #[test]
