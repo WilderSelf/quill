@@ -8,12 +8,14 @@ An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app fo
 semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
 must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
 
-**Status: M0 code-complete (headless PDF/X export).** The headless PDF/X export pipeline is
-implemented and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
+**Status: M1 in progress — editing core + text-layout.** M0 (headless PDF/X export) is
+code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
-tables). Next is the **M1** editing + text-layout arc (shaping, Knuth-Plass justification,
-hyphenation), which begins with a new spec. The authoritative design is the approved plan at
+tables). The **M1** arc (shaping → Knuth-Plass justification → hyphenation → text frames/threading
+→ master pages → incremental layout → perf harness → screen render) is now open; it begins with
+**spec 0016 (rustybuzz shaping)** on the `CharMetrics`/`break_by_width` seam that spec 0015 built.
+The authoritative design is the approved plan at
 `~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before making architectural
 decisions. This file summarizes the parts that shape day-to-day work.
 
@@ -75,7 +77,8 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 **M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
 **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. Currently at **M0**.
+TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. Currently at **M1** (M0 code-complete;
+sole open M0 item is the manual POD upload).
 
 ## Planning: spec-driven development
 

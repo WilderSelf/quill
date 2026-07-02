@@ -6,8 +6,8 @@ Status: **draft** · Scope: Claude tooling (not product code) · Owner: this rep
 
 Reduce the human to an **exception handler**. The recurring session pattern — *open session →
 ask to plan next task → accept the recommendation → execute → PR → wrap* — is automated into a
-loop that ships M0 increments **one atomic PR at a time**, continuously, and only surfaces to the
-user on a **genuine blocker**. The user's job becomes: read notifications, answer the occasional
+loop that ships milestone increments **one atomic PR at a time**, continuously, and only surfaces to
+the user on a **genuine blocker**. The user's job becomes: read notifications, answer the occasional
 question, flip a kill switch if needed.
 
 This spec is the source of truth for the harness design. The `/advance` skill (`SKILL.md` beside
@@ -124,8 +124,9 @@ was prose the model was "supposed to obey." Enforcement must be structural:
 5. A **blocked-class action** would be required (destructive / external-publish e.g. POD upload /
    security-posture / permission-config change).
 6. A **security-review finding** at HIGH severity.
-7. **Milestone boundary reached (M0 → M1)** — an unconditional stop; M1 is far less spec-bound and
-   needs the user back in the loop.
+7. **Milestone boundary reached** — crossing into the next *unentered* milestone is an unconditional
+   stop; the new milestone is far less spec-bound and needs the user back in the loop. **M0 → M1 has
+   been authorized by the user** (M1 is now the active milestone); the live boundary is **M1 → M2**.
 8. **Budget / iteration ceiling** or the 3-consecutive-failure threshold hit.
 9. **Ambiguity the plan doesn't resolve** / low confidence on task selection.
 
