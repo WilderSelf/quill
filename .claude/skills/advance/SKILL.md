@@ -107,17 +107,37 @@ At most **one** attempt: pull the branch, read the failing check's log
 **Escalation cap:** if this run has already produced 3 consecutive failures (across §3/§4), stop:
 `STATUS: BLOCKED:escalation-3-consecutive`.
 
-## 5. WRAP tail — defer to the user, do not run autonomously
+## 5. WRAP tail — run inline, auto-applying (the user has authorized auto-accept)
 
-`/reflect` and `/curate` are `disable-model-invocation: true` **and interactive** — they promote
-learnings and prune config **one human-approved change at a time**, so they cannot be driven
-autonomously (and can't be Skill-invoked either). **Do not attempt them in an autonomous run.**
-Instead, when an increment merges, note in the exit summary that the user should run **`/wrap`**
-(or `/reflect` + `/curate`) at their convenience to capture learnings. Do **not** run `/handoff` —
-that's the user's session-bridge tool, not part of the per-increment loop.
+When an increment merges, capture learnings **autonomously** — do not defer to the user with a "go
+run `/wrap`" note. `/reflect` and `/curate` are `disable-model-invocation: true`, so (like `/ship`)
+you **execute their pipelines inline** as the main agent, reading their `SKILL.md` files as the
+source of truth. The user has **authorized auto-accepting proposals**, so **apply each change
+directly** instead of pausing for per-change approval. Be judicious: this is auto-*accept*, not
+auto-*invent* — promote only a durable learning that generalizes; if the increment surfaced nothing
+worth keeping, record "no new learnings" and move on. Under the permission model these edits are
+already allowed (bare `Edit`/`Write`; deny still guards `settings.json`/secrets).
 
-The Layer 2 quality gates (`/code-review`, `/security-review`, `/simplify`) are a *different* case:
-those are model-invocable and **may** be run via the Skill tool on the periodic cadence.
+Route each learning to its home:
+
+- **Non-repo targets — edit in place, no PR, auto-applied:** project memory
+  (`…/memory/*.md` + its `MEMORY.md` index) and user-scope config (`~/.claude/CLAUDE.md`,
+  `~/.claude/rules/*`). Then run `/curate`'s pipeline over the same targets — dedupe/condense within
+  CLAUDE.md's ~200-line budget, prune stale entries. Apply safe condensations directly.
+- **Repo-tracked targets** (project `CLAUDE.md`, `specs/`, `.claude/rules/`, `.claude/skills/`): a
+  durable learning here is a real repo change. Land **at most one** small capture PR per run via the
+  same gated `/ship`-inline flow (§3) — `docs:`/`chore:` commit, gate-verified `--auto` merge. Never
+  push config straight to `main`. If there's no repo-tracked learning, skip this.
+- **`/handoff`** — optional and low-risk (writes the untracked `HANDOFF.md`). Refresh it if the run
+  produced state worth bridging; otherwise skip.
+
+**Still don't guess.** Auto-accept covers *applying your own proposals*, not resolving genuine
+judgment calls: a `/curate`-flagged **contradiction**, an architectural learning, or anything that
+would rewrite an approved decision → do **not** auto-apply. Note it in the exit summary (or
+`STATUS: BLOCKED:<reason>` if it actually blocks progress) and leave it for the user.
+
+The Layer 2 quality gates (`/code-review`, `/security-review`, `/simplify`) are model-invocable and
+**may** be run via the Skill tool on the periodic cadence.
 
 ## 6. EXIT
 
@@ -133,8 +153,12 @@ findings), then the final status line. Exactly one of:
 
 ## Invariants
 
-- **One atomic increment per run.** Never chain a second increment in the same run — the driver
-  fires the next run.
+- **One atomic increment per run.** Never chain a second *feature* increment in the same run — the
+  driver fires the next run. (The §5 wrap tail may land **one** small `docs:`/`chore:` capture PR
+  plus in-place memory/config edits; that is wrapping the increment, not new feature work.)
+- **Wrap runs autonomously.** After a merge, run `/reflect`+`/curate` inline and auto-apply (§5) —
+  never defer them to the user. Still surface (don't auto-resolve) contradictions and architectural
+  judgment calls.
 - **Idempotent.** Re-running after a merge selects the *next* increment; re-running with an open
   blocking PR reports the blocker, never starts parallel work.
 - **Never** push to `main`, force-push, `--admin`-merge, or enable `--auto` on an unverified gate.
