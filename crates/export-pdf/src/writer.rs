@@ -23,10 +23,9 @@ use quill_layout_engine::{LaidOutPage, PlacedBlock};
 use crate::images::Pixels;
 use crate::{fonts, geom, icc, images, ExportError, ExportOptions};
 
-/// Body/heading font size and line advance, in points. Mirrors the layout engine's line-height
-/// stand-in so glyphs land on the rows the layout reserved for them.
-const FONT_SIZE_PT: f32 = 10.0;
-const LINE_HEIGHT_PT: f32 = 12.0;
+// Body/heading font size and line advance, in points. Shared with the layout engine (spec 0015)
+// so glyphs are measured and drawn at the same size and land on the rows layout reserved.
+use quill_text_layout::{BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT};
 
 /// Monotonic indirect-reference allocator.
 struct Alloc(i32);
@@ -43,19 +42,12 @@ pub fn write_pdf(
     doc: &Document,
     opts: &ExportOptions,
     pages: &[LaidOutPage],
+    font: &fonts::EmbeddedFont,
     out: &mut impl Write,
 ) -> Result<(), ExportError> {
-    // --- Inputs: font subset, ICC bytes, images -------------------------------------------
-    let used_chars = collect_chars(pages);
-    let font = match &opts.font_path {
-        Some(path) => {
-            let program = std::fs::read(path)
-                .map_err(|e| ExportError::Font(format!("reading font '{path}': {e}")))?;
-            fonts::build_from_bytes(&program, None, &used_chars)?
-        }
-        None => fonts::build(&used_chars)?,
-    };
-
+    // --- Inputs: ICC bytes, images --------------------------------------------------------
+    // The font is built once in `export` (it is also the layout engine's metrics source, spec 0015)
+    // and passed in.
     let icc_bytes = std::fs::read(&opts.output_intent_icc)
         .map_err(|e| ExportError::Icc(format!("reading '{}': {e}", opts.output_intent_icc)))?;
     icc::check_icc(&icc_bytes).map_err(ExportError::Icc)?;
@@ -164,14 +156,7 @@ pub fn write_pdf(
         icc_stream.finish();
     }
 
-    write_font(
-        &mut pdf,
-        &font,
-        type0_id,
-        cid_id,
-        descriptor_id,
-        fontfile_id,
-    );
+    write_font(&mut pdf, font, type0_id, cid_id, descriptor_id, fontfile_id);
 
     // Image XObjects: grayscale as /DeviceGray, color as /DeviceCMYK (spec 0005).
     for img in images_by_id.values() {
@@ -195,7 +180,7 @@ pub fn write_pdf(
     // Pages.
     for (i, (page, (page_id, content_id))) in pages.iter().zip(&page_refs).enumerate() {
         let g = geom::page_geom(&doc.page_setup, i);
-        let content = render_page(page, &g, &font, &images_by_id);
+        let content = render_page(page, &g, font, &images_by_id);
 
         {
             let mut p = pdf.page(*page_id);
@@ -244,21 +229,6 @@ struct ImageObj {
     width: u32,
     height: u32,
     id: Ref,
-}
-
-/// Every character used by text blocks across all pages.
-fn collect_chars(pages: &[LaidOutPage]) -> BTreeSet<char> {
-    let mut set = BTreeSet::new();
-    for page in pages {
-        for block in &page.blocks {
-            if let PlacedBlock::Text { lines, .. } = block {
-                for line in lines {
-                    set.extend(line.chars());
-                }
-            }
-        }
-    }
-    set
 }
 
 /// Write the `/OutputIntent` dict. The identifier is `Custom`, so `/Info` is required.

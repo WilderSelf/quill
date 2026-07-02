@@ -14,6 +14,7 @@ authors.workspace = true
 quill-core-model = { workspace = true }
 quill-color = { workspace = true }
 quill-layout-engine = { workspace = true }
+quill-text-layout = { workspace = true }
 thiserror = { workspace = true }
 pdf-writer = { workspace = true }
 subsetter = { workspace = true }

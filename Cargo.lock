@@ -491,6 +491,7 @@ dependencies = [
  "quill-color",
  "quill-core-model",
  "quill-layout-engine",
+ "quill-text-layout",
  "subsetter",
  "thiserror",
  "ttf-parser",
