@@ -9,6 +9,7 @@ authors.workspace = true
 # PDF/X-1a byte generation (spec 0002): pdf-writer emits the object graph, subsetter+ttf-parser
 # embed a subset TrueType font, lcms2 validates/synthesizes the ICC OutputIntent, png/jpeg-decoder
 # decode linked images and flate2 compresses the XObject streams. JPEG input is spec 0008.
+# rustybuzz shapes runs for kerning/ligature-aware measurement (spec 0016).
 # See specs/0002-pdf-byte-generation.md.
 [dependencies]
 quill-core-model = { workspace = true }
@@ -19,6 +20,7 @@ thiserror = { workspace = true }
 pdf-writer = { workspace = true }
 subsetter = { workspace = true }
 ttf-parser = { workspace = true }
+rustybuzz = { workspace = true }
 lcms2 = { workspace = true }
 png = { workspace = true }
 jpeg-decoder = { workspace = true }

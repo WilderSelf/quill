@@ -1,17 +1,18 @@
 # 0016 — Rustybuzz text shaping (kerning/ligature-aware measurement)
 
 - **Milestone:** M1
-- **Status:** in-progress (increment 1 of a multi-part spec; itself landing in two PRs)
-- **Crates:** `quill-text-layout` (owner), `quill-layout-engine`, `quill-export-pdf`
+- **Status:** implemented (increment 1 landed in two PRs — 1a #34, 1b)
+- **Crates:** `quill-text-layout` (trait owner), `quill-layout-engine`, `quill-export-pdf` (shaper)
 
-> **Increment 1 lands in two PRs** (per CLAUDE.md "one atomic change per plan/turn"):
-> **1a — measurement seam (parity, no dependency):** introduces the `RunMetrics` trait +
-> `MonospaceRunMetrics` stub, rewrites `break_by_width` to measure whole candidate lines through
-> `measure_run`, and wires `lay_out`/`export` through `RunMetrics`. The export font implements
-> `RunMetrics` as the per-char sum of its advances, so output is byte-identical to spec 0015.
-> **1b — rustybuzz shaper:** adds `rustybuzz` and replaces the export font's `measure_run` body with
-> real shaping (kerning/ligatures), plus the kern-fixture acceptance test below. The acceptance
-> criteria that name `rustybuzz` and the kern pair are satisfied by **1b**.
+> **Increment 1 landed in two PRs** (per CLAUDE.md "one atomic change per plan/turn"):
+> **1a — measurement seam (parity, no dependency):** introduced the `RunMetrics` trait +
+> `MonospaceRunMetrics` stub, rewrote `break_by_width` to measure whole candidate lines through
+> `measure_run`, and wired `lay_out`/`export` through `RunMetrics`. The export font implemented
+> `RunMetrics` as the per-char sum of its advances, so output was byte-identical to spec 0015.
+> **1b — rustybuzz shaper:** added `rustybuzz` (in `export-pdf`, where the font bytes live — not
+> `text-layout`, which only defines the trait) and replaced the per-char stub with a
+> `ShapingContext` that shapes runs (kerning/ligatures), plus the kern acceptance test below. The
+> acceptance criteria that name `rustybuzz` and the kern pair are satisfied by **1b**.
 
 ## Problem
 
@@ -101,8 +102,11 @@ normalized to single spaces; empty text → no lines.
   before the first word that would exceed the measured max, emits a single over-wide word alone, and
   yields no lines for empty text.
 - `lay_out` and `export` compile against `RunMetrics`; the full workspace is green (`fmt`,
-  `clippy -D warnings`, `build`, `test`). `rustybuzz` is added to `text-layout`/`export-pdf` as a
-  permissive (MIT/Apache-2.0-compatible) dependency.
+  `clippy -D warnings`, `build`, `test`). `rustybuzz` is added as a permissive
+  (MIT/Apache-2.0-compatible) dependency of `export-pdf` — the crate that owns the font bytes and
+  builds the `rustybuzz::Face`. `text-layout` only defines the trait, so it takes no new dependency
+  (minimal-deps principle). `rustybuzz` 0.20 pins `ttf-parser` 0.25, the same version `subsetter`
+  requires, so `cargo tree -d` stays clean.
 - Export output remains valid under the existing Ghostscript golden-file gate (drawn content
   unchanged; only line grouping/pagination may differ).
 

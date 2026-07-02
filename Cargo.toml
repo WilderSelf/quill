@@ -24,6 +24,9 @@ clap = { version = "4", features = ["derive"] }
 pdf-writer = "0.15"
 subsetter = "0.2"
 ttf-parser = "0.25"
+# rustybuzz 0.20 pins ttf-parser 0.25 — the SAME version subsetter needs (checked by cargo tree -d).
+# Shapes runs for kerning/ligature-aware measurement (spec 0016); permissive (MIT/Apache-2.0).
+rustybuzz = "0.20"
 lcms2 = "6"
 png = "0.18"
 # default-features off drops the rayon parallel-decode path — the export decode loop is already
