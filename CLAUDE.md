@@ -105,6 +105,14 @@ real test-uploads to DriveThruRPG/Lulu/IngramSpark for certified conformance (no
 certifies PDF/X — veraPDF validates PDF/A, not PDF/X). Color code (`color` crate) needs unit
 tests on ICC round-trips and ink-coverage math.
 
+**Test fixtures & the dependency graph.** When a test needs a binary fixture (a specific image
+format, a font) that only a *generator* dependency can produce, generate it once **out-of-tree**
+(a throwaway project in the scratchpad) and commit the artifact — don't add the generator to the
+workspace just for tests. Keeps the dependency graph minimal and permissive (e.g. spec 0008's
+single-component grayscale JPEG was made with `jpeg-encoder`, which carries an `AND IJG` clause,
+without adding it as a dep). If a needed encoder is *already* a dep (like `png`), synthesize the
+fixture in-memory in the test instead.
+
 ## Automation & learning (Claude Code)
 
 - **`/ship <task>`** — autonomous plan→merge cycle: plan → `feat/<slug>` branch → implement →
