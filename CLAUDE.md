@@ -60,7 +60,7 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 ## Milestone order (build the risky/differentiating part first)
 
-**M0** press-output spike (headless PDF/X export, proven with veraPDF + a real POD upload) →
+**M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
 **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
 TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. Currently at **M0**.
 
@@ -97,10 +97,11 @@ cargo fmt                        # format
 
 ## Verifying press output
 
-The acceptance test for any export change is external validation, not just unit tests:
-`veraPDF` (PDF/X profile) and a Ghostscript preflight on generated PDFs (golden-file tests in
-CI), plus periodic real test-uploads to DriveThruRPG/Lulu/IngramSpark. Color code
-(`color` crate) needs unit tests on ICC round-trips and ink-coverage math.
+The acceptance test for any export change is external validation, not just unit tests: a
+**Ghostscript** well-formedness gate on generated PDFs (golden-file tests in CI), plus periodic
+real test-uploads to DriveThruRPG/Lulu/IngramSpark for certified conformance (no free tool
+certifies PDF/X — veraPDF validates PDF/A, not PDF/X). Color code (`color` crate) needs unit
+tests on ICC round-trips and ink-coverage math.
 
 ## Automation & learning (Claude Code)
 
