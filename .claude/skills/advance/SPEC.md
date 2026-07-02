@@ -111,21 +111,27 @@ was prose the model was "supposed to obey." Enforcement must be structural:
 
 ## Stop-and-ask conditions (exit `BLOCKED:<reason>` — never guess)
 
-1. Next task needs a **net-new spec or an architectural decision** not in the approved plan.
-2. `/ship` validation/CI can't reach green within its bounded attempts (draft PR left open).
-3. **Branch-protection gate missing or changed** — never enable `--auto` ungated; never `--admin`.
-4. A **blocked-class action** would be required (destructive / external-publish e.g. POD upload /
+1. **Dirty/foreign working tree** — `git status --porcelain` is non-empty on a cold start. The
+   working tree is **shared across sessions**; uncommitted changes this run didn't make belong to a
+   concurrent session, and switching branches over them corrupts their state → `BLOCKED:dirty-tree`.
+   This is the *first* check, before any branch switch (see SKILL §1a).
+2. Next task needs a **net-new spec or an architectural decision** not in the approved plan.
+3. `/ship` validation/CI can't reach green within its bounded attempts (draft PR left open).
+4. **Branch-protection gate missing or changed** — never enable `--auto` ungated; never `--admin`.
+5. A **blocked-class action** would be required (destructive / external-publish e.g. POD upload /
    security-posture / permission-config change).
-5. A **security-review finding** at HIGH severity.
-6. **Milestone boundary reached (M0 → M1)** — an unconditional stop; M1 is far less spec-bound and
+6. A **security-review finding** at HIGH severity.
+7. **Milestone boundary reached (M0 → M1)** — an unconditional stop; M1 is far less spec-bound and
    needs the user back in the loop.
-7. **Budget / iteration ceiling** or the 3-consecutive-failure threshold hit.
-8. **Ambiguity the plan doesn't resolve** / low confidence on task selection.
+8. **Budget / iteration ceiling** or the 3-consecutive-failure threshold hit.
+9. **Ambiguity the plan doesn't resolve** / low confidence on task selection.
 
 ## Acceptance criteria (Layer 0)
 
 - `/advance` is invocable and `disable-model-invocation: true` (explicit invoke only, like `/ship`).
-- It reconciles repo/PR/spec state on a cold start before doing anything.
+- It reconciles repo/PR/spec state on a cold start before doing anything, and **gates on a clean
+  working tree first** — a non-empty `git status --porcelain` exits `BLOCKED:dirty-tree` before any
+  branch switch, so a concurrent session's WIP is never disturbed.
 - It performs **at most one** atomic increment, then exits with exactly one status token.
 - On any stop-and-ask condition it exits `BLOCKED:<reason>` and leaves the repo in a clean state
   (draft PR if mid-flight), never force-merging or pushing to `main`.

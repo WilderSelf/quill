@@ -20,7 +20,21 @@ attempt to work around a denied call — treat a denial as a `BLOCKED` signal.
 
 ## 1. RECONCILE (always first — never skip)
 
-Rebuild state cold. Run read-only:
+**1a. Clean-tree gate — check this BEFORE switching branches.** This project's working tree is
+**shared across sessions**: a concurrent session (another `/advance`, or the user editing) may have
+uncommitted work here, and switching branches over it corrupts their state. So the very first thing:
+
+```
+git status --porcelain
+```
+
+If it reports **any** uncommitted or untracked changes, they are **not yours** — every run starts
+cold and has produced nothing yet — so **do not switch branches and do not touch them** →
+`STATUS: BLOCKED:dirty-tree`. The driver notifies the user; the foreign WIP is left exactly as found.
+(For out-of-band work you *must* do while the tree is dirty, use an isolated `git worktree` on a
+different device — e.g. the `/tmp` scratchpad — and stage only your own files.)
+
+**1b. Rebuild state cold** — only once the tree is verified clean. Run read-only:
 
 ```
 git fetch origin --quiet
@@ -124,4 +138,6 @@ findings), then the final status line. Exactly one of:
 - **Idempotent.** Re-running after a merge selects the *next* increment; re-running with an open
   blocking PR reports the blocker, never starts parallel work.
 - **Never** push to `main`, force-push, `--admin`-merge, or enable `--auto` on an unverified gate.
+- **Never switch branches over a dirty shared tree.** Uncommitted changes you didn't make belong to
+  a concurrent session → `BLOCKED:dirty-tree` (see §1a).
 - **Milestone-aware.** M0→M1 is an unconditional `BLOCKED` stop.
