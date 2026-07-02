@@ -54,6 +54,47 @@ pub struct Thread {
     pub frames: Vec<Frame>,
 }
 
+impl Thread {
+    /// A left-to-right chain of `count` equal-width columns spanning the trim area, separated by
+    /// `gutter_pt` of horizontal space, each the full trim height at `y = 0` (spec 0020). Content
+    /// laid into the returned thread via [`lay_out_in_thread`] fills the leftmost column
+    /// top-to-bottom, then the next column, and onto a new page once the last column fills.
+    ///
+    /// A single column (`count == 1`) is the whole trim area — identical to [`Frame::full_page`]
+    /// (the gutter is then irrelevant, there being no interior gutter). Derived from `PageSetup`
+    /// like [`Frame::full_page`]: no authored field, no serialized-model change. Panics if
+    /// `count == 0` (a thread must have at least one frame — loud failure over a silent empty
+    /// thread).
+    pub fn columns(page_setup: &PageSetup, count: usize, gutter_pt: f32) -> Thread {
+        assert!(
+            count >= 1,
+            "a multi-column thread needs at least one column"
+        );
+        let trim_w = page_setup.trim.w_pt;
+        let trim_h = page_setup.trim.h_pt;
+        // Total gutter is between columns only: (count - 1) gutters. What's left divides evenly.
+        let col_w = (trim_w - (count - 1) as f32 * gutter_pt) / count as f32;
+        // A gutter wide enough to consume the trim yields a non-positive column width. Fail loudly
+        // rather than emit negative-width, overlapping frames that would silently corrupt layout
+        // downstream (break_paragraph against a negative width) — see CLAUDE.md's press-safety rule.
+        assert!(
+            col_w > 0.0,
+            "gutter {gutter_pt} pt too large for {count} columns in {trim_w} pt trim (col_w = {col_w})"
+        );
+        let frames = (0..count)
+            .map(|i| Frame {
+                rect: Rect {
+                    x_pt: i as f32 * (col_w + gutter_pt),
+                    y_pt: 0.0,
+                    w_pt: col_w,
+                    h_pt: trim_h,
+                },
+            })
+            .collect();
+        Thread { frames }
+    }
+}
+
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
 ///
@@ -815,6 +856,135 @@ mod tests {
             (frame.h_pt - lines.len() as f32 * BODY_LINE_HEIGHT_PT).abs() < 0.01,
             "height matches the re-wrapped line count (not the stale 1-line height)"
         );
+    }
+
+    #[test]
+    fn single_column_is_the_full_page() {
+        // count == 1 is the whole trim area (== Frame::full_page), regardless of gutter.
+        let page = PageSetup::default();
+        for gutter in [0.0, 12.0, 36.0] {
+            let thread = Thread::columns(&page, 1, gutter);
+            assert_eq!(thread.frames.len(), 1);
+            assert_eq!(
+                thread.frames[0].rect,
+                Frame::full_page(&page).rect,
+                "gutter {gutter}"
+            );
+        }
+    }
+
+    #[test]
+    fn columns_tile_the_trim_width() {
+        // N columns of equal width, separated by (N-1) gutters, exactly span the trim width and are
+        // laid left-to-right without overlap.
+        let page = PageSetup::default();
+        let trim_w = page.trim.w_pt;
+        let gutter = 18.0;
+        for count in [2usize, 3, 4] {
+            let thread = Thread::columns(&page, count, gutter);
+            assert_eq!(thread.frames.len(), count);
+
+            let col_w = thread.frames[0].rect.w_pt;
+            // All columns share the same width.
+            assert!(
+                thread
+                    .frames
+                    .iter()
+                    .all(|f| (f.rect.w_pt - col_w).abs() < 0.01),
+                "count {count}: columns should be equal width"
+            );
+            // N columns + (N-1) gutters span the trim width exactly.
+            let spanned = count as f32 * col_w + (count - 1) as f32 * gutter;
+            assert!(
+                (spanned - trim_w).abs() < 0.01,
+                "count {count}: {spanned} should span trim width {trim_w}"
+            );
+            // Left-to-right, non-overlapping: each column starts one (col_w + gutter) past the last.
+            for i in 1..count {
+                let prev = thread.frames[i - 1].rect;
+                let cur = thread.frames[i].rect;
+                assert!(
+                    (cur.x_pt - (prev.x_pt + col_w + gutter)).abs() < 0.01,
+                    "count {count}: column {i} should follow the gutter after column {}",
+                    i - 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "too large")]
+    fn oversized_gutter_panics_rather_than_corrupting() {
+        // A gutter wide enough to make the column width non-positive must fail loudly, not emit
+        // negative-width overlapping frames (CLAUDE.md: visible failure over silent corruption).
+        let page = PageSetup::default(); // 432 pt trim: two 500 pt gutters can't fit.
+        Thread::columns(&page, 2, 500.0);
+    }
+
+    #[test]
+    fn columns_are_full_height_at_the_top() {
+        let page = PageSetup::default();
+        let thread = Thread::columns(&page, 3, 12.0);
+        for (i, f) in thread.frames.iter().enumerate() {
+            assert_eq!(f.rect.y_pt, 0.0, "column {i} y");
+            assert_eq!(f.rect.h_pt, page.trim.h_pt, "column {i} height");
+        }
+    }
+
+    #[test]
+    fn columns_compose_with_threading() {
+        // A short two-column thread (columns only ~8 lines tall) fed enough blocks to overflow the
+        // first column must continue into the SECOND column on the same page — proving the
+        // constructor composes with lay_out_in_thread to produce real multi-column flow.
+        let page = PageSetup::default();
+        // Full-height columns hold ~54 lines each, too many to overflow cheaply; shrink the height
+        // by rebuilding the thread's frames to 96 pt (8 lines) so 12 blocks overflow column 0.
+        let base = Thread::columns(&page, 2, 18.0);
+        // Keep the constructor's derived x/width; only shrink the height to force overflow.
+        let thread = Thread {
+            frames: base
+                .frames
+                .iter()
+                .map(|f| Frame {
+                    rect: Rect {
+                        h_pt: 96.0,
+                        ..f.rect
+                    },
+                })
+                .collect(),
+        };
+        // The substituted frames must still carry the derived column width (432 − 18)/2 = 207, so a
+        // regression in col_w can't slip past this test.
+        assert!((thread.frames[0].rect.w_pt - 207.0).abs() < 0.01);
+        let content: Vec<Block> = (0..12)
+            .map(|i| Block::Body {
+                text: format!("L{i}"),
+                color: Color::Gray { v: 0.0 },
+            })
+            .collect();
+        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+
+        assert_eq!(
+            pages.len(),
+            1,
+            "12 lines fit two 8-line columns on one page"
+        );
+        let left_x = thread.frames[0].rect.x_pt;
+        let right_x = thread.frames[1].rect.x_pt;
+        let xs: Vec<f32> = pages[0]
+            .blocks
+            .iter()
+            .map(|b| match b {
+                PlacedBlock::Text { frame, .. } => frame.x_pt,
+                PlacedBlock::Image { frame, .. } => frame.x_pt,
+            })
+            .collect();
+        // Partition, not just presence: the 8-line-tall first column holds exactly the first 8
+        // blocks, the remaining 4 overflow into the second column on the same page.
+        let left = xs.iter().filter(|&&x| x == left_x).count();
+        let right = xs.iter().filter(|&&x| x == right_x).count();
+        assert_eq!(left, 8, "left column holds its 8 lines");
+        assert_eq!(right, 4, "the remaining 4 overflow into the right column");
     }
 
     /// Build a minimal document from scratch with the given content blocks and default page setup.
