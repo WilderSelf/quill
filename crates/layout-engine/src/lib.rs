@@ -6,11 +6,40 @@
 //! crates compile and the export pipeline has something to consume. Uses `quill-text-layout`
 //! for line breaking.
 
-use quill_core_model::{Asset, Block, Color, Document, Rect};
+use quill_core_model::{Asset, Block, Color, Document, PageSetup, Rect};
 use quill_text_layout::{
     justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics, BODY_FONT_SIZE_PT,
     BODY_LINE_HEIGHT_PT,
 };
+
+/// A positioned rectangular region that content flows into. The layout engine fills a frame
+/// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
+/// this increment, to the next frame in a thread once threading lands (spec 0019 incr. 2).
+///
+/// Introduced as a seam **at parity**: the frame [`lay_out`] uses is [`Frame::full_page`] (the whole
+/// trim area at the origin), so the produced pages — and every export golden test — are byte-identical
+/// to the pre-frame implicit column. A frame with a non-zero origin, a narrower width, or a shorter
+/// height is the new capability, exercised via [`lay_out_in_frame`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frame {
+    pub rect: Rect,
+}
+
+impl Frame {
+    /// The whole-page content frame: the entire trim area at the origin. This is the frame
+    /// [`lay_out`] uses, so its output is identical to the pre-frame implicit column. Margins/insets
+    /// and multiple frames per page are follow-ups (spec 0019 non-goals).
+    pub fn full_page(page_setup: &PageSetup) -> Frame {
+        Frame {
+            rect: Rect {
+                x_pt: 0.0,
+                y_pt: 0.0,
+                w_pt: page_setup.trim.w_pt,
+                h_pt: page_setup.trim.h_pt,
+            },
+        }
+    }
+}
 
 /// Compute an image's placed size in points from its pixel dimensions and DPI, preserving aspect
 /// ratio and scaling down to fit `content_width` when the natural width is wider. See spec 0009.
@@ -52,8 +81,9 @@ pub struct LaidOutPage {
     pub blocks: Vec<PlacedBlock>,
 }
 
-/// Lay a document out into pages. Paginates: starts a new page when a block would push `y`
-/// past `doc.page_setup.trim.h_pt`. Returns at least one page (even if the document is empty).
+/// Lay a document out into pages, flowing its content into the whole-page frame
+/// ([`Frame::full_page`]). Paginates: starts a new page when a block would pass the frame's bottom
+/// edge (the full trim height here). Returns at least one page (even if the document is empty).
 ///
 /// Text is broken to fit the frame width using the caller-supplied `metrics` (the embedded font in
 /// the export path) at [`BODY_FONT_SIZE_PT`] — see `specs/0015-text-metrics-line-breaking.md` and
@@ -67,14 +97,42 @@ pub fn lay_out(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    let width = doc.page_setup.trim.w_pt;
-    let page_h = doc.page_setup.trim.h_pt;
+    // At parity: the whole trim area at the origin, so the produced pages are byte-identical to the
+    // pre-frame implicit column (spec 0019 incr. 1).
+    lay_out_in_frame(
+        &doc.content,
+        &doc.assets,
+        &Frame::full_page(&doc.page_setup),
+        metrics,
+        hyphenator,
+    )
+}
+
+/// Flow `content` into a single [`Frame`], paginating vertically. Text wraps to the frame width,
+/// blocks are positioned at the frame origin (`frame.rect.x_pt` / `frame.rect.y_pt + local_y`), and
+/// a block overflows to a new page when it would pass the frame's bottom edge — see spec 0019.
+///
+/// Each page repeats the same frame geometry (origin + size); threading distinct frames is a
+/// follow-up (spec 0019 incr. 2). `assets` resolves [`Block::Image`] ids; unknown ids are skipped.
+pub fn lay_out_in_frame(
+    content: &[Block],
+    assets: &[Asset],
+    frame: &Frame,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<LaidOutPage> {
+    let origin_x = frame.rect.x_pt;
+    let origin_y = frame.rect.y_pt;
+    let width = frame.rect.w_pt;
+    // Absolute y at which content overflows: the frame's bottom edge.
+    let bottom = origin_y + frame.rect.h_pt;
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut page = LaidOutPage::default();
-    let mut y: f32 = 0.0;
+    // Cursor is an absolute y, starting at the frame top and reset there on each new page.
+    let mut y: f32 = origin_y;
 
-    for block in &doc.content {
+    for block in content {
         match block {
             Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
                 // Body text is justified for press-quality even spacing; headings stay ragged-left
@@ -95,15 +153,15 @@ pub fn lay_out(
                 let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
 
                 // If this block doesn't fit (and the page already has content), start a new page.
-                if y + height > page_h && !page.blocks.is_empty() {
+                if y + height > bottom && !page.blocks.is_empty() {
                     pages.push(page);
                     page = LaidOutPage::default();
-                    y = 0.0;
+                    y = origin_y;
                 }
 
                 page.blocks.push(PlacedBlock::Text {
                     frame: Rect {
-                        x_pt: 0.0,
+                        x_pt: origin_x,
                         y_pt: y,
                         w_pt: width,
                         h_pt: height,
@@ -115,23 +173,23 @@ pub fn lay_out(
             }
             Block::Image { asset } => {
                 // Resolve the asset id. If not found, skip this block (no panic).
-                let Some(asset_rec) = doc.assets.iter().find(|a| &a.id == asset) else {
+                let Some(asset_rec) = assets.iter().find(|a| &a.id == asset) else {
                     continue;
                 };
 
                 // Size the image from its pixel dimensions and DPI at its true aspect ratio,
-                // scaling down to fit the content width when wider. See spec 0009.
+                // scaling down to fit the frame width when wider. See spec 0009.
                 let (w, h) = image_size(asset_rec, width);
 
-                if y + h > page_h && !page.blocks.is_empty() {
+                if y + h > bottom && !page.blocks.is_empty() {
                     pages.push(page);
                     page = LaidOutPage::default();
-                    y = 0.0;
+                    y = origin_y;
                 }
 
                 page.blocks.push(PlacedBlock::Image {
                     frame: Rect {
-                        x_pt: 0.0,
+                        x_pt: origin_x,
                         y_pt: y,
                         w_pt: w,
                         h_pt: h,
@@ -280,6 +338,179 @@ mod tests {
         assert!(
             heading_lines.iter().all(|l| l.space_adjust_pt == 0.0),
             "headings are ragged-left (never justified)"
+        );
+    }
+
+    /// The `Rect` of the first `PlacedBlock::Text` found across `pages`.
+    fn first_text_frame(pages: &[LaidOutPage]) -> Rect {
+        pages
+            .iter()
+            .flat_map(|p| &p.blocks)
+            .find_map(|b| match b {
+                PlacedBlock::Text { frame, .. } => Some(*frame),
+                _ => None,
+            })
+            .expect("a text block")
+    }
+
+    #[test]
+    fn full_page_frame_is_the_whole_trim_at_origin() {
+        // The seam's parity anchor: Frame::full_page is exactly the trim area at (0,0), which is why
+        // lay_out (which uses it) stays byte-identical to the pre-frame column (spec 0019 incr. 1).
+        let page = PageSetup::default();
+        let frame = Frame::full_page(&page);
+        assert_eq!(frame.rect.x_pt, 0.0);
+        assert_eq!(frame.rect.y_pt, 0.0);
+        assert_eq!(frame.rect.w_pt, page.trim.w_pt);
+        assert_eq!(frame.rect.h_pt, page.trim.h_pt);
+    }
+
+    #[test]
+    fn lay_out_matches_full_page_frame_path() {
+        // lay_out is exactly lay_out_in_frame over the full-page frame — same pages, proving the
+        // wrapper introduces no divergence (parity).
+        let doc = Document::sample();
+        let via_lay_out = lay_out(&doc, &MONO, &NoHyphenator);
+        let via_frame = lay_out_in_frame(
+            &doc.content,
+            &doc.assets,
+            &Frame::full_page(&doc.page_setup),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(via_lay_out, via_frame);
+    }
+
+    #[test]
+    fn frame_origin_offsets_placed_blocks() {
+        // The same single short paragraph, laid full-page vs. into a frame at origin (36, 48). For
+        // content that fits on one page, every placed block shifts by exactly (36, 48).
+        let content = vec![Block::Body {
+            text: "short line".into(),
+            color: Color::Gray { v: 0.0 },
+        }];
+        let assets: Vec<Asset> = vec![];
+        let page = PageSetup::default();
+
+        let full = first_text_frame(&lay_out_in_frame(
+            &content,
+            &assets,
+            &Frame::full_page(&page),
+            &MONO,
+            &NoHyphenator,
+        ));
+        let offset = Frame {
+            rect: Rect {
+                x_pt: 36.0,
+                y_pt: 48.0,
+                w_pt: page.trim.w_pt,
+                h_pt: page.trim.h_pt,
+            },
+        };
+        let shifted = first_text_frame(&lay_out_in_frame(
+            &content,
+            &assets,
+            &offset,
+            &MONO,
+            &NoHyphenator,
+        ));
+
+        assert!(
+            (shifted.x_pt - full.x_pt - 36.0).abs() < 0.01,
+            "x: {} vs {}",
+            shifted.x_pt,
+            full.x_pt
+        );
+        assert!(
+            (shifted.y_pt - full.y_pt - 48.0).abs() < 0.01,
+            "y: {} vs {}",
+            shifted.y_pt,
+            full.y_pt
+        );
+    }
+
+    #[test]
+    fn narrower_frame_wraps_to_more_lines() {
+        // A paragraph that wraps to N lines in the full-page frame wraps to strictly more lines in a
+        // frame half as wide — text respects the frame width, not the page width.
+        let content = vec![Block::Body {
+            text: "goblins raid the village at dusk stealing grain and copper coins from every trembling home nearby".into(),
+            color: Color::Gray { v: 0.0 },
+        }];
+        let assets: Vec<Asset> = vec![];
+        let page = PageSetup::default();
+
+        let wide = first_text_lines(&lay_out_in_frame(
+            &content,
+            &assets,
+            &Frame::full_page(&page),
+            &MONO,
+            &NoHyphenator,
+        ));
+        let narrow_frame = Frame {
+            rect: Rect {
+                x_pt: 0.0,
+                y_pt: 0.0,
+                w_pt: page.trim.w_pt / 2.0,
+                h_pt: page.trim.h_pt,
+            },
+        };
+        let narrow = first_text_lines(&lay_out_in_frame(
+            &content,
+            &assets,
+            &narrow_frame,
+            &MONO,
+            &NoHyphenator,
+        ));
+        assert!(
+            narrow.len() > wide.len(),
+            "narrow frame {} lines should exceed wide frame {} lines",
+            narrow.len(),
+            wide.len()
+        );
+    }
+
+    #[test]
+    fn shorter_frame_paginates_earlier() {
+        // 20 single-line blocks fit on one full-page frame (648 pt / 12 pt = 54 lines). A 60 pt-tall
+        // frame holds only ~5 lines, so the same content spills to multiple pages — overflow is
+        // measured against the frame's bottom edge, not the trim height.
+        let content: Vec<Block> = (0..20)
+            .map(|i| Block::Body {
+                text: format!("L{i}"),
+                color: Color::Gray { v: 0.0 },
+            })
+            .collect();
+        let assets: Vec<Asset> = vec![];
+        let page = PageSetup::default();
+
+        let full = lay_out_in_frame(
+            &content,
+            &assets,
+            &Frame::full_page(&page),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(
+            full.len(),
+            1,
+            "20 lines fit one full page, got {}",
+            full.len()
+        );
+
+        let short_frame = Frame {
+            rect: Rect {
+                x_pt: 0.0,
+                y_pt: 0.0,
+                w_pt: page.trim.w_pt,
+                h_pt: 60.0,
+            },
+        };
+        let short = lay_out_in_frame(&content, &assets, &short_frame, &MONO, &NoHyphenator);
+        assert!(
+            short.len() >= 2,
+            "a 60 pt frame must paginate 20 lines, got {}",
+            short.len()
         );
     }
 
