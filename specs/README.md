@@ -14,5 +14,6 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0002 | [Real PDF/X byte generation](0002-pdf-byte-generation.md) | M0 | implemented |
 | 0003 | [PDF/X-3:2002 output](0003-pdf-x3-output.md) | M0 | implemented |
 | 0004 | [User-supplied font embedding](0004-user-font-embedding.md) | M0 | implemented |
+| 0005 | [Color CMYK image embedding](0005-color-cmyk-images.md) | M0 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).

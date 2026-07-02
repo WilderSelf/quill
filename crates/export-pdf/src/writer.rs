@@ -2,8 +2,9 @@
 //! (PDF/X-1a:2001 or PDF/X-3:2002).
 //!
 //! Consumes laid-out pages plus the document and writes bytes: catalog + pages tree, one page per
-//! `LaidOutPage` (`MediaBox == BleedBox`, centered `TrimBox`), an embedded subset font, grayscale
-//! image XObjects, the ICC `OutputIntent`, and the XMP identification packet. Both X-1a:2001 and
+//! `LaidOutPage` (`MediaBox == BleedBox`, centered `TrimBox`), an embedded subset font, image
+//! XObjects (grayscale `/DeviceGray` or color `/DeviceCMYK`), the ICC `OutputIntent`, and the XMP
+//! identification packet. Both X-1a:2001 and
 //! X-3:2002 pin the header to **PDF 1.3**; the only per-level difference the trivial layout
 //! reaches is the `GTS_PDFX*` identification strings.
 
@@ -15,9 +16,11 @@ use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, TrappingStatus};
 use pdf_writer::writers::OutputIntent;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
+use quill_color::RgbToCmyk;
 use quill_core_model::{Color, Document};
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 
+use crate::images::Pixels;
 use crate::{fonts, geom, icc, images, ExportError, ExportOptions};
 
 /// Body/heading font size and line advance, in points. Mirrors the layout engine's line-height
@@ -57,6 +60,9 @@ pub fn write_pdf(
         .map_err(|e| ExportError::Icc(format!("reading '{}': {e}", opts.output_intent_icc)))?;
     icc::check_icc(&icc_bytes).map_err(ExportError::Icc)?;
 
+    // Color images are converted to CMYK against the OutputIntent profile (spec 0005).
+    let cmyk = RgbToCmyk::from_output_profile(&icc_bytes);
+
     // Decode each distinct placed image once (missing/unsupported → skipped).
     let base_dir = Path::new(".");
     let mut images_by_id: BTreeMap<String, ImageObj> = BTreeMap::new();
@@ -67,13 +73,13 @@ pub fn write_pdf(
                     continue;
                 }
                 if let Some(asset) = doc.assets.iter().find(|a| &a.id == asset_id) {
-                    if let Some(img) = images::resolve(asset, base_dir) {
+                    if let Some(img) = images::resolve(asset, base_dir, &cmyk) {
                         let idx = images_by_id.len();
                         images_by_id.insert(
                             asset_id.clone(),
                             ImageObj {
                                 name: format!("Im{idx}"),
-                                gray: img.gray,
+                                pixels: img.pixels,
                                 width: img.width,
                                 height: img.height,
                                 id: Ref::new(1), // placeholder, assigned below
@@ -167,13 +173,20 @@ pub fn write_pdf(
         fontfile_id,
     );
 
-    // Image XObjects.
+    // Image XObjects: grayscale as /DeviceGray, color as /DeviceCMYK (spec 0005).
     for img in images_by_id.values() {
-        let compressed = deflate(&img.gray);
+        let bytes = match &img.pixels {
+            Pixels::Gray(g) => g,
+            Pixels::Cmyk(c) => c,
+        };
+        let compressed = deflate(bytes);
         let mut xobj = pdf.image_xobject(img.id, &compressed);
         xobj.width(img.width as i32);
         xobj.height(img.height as i32);
-        xobj.color_space().device_gray();
+        match img.pixels {
+            Pixels::Gray(_) => xobj.color_space().device_gray(),
+            Pixels::Cmyk(_) => xobj.color_space().device_cmyk(),
+        };
         xobj.bits_per_component(8);
         xobj.filter(Filter::FlateDecode);
         xobj.finish();
@@ -227,7 +240,7 @@ pub fn write_pdf(
 /// A decoded image plus its assigned reference and content-stream name.
 struct ImageObj {
     name: String,
-    gray: Vec<u8>,
+    pixels: Pixels,
     width: u32,
     height: u32,
     id: Ref,
