@@ -21,6 +21,7 @@ pdf-writer = { workspace = true }
 subsetter = { workspace = true }
 ttf-parser = { workspace = true }
 rustybuzz = { workspace = true }
+hypher = { workspace = true }
 lcms2 = { workspace = true }
 png = { workspace = true }
 jpeg-decoder = { workspace = true }
