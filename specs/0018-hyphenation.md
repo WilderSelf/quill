@@ -1,7 +1,8 @@
 # 0018 — Hyphenation (Knuth-Liang, en-US)
 
 - **Milestone:** M1
-- **Status:** accepted (decomposed into two risk-ordered increments; neither implemented yet)
+- **Status:** in-progress (increment 1 implemented — penalty item stream + `Hyphenator` seam at
+  parity; increment 2 — real en-US `hypher` hyphenation + rendered hyphen — pending)
 - **Crates:** `quill-text-layout` (owner), `quill-layout-engine`, `quill-export-pdf`
 
 ## Problem
