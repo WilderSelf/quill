@@ -13,8 +13,11 @@ code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
 tables). The **M1** arc (shaping → Knuth-Plass justification → hyphenation → text frames/threading
-→ master pages → incremental layout → perf harness → screen render) is now open; it begins with
-**spec 0016 (rustybuzz shaping)** on the `CharMetrics`/`break_by_width` seam that spec 0015 built.
+→ master pages → incremental layout → perf harness → screen render) is well underway: shaping
+(0016), Knuth-Plass justification (0017), hyphenation (0018), text frames/threading (0019),
+multi-column threads (0020), and linked-image proxy pixels (0021–0023) have shipped. Next up are
+master pages, incremental dependency-tracked layout, the perf harness, and screen render — plus the
+`core-model` data-model + `FORMAT_VERSION` work that persisting frames/styles/master pages requires.
 The authoritative design is the approved plan at
 `~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before making architectural
 decisions. This file summarizes the parts that shape day-to-day work.

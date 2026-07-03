@@ -23,7 +23,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0011 | [CFF / OpenType-CFF (.otf) font embedding](0011-cff-font-embedding.md) | M0 | implemented |
 | 0012 | [CMYK JPEG input](0012-cmyk-jpeg-input.md) | M0 | implemented |
 | 0013 | [Bleed single source of truth](0013-bleed-single-source.md) | M0 | implemented |
-| 0015 | [Real width-based line breaking (font metrics)](0015-text-metrics-line-breaking.md) | M0 | in-progress |
+| 0015 | [Real width-based line breaking (font metrics)](0015-text-metrics-line-breaking.md) | M0 | implemented |
 | 0016 | [Rustybuzz text shaping (kerning/ligature measurement)](0016-rustybuzz-shaping.md) | M1 | implemented |
 | 0017 | [Knuth-Plass optimal line breaking](0017-knuth-plass-line-breaking.md) | M1 | implemented |
 | 0018 | [Hyphenation (Knuth-Liang, en-US)](0018-hyphenation.md) | M1 | implemented |
