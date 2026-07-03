@@ -8,3 +8,6 @@ authors.workspace = true
 
 # The GPU canvas (`skia-safe`, evaluating `vello`) arrives in a later spec-driven commit.
 [dependencies]
+# Screen-proxy decode reuses the workspace's existing targeted PNG decoder (spec 0021) rather than
+# the umbrella `image` crate, keeping the dep graph minimal and permissive (MIT/Apache).
+png = { workspace = true }
