@@ -534,6 +534,7 @@ version = "0.0.0"
 dependencies = [
  "jpeg-decoder",
  "png",
+ "quill-core-model",
 ]
 
 [[package]]

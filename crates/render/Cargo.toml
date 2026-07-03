@@ -12,3 +12,6 @@ authors.workspace = true
 # rather than the umbrella `image` crate, keeping the dep graph minimal and permissive (MIT/Apache).
 png = { workspace = true }
 jpeg-decoder = { workspace = true }
+# For `Asset` — populating the proxy cache from a document's linked-asset list (spec 0023). Internal,
+# acyclic: `core-model` is the base crate and `render` is downstream of it in the data flow.
+quill-core-model = { workspace = true }
