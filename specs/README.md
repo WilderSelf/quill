@@ -27,10 +27,10 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0016 | [Rustybuzz text shaping (kerning/ligature measurement)](0016-rustybuzz-shaping.md) | M1 | implemented |
 | 0017 | [Knuth-Plass optimal line breaking](0017-knuth-plass-line-breaking.md) | M1 | implemented |
 | 0018 | [Hyphenation (Knuth-Liang, en-US)](0018-hyphenation.md) | M1 | implemented |
-| 0019 | [Text frames + threading](0019-text-frames-threading.md) | M1 | in-progress |
-| 0020 | [Multi-column thread from page setup](0020-multi-column-thread.md) | M1 | in-progress |
-| 0021 | [Linked-image proxy pixels (PNG)](0021-png-proxy-pixels.md) | M1 | in-progress |
-| 0022 | [Linked-image proxy pixels (JPEG)](0022-jpeg-proxy-pixels.md) | M1 | in-progress |
-| 0023 | [Populate the proxy cache from a document's linked assets](0023-proxy-cache-from-assets.md) | M1 | in-progress |
+| 0019 | [Text frames + threading](0019-text-frames-threading.md) | M1 | implemented |
+| 0020 | [Multi-column thread from page setup](0020-multi-column-thread.md) | M1 | implemented |
+| 0021 | [Linked-image proxy pixels (PNG)](0021-png-proxy-pixels.md) | M1 | implemented |
+| 0022 | [Linked-image proxy pixels (JPEG)](0022-jpeg-proxy-pixels.md) | M1 | implemented |
+| 0023 | [Populate the proxy cache from a document's linked assets](0023-proxy-cache-from-assets.md) | M1 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
