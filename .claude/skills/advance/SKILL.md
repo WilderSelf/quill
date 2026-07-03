@@ -37,7 +37,7 @@ different device — e.g. the `/tmp` scratchpad — and stage only your own file
 **1b. Rebuild state cold** — only once the tree is verified clean. Run read-only:
 
 ```
-git fetch origin --quiet
+git fetch origin --prune --quiet
 git switch main && git pull --ff-only origin main
 gh pr list --state open --json number,title,headRefName,isDraft,mergeStateStatus,statusCheckRollup
 ```
@@ -50,6 +50,29 @@ Interpret **before touching anything**:
   - **open, checks pending/queued** → CI hasn't finished. Do nothing. `STATUS: NOTHING_TO_DO` (the next tick rechecks; *pending is never done*).
   - **open, checks green, not yet merged** → confirm `--auto` merge is enabled; if the gate is verified and it is, `STATUS: NOTHING_TO_DO` (server-side merge is imminent). If `--auto` is not enabled and the gate is verified, enable it, then `STATUS: NOTHING_TO_DO`.
 - **No open harness PR** → the previous increment merged (or none started). Proceed to SELECT.
+
+**1c. Prune merged branches + worktrees (squash-safe — do this every reconcile).** PRs merge via
+**squash**, so a merged branch's tip is *never* an ancestor of `main` — `git branch --merged` will
+**not** list it, and stale `feat/*`/`docs/*` branches (and their `/tmp` worktrees) accumulate. Do
+**not** use `git branch --merged`; use PR/remote state, which is squash-correct. Never delete a
+branch with an **open** PR (a concurrent session's in-flight or draft work) or unpushed local-only
+work:
+
+```
+git worktree prune                                   # drop admin entries for gone worktree dirs
+# (a) remote branch was deleted by `--delete-branch` → local upstream shows "gone":
+git branch -vv | awk '/: gone]/{print $1}' | grep -vx main | xargs -r git branch -D
+# (b) PR merged but its remote branch survived deletion (like #50): match by headRefName:
+for b in $(gh pr list --state merged --limit 50 --json headRefName --jq '.[].headRefName'); do
+  [ "$b" = main ] && continue
+  git show-ref --verify --quiet "refs/heads/$b" && git branch -D "$b"
+  git ls-remote --exit-code --heads origin "$b" >/dev/null 2>&1 && git push origin --delete "$b"
+done
+```
+
+`git branch -D` is safe here: git refuses to delete a branch checked out in another worktree, and
+we only target branches whose PR is **merged** or whose upstream is **gone**. (`git push origin
+--delete` is *not* a `main`/force push, so it clears the deny list.)
 
 Only ever pin CI status to the **head SHA** of the PR (`statusCheckRollup` is already head-pinned
 in the query above). Never resolve "latest run by workflow name" — that watches stale results.
@@ -144,8 +167,13 @@ Route each learning to its home:
   durable learning here is a real repo change. Land **at most one** small capture PR per run via the
   same gated `/ship`-inline flow (§3) — `docs:`/`chore:` commit, gate-verified `--auto` merge. Never
   push config straight to `main`. If there's no repo-tracked learning, skip this.
-- **`/handoff`** — optional and low-risk (writes the untracked `HANDOFF.md`). Refresh it if the run
-  produced state worth bridging; otherwise skip.
+- **`/handoff`** — **refresh `HANDOFF.md` whenever an increment merged (i.e. `main` advanced)**, not
+  "optionally." A skipped refresh is exactly how it went stale (pointed at a merged PR as still-open,
+  13 commits behind). Execute the `/handoff` pipeline inline (it's `disable-model-invocation`): it is
+  **re-verify-live, not carry-forward** — restate repo/PR/gate state from `git`/`gh` as of *now*,
+  never copy the previous `HANDOFF.md`'s claims. The file is untracked/gitignored, so this is a
+  local write, no PR. Skip only when nothing merged this run (`NOTHING_TO_DO`/`BLOCKED` with no
+  merge).
 
 **Still don't guess.** Auto-accept covers *applying your own proposals*, not resolving genuine
 judgment calls: a `/curate`-flagged **contradiction**, an architectural learning, or anything that

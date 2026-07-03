@@ -150,6 +150,12 @@ was prose the model was "supposed to obey." Enforcement must be structural:
 - It executes `/ship`'s documented pipeline inline (not via the Skill tool) rather than
   maintaining a divergent copy, and runs `/reflect`+`/curate` inline **autonomously**, auto-applying
   learnings to memory/config (surfacing, not auto-resolving, contradictions/architectural calls).
+- Reconcile is **self-cleaning**: it prunes worktrees and local/remote branches whose PR has
+  **merged** — using PR/upstream state, *not* `git branch --merged` (squash-merge makes a merged
+  branch's tip a non-ancestor of `main`, so `--merged` misses it). Open/draft-PR and unpushed
+  branches are never deleted (§1c).
+- `HANDOFF.md` is **refreshed on every merged increment** by the wrap tail, re-verified live (never
+  carried forward), so it can't drift stale as it did (merged PR shown as open, 13 commits behind).
 
 ## Build order (each its own atomic increment)
 
