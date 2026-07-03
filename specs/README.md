@@ -32,5 +32,6 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0021 | [Linked-image proxy pixels (PNG)](0021-png-proxy-pixels.md) | M1 | implemented |
 | 0022 | [Linked-image proxy pixels (JPEG)](0022-jpeg-proxy-pixels.md) | M1 | implemented |
 | 0023 | [Populate the proxy cache from a document's linked assets](0023-proxy-cache-from-assets.md) | M1 | implemented |
+| 0024 | [Incremental proxy-cache invalidation (skip unchanged assets)](0024-proxy-cache-invalidation.md) | M1 | in-progress |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).

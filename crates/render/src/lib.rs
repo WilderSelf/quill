@@ -8,6 +8,7 @@
 use quill_core_model::Asset;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::SystemTime;
 
 /// Longest edge, in pixels, for cached on-screen image proxies.
 pub const PROXY_MAX_EDGE_PX: u32 = 2048;
@@ -206,11 +207,53 @@ fn downsample_rgba(src: &Rgba8) -> Proxy {
     }
 }
 
+/// A cheap signature of a linked source file — `mtime + size` from a single `stat`, never the file
+/// body. `populate_from_assets` reuses a cached proxy when the file's current signature still equals
+/// the one stored when the proxy was generated, so re-populating a 500-page doc is hundreds of
+/// `stat`s, not hundreds of decodes. `mtime + size` deliberately misses a same-size, same-mtime
+/// in-place edit — content-hash invalidation is a named follow-up (spec 0024 non-goal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceSig {
+    mtime: SystemTime,
+    len: u64,
+}
+
+/// The `mtime + size` signature of `path`, or `None` if it can't be `stat`ed / has no modification
+/// time (missing file, or a platform without mtime). A `None` never equals a stored signature, so
+/// the asset is treated as changed and regenerated.
+fn source_sig(path: &Path) -> Option<SourceSig> {
+    let md = std::fs::metadata(path).ok()?;
+    Some(SourceSig {
+        mtime: md.modified().ok()?,
+        len: md.len(),
+    })
+}
+
+/// A cached proxy plus the source signature it was generated from. Byte-fed inserts
+/// (`insert_png` / `insert_jpeg` / `insert_image`) carry no path, so their `sig` is `None`.
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    proxy: Proxy,
+    sig: Option<SourceSig>,
+}
+
+/// Outcome counts for one [`ProxyCache::populate_from_assets`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PopulateReport {
+    /// Assets decoded fresh this call — new, or their source file changed since last cached.
+    pub generated: usize,
+    /// Assets whose cached proxy was reused because the source file was unchanged (no decode).
+    pub reused: usize,
+    /// Assets with no proxy this call — missing, unreadable, or unsupported/undecodable. Any proxy
+    /// cached for that id on a prior call is left intact (a vanished link shows its last-known art).
+    pub skipped: usize,
+}
+
 /// Holds the decoded, downsampled screen proxy for each linked asset, so the on-screen renderer
 /// composites small proxies instead of full-resolution art.
 #[derive(Debug, Default)]
 pub struct ProxyCache {
-    proxies: HashMap<String, Proxy>,
+    proxies: HashMap<String, CacheEntry>,
 }
 
 impl ProxyCache {
@@ -224,7 +267,8 @@ impl ProxyCache {
     pub fn insert_png(&mut self, asset_id: &str, bytes: &[u8]) -> bool {
         match decode_png_proxy(bytes) {
             Some(proxy) => {
-                self.proxies.insert(asset_id.to_string(), proxy);
+                self.proxies
+                    .insert(asset_id.to_string(), CacheEntry { proxy, sig: None });
                 true
             }
             None => false,
@@ -237,7 +281,8 @@ impl ProxyCache {
     pub fn insert_jpeg(&mut self, asset_id: &str, bytes: &[u8]) -> bool {
         match decode_jpeg_proxy(bytes) {
             Some(proxy) => {
-                self.proxies.insert(asset_id.to_string(), proxy);
+                self.proxies
+                    .insert(asset_id.to_string(), CacheEntry { proxy, sig: None });
                 true
             }
             None => false,
@@ -250,7 +295,8 @@ impl ProxyCache {
     pub fn insert_image(&mut self, asset_id: &str, bytes: &[u8]) -> bool {
         match decode_image_proxy(bytes) {
             Some(proxy) => {
-                self.proxies.insert(asset_id.to_string(), proxy);
+                self.proxies
+                    .insert(asset_id.to_string(), CacheEntry { proxy, sig: None });
                 true
             }
             None => false,
@@ -258,27 +304,48 @@ impl ProxyCache {
     }
 
     /// Read and cache a screen proxy for each asset, resolving `asset.path` against `base_dir` (the
-    /// document's asset root). Each cached proxy is keyed by the asset's `id`.
+    /// document's asset root), **skipping the decode for any asset whose source file is unchanged**
+    /// since it was last cached (by `mtime + size`; see [`SourceSig`]). Each proxy is keyed by the
+    /// asset's `id`.
     ///
     /// Missing, unreadable, or unsupported files are **skipped, not fatal** — a broken image link
-    /// must not abort loading a 500-page document. Returns the number of proxies successfully
-    /// generated. Re-running replaces existing entries.
-    pub fn populate_from_assets(&mut self, assets: &[Asset], base_dir: &Path) -> usize {
-        let mut generated = 0;
+    /// must not abort loading a 500-page document, and does not evict a proxy cached on a prior
+    /// call. Returns a [`PopulateReport`] partitioning the assets into generated / reused / skipped.
+    pub fn populate_from_assets(&mut self, assets: &[Asset], base_dir: &Path) -> PopulateReport {
+        let mut report = PopulateReport::default();
         for asset in assets {
-            let Ok(bytes) = std::fs::read(base_dir.join(&asset.path)) else {
-                continue; // missing / unreadable link — skip, don't fail the load
+            let path = base_dir.join(&asset.path);
+            let sig = source_sig(&path);
+
+            // Reuse only when the file's current signature reads back byte-identical to the one the
+            // cached proxy was generated from. A `None` signature (unstat-able, or a byte-fed entry)
+            // never matches, so the asset falls through to a (re)decode.
+            if let (Some(sig), Some(entry)) = (sig, self.proxies.get(&asset.id)) {
+                if entry.sig == Some(sig) {
+                    report.reused += 1;
+                    continue;
+                }
+            }
+
+            let Ok(bytes) = std::fs::read(&path) else {
+                report.skipped += 1; // missing / unreadable link — skip, don't fail the load
+                continue;
             };
-            if self.insert_image(&asset.id, &bytes) {
-                generated += 1;
+            match decode_image_proxy(&bytes) {
+                Some(proxy) => {
+                    self.proxies
+                        .insert(asset.id.clone(), CacheEntry { proxy, sig });
+                    report.generated += 1;
+                }
+                None => report.skipped += 1, // unsupported / undecodable — leave any prior proxy
             }
         }
-        generated
+        report
     }
 
     /// The cached proxy for an asset, if present.
     pub fn get(&self, asset_id: &str) -> Option<&Proxy> {
-        self.proxies.get(asset_id)
+        self.proxies.get(asset_id).map(|entry| &entry.proxy)
     }
 }
 
@@ -557,9 +624,11 @@ mod tests {
 
         let assets = [asset("map", "map.png"), asset("photo", "photo.jpg")];
         let mut cache = ProxyCache::new();
-        let n = cache.populate_from_assets(&assets, &dir);
+        let report = cache.populate_from_assets(&assets, &dir);
 
-        assert_eq!(n, 2, "both linked images generate a proxy");
+        assert_eq!(report.generated, 2, "both linked images generate a proxy");
+        assert_eq!(report.reused, 0);
+        assert_eq!(report.skipped, 0);
         assert_eq!(
             cache.get("map").map(|p| (p.width, p.height)),
             Some((12, 10))
@@ -588,12 +657,186 @@ mod tests {
             asset("text", "notes.txt"),
         ];
         let mut cache = ProxyCache::new();
-        let n = cache.populate_from_assets(&assets, &dir);
+        let report = cache.populate_from_assets(&assets, &dir);
 
-        assert_eq!(n, 1, "only the readable, decodable asset counts");
+        assert_eq!(
+            report.generated, 1,
+            "only the readable, decodable asset counts"
+        );
+        assert_eq!(report.skipped, 2, "missing + non-image are both skipped");
+        assert_eq!(report.reused, 0);
         assert!(cache.get("ok").is_some());
         assert!(cache.get("gone").is_none(), "missing file skipped");
         assert!(cache.get("text").is_none(), "non-image skipped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_assets_are_reused_not_redecoded() {
+        // Two untouched files, populated twice. The second pass must reuse both by signature —
+        // generated == 0, reused == 2 — with the proxies still available.
+        let dir = temp_dir("reuse");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.png"),
+            encode_png(6, 6, png::ColorType::Rgba, &[9u8; 6 * 6 * 4]),
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.jpg"), TEST_JPEG_RGB).unwrap();
+
+        let assets = [asset("a", "a.png"), asset("b", "b.jpg")];
+        let mut cache = ProxyCache::new();
+
+        let first = cache.populate_from_assets(&assets, &dir);
+        assert_eq!(first.generated, 2);
+
+        let second = cache.populate_from_assets(&assets, &dir);
+        assert_eq!(second.reused, 2, "unchanged files reused, not re-decoded");
+        assert_eq!(second.generated, 0);
+        assert_eq!(second.skipped, 0);
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("b").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_asset_is_regenerated_sibling_reused() {
+        // Overwrite one file with a different-DIMENSION image: the byte length changes, so the
+        // signature differs regardless of mtime granularity — a deterministic "changed" signal. The
+        // untouched sibling must be reused in the same pass, and the changed proxy reflect new dims.
+        let dir = temp_dir("change");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("hero.png"),
+            encode_png(4, 4, png::ColorType::Rgba, &[1u8; 4 * 4 * 4]),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bg.png"),
+            encode_png(5, 5, png::ColorType::Rgba, &[2u8; 5 * 5 * 4]),
+        )
+        .unwrap();
+
+        let assets = [asset("hero", "hero.png"), asset("bg", "bg.png")];
+        let mut cache = ProxyCache::new();
+        assert_eq!(cache.populate_from_assets(&assets, &dir).generated, 2);
+        assert_eq!(cache.get("hero").map(|p| (p.width, p.height)), Some((4, 4)));
+
+        // Change only hero, to a clearly different size (16×20 ≠ 4×4 in byte length).
+        std::fs::write(
+            dir.join("hero.png"),
+            encode_png(16, 20, png::ColorType::Rgba, &[3u8; 16 * 20 * 4]),
+        )
+        .unwrap();
+
+        let report = cache.populate_from_assets(&assets, &dir);
+        assert_eq!(report.generated, 1, "only the changed file is re-decoded");
+        assert_eq!(report.reused, 1, "the untouched sibling is reused");
+        assert_eq!(
+            cache.get("hero").map(|p| (p.width, p.height)),
+            Some((16, 20)),
+            "the regenerated proxy reflects the new source dimensions"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_asset_between_calls_is_generated_others_reused() {
+        // A second populate that adds a new asset generates only the newcomer; carried-over assets
+        // are reused.
+        let dir = temp_dir("newcomer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("one.png"),
+            encode_png(4, 4, png::ColorType::Rgb, &[1u8; 4 * 4 * 3]),
+        )
+        .unwrap();
+        let mut cache = ProxyCache::new();
+        assert_eq!(
+            cache
+                .populate_from_assets(&[asset("one", "one.png")], &dir)
+                .generated,
+            1
+        );
+
+        std::fs::write(
+            dir.join("two.png"),
+            encode_png(7, 7, png::ColorType::Rgb, &[2u8; 7 * 7 * 3]),
+        )
+        .unwrap();
+        let report =
+            cache.populate_from_assets(&[asset("one", "one.png"), asset("two", "two.png")], &dir);
+        assert_eq!(report.generated, 1, "only the new asset is decoded");
+        assert_eq!(report.reused, 1, "the carried-over asset is reused");
+        assert!(cache.get("two").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_fed_entry_is_regenerated_by_a_later_populate() {
+        // A byte-fed insert (`insert_png`) stores `sig: None`, which never equals a file's real
+        // signature — so a later `populate_from_assets` for the same id must *generate* (read from
+        // disk), not falsely reuse the signature-less entry. Locks the invariant the spec calls out.
+        let dir = temp_dir("bytefed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = ProxyCache::new();
+        assert!(cache.insert_png(
+            "hero",
+            &encode_png(3, 3, png::ColorType::Rgb, &[1u8; 3 * 3 * 3])
+        ));
+
+        // The on-disk file for the same id is a different size, so a false reuse would be visible.
+        std::fs::write(
+            dir.join("hero.png"),
+            encode_png(11, 9, png::ColorType::Rgb, &[2u8; 11 * 9 * 3]),
+        )
+        .unwrap();
+
+        let report = cache.populate_from_assets(&[asset("hero", "hero.png")], &dir);
+        assert_eq!(
+            report.generated, 1,
+            "byte-fed (sig: None) entry is regenerated, not reused"
+        );
+        assert_eq!(report.reused, 0);
+        assert_eq!(
+            cache.get("hero").map(|p| (p.width, p.height)),
+            Some((11, 9)),
+            "the file-backed proxy replaced the byte-fed one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanished_link_is_skipped_without_evicting_prior_proxy() {
+        // A file cached on the first pass, then deleted, must be counted `skipped` on the next pass
+        // — but its previously cached proxy is left intact (show last-known art, don't blank it).
+        let dir = temp_dir("vanish");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("art.png");
+        std::fs::write(
+            &file,
+            encode_png(8, 8, png::ColorType::Rgb, &[5u8; 8 * 8 * 3]),
+        )
+        .unwrap();
+
+        let assets = [asset("art", "art.png")];
+        let mut cache = ProxyCache::new();
+        assert_eq!(cache.populate_from_assets(&assets, &dir).generated, 1);
+
+        std::fs::remove_file(&file).unwrap();
+        let report = cache.populate_from_assets(&assets, &dir);
+        assert_eq!(report.skipped, 1, "the vanished link is skipped");
+        assert_eq!(report.generated, 0);
+        assert_eq!(report.reused, 0);
+        assert!(
+            cache.get("art").is_some(),
+            "the prior proxy survives a vanished link"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
