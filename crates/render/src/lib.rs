@@ -5,7 +5,9 @@
 //! so full-resolution art is only touched at export — which is central to staying fast on 500-page,
 //! image-heavy books. PNG proxies land first (spec 0021); JPEG/other formats are later increments.
 
+use quill_core_model::Asset;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Longest edge, in pixels, for cached on-screen image proxies.
 pub const PROXY_MAX_EDGE_PX: u32 = 2048;
@@ -106,6 +108,21 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<Rgba8> {
 pub fn decode_jpeg_proxy(bytes: &[u8]) -> Option<Proxy> {
     let src = decode_jpeg_rgba(bytes)?;
     Some(downsample_rgba(&src))
+}
+
+/// Decode PNG or JPEG image `bytes` into a screen [`Proxy`], dispatched on the leading magic bytes
+/// (mirrors `export-pdf`'s `decode`): `\x89PNG…` → [`decode_png_proxy`], `\xFF\xD8\xFF` →
+/// [`decode_jpeg_proxy`]. Returns `None` for unknown/unsupported formats or any decode failure — a
+/// missing screen proxy is recoverable (skip, don't panic). Dispatch is by content, not by any
+/// filename extension.
+pub fn decode_image_proxy(bytes: &[u8]) -> Option<Proxy> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        decode_png_proxy(bytes)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        decode_jpeg_proxy(bytes)
+    } else {
+        None
+    }
 }
 
 /// Decode JPEG bytes to full-resolution RGBA8, or `None` on a decode error or an unhandled pixel
@@ -225,6 +242,38 @@ impl ProxyCache {
             }
             None => false,
         }
+    }
+
+    /// Sniff `bytes` (PNG or JPEG, by magic bytes) and cache the resulting [`Proxy`] under
+    /// `asset_id`. Returns `false` (and stores nothing) when the bytes aren't a supported, decodable
+    /// image, so a bad asset can't evict or corrupt a previously cached proxy.
+    pub fn insert_image(&mut self, asset_id: &str, bytes: &[u8]) -> bool {
+        match decode_image_proxy(bytes) {
+            Some(proxy) => {
+                self.proxies.insert(asset_id.to_string(), proxy);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Read and cache a screen proxy for each asset, resolving `asset.path` against `base_dir` (the
+    /// document's asset root). Each cached proxy is keyed by the asset's `id`.
+    ///
+    /// Missing, unreadable, or unsupported files are **skipped, not fatal** — a broken image link
+    /// must not abort loading a 500-page document. Returns the number of proxies successfully
+    /// generated. Re-running replaces existing entries.
+    pub fn populate_from_assets(&mut self, assets: &[Asset], base_dir: &Path) -> usize {
+        let mut generated = 0;
+        for asset in assets {
+            let Ok(bytes) = std::fs::read(base_dir.join(&asset.path)) else {
+                continue; // missing / unreadable link — skip, don't fail the load
+            };
+            if self.insert_image(&asset.id, &bytes) {
+                generated += 1;
+            }
+        }
+        generated
     }
 
     /// The cached proxy for an asset, if present.
@@ -383,7 +432,7 @@ mod tests {
 
     #[test]
     fn cache_insert_and_get_round_trip() {
-        let png = encode_png(16, 16, png::ColorType::Rgba, &vec![10u8; 16 * 16 * 4]);
+        let png = encode_png(16, 16, png::ColorType::Rgba, &[10u8; 16 * 16 * 4]);
         let mut cache = ProxyCache::new();
         assert!(cache.insert_png("hero", &png));
         let proxy = cache.get("hero").expect("cached");
@@ -443,6 +492,110 @@ mod tests {
         let proxy = cache.get("photo").expect("cached");
         assert_eq!((proxy.width, proxy.height), (8, 8));
         assert_eq!(proxy.rgba.len(), 8 * 8 * 4);
+    }
+
+    /// A unique-per-process temp dir for a test, so a stale dir from an aborted run or a concurrent
+    /// runner can't collide (the process id disambiguates; `name` disambiguates within a process).
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("quill_render_0023_{name}_{}", std::process::id()))
+    }
+
+    /// A minimal `Asset` referencing `path` under an id; only id/path matter for proxy generation.
+    fn asset(id: &str, path: &str) -> Asset {
+        Asset {
+            id: id.into(),
+            path: path.into(),
+            px_w: 0,
+            px_h: 0,
+            dpi: 0.0,
+            line_art: false,
+            has_alpha: false,
+        }
+    }
+
+    #[test]
+    fn decode_image_proxy_dispatches_on_magic_bytes() {
+        let png = encode_png(4, 4, png::ColorType::Rgba, &[7u8; 4 * 4 * 4]);
+        assert!(
+            decode_image_proxy(&png).is_some(),
+            "PNG signature → png proxy"
+        );
+        assert!(
+            decode_image_proxy(TEST_JPEG_RGB).is_some(),
+            "JPEG SOI → jpeg proxy"
+        );
+        assert!(
+            decode_image_proxy(b"GIF89a not supported").is_none(),
+            "unknown magic → None"
+        );
+    }
+
+    #[test]
+    fn insert_image_sniffs_and_round_trips() {
+        let png = encode_png(5, 6, png::ColorType::Rgb, &[3u8; 5 * 6 * 3]);
+        let mut cache = ProxyCache::new();
+        assert!(cache.insert_image("a", &png));
+        assert_eq!(cache.get("a").map(|p| (p.width, p.height)), Some((5, 6)));
+        assert!(!cache.insert_image("b", b"not an image"));
+        assert!(cache.get("b").is_none());
+
+        // Re-inserting the same id replaces the cached proxy (spec: "re-running replaces entries").
+        let bigger = encode_png(9, 9, png::ColorType::Rgb, &[4u8; 9 * 9 * 3]);
+        assert!(cache.insert_image("a", &bigger));
+        assert_eq!(cache.get("a").map(|p| (p.width, p.height)), Some((9, 9)));
+    }
+
+    #[test]
+    fn populate_from_assets_reads_real_files() {
+        // Write a real PNG and a real JPEG into a temp dir; two assets reference them by relative
+        // path. populate_from_assets must read both and cache a proxy keyed by each asset id.
+        let dir = temp_dir("populate_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = encode_png(12, 10, png::ColorType::Rgba, &[9u8; 12 * 10 * 4]);
+        std::fs::write(dir.join("map.png"), &png).unwrap();
+        std::fs::write(dir.join("photo.jpg"), TEST_JPEG_RGB).unwrap();
+
+        let assets = [asset("map", "map.png"), asset("photo", "photo.jpg")];
+        let mut cache = ProxyCache::new();
+        let n = cache.populate_from_assets(&assets, &dir);
+
+        assert_eq!(n, 2, "both linked images generate a proxy");
+        assert_eq!(
+            cache.get("map").map(|p| (p.width, p.height)),
+            Some((12, 10))
+        );
+        assert_eq!(
+            cache.get("photo").map(|p| (p.width, p.height)),
+            Some((8, 8))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn populate_from_assets_skips_missing_and_unsupported() {
+        // One good PNG, one missing file, one non-image file. Only the good one is counted/cached;
+        // no panic on the broken links (a broken link must not abort loading a 500-page doc).
+        let dir = temp_dir("populate_skip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = encode_png(4, 4, png::ColorType::Rgb, &[1u8; 4 * 4 * 3]);
+        std::fs::write(dir.join("ok.png"), &png).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"this is not an image").unwrap();
+
+        let assets = [
+            asset("ok", "ok.png"),
+            asset("gone", "does-not-exist.png"),
+            asset("text", "notes.txt"),
+        ];
+        let mut cache = ProxyCache::new();
+        let n = cache.populate_from_assets(&assets, &dir);
+
+        assert_eq!(n, 1, "only the readable, decodable asset counts");
+        assert!(cache.get("ok").is_some());
+        assert!(cache.get("gone").is_none(), "missing file skipped");
+        assert!(cache.get("text").is_none(), "non-image skipped");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
