@@ -532,6 +532,7 @@ dependencies = [
 name = "quill-render"
 version = "0.0.0"
 dependencies = [
+ "jpeg-decoder",
  "png",
 ]
 
