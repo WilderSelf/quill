@@ -95,6 +95,47 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<Rgba8> {
     })
 }
 
+/// Decode baseline/progressive JPEG `bytes` and downsample to a screen [`Proxy`]. Returns `None` on
+/// any decode failure — a missing/corrupt screen proxy is recoverable (skip and show nothing),
+/// unlike a press export, so we never panic here.
+///
+/// `L8` grayscale and `RGB24` are widened to RGBA8 and downsampled via the shared [`downsample_rgba`].
+/// `CMYK32` and `L16` are skipped (`None`): a CMYK JPEG is the ambiguity minefield `export-pdf`
+/// documents (Adobe transform / YCCK inversion), so a color-correct screen proxy for it is deferred
+/// to a later color-managed increment (a named non-goal of spec 0022).
+pub fn decode_jpeg_proxy(bytes: &[u8]) -> Option<Proxy> {
+    let src = decode_jpeg_rgba(bytes)?;
+    Some(downsample_rgba(&src))
+}
+
+/// Decode JPEG bytes to full-resolution RGBA8, or `None` on a decode error or an unhandled pixel
+/// format (`CMYK32` / `L16` — deferred, see [`decode_jpeg_proxy`]).
+fn decode_jpeg_rgba(bytes: &[u8]) -> Option<Rgba8> {
+    use jpeg_decoder::PixelFormat;
+
+    let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let data = decoder.decode().ok()?;
+    let info = decoder.info()?; // populated once decode() succeeds
+    let (w, h) = (info.width as u32, info.height as u32);
+
+    let pixels: Vec<u8> = match info.pixel_format {
+        PixelFormat::L8 => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        PixelFormat::RGB24 => data
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        // CMYK JPEGs are ambiguous (see spec 0012) and 16-bit gray is uncommon; both are deferred to
+        // a later color-managed proxy increment rather than shown in a wrong/approximate color.
+        PixelFormat::CMYK32 | PixelFormat::L16 => return None,
+    };
+    debug_assert_eq!(pixels.len(), (w as usize) * (h as usize) * 4);
+    Some(Rgba8 {
+        width: w,
+        height: h,
+        pixels,
+    })
+}
+
 /// Area-average downscale of a full-resolution RGBA8 image to its [`proxy_size`]. Each target pixel
 /// is the mean of the source pixels in its cell `[tx*sw/tw .. (tx+1)*sw/tw) × [ty*sh/th ..]`. Since
 /// `proxy_size` never upscales, every cell covers ≥ 1 source pixel; when no downscale is needed the
@@ -165,6 +206,19 @@ impl ProxyCache {
     /// corrupt a previously cached proxy.
     pub fn insert_png(&mut self, asset_id: &str, bytes: &[u8]) -> bool {
         match decode_png_proxy(bytes) {
+            Some(proxy) => {
+                self.proxies.insert(asset_id.to_string(), proxy);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Decode + downsample JPEG `bytes` and cache the resulting [`Proxy`] under `asset_id`. Returns
+    /// `false` (and stores nothing) when the JPEG can't be decoded or is an unhandled pixel format
+    /// (CMYK / 16-bit), so a bad asset can't evict or corrupt a previously cached proxy.
+    pub fn insert_jpeg(&mut self, asset_id: &str, bytes: &[u8]) -> bool {
+        match decode_jpeg_proxy(bytes) {
             Some(proxy) => {
                 self.proxies.insert(asset_id.to_string(), proxy);
                 true
@@ -336,6 +390,59 @@ mod tests {
         assert_eq!((proxy.width, proxy.height), (16, 16));
         assert_eq!(proxy.rgba.len(), 16 * 16 * 4);
         assert!(cache.get("missing").is_none());
+    }
+
+    // Tiny 8×8 JPEG fixtures (JPEG is lossy + `jpeg-decoder` is decode-only, so — unlike the PNG
+    // tests — these are committed rather than synthesized in-memory; copied from export-pdf/assets).
+    const TEST_JPEG_GRAY: &[u8] = include_bytes!("../assets/test_gray.jpg");
+    const TEST_JPEG_RGB: &[u8] = include_bytes!("../assets/test_rgb.jpg");
+    const TEST_JPEG_CMYK: &[u8] = include_bytes!("../assets/test_cmyk.jpg");
+
+    #[test]
+    fn rgb_jpeg_decodes_to_opaque_rgba_proxy() {
+        let proxy = decode_jpeg_proxy(TEST_JPEG_RGB).expect("decodes rgb jpeg");
+        assert_eq!((proxy.width, proxy.height), (8, 8)); // < 2048 → native size
+        assert_eq!(proxy.rgba.len(), 8 * 8 * 4);
+        for px in proxy.rgba.chunks_exact(4) {
+            assert_eq!(px[3], 255, "opaque");
+        }
+    }
+
+    #[test]
+    fn grayscale_jpeg_widens_to_opaque_rgba() {
+        let proxy = decode_jpeg_proxy(TEST_JPEG_GRAY).expect("decodes gray jpeg");
+        assert_eq!((proxy.width, proxy.height), (8, 8));
+        for px in proxy.rgba.chunks_exact(4) {
+            assert_eq!(px[0], px[1], "R==G");
+            assert_eq!(px[1], px[2], "G==B");
+            assert_eq!(px[3], 255, "opaque");
+        }
+    }
+
+    #[test]
+    fn cmyk_jpeg_is_skipped_not_miscolored() {
+        // CMYK JPEGs are the spec-0012 ambiguity minefield → deferred, not shown in a wrong color.
+        // This same fixture is proven to decode as genuine CMYK32 (not an error) by export-pdf's
+        // `decodes_transform0_cmyk_jpeg_to_clamped_cmyk` test, so the `None` here is the deliberate
+        // CMYK32-skip arm — not a decode failure masquerading as a skip.
+        assert!(decode_jpeg_proxy(TEST_JPEG_CMYK).is_none());
+        let mut cache = ProxyCache::new();
+        assert!(!cache.insert_jpeg("cmyk", TEST_JPEG_CMYK));
+        assert!(cache.get("cmyk").is_none());
+    }
+
+    #[test]
+    fn corrupt_jpeg_is_skipped_not_fatal() {
+        assert!(decode_jpeg_proxy(b"\xff\xd8not a real jpeg").is_none());
+    }
+
+    #[test]
+    fn cache_insert_jpeg_and_get_round_trip() {
+        let mut cache = ProxyCache::new();
+        assert!(cache.insert_jpeg("photo", TEST_JPEG_RGB));
+        let proxy = cache.get("photo").expect("cached");
+        assert_eq!((proxy.width, proxy.height), (8, 8));
+        assert_eq!(proxy.rgba.len(), 8 * 8 * 4);
     }
 
     #[test]
