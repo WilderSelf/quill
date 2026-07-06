@@ -1,0 +1,11 @@
+{
+  "validate": [
+    "cargo fmt --all --check",
+    "cargo clippy --all-targets --all-features -- -D warnings",
+    "cargo build --workspace",
+    "cargo test --workspace"
+  ],
+  "merge_model": "pr-gated",
+  "main_branch": "main",
+  "plan_path": "~/.claude/plans/i-want-to-create-prancy-bee.md"
+}
