@@ -136,6 +136,13 @@ fixture in-memory in the test instead.
   validate (fmt/clippy/build/test, bounded to 5 attempts) → `reviewer` subagent → PR →
   auto-merge deferring to CI. Blocked ⇒ draft PR, never a forced merge. Merge gate = GitHub
   branch protection + CI, not the permission list. Reviewer/planner live in `.claude/agents/`.
+- **Workflow kit + profile.** This repo uses the shared user-scope workflow kit; its per-repo
+  profile is `.claude/workflow.json` (`validate` commands, `merge_model: pr-gated`, `main_branch`,
+  and `plan_path` → the approved plan `~/.claude/plans/i-want-to-create-prancy-bee.md`). `/ship`
+  reads it for the validate gate and merge model. **`/advance`** (user-scope) is the Layer-0
+  self-driving unit: reconcile → select ONE atomic increment from the approved plan → ship inline
+  → wrap tail → exit with a `STATUS:` token. This repo keeps its own `planner`/`reviewer` in
+  `.claude/agents/` (domain-specific overrides of the generic user-scope agents).
 - **`/reflect`** — after a session or `/ship` cycle, promotes learnings into the right home
   (this file, `.claude/rules/`, a skill, an agent, or a hook), one human-approved change at a
   time. **`/curate`** — dedupe/condense this file (200-line budget), flag contradictions,
