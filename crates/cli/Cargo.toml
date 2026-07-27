@@ -14,3 +14,8 @@ path = "src/main.rs"
 clap = { workspace = true }
 quill-core-model = { workspace = true }
 quill-export-pdf = { workspace = true }
+# `quill render` (spec 0033): the screen path, gated in CI the way export is gated by Ghostscript.
+quill-render = { workspace = true }
+quill-fonts = { workspace = true }
+quill-layout-engine = { workspace = true }
+quill-text-layout = { workspace = true }
