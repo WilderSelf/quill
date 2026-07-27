@@ -90,14 +90,16 @@ impl EmbeddedFont {
         self.ascent * size_pt / 1000.0
     }
 
-    /// Build a [`ShapingContext`] over this font's original program — the `rustybuzz::Face` is
-    /// parsed **once** here and reused for every run the layout pass measures (spec 0016 "Wiring",
-    /// mirroring spec 0015's build-once metrics). The context borrows `self`, so it is short-lived:
-    /// `export()` builds it, lays out with it, then embeds the same font.
+    /// Build a [`ShapingContext`] over this font's original program.
+    ///
+    /// Since spec 0032 the shaping itself lives in `quill-fonts`, so the exporter and the screen
+    /// renderer measure through *the same* code. Two shapers would be free to drift, and a
+    /// disagreement about run width means the screen wraps text in one place and the printed page
+    /// in another.
     pub fn shaper(&self) -> ShapingContext<'_> {
         ShapingContext {
             font: self,
-            face: rustybuzz::Face::from_slice(&self.program, 0),
+            shared: quill_fonts::Font::from_bytes(self.program.clone()),
         }
     }
 }
@@ -119,36 +121,25 @@ impl quill_text_layout::CharMetrics for EmbeddedFont {
 /// is the `RunMetrics` implementation the export path measures line breaks with; only measurement
 /// changes this increment — the drawn content stream is unchanged.
 pub struct ShapingContext<'a> {
-    /// The font whose advances back the fallback path (and whose program the face was built from).
+    /// The font whose advances back the fallback path.
     font: &'a EmbeddedFont,
-    /// The shaping face over `font.program`. `None` only if rustybuzz can't parse a program that
+    /// The shared shaper (spec 0032). `None` only if the shared crate cannot parse a program that
     /// `ttf_parser` already accepted (not expected in practice) — then we degrade gracefully to the
     /// per-char sum rather than panic.
-    face: Option<rustybuzz::Face<'a>>,
+    shared: Option<quill_fonts::Font>,
 }
 
 impl quill_text_layout::RunMetrics for ShapingContext<'_> {
     fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
         use quill_text_layout::CharMetrics;
-        let Some(face) = &self.face else {
+        let Some(shared) = &self.shared else {
             // Degrade to the kerning-free per-char sum (spec 0015 behavior) if shaping is unavailable.
             return text
                 .chars()
                 .map(|ch| self.font.advance_pt(ch, size_pt))
                 .sum();
         };
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
-        buffer.push_str(text);
-        buffer.set_direction(rustybuzz::Direction::LeftToRight);
-        // Increment 1 is LTR, single default script/language; complex-script itemization is a
-        // named follow-up. Sum shaped x-advances (font units) and scale to points.
-        let shaped = rustybuzz::shape(face, &[], buffer);
-        let units: i32 = shaped
-            .glyph_positions()
-            .iter()
-            .map(|pos| pos.x_advance)
-            .sum();
-        units as f32 * size_pt / face.units_per_em() as f32
+        shared.measure_run(text, size_pt)
     }
 }
 

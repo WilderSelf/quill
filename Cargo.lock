@@ -514,11 +514,21 @@ dependencies = [
  "png",
  "quill-color",
  "quill-core-model",
+ "quill-fonts",
  "quill-layout-engine",
  "quill-text-layout",
  "rustybuzz",
  "subsetter",
  "thiserror",
+ "ttf-parser",
+]
+
+[[package]]
+name = "quill-fonts"
+version = "0.0.0"
+dependencies = [
+ "quill-text-layout",
+ "rustybuzz",
  "ttf-parser",
 ]
 

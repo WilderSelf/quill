@@ -16,6 +16,8 @@ quill-core-model = { workspace = true }
 quill-color = { workspace = true }
 quill-layout-engine = { workspace = true }
 quill-text-layout = { workspace = true }
+# Shaping and metrics, shared with the screen renderer so the two cannot drift (spec 0032).
+quill-fonts = { workspace = true }
 thiserror = { workspace = true }
 pdf-writer = { workspace = true }
 subsetter = { workspace = true }
