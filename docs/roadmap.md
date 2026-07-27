@@ -288,6 +288,19 @@ Screen render and the app shell cannot lay out or draw text: `mod fonts;` and `m
 
 **Risks** — `cargo clippy --all-targets --all-features` will enable a `gui` feature if it exists, dragging `eframe`/`winit` into the three-OS matrix and breaking the ubuntu leg until system libraries are installed — this is the single most likely way this increment reddens required contexts, and the spec must decide between an apt step and dropping `--all-features`. egui's MSRV floor forces the stale `rust-version` fix. Painting must be virtualized from the first commit or the 500-page smoothness constraint is violated by the shell itself.
 
+## Known issues
+
+Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten.
+
+- **Knuth-Plass line breaking is superlinear in paragraph length.** An 8× longer paragraph costs
+  ~36× the time (linear would be 8×, quadratic 64×), so active-node pruning is missing or
+  ineffective. Found by spec 0027's harness on its first run. Low severity in practice — real
+  paragraphs are 30–90 words, ~64 µs each — but a genuine cliff for pathological input such as a
+  stat block or table flattened into one very long paragraph, which this product's users plausibly
+  produce. Deliberately not fixed inside 0027: changing the line breaker and the measurement in one
+  commit would leave neither trustworthy. `benches/budgets.toml` pins today's value so a further
+  regression is still caught.
+
 ## Open questions
 
 Deliberately unresolved; each would change work if answered differently. Recorded so they are

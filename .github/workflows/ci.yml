@@ -103,6 +103,16 @@ jobs:
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/from-tpub.pdf
           echo "Ghostscript interpreted all three PDFs with no errors."
 
+      - name: Performance budgets (spec 0027)
+        run: |
+          set -euo pipefail
+          # Folded into this existing Linux-only job on purpose. A *new* job would emit a new
+          # check-run, and a new check-run is not automatically a required branch-protection
+          # context — so it could fail silently while PRs kept merging. Running here means the gate
+          # is real without an out-of-band admin change, and the macOS/Windows legs stay untouched
+          # (benchmarking three OSes would triple the cost for no additional signal).
+          cargo bench -p quill-testdoc
+
       - name: Ghostscript PDF/X re-distill (informational)
         run: |
           set +e

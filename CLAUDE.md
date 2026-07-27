@@ -116,8 +116,8 @@ cargo build                      # build all crates
 cargo test                       # run all tests
 cargo test -p <crate>            # test one crate, e.g. -p export-pdf
 cargo test -p <crate> <name>     # run a single test by name substring
-cargo run -p cli -- <args>       # headless render/export (primary M0 entrypoint)
-cargo bench                      # perf harness (500-page synthetic doc; gates M1+)
+cargo run -p quill-cli -- <args> # headless render/export (primary M0 entrypoint)
+cargo bench -p quill-testdoc     # perf harness vs benches/budgets.toml; non-zero exit on a blowup
 cargo clippy --all-targets       # lint
 cargo fmt                        # format
 ```

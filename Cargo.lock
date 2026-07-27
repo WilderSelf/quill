@@ -539,6 +539,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quill-testdoc"
+version = "0.0.0"
+dependencies = [
+ "quill-core-model",
+ "quill-layout-engine",
+ "quill-render",
+ "quill-text-layout",
+]
+
+[[package]]
 name = "quill-text-layout"
 version = "0.0.0"
 
