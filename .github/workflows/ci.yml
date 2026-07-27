@@ -27,6 +27,16 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
+      # `--all-features` below enables quill-app's non-default `gui` feature, which pulls
+      # eframe/winit/glow. Those need windowing headers on Linux; macOS and Windows ship theirs.
+      # Without this the ubuntu leg fails to link, and it is a *required* context.
+      - name: Install windowing libraries (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev \
+            libxi-dev libxcursor-dev libgl1-mesa-dev libegl1-mesa-dev
+
       - name: Format
         run: cargo fmt --all --check
 

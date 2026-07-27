@@ -8,18 +8,20 @@ An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app fo
 semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
 must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
 
-**Status: M1 in progress — editing core + text-layout.** M0 (headless PDF/X export) is
+**Status: M1 complete — editing core + text-layout.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
 tables). The **M1** arc (shaping → Knuth-Plass justification → hyphenation → text frames/threading
 → master pages → incremental layout → perf harness → screen render) is well underway: shaping
 (0016), Knuth-Plass justification (0017), hyphenation (0018), text frames/threading (0019),
-multi-column threads (0020), linked-image proxy pixels (0021–0023) and incremental proxy-cache
-invalidation (0024) have shipped. What remains is sequenced as specs 0025–0034: the `.tpub`
-container and versioned load contract, block identity, the perf harness, styles, master pages,
-persisted frames (`FORMAT_VERSION` 2), incremental dependency-tracked layout, a shared fonts crate,
-screen render, and the app shell.
+multi-column threads (0020), linked-image proxy pixels (0021–0023), incremental proxy-cache
+invalidation (0024), the `.tpub` container and versioned load contract (0025), block identity
+(0026), the perf harness (0027), paragraph styles (0028), master pages (0029–0030,
+`FORMAT_VERSION` 2), incremental dependency-tracked layout (0031), the shared fonts crate (0032),
+screen render (0033) and the app shell (0034) have all shipped. **The M1 arc is complete.** M2 —
+the beginner on-ramp (templates, stat blocks, TOC) — is next and not yet decomposed; see
+`docs/roadmap.md`.
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
 making architectural decisions. This file holds architecture, constraints and conventions; the

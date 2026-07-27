@@ -44,6 +44,10 @@ flate2 = "1"
 # no native C++ build on any leg of the three-OS CI matrix, which is why it was chosen over
 # `skia-safe`. See the decisions log in docs/roadmap.md.
 tiny-skia = "0.12"
+# The desktop window (spec 0034). MIT/Apache-2.0. Optional and non-default in `quill-app`, because
+# it pulls winit/glow and their Linux system-library requirements; the shell's logic is tested
+# without it.
+eframe = "0.33"
 # The `.tpub` zip container (spec 0025). MIT. default-features off is deliberate: the default set
 # pulls bzip2/zstd/lzma/AES backends (several with C dependencies) that the format never uses —
 # `.tpub` is deflate-only, which is also what `.idml`/ODF readers universally support.
@@ -58,6 +62,7 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # Internal crates (path deps within the workspace).
 quill-core-model = { path = "crates/core-model" }
 quill-fonts = { path = "crates/fonts" }
+quill-app = { path = "crates/app" }
 quill-text-layout = { path = "crates/text-layout" }
 quill-layout-engine = { path = "crates/layout-engine" }
 quill-color = { path = "crates/color" }
