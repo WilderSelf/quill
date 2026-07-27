@@ -61,7 +61,7 @@ pub fn write_pdf(
     let base_dir: &Path = &opts.asset_root;
     let mut images_by_id: BTreeMap<String, ImageObj> = BTreeMap::new();
     for page in pages {
-        for block in &page.blocks {
+        for block in page.statics.iter().chain(page.blocks.iter()) {
             if let PlacedBlock::Image { asset_id, .. } = block {
                 if images_by_id.contains_key(asset_id) {
                     continue;
@@ -199,7 +199,7 @@ pub fn write_pdf(
             // Only the images actually placed on this page.
             let mut xo = res.x_objects();
             let mut seen = BTreeSet::new();
-            for block in &page.blocks {
+            for block in page.statics.iter().chain(page.blocks.iter()) {
                 if let PlacedBlock::Image { asset_id, .. } = block {
                     if let Some(img) = images_by_id.get(asset_id) {
                         if seen.insert(asset_id.clone()) {
@@ -330,7 +330,9 @@ fn render_page(
     images_by_id: &BTreeMap<String, ImageObj>,
 ) -> Vec<u8> {
     let mut content = Content::new();
-    for block in &page.blocks {
+    // Statics first, then flowed content: a master page's background art has to sit *behind* the
+    // text that flows over it, and PDF content streams paint in order (spec 0029).
+    for block in page.statics.iter().chain(page.blocks.iter()) {
         match block {
             PlacedBlock::Text {
                 frame,
@@ -464,6 +466,8 @@ mod tests {
         chars.insert('i');
         let font = fonts::build(&chars).expect("build bundled font");
         let page = LaidOutPage {
+            index: 0,
+            statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
                 frame: quill_core_model::Rect {
                     x_pt: 0.0,
@@ -491,6 +495,8 @@ mod tests {
         let chars: BTreeSet<char> = text.chars().collect();
         let font = fonts::build(&chars).expect("build bundled font");
         let page = LaidOutPage {
+            index: 0,
+            statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
                 frame: quill_core_model::Rect {
                     x_pt: 0.0,
