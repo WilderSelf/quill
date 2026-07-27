@@ -32,6 +32,8 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
   "spreads": [ { "pages": [ { "master": "...", "frames": [ ... ] } ] } ],
   "styles": { "paragraph": { ... }, "character": { ... } },
   "content": [ /* semantic blocks: headings, body, stat blocks, tables, random tables */ ],
+  "revision": 0,
+  "next_block_id": 4,
   "assets": [ { "id": "...", "path": "assets/....png", "px_w": 1500, "px_h": 1200, "dpi": 300 } ]
 }
 ```
@@ -61,6 +63,17 @@ caller-named directory and returns the `asset_root` that relative `Asset.path` v
 against. Extraction is explicit rather than into a hidden temp directory, so "where are this
 document's assets right now" stays answerable. Entry names that would escape the extraction
 directory (`..`, absolute paths, drive prefixes) are refused rather than sanitized.
+
+## Block identity
+
+Every content block carries an integer `id`, unique within the document and stable across saves
+(spec 0026). Identity is what lets incremental layout cache per block: an index would renumber on
+every insert. `revision` is a monotonic edit counter; `next_block_id` is the allocator's state,
+persisted so a reload can never hand a deleted block's id to a new one.
+
+All three fields default when absent, so manifests written before they existed still load without a
+version bump. Two blocks sharing an id is an error — a duplicate identity would let a cache return
+the wrong block's layout.
 
 ## Two linked representations
 

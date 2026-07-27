@@ -6,6 +6,8 @@
 //! crates compile and the export pipeline has something to consume. Uses `quill-text-layout`
 //! for line breaking.
 
+use std::collections::BTreeMap;
+
 use quill_core_model::{Asset, Block, Color, Document, PageSetup, Rect};
 use quill_text_layout::{
     justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics, BODY_FONT_SIZE_PT,
@@ -186,6 +188,10 @@ pub fn lay_out_in_frame(
     )
 }
 
+/// An id → [`Asset`] lookup, built once per layout pass. Borrows the document's assets rather than
+/// copying them; layout never outlives the document it is laying out.
+type AssetIndex<'a> = BTreeMap<&'a str, &'a Asset>;
+
 /// The intrinsic size of a block once broken/measured for a given frame width, plus the payload
 /// needed to place it. Re-computed against each candidate frame the block is tried in, since both
 /// text wrapping and image sizing depend on the frame width (spec 0019 incr. 2).
@@ -209,7 +215,7 @@ enum Measured {
 fn measure_block(
     block: &Block,
     width: f32,
-    assets: &[Asset],
+    assets: &AssetIndex<'_>,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Option<(Measured, f32)> {
@@ -239,9 +245,9 @@ fn measure_block(
                 height,
             ))
         }
-        Block::Image { asset } => {
+        Block::Image { asset, .. } => {
             // Resolve the asset id. If not found, skip this block (no panic).
-            let asset_rec = assets.iter().find(|a| &a.id == asset)?;
+            let asset_rec = *assets.get(asset.as_str())?;
             // Size the image at its true aspect ratio, scaling down to fit the frame width when
             // wider. See spec 0009.
             let (w, h) = image_size(asset_rec, width);
@@ -276,6 +282,12 @@ pub fn lay_out_in_thread(
         !thread.frames.is_empty(),
         "a thread must have at least one frame"
     );
+
+    // Build the id → asset index once for the whole pass. `measure_block` runs once per candidate
+    // frame per block, and it used to resolve image ids with a linear scan of `assets` — quadratic
+    // in an art-heavy document, which is precisely the workload this engine exists for (spec 0026).
+    let assets: AssetIndex<'_> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let assets = &assets;
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut page = LaidOutPage::default();
@@ -423,10 +435,7 @@ mod tests {
         // A single 100-char word (600 pt under MONO) overflows the 432 pt frame with NoHyphenator
         // (one long line, no hyphen). With HalfStub it splits at offset 50 — the first line ends in
         // a rendered hyphen — so the two paths must differ.
-        let doc = doc_with_blocks(vec![Block::Body {
-            text: "z".repeat(100),
-            color: Color::Gray { v: 0.0 },
-        }]);
+        let doc = doc_with_blocks(vec![Block::body("z".repeat(100), Color::Gray { v: 0.0 })]);
 
         let plain = first_text_lines(&lay_out(&doc, &MONO, &NoHyphenator));
         let hyphenated = first_text_lines(&lay_out(&doc, &MONO, &HalfStub));
@@ -456,15 +465,8 @@ mod tests {
         // as a Heading stays fully ragged (Alignment::Left). Spec 0017 increment 2.
         let words =
             "goblins raid the village at dusk stealing grain and copper coins from every trembling home nearby";
-        let body = doc_with_blocks(vec![Block::Body {
-            text: words.into(),
-            color: Color::Gray { v: 0.0 },
-        }]);
-        let heading = doc_with_blocks(vec![Block::Heading {
-            level: 1,
-            text: words.into(),
-            color: Color::Gray { v: 0.0 },
-        }]);
+        let body = doc_with_blocks(vec![Block::body(words, Color::Gray { v: 0.0 })]);
+        let heading = doc_with_blocks(vec![Block::heading(1, words, Color::Gray { v: 0.0 })]);
 
         let body_lines = first_text_lines(&lay_out(&body, &MONO, &NoHyphenator));
         let heading_lines = first_text_lines(&lay_out(&heading, &MONO, &NoHyphenator));
@@ -529,10 +531,7 @@ mod tests {
     fn frame_origin_offsets_placed_blocks() {
         // The same single short paragraph, laid full-page vs. into a frame at origin (36, 48). For
         // content that fits on one page, every placed block shifts by exactly (36, 48).
-        let content = vec![Block::Body {
-            text: "short line".into(),
-            color: Color::Gray { v: 0.0 },
-        }];
+        let content = vec![Block::body("short line", Color::Gray { v: 0.0 })];
         let assets: Vec<Asset> = vec![];
         let page = PageSetup::default();
 
@@ -577,10 +576,7 @@ mod tests {
     fn narrower_frame_wraps_to_more_lines() {
         // A paragraph that wraps to N lines in the full-page frame wraps to strictly more lines in a
         // frame half as wide — text respects the frame width, not the page width.
-        let content = vec![Block::Body {
-            text: "goblins raid the village at dusk stealing grain and copper coins from every trembling home nearby".into(),
-            color: Color::Gray { v: 0.0 },
-        }];
+        let content = vec![Block::body("goblins raid the village at dusk stealing grain and copper coins from every trembling home nearby", Color::Gray { v: 0.0 })];
         let assets: Vec<Asset> = vec![];
         let page = PageSetup::default();
 
@@ -620,10 +616,7 @@ mod tests {
         // frame holds only ~5 lines, so the same content spills to multiple pages — overflow is
         // measured against the frame's bottom edge, not the trim height.
         let content: Vec<Block> = (0..20)
-            .map(|i| Block::Body {
-                text: format!("L{i}"),
-                color: Color::Gray { v: 0.0 },
-            })
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let assets: Vec<Asset> = vec![];
         let page = PageSetup::default();
@@ -708,10 +701,7 @@ mod tests {
         // left column (8 lines) and must continue into the RIGHT column on the SAME page — not spill
         // to a second page (12 <= 16 lines of capacity).
         let content: Vec<Block> = (0..12)
-            .map(|i| Block::Body {
-                text: format!("L{i}"),
-                color: Color::Gray { v: 0.0 },
-            })
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let thread = two_column_thread(216.0, 96.0);
         let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
@@ -744,10 +734,7 @@ mod tests {
         // Two 96 pt-tall columns = 16 lines of capacity per page. 20 single-line blocks overflow
         // BOTH columns and must spill to a second page, restarting at the first (left) frame.
         let content: Vec<Block> = (0..20)
-            .map(|i| Block::Body {
-                text: format!("L{i}"),
-                color: Color::Gray { v: 0.0 },
-            })
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let thread = two_column_thread(216.0, 96.0);
         let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
@@ -772,10 +759,7 @@ mod tests {
         // Every block that overflowed into the right column must carry that frame's x (216), never
         // the left frame's — proving placement uses the frame the block actually landed in.
         let content: Vec<Block> = (0..12)
-            .map(|i| Block::Body {
-                text: format!("L{i}"),
-                color: Color::Gray { v: 0.0 },
-            })
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let thread = two_column_thread(216.0, 96.0);
         let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
@@ -824,14 +808,8 @@ mod tests {
         // "alpha beta gamma delta" = 22 chars: one line at 432 pt, but cannot fit in fewer than 3
         // lines of 10 chars, so it must wrap to >= 2 lines in frame B.
         let content = vec![
-            Block::Body {
-                text: "first".into(),
-                color: Color::Gray { v: 0.0 },
-            },
-            Block::Body {
-                text: "alpha beta gamma delta".into(),
-                color: Color::Gray { v: 0.0 },
-            },
+            Block::body("first", Color::Gray { v: 0.0 }),
+            Block::body("alpha beta gamma delta", Color::Gray { v: 0.0 }),
         ];
         let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
 
@@ -957,10 +935,7 @@ mod tests {
         // regression in col_w can't slip past this test.
         assert!((thread.frames[0].rect.w_pt - 207.0).abs() < 0.01);
         let content: Vec<Block> = (0..12)
-            .map(|i| Block::Body {
-                text: format!("L{i}"),
-                color: Color::Gray { v: 0.0 },
-            })
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
 
@@ -989,14 +964,19 @@ mod tests {
 
     /// Build a minimal document from scratch with the given content blocks and default page setup.
     fn doc_with_blocks(content: Vec<Block>) -> Document {
-        Document {
+        let mut doc = Document {
             format_version: quill_core_model::FORMAT_VERSION,
             metadata: Metadata::default(),
             page_setup: PageSetup::default(), // 432 × 648 pt (6×9 in)
             content,
             assets: vec![],
             fonts_embeddable: false,
-        }
+            revision: 0,
+            next_block_id: 0,
+        };
+        // Give the blocks ids, as a loaded document would have (spec 0026).
+        doc.assign_missing_block_ids().expect("fresh blocks");
+        doc
     }
 
     #[test]
@@ -1004,10 +984,7 @@ mod tests {
         // Each Body block produces 1 line = BODY_LINE_HEIGHT_PT (12 pt).
         // Page height is 648 pt → 54 lines fit. Push 100 blocks to guarantee overflow.
         let blocks: Vec<Block> = (0..100)
-            .map(|i| Block::Body {
-                text: format!("Line {i}"),
-                color: Color::Gray { v: 0.0 },
-            })
+            .map(|i| Block::body(format!("Line {i}"), Color::Gray { v: 0.0 }))
             .collect();
         let doc = doc_with_blocks(blocks);
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -1024,10 +1001,7 @@ mod tests {
         let page_h = PageSetup::default().trim.h_pt; // 648.0
         let lines_per_page = (page_h / BODY_LINE_HEIGHT_PT).floor() as usize; // 54
 
-        let make_block = |i: usize| Block::Body {
-            text: format!("L{i}"),
-            color: Color::Gray { v: 0.0 },
-        };
+        let make_block = |i: usize| Block::body(format!("L{i}"), Color::Gray { v: 0.0 });
 
         // Exactly lines_per_page blocks → fits on one page.
         let exact_blocks: Vec<Block> = (0..lines_per_page).map(make_block).collect();
@@ -1065,13 +1039,9 @@ mod tests {
                 ..PageSetup::default()
             },
             content: vec![
-                Block::Image {
-                    asset: asset_id.clone(),
-                },
+                Block::image(asset_id.clone()),
                 // Unknown asset — should be silently skipped.
-                Block::Image {
-                    asset: "unknown-asset-xyz".to_string(),
-                },
+                Block::image("unknown-asset-xyz".to_string()),
             ],
             assets: vec![Asset {
                 id: asset_id.clone(),
@@ -1085,6 +1055,8 @@ mod tests {
                 has_alpha: false,
             }],
             fonts_embeddable: false,
+            revision: 0,
+            next_block_id: 0,
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -1152,5 +1124,60 @@ mod tests {
         let (w, h) = image_size(&sized_asset(0, 0, 300.0), content_width);
         assert_eq!(w, content_width);
         assert_eq!(h, content_width);
+    }
+
+    #[test]
+    fn many_images_all_place_through_the_asset_index() {
+        // Resolution used to be a linear scan of `assets` run once per candidate frame per block —
+        // quadratic, on exactly the workload this engine exists for. This asserts correctness at
+        // scale (every block placed, none silently skipped); the timing claim belongs to the bench
+        // harness in spec 0027, not to a unit test on a shared runner.
+        const N: usize = 2_000;
+        let assets: Vec<Asset> = (0..N)
+            .map(|i| Asset {
+                id: format!("img{i}"),
+                path: format!("assets/img{i}.png"),
+                px_w: 300,
+                px_h: 300,
+                dpi: 300.0,
+                line_art: false,
+                has_alpha: false,
+            })
+            .collect();
+        let content: Vec<Block> = (0..N).map(|i| Block::image(format!("img{i}"))).collect();
+
+        let mut doc = doc_with_blocks(content);
+        doc.assets = assets;
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+
+        let placed = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Image { .. }))
+            .count();
+        assert_eq!(placed, N, "every image block must be placed");
+    }
+
+    #[test]
+    fn an_unknown_asset_id_is_still_skipped_without_panicking() {
+        // Behavior preserved across the index change: an unresolvable image is skipped, not fatal.
+        let mut doc = doc_with_blocks(vec![
+            Block::image("nope"),
+            Block::body("after", Color::Gray { v: 0.0 }),
+        ]);
+        doc.assets = vec![];
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let images = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Image { .. }))
+            .count();
+        assert_eq!(images, 0);
+        let texts = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Text { .. }))
+            .count();
+        assert_eq!(texts, 1, "the block after a skipped image must still place");
     }
 }

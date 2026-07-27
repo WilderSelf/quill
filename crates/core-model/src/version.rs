@@ -31,6 +31,9 @@ pub enum LoadError {
     Container(String),
     /// The container is structurally valid but not a `.tpub` (e.g. no `document.json`).
     NotATpub(String),
+    /// Two blocks claim the same [`BlockId`](crate::BlockId). Refused rather than repaired: see
+    /// [`Document::assign_missing_block_ids`](crate::Document::assign_missing_block_ids).
+    DuplicateBlockId(u64),
 }
 
 impl fmt::Display for LoadError {
@@ -44,6 +47,10 @@ impl fmt::Display for LoadError {
             ),
             LoadError::Container(m) => write!(f, "reading .tpub container: {m}"),
             LoadError::NotATpub(m) => write!(f, "not a .tpub container: {m}"),
+            LoadError::DuplicateBlockId(id) => write!(
+                f,
+                "two content blocks share id {id}; block ids must be unique within a document"
+            ),
         }
     }
 }

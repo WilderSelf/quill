@@ -379,10 +379,8 @@ mod tests {
     fn space_glyph_is_subset_even_without_literal_space() {
         let doc = {
             let mut d = Document::sample();
-            d.content = vec![Block::Body {
-                text: "alpha\tbeta\ngamma".into(), // no literal U+0020
-                color: Color::Gray { v: 0.0 },
-            }];
+            // no literal U+0020
+            d.content = vec![Block::body("alpha\tbeta\ngamma", Color::Gray { v: 0.0 })];
             d
         };
         let chars = collect_doc_chars(&doc);
@@ -402,10 +400,8 @@ mod tests {
     fn hyphen_glyph_is_subset_even_without_literal_hyphen() {
         let doc = {
             let mut d = Document::sample();
-            d.content = vec![Block::Body {
-                text: "alpha beta gamma".into(), // no literal U+002D
-                color: Color::Gray { v: 0.0 },
-            }];
+            // no literal U+002D
+            d.content = vec![Block::body("alpha beta gamma", Color::Gray { v: 0.0 })];
             d
         };
         let chars = collect_doc_chars(&doc);
@@ -431,14 +427,14 @@ mod tests {
     #[test]
     fn rgb_color_fails_colorspace_check() {
         let mut doc = Document::sample();
-        doc.content.push(Block::Body {
-            text: "oops".into(),
-            color: Color::Rgb {
+        doc.content.push(Block::body(
+            "oops",
+            Color::Rgb {
                 r: 1.0,
                 g: 0.0,
                 b: 0.0,
             },
-        });
+        ));
         let report = preflight(&doc, &opts_with_icc());
         assert!(!report.passed());
         assert!(report
@@ -622,7 +618,14 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0xb30b_f361_5933_e08e;
+    /// Changed by spec 0026: blocks gained an `id` field, so `doc.to_json()` changed, and
+    /// `writer::doc_id_bytes` hashes that JSON into the document identifier.
+    ///
+    /// Diffed against the previous build to confirm the change is only what it should be: exactly
+    /// 120 bytes differ, in three places — the XMP `DocumentID`, the XMP `InstanceID`, and the
+    /// trailer `/ID` — all three derived from that one hash. Total length is unchanged (8558) and
+    /// every page content stream, font and image byte is identical.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x69fa_7048_371a_23e6;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -736,9 +739,7 @@ mod tests {
             line_art: false,
             has_alpha: false,
         }];
-        doc.content.push(Block::Image {
-            asset: "pic".into(),
-        });
+        doc.content.push(Block::image("pic"));
 
         opts.asset_root = root.clone();
         let mut found = Vec::new();
@@ -836,9 +837,7 @@ mod tests {
             line_art: false,
             has_alpha: false,
         }];
-        doc.content.push(Block::Image {
-            asset: "pic".into(),
-        });
+        doc.content.push(Block::image("pic"));
 
         let mut buf = Vec::new();
         export(&doc, &opts, &mut buf).expect("export with image should succeed");
@@ -877,9 +876,7 @@ mod tests {
             line_art: false,
             has_alpha: false,
         }];
-        doc.content.push(Block::Image {
-            asset: "pic".into(),
-        });
+        doc.content.push(Block::image("pic"));
 
         let mut buf = Vec::new();
         export(&doc, &opts, &mut buf).expect("export with color image should succeed");
@@ -910,9 +907,7 @@ mod tests {
             line_art: false,
             has_alpha: false,
         }];
-        doc.content.push(Block::Image {
-            asset: "pic".into(),
-        });
+        doc.content.push(Block::image("pic"));
 
         let mut buf = Vec::new();
         export(&doc, &opts, &mut buf).expect("export with jpeg image should succeed");
@@ -943,9 +938,7 @@ mod tests {
             line_art: false,
             has_alpha: false,
         }];
-        doc.content.push(Block::Image {
-            asset: "pic".into(),
-        });
+        doc.content.push(Block::image("pic"));
 
         let mut buf = Vec::new();
         export(&doc, &opts, &mut buf).expect("export with cmyk jpeg should succeed");
