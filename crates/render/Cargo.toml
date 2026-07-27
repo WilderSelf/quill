@@ -6,7 +6,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# The GPU canvas (`skia-safe`, evaluating `vello`) arrives in a later spec-driven commit.
+# The canvas is decided: a backend-neutral paint list rasterized by `tiny-skia` (spec 0033). See the
+# decisions log in `docs/roadmap.md` for why not `skia-safe`/`vello`. It arrives with that spec.
 [dependencies]
 # Screen-proxy decode reuses the workspace's existing targeted decoders (specs 0021 PNG / 0022 JPEG)
 # rather than the umbrella `image` crate, keeping the dep graph minimal and permissive (MIT/Apache).

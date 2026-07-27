@@ -15,12 +15,15 @@ IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC ha
 tables). The **M1** arc (shaping → Knuth-Plass justification → hyphenation → text frames/threading
 → master pages → incremental layout → perf harness → screen render) is well underway: shaping
 (0016), Knuth-Plass justification (0017), hyphenation (0018), text frames/threading (0019),
-multi-column threads (0020), and linked-image proxy pixels (0021–0023) have shipped. Next up are
-master pages, incremental dependency-tracked layout, the perf harness, and screen render — plus the
-`core-model` data-model + `FORMAT_VERSION` work that persisting frames/styles/master pages requires.
-The authoritative design is the approved plan at
-`~/.claude/plans/i-want-to-create-prancy-bee.md`. Read it before making architectural
-decisions. This file summarizes the parts that shape day-to-day work.
+multi-column threads (0020), linked-image proxy pixels (0021–0023) and incremental proxy-cache
+invalidation (0024) have shipped. What remains is sequenced as specs 0025–0034: the `.tpub`
+container and versioned load contract, block identity, the perf harness, styles, master pages,
+persisted frames (`FORMAT_VERSION` 2), incremental dependency-tracked layout, a shared fonts crate,
+screen render, and the app shell.
+The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
+reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
+making architectural decisions. This file holds architecture, constraints and conventions; the
+roadmap holds what gets built, in what order, and what "done" means.
 
 ## Non-negotiable constraints (these drive every design choice)
 
@@ -49,16 +52,21 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 | `text-layout` | Shaping (`rustybuzz`), **custom Knuth-Plass line breaking** for press-quality justification, hyphenation, bidi. |
 | `layout-engine` | Frames, text threading, master pages, layers, baseline grid. **Incremental & dependency-tracked.** |
 | `color` | `lcms2`: ICC, RGB→CMYK, grayscale, soft-proof, **ink-coverage (240%) enforcement**. |
-| `render` | On-screen viewport (`skia-safe`, GPU) + **linked-image downsampled proxy cache**. |
+| `render` | On-screen viewport (backend-neutral paint list → `tiny-skia` CPU raster) + **linked-image downsampled proxy cache**. |
 | `export-pdf` | **The differentiator.** PDF/X writer on `pdf-writer` + `subsetter`; preflight. |
 | `components-ttrpg` | Stat blocks, random tables, reusable snippets — portable, first-class objects. |
-| `app` | `egui` shell + Skia document canvas. |
+| `app` | `egui` shell + document canvas (paints the `render` crate's op list). |
 | `cli` | Headless render/export; drives M0 and CI. |
 
 ### Decisions that are easy to get wrong
 
-- **Do NOT use Skia's built-in PDF backend for export.** It is RGB-oriented and cannot meet
-  PDF/X-1a. Screen rendering uses Skia; press export uses the dedicated `export-pdf` writer.
+- **Never render press output through a screen canvas.** Screen backends are RGB-oriented and
+  cannot meet PDF/X-1a. Screen rendering and press export are two separate paths that share
+  geometry and font metrics but nothing else; press export goes through the `export-pdf` writer.
+- **The screen canvas is `tiny-skia`, behind a backend-neutral paint list** (`render` emits
+  `Vec<PaintOp>`, then rasterizes). Pure Rust and permissive, with no native build on the
+  three-OS CI matrix, and a GPU backend can replace the rasterizer without touching layout.
+  See the decisions log in `docs/roadmap.md`.
 - **Images are linked, not embedded, with cached downsampled proxies.** Never composite
   full-res on screen — full-res is only touched at export. This is the core perf strategy.
 - **Layout is incremental.** Editing one text thread must re-flow only affected pages, never
@@ -138,7 +146,7 @@ fixture in-memory in the test instead.
   branch protection + CI, not the permission list. Reviewer/planner live in `.claude/agents/`.
 - **Workflow kit + profile.** This repo uses the shared user-scope workflow kit; its per-repo
   profile is `.claude/workflow.json` (`validate` commands, `merge_model: pr-gated`, `main_branch`,
-  and `plan_path` → the approved plan `~/.claude/plans/i-want-to-create-prancy-bee.md`). `/ship`
+  and `plan_path` → the tracked plan `docs/roadmap.md`). `/ship`
   reads it for the validate gate and merge model. **`/advance`** (user-scope) is the Layer-0
   self-driving unit: reconcile → select ONE atomic increment from the approved plan → ship inline
   → wrap tail → exit with a `STATUS:` token. This repo keeps its own `planner`/`reviewer` in

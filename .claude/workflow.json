@@ -7,5 +7,5 @@
   ],
   "merge_model": "pr-gated",
   "main_branch": "main",
-  "plan_path": "~/.claude/plans/i-want-to-create-prancy-bee.md"
+  "plan_path": "docs/roadmap.md"
 }
