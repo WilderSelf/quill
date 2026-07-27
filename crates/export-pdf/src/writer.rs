@@ -25,9 +25,7 @@ use crate::{fonts, geom, icc, images, ExportError, ExportOptions};
 
 // Body/heading font size and line advance, in points. Shared with the layout engine (spec 0015)
 // so glyphs are measured and drawn at the same size and land on the rows layout reserved.
-use quill_text_layout::{
-    Line, BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT,
-};
+use quill_text_layout::Line;
 
 /// Monotonic indirect-reference allocator.
 struct Alloc(i32);
@@ -338,9 +336,15 @@ fn render_page(
                 frame,
                 lines,
                 color,
+                font_size_pt,
+                leading_pt,
             } => {
                 content.begin_text();
-                content.set_font(Name(b"F0"), FONT_SIZE_PT);
+                // Per-block size, from the style the layout engine measured with (spec 0028).
+                // Taking it from the placed block rather than re-deriving it is what guarantees the
+                // glyphs are drawn at the size they were broken at — any disagreement between the
+                // two would put text in the wrong place, or overset a frame that measured as fitting.
+                content.set_font(Name(b"F0"), *font_size_pt);
                 // Emit the authored press-legal fill color. Preflight rejects RGB before export,
                 // so `Rgb` is unreachable here; fall back to black (rather than panicking) so a
                 // `--force` export can never abort mid-stream.
@@ -349,13 +353,13 @@ fn render_page(
                     Color::Cmyk { c, m, y, k } => content.set_fill_cmyk(*c, *m, *y, *k),
                     Color::Rgb { .. } => content.set_fill_gray(0.0),
                 };
-                let ascent = font.ascent_pt(FONT_SIZE_PT);
+                let ascent = font.ascent_pt(*font_size_pt);
                 for (li, line) in lines.iter().enumerate() {
-                    let top_y = frame.y_pt + ascent + li as f32 * LINE_HEIGHT_PT;
+                    let top_y = frame.y_pt + ascent + li as f32 * leading_pt;
                     let (x, y) = g.flip(frame.x_pt, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
-                    show_line(&mut content, font, line);
+                    show_line(&mut content, font, line, *font_size_pt);
                 }
                 content.end_text();
             }
@@ -385,13 +389,15 @@ fn render_page(
 /// unusable here — the font is a Type0/Identity-H composite (2-byte codes), and PDF word spacing
 /// applies only to single-byte code 32. The `TJ` `amount` is in thousandths of a text-space unit and
 /// is *subtracted* from the position, so a rightward (space-adding) shift of `space_adjust_pt` points
-/// at `FONT_SIZE_PT` is `-1000 · space_adjust_pt / FONT_SIZE_PT`.
-fn show_line(content: &mut Content, font: &fonts::EmbeddedFont, line: &Line) {
+/// at `font_size_pt` is `-1000 · space_adjust_pt / font_size_pt`. The size is the block's own
+/// (spec 0028), not a global constant: the adjustment is in thousandths of an *em*, so using the
+/// wrong size would misplace every word on a justified line set at anything but body size.
+fn show_line(content: &mut Content, font: &fonts::EmbeddedFont, line: &Line, font_size_pt: f32) {
     if line.space_adjust_pt == 0.0 {
         content.show(Str(&font.encode_line(&line.text)));
         return;
     }
-    let amount = -1000.0 * line.space_adjust_pt / FONT_SIZE_PT;
+    let amount = -1000.0 * line.space_adjust_pt / font_size_pt;
     let words: Vec<&str> = line.text.split(' ').collect();
     let mut tj = content.show_positioned();
     let mut items = tj.items();
@@ -443,6 +449,9 @@ fn doc_id_hex(doc: &Document) -> String {
 mod tests {
     use super::*;
     use quill_core_model::PageSetup;
+    use quill_text_layout::{
+        BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT,
+    };
 
     /// Build a one-page layout holding a single text block with the given fill color, render it,
     /// and return the (uncompressed) content-stream bytes as a lossy string. Unlike the finished
@@ -462,6 +471,8 @@ mod tests {
                     w_pt: setup.trim.w_pt,
                     h_pt: LINE_HEIGHT_PT,
                 },
+                font_size_pt: FONT_SIZE_PT,
+                leading_pt: LINE_HEIGHT_PT,
                 lines: vec![Line {
                     text: "Hi".to_string(),
                     space_adjust_pt: 0.0,
@@ -487,6 +498,8 @@ mod tests {
                     w_pt: setup.trim.w_pt,
                     h_pt: LINE_HEIGHT_PT,
                 },
+                font_size_pt: FONT_SIZE_PT,
+                leading_pt: LINE_HEIGHT_PT,
                 lines: vec![Line {
                     text: text.to_string(),
                     space_adjust_pt,

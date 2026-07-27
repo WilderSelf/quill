@@ -8,11 +8,10 @@
 
 use std::collections::BTreeMap;
 
-use quill_core_model::{Asset, Block, Color, Document, PageSetup, Rect};
-use quill_text_layout::{
-    justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics, BODY_FONT_SIZE_PT,
-    BODY_LINE_HEIGHT_PT,
+use quill_core_model::{
+    Asset, Block, Color, Document, PageSetup, ParagraphStyle, Rect, StyleSheet, TextAlign,
 };
+use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
 
 /// A positioned rectangular region that content flows into. The layout engine fills a frame
 /// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
@@ -124,6 +123,12 @@ pub enum PlacedBlock {
         /// Broken lines, each carrying its inter-word justification adjustment (spec 0017 incr. 2).
         lines: Vec<Line>,
         color: Color,
+        /// The size the text was measured at. Carried here because `PlacedBlock` is all the writer
+        /// and the screen renderer see: without it they would have to re-derive the size from the
+        /// document, and any disagreement would put glyphs in the wrong place (spec 0028).
+        font_size_pt: f32,
+        /// Baseline-to-baseline distance, likewise carried rather than re-derived.
+        leading_pt: f32,
     },
     Image {
         frame: Rect,
@@ -158,6 +163,7 @@ pub fn lay_out(
     lay_out_in_frame(
         &doc.content,
         &doc.assets,
+        &doc.styles,
         &Frame::full_page(&doc.page_setup),
         metrics,
         hyphenator,
@@ -173,6 +179,7 @@ pub fn lay_out(
 pub fn lay_out_in_frame(
     content: &[Block],
     assets: &[Asset],
+    styles: &StyleSheet,
     frame: &Frame,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
@@ -180,6 +187,7 @@ pub fn lay_out_in_frame(
     lay_out_in_thread(
         content,
         assets,
+        styles,
         &Thread {
             frames: vec![*frame],
         },
@@ -199,6 +207,7 @@ enum Measured {
     Text {
         lines: Vec<Line>,
         color: Color,
+        style: ParagraphStyle,
     },
     Image {
         asset_id: String,
@@ -216,31 +225,39 @@ fn measure_block(
     block: &Block,
     width: f32,
     assets: &AssetIndex<'_>,
+    styles: &StyleSheet,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Option<(Measured, f32)> {
     match block {
         Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
-            // Body text is justified for press-quality even spacing; headings stay ragged-left
-            // (a heading is typically one short line, where justification would do nothing anyway —
-            // its single line is the paragraph's last, which is never justified).
-            let align = match block {
-                Block::Heading { .. } => Alignment::Left,
-                _ => Alignment::Justified,
+            // Size, leading and alignment now come from the document's stylesheet rather than from
+            // crate constants (spec 0028). Before this, every block in every document was set at
+            // body size — a heading differed from body text only by being ragged-left.
+            let style = styles.resolve(block);
+            let align = match style.align {
+                TextAlign::Justified => Alignment::Justified,
+                TextAlign::Left => Alignment::Left,
             };
             let lines = justify_paragraph_hyphenated(
                 text,
                 width,
-                BODY_FONT_SIZE_PT,
+                style.font_size_pt,
                 align,
                 metrics,
                 hyphenator,
             );
-            let height = lines.len() as f32 * BODY_LINE_HEIGHT_PT;
+            // Space before/after is part of the block's occupied height, so pagination accounts for
+            // it: a heading that only fits on the next page because of its space-above must break
+            // there, or it would sit at the very top with its space silently swallowed.
+            let height = lines.len() as f32 * style.leading_pt
+                + style.space_before_pt
+                + style.space_after_pt;
             Some((
                 Measured::Text {
                     lines,
                     color: *color,
+                    style,
                 },
                 height,
             ))
@@ -274,6 +291,7 @@ fn measure_block(
 pub fn lay_out_in_thread(
     content: &[Block],
     assets: &[Asset],
+    styles: &StyleSheet,
     thread: &Thread,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
@@ -309,7 +327,7 @@ pub fn lay_out_in_thread(
         loop {
             let frame = thread.frames[frame_idx];
             let Some((measured, height)) =
-                measure_block(block, frame.rect.w_pt, assets, metrics, hyphenator)
+                measure_block(block, frame.rect.w_pt, assets, styles, metrics, hyphenator)
             else {
                 break; // unresolved image asset → skip this block (no panic)
             };
@@ -330,15 +348,26 @@ pub fn lay_out_in_thread(
             }
 
             let placed = match measured {
-                Measured::Text { lines, color } => PlacedBlock::Text {
+                Measured::Text {
+                    lines,
+                    color,
+                    style,
+                } => PlacedBlock::Text {
+                    // The frame starts *below* the style's space-above: that space belongs to this
+                    // block's height (so pagination reserves it) but no text is drawn in it.
                     frame: Rect {
                         x_pt: frame.rect.x_pt,
-                        y_pt: y,
+                        y_pt: y + style.space_before_pt,
                         w_pt: frame.rect.w_pt,
-                        h_pt: height,
+                        h_pt: height - style.space_before_pt,
                     },
                     lines,
                     color,
+                    // Carried through to the writer. Without this the exported PDF would set every
+                    // paragraph at body size regardless of its style, because `PlacedBlock` was the
+                    // only thing the writer sees and it did not record how the text was measured.
+                    font_size_pt: style.font_size_pt,
+                    leading_pt: style.leading_pt,
                 },
                 Measured::Image { asset_id, width } => PlacedBlock::Image {
                     frame: Rect {
@@ -367,6 +396,7 @@ mod tests {
     use super::*;
     use quill_core_model::{Asset, Block, Color, Document, Metadata, PageSetup, Size};
     use quill_text_layout::{Hyphenator, MonospaceRunMetrics, NoHyphenator};
+    use quill_text_layout::{BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
 
     /// 0.6 em × 10 pt = 6 pt/char, matching the old `APPROX_CHAR_WIDTH_PT` stand-in so these
     /// pagination tests keep their familiar per-character arithmetic.
@@ -520,6 +550,7 @@ mod tests {
         let via_frame = lay_out_in_frame(
             &doc.content,
             &doc.assets,
+            &StyleSheet::default(),
             &Frame::full_page(&doc.page_setup),
             &MONO,
             &NoHyphenator,
@@ -538,6 +569,7 @@ mod tests {
         let full = first_text_frame(&lay_out_in_frame(
             &content,
             &assets,
+            &StyleSheet::default(),
             &Frame::full_page(&page),
             &MONO,
             &NoHyphenator,
@@ -553,6 +585,7 @@ mod tests {
         let shifted = first_text_frame(&lay_out_in_frame(
             &content,
             &assets,
+            &StyleSheet::default(),
             &offset,
             &MONO,
             &NoHyphenator,
@@ -583,6 +616,7 @@ mod tests {
         let wide = first_text_lines(&lay_out_in_frame(
             &content,
             &assets,
+            &StyleSheet::default(),
             &Frame::full_page(&page),
             &MONO,
             &NoHyphenator,
@@ -598,6 +632,7 @@ mod tests {
         let narrow = first_text_lines(&lay_out_in_frame(
             &content,
             &assets,
+            &StyleSheet::default(),
             &narrow_frame,
             &MONO,
             &NoHyphenator,
@@ -624,6 +659,7 @@ mod tests {
         let full = lay_out_in_frame(
             &content,
             &assets,
+            &StyleSheet::default(),
             &Frame::full_page(&page),
             &MONO,
             &NoHyphenator,
@@ -643,7 +679,14 @@ mod tests {
                 h_pt: 60.0,
             },
         };
-        let short = lay_out_in_frame(&content, &assets, &short_frame, &MONO, &NoHyphenator);
+        let short = lay_out_in_frame(
+            &content,
+            &assets,
+            &StyleSheet::default(),
+            &short_frame,
+            &MONO,
+            &NoHyphenator,
+        );
         assert!(
             short.len() >= 2,
             "a 60 pt frame must paginate 20 lines, got {}",
@@ -682,10 +725,18 @@ mod tests {
         // export output) is unchanged by threading.
         let doc = Document::sample();
         let frame = Frame::full_page(&doc.page_setup);
-        let via_frame = lay_out_in_frame(&doc.content, &doc.assets, &frame, &MONO, &NoHyphenator);
+        let via_frame = lay_out_in_frame(
+            &doc.content,
+            &doc.assets,
+            &StyleSheet::default(),
+            &frame,
+            &MONO,
+            &NoHyphenator,
+        );
         let via_thread = lay_out_in_thread(
             &doc.content,
             &doc.assets,
+            &StyleSheet::default(),
             &Thread {
                 frames: vec![frame],
             },
@@ -704,7 +755,14 @@ mod tests {
             .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let thread = two_column_thread(216.0, 96.0);
-        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
 
         assert_eq!(
             pages.len(),
@@ -737,7 +795,14 @@ mod tests {
             .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let thread = two_column_thread(216.0, 96.0);
-        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
 
         assert!(
             pages.len() >= 2,
@@ -762,7 +827,14 @@ mod tests {
             .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
         let thread = two_column_thread(216.0, 96.0);
-        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
         let right: Vec<&Rect> = pages[0]
             .blocks
             .iter()
@@ -811,7 +883,14 @@ mod tests {
             Block::body("first", Color::Gray { v: 0.0 }),
             Block::body("alpha beta gamma delta", Color::Gray { v: 0.0 }),
         ];
-        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
 
         // The second block lands in the narrow frame B (x = 216).
         let (frame, lines) = pages[0]
@@ -937,7 +1016,14 @@ mod tests {
         let content: Vec<Block> = (0..12)
             .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
             .collect();
-        let pages = lay_out_in_thread(&content, &[], &thread, &MONO, &NoHyphenator);
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
 
         assert_eq!(
             pages.len(),
@@ -973,6 +1059,7 @@ mod tests {
             fonts_embeddable: false,
             revision: 0,
             next_block_id: 0,
+            styles: StyleSheet::default(),
         };
         // Give the blocks ids, as a loaded document would have (spec 0026).
         doc.assign_missing_block_ids().expect("fresh blocks");
@@ -1057,6 +1144,7 @@ mod tests {
             fonts_embeddable: false,
             revision: 0,
             next_block_id: 0,
+            styles: StyleSheet::default(),
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -1124,6 +1212,112 @@ mod tests {
         let (w, h) = image_size(&sized_asset(0, 0, 300.0), content_width);
         assert_eq!(w, content_width);
         assert_eq!(h, content_width);
+    }
+
+    /// The size/leading a placed text block reports.
+    fn first_text_metrics(pages: &[LaidOutPage]) -> (f32, f32) {
+        pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .find_map(|b| match b {
+                PlacedBlock::Text {
+                    font_size_pt,
+                    leading_pt,
+                    ..
+                } => Some((*font_size_pt, *leading_pt)),
+                _ => None,
+            })
+            .expect("expected a text block")
+    }
+
+    #[test]
+    fn a_heading_is_laid_out_at_its_style_size_not_body_size() {
+        // Before spec 0028 every block was measured at BODY_FONT_SIZE_PT, so a heading differed
+        // from body text only by being ragged-left.
+        let doc = doc_with_blocks(vec![Block::heading(1, "Title", Color::Gray { v: 0.0 })]);
+        let (size, leading) = first_text_metrics(&lay_out(&doc, &MONO, &NoHyphenator));
+        let expected = doc.styles.paragraph["h1"];
+        assert_eq!(size, expected.font_size_pt);
+        assert_eq!(leading, expected.leading_pt);
+        assert!(size > BODY_FONT_SIZE_PT, "h1 must be larger than body");
+    }
+
+    #[test]
+    fn body_text_keeps_the_historical_size_and_leading() {
+        let doc = doc_with_blocks(vec![Block::body("some prose", Color::Gray { v: 0.0 })]);
+        let (size, leading) = first_text_metrics(&lay_out(&doc, &MONO, &NoHyphenator));
+        assert_eq!(size, BODY_FONT_SIZE_PT);
+        assert_eq!(leading, BODY_LINE_HEIGHT_PT);
+    }
+
+    #[test]
+    fn a_larger_style_wraps_to_more_lines_in_the_same_frame() {
+        // The load-bearing consequence: style affects *measurement*, not just what is drawn. If it
+        // only reached the writer, text would be drawn larger than the space reserved for it.
+        let text = "a moderately long line of prose that will wrap differently at two sizes";
+        let small = doc_with_blocks(vec![Block::body(text, Color::Gray { v: 0.0 })]);
+        let large = doc_with_blocks(vec![Block::heading(1, text, Color::Gray { v: 0.0 })]);
+        let count = |pages: Vec<LaidOutPage>| {
+            pages
+                .iter()
+                .flat_map(|p| p.blocks.iter())
+                .find_map(|b| match b {
+                    PlacedBlock::Text { lines, .. } => Some(lines.len()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            count(lay_out(&large, &MONO, &NoHyphenator))
+                > count(lay_out(&small, &MONO, &NoHyphenator)),
+            "the same text at h1 size must break into more lines than at body size"
+        );
+    }
+
+    #[test]
+    fn space_before_offsets_the_frame_without_being_drawn_in() {
+        // Space above is part of the block's occupied height (so pagination reserves it) but no
+        // text sits in it — the text frame starts below it.
+        let doc = doc_with_blocks(vec![
+            Block::body("first", Color::Gray { v: 0.0 }),
+            Block::heading(2, "Heading", Color::Gray { v: 0.0 }),
+        ]);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let frames: Vec<Rect> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, .. } => Some(*frame),
+                _ => None,
+            })
+            .collect();
+        let h2 = doc.styles.paragraph["h2"];
+        let gap = frames[1].y_pt - (frames[0].y_pt + frames[0].h_pt);
+        assert!(
+            (gap - h2.space_before_pt).abs() < 0.01,
+            "expected {} pt of space above the heading, got {gap}",
+            h2.space_before_pt
+        );
+    }
+
+    #[test]
+    fn a_document_of_only_body_text_lays_out_exactly_as_before_styles() {
+        // Parity: with the default sheet, body-only content must be positioned identically to the
+        // pre-styles engine — one line per BODY_LINE_HEIGHT_PT starting at the frame top.
+        let content: Vec<Block> = (0..5)
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
+            .collect();
+        let doc = doc_with_blocks(content);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let ys: Vec<f32> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, .. } => Some(frame.y_pt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ys, vec![0.0, 12.0, 24.0, 36.0, 48.0]);
     }
 
     #[test]

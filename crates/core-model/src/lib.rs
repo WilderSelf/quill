@@ -154,12 +154,18 @@ pub enum Block {
         level: u8,
         text: String,
         color: Color,
+        /// Overrides the structural default (`h{level}`). `None` is the common case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<String>,
     },
     Body {
         #[serde(default)]
         id: BlockId,
         text: String,
         color: Color,
+        /// Overrides the structural default (`body`). `None` is the common case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<String>,
     },
     Image {
         #[serde(default)]
@@ -184,23 +190,34 @@ impl Block {
         }
     }
 
-    /// A body paragraph with no id yet.
+    /// A body paragraph with no id yet, taking the default `body` style.
     pub fn body(text: impl Into<String>, color: Color) -> Block {
         Block::Body {
             id: BlockId::UNASSIGNED,
             text: text.into(),
             color,
+            style: None,
         }
     }
 
-    /// A heading with no id yet.
+    /// A heading with no id yet, taking the default `h{level}` style.
     pub fn heading(level: u8, text: impl Into<String>, color: Color) -> Block {
         Block::Heading {
             id: BlockId::UNASSIGNED,
             level,
             text: text.into(),
             color,
+            style: None,
         }
+    }
+
+    /// Name an explicit paragraph style for this block. No-op on an image.
+    pub fn with_style(mut self, name: impl Into<String>) -> Block {
+        match &mut self {
+            Block::Heading { style, .. } | Block::Body { style, .. } => *style = Some(name.into()),
+            Block::Image { .. } => {}
+        }
+        self
     }
 
     /// An image placement referencing an [`Asset::id`], with no id yet.
@@ -209,6 +226,128 @@ impl Block {
             id: BlockId::UNASSIGNED,
             asset: asset.into(),
         }
+    }
+}
+
+/// How a paragraph's lines are set within their frame.
+///
+/// Mirrors `quill_text_layout::Alignment`, which is not serializable and lives downstream of this
+/// crate. Keeping an authored spelling here means the *document* owns the intent and the layout
+/// crate owns the algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlign {
+    /// Stretch inter-word space so every line but the last fills the measure.
+    #[default]
+    Justified,
+    /// Ragged right: words sit at their natural advances.
+    Left,
+}
+
+/// The typographic treatment of a paragraph.
+///
+/// Before this existed, size and leading were crate constants in `quill-text-layout`
+/// (`BODY_FONT_SIZE_PT`, `BODY_LINE_HEIGHT_PT`) and every block in every document was set at body
+/// size — headings included, which meant a heading was distinguishable from body text only by
+/// being ragged-left.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ParagraphStyle {
+    pub font_size_pt: Pt,
+    /// Baseline-to-baseline distance. Kept separate from `font_size_pt` rather than derived from a
+    /// multiplier, because press typography routinely wants them set independently.
+    pub leading_pt: Pt,
+    #[serde(default)]
+    pub align: TextAlign,
+    /// Vertical space reserved above the paragraph. This is what stops a heading from sitting flush
+    /// against the paragraph before it.
+    #[serde(default)]
+    pub space_before_pt: Pt,
+    #[serde(default)]
+    pub space_after_pt: Pt,
+}
+
+impl Default for ParagraphStyle {
+    fn default() -> Self {
+        // The historical body treatment, preserved exactly: 10 pt on 12 pt, justified. Any document
+        // that does not mention styles must lay out precisely as it did before they existed.
+        Self {
+            font_size_pt: 10.0,
+            leading_pt: 12.0,
+            align: TextAlign::Justified,
+            space_before_pt: 0.0,
+            space_after_pt: 0.0,
+        }
+    }
+}
+
+/// The style name applied to body paragraphs when a block names none.
+pub const BODY_STYLE: &str = "body";
+
+/// The style name for a heading of the given level (`h1`..`h6`).
+pub fn heading_style_name(level: u8) -> String {
+    format!("h{}", level.clamp(1, 6))
+}
+
+/// Named paragraph styles for a document.
+///
+/// A named sheet rather than per-block formatting: changing "every heading in the book" has to be
+/// one edit, not a sweep over 500 pages. Blocks name a style; the sheet holds the treatment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StyleSheet {
+    #[serde(default)]
+    pub paragraph: BTreeMap<String, ParagraphStyle>,
+}
+
+impl Default for StyleSheet {
+    fn default() -> Self {
+        let mut paragraph = BTreeMap::new();
+        paragraph.insert(BODY_STYLE.to_string(), ParagraphStyle::default());
+        // A conventional descending scale. Headings are ragged-left because justifying a one-line
+        // heading would stretch it across the measure; and they carry space above so they separate
+        // from the text they follow.
+        for (level, size, leading) in [
+            (1u8, 24.0, 28.0),
+            (2, 18.0, 22.0),
+            (3, 14.0, 18.0),
+            (4, 12.0, 15.0),
+            (5, 11.0, 14.0),
+            (6, 10.0, 13.0),
+        ] {
+            paragraph.insert(
+                heading_style_name(level),
+                ParagraphStyle {
+                    font_size_pt: size,
+                    leading_pt: leading,
+                    align: TextAlign::Left,
+                    space_before_pt: leading * 0.75,
+                    space_after_pt: leading * 0.25,
+                },
+            );
+        }
+        StyleSheet { paragraph }
+    }
+}
+
+impl StyleSheet {
+    /// The style that applies to `block`.
+    ///
+    /// Resolution is: the block's explicit style name, else its structural default (`body`, or
+    /// `h{level}` for a heading). An unknown name falls back to `body` and finally to
+    /// [`ParagraphStyle::default`] — a missing style must not lose the text. Losing a paragraph
+    /// because its style was renamed would be far worse than setting it in the body face.
+    pub fn resolve(&self, block: &Block) -> ParagraphStyle {
+        let named = match block {
+            Block::Heading { style, level, .. } => {
+                style.clone().unwrap_or_else(|| heading_style_name(*level))
+            }
+            Block::Body { style, .. } => style.clone().unwrap_or_else(|| BODY_STYLE.to_string()),
+            Block::Image { .. } => return ParagraphStyle::default(),
+        };
+        self.paragraph
+            .get(&named)
+            .or_else(|| self.paragraph.get(BODY_STYLE))
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -234,6 +373,10 @@ pub struct Document {
     /// reusing the id of a deleted block would silently hand a stale cache entry to a new block.
     #[serde(default)]
     pub next_block_id: u64,
+    /// Named paragraph styles (spec 0028). Defaulted, so a manifest that predates styles loads and
+    /// lays out exactly as it did before they existed.
+    #[serde(default)]
+    pub styles: StyleSheet,
 }
 
 impl Document {
@@ -276,6 +419,7 @@ impl Document {
             fonts_embeddable: true,
             revision: 0,
             next_block_id: 0,
+            styles: StyleSheet::default(),
         };
         // The sample is a *loaded* document as far as everything downstream is concerned, so it
         // carries real ids like one — otherwise every consumer would have to special-case it.
@@ -521,6 +665,120 @@ mod tests {
             Some("assets/map1.png")
         );
         assert!(!index.contains_key("nope"));
+    }
+
+    // --- Paragraph styles (spec 0028) ---------------------------------------------------------
+
+    #[test]
+    fn the_default_body_style_preserves_the_historical_treatment() {
+        // 10 pt on 12 pt justified were crate constants in quill-text-layout. A document that never
+        // mentions styles must lay out exactly as it did before styles existed.
+        let s = ParagraphStyle::default();
+        assert_eq!(s.font_size_pt, 10.0);
+        assert_eq!(s.leading_pt, 12.0);
+        assert_eq!(s.align, TextAlign::Justified);
+        assert_eq!(s.space_before_pt, 0.0);
+        assert_eq!(s.space_after_pt, 0.0);
+    }
+
+    #[test]
+    fn headings_resolve_to_their_level_style_and_are_larger_than_body() {
+        let sheet = StyleSheet::default();
+        let body = sheet.resolve(&Block::body("x", Color::Gray { v: 0.0 }));
+        let mut previous = f32::MAX;
+        for level in 1..=6u8 {
+            let style = sheet.resolve(&Block::heading(level, "x", Color::Gray { v: 0.0 }));
+            assert!(
+                style.font_size_pt >= body.font_size_pt,
+                "h{level} should not be smaller than body"
+            );
+            assert!(
+                style.font_size_pt <= previous,
+                "h{level} should not be larger than h{}",
+                level - 1
+            );
+            assert_eq!(style.align, TextAlign::Left, "headings are ragged-left");
+            assert!(
+                style.space_before_pt > 0.0,
+                "h{level} needs space above so it separates from the text it follows"
+            );
+            previous = style.font_size_pt;
+        }
+        assert!(
+            sheet
+                .resolve(&Block::heading(1, "x", Color::Gray { v: 0.0 }))
+                .font_size_pt
+                > body.font_size_pt,
+            "h1 must be visibly larger than body — the whole point of this increment"
+        );
+    }
+
+    #[test]
+    fn a_block_can_name_an_explicit_style() {
+        let mut sheet = StyleSheet::default();
+        sheet.paragraph.insert(
+            "sidebar".into(),
+            ParagraphStyle {
+                font_size_pt: 8.0,
+                leading_pt: 9.5,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+            },
+        );
+        let block = Block::body("aside", Color::Gray { v: 0.0 }).with_style("sidebar");
+        assert_eq!(sheet.resolve(&block).font_size_pt, 8.0);
+    }
+
+    #[test]
+    fn an_unknown_style_name_falls_back_rather_than_losing_the_text() {
+        // A renamed or deleted style must not make a paragraph vanish or panic — setting it in the
+        // body face is recoverable, losing it is not.
+        let sheet = StyleSheet::default();
+        let block = Block::body("x", Color::Gray { v: 0.0 }).with_style("does-not-exist");
+        assert_eq!(sheet.resolve(&block), ParagraphStyle::default());
+    }
+
+    #[test]
+    fn a_heading_beyond_h6_still_resolves() {
+        // `level` is a u8, so nothing stops a document declaring level 99.
+        let sheet = StyleSheet::default();
+        let style = sheet.resolve(&Block::heading(99, "x", Color::Gray { v: 0.0 }));
+        assert_eq!(style, sheet.paragraph["h6"]);
+    }
+
+    #[test]
+    fn styles_round_trip_through_json() {
+        let mut doc = Document::sample();
+        doc.styles.paragraph.insert(
+            "callout".into(),
+            ParagraphStyle {
+                font_size_pt: 13.5,
+                leading_pt: 16.0,
+                align: TextAlign::Left,
+                space_before_pt: 6.0,
+                space_after_pt: 3.0,
+            },
+        );
+        let back = Document::from_json(&doc.to_json().expect("save")).expect("load");
+        assert_eq!(back.styles, doc.styles);
+    }
+
+    #[test]
+    fn a_manifest_without_styles_gets_the_defaults() {
+        // Backwards compatibility: `styles` is serde(default), so no FORMAT_VERSION bump.
+        let doc = Document::from_json(UNIDENTIFIED).expect("load");
+        assert_eq!(doc.styles, StyleSheet::default());
+        assert_eq!(doc.styles.resolve(&doc.content[1]).font_size_pt, 10.0);
+    }
+
+    #[test]
+    fn an_image_block_resolves_to_the_default_style() {
+        // Images have no paragraph treatment, but `resolve` must be total.
+        assert_eq!(
+            StyleSheet::default().resolve(&Block::image("x")),
+            ParagraphStyle::default()
+        );
     }
 
     #[test]
