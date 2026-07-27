@@ -496,6 +496,7 @@ dependencies = [
 name = "quill-core-model"
 version = "0.0.0"
 dependencies = [
+ "flate2",
  "serde",
  "serde_json",
  "zip",

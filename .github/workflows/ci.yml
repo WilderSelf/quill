@@ -103,6 +103,21 @@ jobs:
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/from-tpub.pdf
           echo "Ghostscript interpreted all three PDFs with no errors."
 
+      - name: Per-crate build (feature-unification guard)
+        run: |
+          set -euo pipefail
+          # `cargo build --workspace` unifies features across every crate, so a crate whose own
+          # manifest is missing a feature its dependency needs still compiles as long as some other
+          # crate in the workspace happens to enable it. That is how `quill-core-model` came to be
+          # unbuildable on its own while CI stayed green. Building each crate alone is the only
+          # thing that catches it.
+          for crate in $(cargo metadata --no-deps --format-version 1 \
+                         | grep -o '"name":"quill-[a-z-]*"' | cut -d'"' -f4 | sort -u); do
+            echo "::group::$crate"
+            cargo build -p "$crate"
+            echo "::endgroup::"
+          done
+
       - name: Performance budgets (spec 0027)
         run: |
           set -euo pipefail
