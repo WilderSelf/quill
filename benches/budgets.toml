@@ -23,6 +23,16 @@ ms_per_page = 0.5
 # value is ~2.0, and it measures 2.08. This is the single most valuable line in the file: it is what
 # would catch a quadratic scan being reintroduced into the engine.
 scaling_ratio = 2.2
+# Pages re-flowed after editing one paragraph in the middle of a 500-page document. This is the M1
+# claim — "re-flow only affected pages" — stated as a number. A regression that broke checkpoint
+# resume or flow re-convergence would send this to ~250 or ~500.
+incremental_pages_reflowed = 3.0
+# The same edit as a fraction of a full layout pass. Stated as a ratio against a pass measured in
+# the same run, so it does not drift with runner speed.
+# Measured 0.002 — a one-paragraph edit costs about a fifth of a percent of a full pass. The budget
+# sits well above that so runner noise on a sub-millisecond measurement cannot redden CI, while
+# still catching a regression that reintroduced walking the document's tail.
+incremental_work_fraction = 0.01
 
 [line_breaking]
 # One Knuth-Plass justification pass over one generated body paragraph. Measured 64.2.
