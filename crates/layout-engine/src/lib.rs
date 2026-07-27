@@ -139,7 +139,61 @@ pub enum PlacedBlock {
 /// A laid-out page.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LaidOutPage {
+    /// Zero-based position in the document.
+    ///
+    /// A page had no identity before spec 0029, which is why nothing could vary by page: a running
+    /// head cannot say "42" and a verso cannot mirror a recto if the page does not know which one it
+    /// is. Incremental layout (spec 0031) also needs it to report *which* pages changed.
+    pub index: usize,
+    /// Content that flowed onto this page.
     pub blocks: Vec<PlacedBlock>,
+    /// Content the page's template contributed — running heads, folios, background art.
+    ///
+    /// Kept separate from `blocks` rather than merged, for two reasons: it is drawn first (so master
+    /// art sits behind flowed content), and incremental relayout can leave it alone, since it does
+    /// not depend on where the text happened to break.
+    pub statics: Vec<PlacedBlock>,
+}
+
+/// Supplies the geometry and static content of each page.
+///
+/// Two things in the pagination loop previously made every page identical: the page-advance branch
+/// reset the frame cursor into the *same* frame list, and a page had no index to vary anything by.
+/// This trait is the seam where both stop being true — a master page is an implementation of it.
+///
+/// Introduced **at parity**: [`UniformTemplate`] returns the same frames for every page and no
+/// statics, which is exactly the previous behavior. Making the geometry vary per page is the new
+/// capability, exercised in tests and used by spec 0030's authored master pages.
+pub trait PageTemplate {
+    /// The frames content flows through on `page_index`, in order.
+    ///
+    /// Must be non-empty; a page with nowhere to put content would silently drop it.
+    fn frames(&self, page_index: usize) -> Vec<Frame>;
+
+    /// Content the template draws on `page_index`, independent of what flows there.
+    fn statics(&self, _page_index: usize) -> Vec<PlacedBlock> {
+        Vec::new()
+    }
+}
+
+/// A template that gives every page the same frames and no static content.
+///
+/// The parity implementation: layout through this is identical to the pre-template engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniformTemplate {
+    pub thread: Thread,
+}
+
+impl UniformTemplate {
+    pub fn new(thread: Thread) -> Self {
+        UniformTemplate { thread }
+    }
+}
+
+impl PageTemplate for UniformTemplate {
+    fn frames(&self, _page_index: usize) -> Vec<Frame> {
+        self.thread.frames.clone()
+    }
 }
 
 /// Lay a document out into pages, flowing its content into the whole-page frame
@@ -296,23 +350,60 @@ pub fn lay_out_in_thread(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    assert!(
-        !thread.frames.is_empty(),
-        "a thread must have at least one frame"
-    );
+    lay_out_with_template(
+        content,
+        assets,
+        styles,
+        &UniformTemplate::new(thread.clone()),
+        metrics,
+        hyphenator,
+    )
+}
 
+/// Flow `content` through pages whose geometry and static content come from `template`
+/// (spec 0029).
+///
+/// This is [`lay_out_in_thread`] generalized: instead of one frame list repeated on every page, each
+/// page asks the template what its frames are. With a [`UniformTemplate`] the two are identical.
+///
+/// Panics if the template hands back a page with no frames — a page with nowhere to put content
+/// would silently drop it, and losing content is exactly the class of failure `CLAUDE.md` forbids.
+pub fn lay_out_with_template(
+    content: &[Block],
+    assets: &[Asset],
+    styles: &StyleSheet,
+    template: &impl PageTemplate,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<LaidOutPage> {
     // Build the id → asset index once for the whole pass. `measure_block` runs once per candidate
     // frame per block, and it used to resolve image ids with a linear scan of `assets` — quadratic
     // in an art-heavy document, which is precisely the workload this engine exists for (spec 0026).
     let assets: AssetIndex<'_> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
     let assets = &assets;
 
+    /// Fetch a page's frames, refusing an empty list rather than silently dropping content.
+    fn frames_for(template: &impl PageTemplate, index: usize) -> Vec<Frame> {
+        let frames = template.frames(index);
+        assert!(
+            !frames.is_empty(),
+            "page template produced no frames for page {index}; content would be dropped"
+        );
+        frames
+    }
+
     let mut pages: Vec<LaidOutPage> = Vec::new();
-    let mut page = LaidOutPage::default();
-    // Which frame in the thread the cursor is currently filling.
+    let mut page_index: usize = 0;
+    let mut frames = frames_for(template, page_index);
+    let mut page = LaidOutPage {
+        index: page_index,
+        blocks: Vec::new(),
+        statics: template.statics(page_index),
+    };
+    // Which frame on the current page the cursor is filling.
     let mut frame_idx: usize = 0;
     // Absolute y cursor, starting at the current frame's top and reset there on each frame advance.
-    let mut y: f32 = thread.frames[0].rect.y_pt;
+    let mut y: f32 = frames[0].rect.y_pt;
     // Whether the *current* frame has received a block yet — mirrors incr. 1's page-empty guard,
     // now per frame so an oversized block is placed rather than skipped through every frame/page.
     let mut frame_empty = true;
@@ -325,7 +416,7 @@ pub fn lay_out_in_thread(
         // next iteration places (the `frame_empty` guard also places an oversized block rather than
         // looping past every frame).
         loop {
-            let frame = thread.frames[frame_idx];
+            let frame = frames[frame_idx];
             let Some((measured, height)) =
                 measure_block(block, frame.rect.w_pt, assets, styles, metrics, hyphenator)
             else {
@@ -335,14 +426,22 @@ pub fn lay_out_in_thread(
 
             if y + height > bottom && !frame_empty {
                 // Doesn't fit and the current frame has content → move on before placing.
-                if frame_idx + 1 < thread.frames.len() {
-                    frame_idx += 1; // next frame in the thread, same page
+                if frame_idx + 1 < frames.len() {
+                    frame_idx += 1; // next frame on this page
                 } else {
-                    pages.push(page); // thread exhausted → new page, back to the first frame
-                    page = LaidOutPage::default();
+                    // Page exhausted. The next page asks the template for its own geometry, rather
+                    // than reusing this page's — that is the whole point of the seam.
+                    pages.push(page);
+                    page_index += 1;
+                    frames = frames_for(template, page_index);
+                    page = LaidOutPage {
+                        index: page_index,
+                        blocks: Vec::new(),
+                        statics: template.statics(page_index),
+                    };
                     frame_idx = 0;
                 }
-                y = thread.frames[frame_idx].rect.y_pt;
+                y = frames[frame_idx].rect.y_pt;
                 frame_empty = true;
                 continue; // re-measure against the frame it moved into
             }
@@ -1318,6 +1417,181 @@ mod tests {
             })
             .collect();
         assert_eq!(ys, vec![0.0, 12.0, 24.0, 36.0, 48.0]);
+    }
+
+    // --- Per-page template seam (spec 0029) ---------------------------------------------------
+
+    /// A template whose frames narrow on every page — the simplest thing a uniform thread cannot
+    /// express, and enough to prove geometry really is asked for per page.
+    struct NarrowingTemplate;
+
+    impl PageTemplate for NarrowingTemplate {
+        fn frames(&self, page_index: usize) -> Vec<Frame> {
+            vec![Frame {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 400.0 - 50.0 * page_index as f32,
+                    h_pt: 100.0,
+                },
+            }]
+        }
+    }
+
+    /// A template that stamps a folio on every page.
+    struct FolioTemplate;
+
+    impl PageTemplate for FolioTemplate {
+        fn frames(&self, _page_index: usize) -> Vec<Frame> {
+            vec![Frame {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 432.0,
+                    h_pt: 100.0,
+                },
+            }]
+        }
+        fn statics(&self, page_index: usize) -> Vec<PlacedBlock> {
+            vec![PlacedBlock::Text {
+                frame: Rect {
+                    x_pt: 0.0,
+                    y_pt: 620.0,
+                    w_pt: 432.0,
+                    h_pt: 12.0,
+                },
+                lines: vec![Line {
+                    text: format!("{}", page_index + 1),
+                    space_adjust_pt: 0.0,
+                }],
+                color: Color::Gray { v: 0.0 },
+                font_size_pt: 9.0,
+                leading_pt: 11.0,
+            }]
+        }
+    }
+
+    fn many_lines(n: usize) -> Vec<Block> {
+        (0..n)
+            .map(|i| Block::body(format!("L{i}"), Color::Gray { v: 0.0 }))
+            .collect()
+    }
+
+    #[test]
+    fn a_uniform_template_is_identical_to_a_plain_thread() {
+        // Parity, the whole basis for landing this seam separately from master pages.
+        let content = many_lines(40);
+        let thread = Thread::columns(&PageSetup::default(), 2, 12.0);
+        let styles = StyleSheet::default();
+
+        let via_thread = lay_out_in_thread(&content, &[], &styles, &thread, &MONO, &NoHyphenator);
+        let via_template = lay_out_with_template(
+            &content,
+            &[],
+            &styles,
+            &UniformTemplate::new(thread.clone()),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(via_thread, via_template);
+    }
+
+    #[test]
+    fn pages_are_numbered_in_order_from_zero() {
+        // A page had no identity at all before this: a running head could not say "42".
+        let pages = lay_out_in_thread(
+            &many_lines(200),
+            &[],
+            &StyleSheet::default(),
+            &Thread::columns(&PageSetup::default(), 1, 0.0),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(pages.len() > 2, "expected several pages");
+        let indices: Vec<usize> = pages.iter().map(|p| p.index).collect();
+        assert_eq!(indices, (0..pages.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn each_page_takes_its_own_geometry_from_the_template() {
+        // The capability the seam exists for: before this, the page-advance branch reset into the
+        // same frame list, so every page was geometrically identical by construction.
+        let pages = lay_out_with_template(
+            &many_lines(60),
+            &[],
+            &StyleSheet::default(),
+            &NarrowingTemplate,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(pages.len() >= 3, "expected at least 3 pages");
+        let widths: Vec<f32> = pages
+            .iter()
+            .take(3)
+            .map(|p| match &p.blocks[0] {
+                PlacedBlock::Text { frame, .. } => frame.w_pt,
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(widths, vec![400.0, 350.0, 300.0]);
+    }
+
+    #[test]
+    fn template_statics_land_on_every_page_and_vary_by_page() {
+        let pages = lay_out_with_template(
+            &many_lines(30),
+            &[],
+            &StyleSheet::default(),
+            &FolioTemplate,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(pages.len() >= 2);
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(page.statics.len(), 1, "page {i} should carry a folio");
+            match &page.statics[0] {
+                PlacedBlock::Text { lines, .. } => {
+                    assert_eq!(lines[0].text, format!("{}", i + 1))
+                }
+                _ => panic!("expected a text folio"),
+            }
+        }
+    }
+
+    #[test]
+    fn statics_are_kept_separate_from_flowed_content() {
+        // They are drawn first (so master art sits behind text) and incremental relayout can leave
+        // them alone; merging them into `blocks` would lose both properties.
+        let pages = lay_out_with_template(
+            &many_lines(5),
+            &[],
+            &StyleSheet::default(),
+            &FolioTemplate,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(pages[0].statics.len(), 1);
+        assert_eq!(pages[0].blocks.len(), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "produced no frames")]
+    fn a_template_with_no_frames_fails_loudly() {
+        // Content silently disappearing is the failure class CLAUDE.md forbids.
+        struct Empty;
+        impl PageTemplate for Empty {
+            fn frames(&self, _: usize) -> Vec<Frame> {
+                Vec::new()
+            }
+        }
+        lay_out_with_template(
+            &many_lines(1),
+            &[],
+            &StyleSheet::default(),
+            &Empty,
+            &MONO,
+            &NoHyphenator,
+        );
     }
 
     #[test]
