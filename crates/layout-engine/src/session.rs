@@ -1,0 +1,765 @@
+//! Incremental, dependency-tracked layout — see `specs/0031-incremental-layout-session.md`.
+//!
+//! `CLAUDE.md` states it as a non-negotiable: *editing one text thread must re-flow only affected
+//! pages, never the whole document.* Until now every call re-ran Knuth-Plass over every block from
+//! index 0, so changing one paragraph on page 3 re-broke all 500 pages. That is the behavior the
+//! primary competitor is documented to collapse under, and avoiding it is the reason this engine
+//! exists.
+//!
+//! ## How the work is bounded
+//!
+//! Three mechanisms, each covering a different part of the cost:
+//!
+//! 1. **A measurement cache**, keyed by what a measurement actually depends on — the block's
+//!    content, the width it was broken to, and the style it was set in. An untouched paragraph
+//!    re-flowed into the same column is not re-broken.
+//! 2. **Resume from a checkpoint.** Layout records the flow state at each page boundary, so an edit
+//!    on page 300 restarts from page 300's checkpoint rather than from block 0. Pages before it are
+//!    reused untouched.
+//! 3. **Stop when the flow re-converges.** After a local edit the flow usually returns to exactly
+//!    the state it had before within a page or two — same block, same page number, same column,
+//!    same y. When that happens and nothing later changed, the *remaining* pages are reused as-is.
+//!
+//! Without (3), an edit on page 3 of 500 would still re-flow 497 pages; it is what turns "reflow
+//! from the edit" into "reflow around the edit".
+//!
+//! ## What the session is tied to
+//!
+//! The cache key covers content, width and style, but **not** the font metrics or hyphenator — they
+//! are passed per call and are not comparable values. A session is therefore bound by contract to
+//! the metrics it was first used with; call [`LayoutSession::invalidate`] if they change. This is a
+//! real constraint rather than a hidden assumption, and it is why the type is a session rather than
+//! a free function with a global cache.
+
+use std::collections::HashMap;
+
+use quill_core_model::{Block, BlockId, Document};
+use quill_text_layout::{Hyphenator, RunMetrics};
+
+use crate::{
+    flow, measure_block, AssetIndex, DocumentTemplate, FlowState, LaidOutPage, Measured, Measurer,
+    PageTemplate, StyleSheet,
+};
+
+/// What a relayout actually did.
+///
+/// Deterministic work counters, not timings. The M1 claim is "re-flow only affected pages", which is
+/// a statement about *work*, and counters state it far more precisely than a wall-clock number that
+/// swings 10-30% on a shared CI runner (see `benches/budgets.toml`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutStats {
+    /// Blocks that had to be broken/sized from scratch.
+    pub blocks_measured: usize,
+    /// Blocks served from the measurement cache.
+    pub blocks_from_cache: usize,
+    /// Pages produced by this pass.
+    pub pages_reflowed: usize,
+    /// Pages carried over untouched — before the edit, or after the flow re-converged.
+    pub pages_reused: usize,
+}
+
+impl LayoutStats {
+    /// Total pages in the resulting document.
+    pub fn pages_total(&self) -> usize {
+        self.pages_reflowed + self.pages_reused
+    }
+}
+
+/// The result of an incremental pass.
+#[derive(Debug, Clone)]
+pub struct LayoutResult {
+    pub pages: Vec<LaidOutPage>,
+    pub stats: LayoutStats,
+    /// Indices of pages whose content differs from the previous pass — what a viewport needs to
+    /// repaint, and nothing more.
+    pub changed_pages: Vec<usize>,
+}
+
+/// Identifies a measurement: everything a broken paragraph depends on.
+///
+/// If this key is missing a dimension the measurement actually depends on, the cache returns a
+/// stale layout and the document is silently wrong — so the fields here are the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeasureKey {
+    block: BlockId,
+    /// Fingerprint of the block's *content*, so editing text invalidates it even though the id is
+    /// deliberately stable across edits.
+    content: u64,
+    /// Frame width, as bits — `f32` is not `Hash`, and a paragraph broken to 200 pt is a different
+    /// measurement from the same paragraph broken to 210 pt.
+    width_bits: u32,
+    /// Style fingerprint: size, leading, alignment and the surrounding space all change the result.
+    style: u64,
+}
+
+/// An incremental layout engine for one document.
+pub struct LayoutSession {
+    cache: HashMap<MeasureKey, (Measured, f32)>,
+    /// Previous pass's output, for reuse.
+    pages: Vec<LaidOutPage>,
+    /// Flow state at the start of each previous page.
+    checkpoints: Vec<FlowState>,
+    /// Block order and content fingerprints from the previous pass, for diffing.
+    previous: Vec<(BlockId, u64)>,
+    /// Fingerprint of everything *other* than block content that layout depends on: the stylesheet,
+    /// page setup and master pages.
+    ///
+    /// Without this the diff sees only blocks, so restyling the document — or changing its margins,
+    /// or its master page — looks like "nothing changed" and the session returns the previous pages
+    /// unaltered. That is a stale document presented as a current one, which is worse than being
+    /// slow.
+    previous_context: u64,
+    /// Whether a previous pass exists at all.
+    primed: bool,
+}
+
+impl Default for LayoutSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LayoutSession {
+    pub fn new() -> LayoutSession {
+        LayoutSession {
+            cache: HashMap::new(),
+            pages: Vec::new(),
+            checkpoints: Vec::new(),
+            previous: Vec::new(),
+            previous_context: 0,
+            primed: false,
+        }
+    }
+
+    /// Drop everything cached. Required if the font metrics or hyphenator change — see the module
+    /// docs for why that cannot be detected automatically.
+    pub fn invalidate(&mut self) {
+        self.cache.clear();
+        self.pages.clear();
+        self.checkpoints.clear();
+        self.previous.clear();
+        self.previous_context = 0;
+        self.primed = false;
+    }
+
+    /// Number of cached measurements, for tests and diagnostics.
+    pub fn cached_measurements(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Lay `doc` out, reusing whatever the previous pass established.
+    pub fn relayout(
+        &mut self,
+        doc: &Document,
+        metrics: &impl RunMetrics,
+        hyphenator: &impl Hyphenator,
+    ) -> LayoutResult {
+        let template = DocumentTemplate::new(doc);
+        self.relayout_with_template(doc, &template, metrics, hyphenator)
+    }
+
+    /// [`relayout`](Self::relayout) against an explicit template.
+    pub fn relayout_with_template(
+        &mut self,
+        doc: &Document,
+        template: &impl PageTemplate,
+        metrics: &impl RunMetrics,
+        hyphenator: &impl Hyphenator,
+    ) -> LayoutResult {
+        let current: Vec<(BlockId, u64)> = doc
+            .content
+            .iter()
+            .map(|b| (b.id(), content_fingerprint(b)))
+            .collect();
+
+        // Anything that is not block content but still changes layout — styles, margins, masters —
+        // invalidates the whole document, because it can move every page.
+        let context = context_fingerprint(doc);
+        let context_changed = self.primed && context != self.previous_context;
+
+        // The first block whose identity or content differs. Everything before it flowed exactly as
+        // it did last time, so the pages containing it are still correct.
+        let dirty_from = if !self.primed || context_changed {
+            Some(0)
+        } else {
+            first_difference(&self.previous, &current)
+        };
+
+        let Some(dirty_from) = dirty_from else {
+            // Nothing changed. Note this still returns the previous pages rather than recomputing:
+            // a no-op edit (or a repaint request) must cost nothing.
+            return LayoutResult {
+                pages: self.pages.clone(),
+                stats: LayoutStats {
+                    pages_reused: self.pages.len(),
+                    ..Default::default()
+                },
+                changed_pages: Vec::new(),
+            };
+        };
+
+        // Resume from the last page that began at or before the edit.
+        let resume_page = self
+            .checkpoints
+            .iter()
+            .rposition(|c| c.block_idx <= dirty_from)
+            .unwrap_or(0);
+        let start = self
+            .checkpoints
+            .get(resume_page)
+            .copied()
+            .unwrap_or(FlowState {
+                block_idx: 0,
+                page_index: 0,
+                frame_idx: 0,
+                y: crate::frames_for(template, 0)[0].rect.y_pt,
+                frame_empty: true,
+            });
+
+        let kept: Vec<LaidOutPage> = self.pages.iter().take(start.page_index).cloned().collect();
+        let previous_pages = std::mem::take(&mut self.pages);
+        let previous_checkpoints = std::mem::take(&mut self.checkpoints);
+
+        let mut cache = CachingMeasurer {
+            cache: std::mem::take(&mut self.cache),
+            styles: &doc.styles,
+            measured: 0,
+            hits: 0,
+        };
+
+        // Everything at or after `last_dirty` is identical to the previous pass, which is what
+        // makes rejoining it sound.
+        let last_dirty = if self.primed && !context_changed {
+            last_difference(&self.previous, &current)
+        } else {
+            usize::MAX
+        };
+        let resync = if self.primed && last_dirty != usize::MAX {
+            Some(crate::Resync {
+                checkpoints: &previous_checkpoints,
+                last_dirty,
+            })
+        } else {
+            None
+        };
+
+        let result = flow(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            template,
+            metrics,
+            hyphenator,
+            start,
+            &mut cache,
+            resync,
+        );
+
+        let measured = cache.measured;
+        let hits = cache.hits;
+        self.cache = cache.cache;
+
+        // The flow stopped early because it rejoined the previous layout: everything from that page
+        // on is still valid, so take it verbatim. Page *index* is part of the match, so a master
+        // static carrying `{page}` cannot end up stamped with the wrong number.
+        let mut new_pages = result.pages;
+        let new_checkpoints = result.checkpoints;
+        let mut reused_tail = 0usize;
+
+        if let Some(at) = result.resynced_at {
+            let tail: Vec<LaidOutPage> = previous_pages.iter().skip(at).cloned().collect();
+            reused_tail = tail.len();
+            new_pages.extend(tail);
+        }
+
+        let reflowed = new_pages.len() - reused_tail;
+        let mut pages = kept;
+        pages.extend(new_pages);
+
+        // Renumber defensively: reused tail pages carry their old indices, which are only correct
+        // when the page count above them is unchanged — which is exactly the condition
+        // `find_reconvergence` enforces. Asserting it here rather than trusting it keeps a subtle
+        // bug from becoming a mis-numbered folio in a printed book.
+        for (i, page) in pages.iter_mut().enumerate() {
+            debug_assert_eq!(
+                page.index, i,
+                "page index drifted during incremental layout"
+            );
+            page.index = i;
+        }
+
+        let changed_pages = diff_pages(&previous_pages, &pages);
+
+        self.pages = pages.clone();
+        self.checkpoints =
+            rebuild_checkpoints(previous_checkpoints, new_checkpoints, start.page_index);
+        self.previous = current;
+        self.previous_context = context;
+        self.primed = true;
+
+        LayoutResult {
+            pages,
+            stats: LayoutStats {
+                blocks_measured: measured,
+                blocks_from_cache: hits,
+                pages_reflowed: reflowed,
+                pages_reused: start.page_index + reused_tail,
+            },
+            changed_pages,
+        }
+    }
+}
+
+/// Rebuild the checkpoint list to match the emitted pages.
+///
+/// Checkpoints for reused tail pages are dropped rather than recomputed: the next pass will simply
+/// resume from the last checkpoint it *does* have, which is always sound — it can only cost extra
+/// work, never produce a wrong layout.
+fn rebuild_checkpoints(
+    previous: Vec<FlowState>,
+    fresh: Vec<FlowState>,
+    kept_pages: usize,
+) -> Vec<FlowState> {
+    let mut out: Vec<FlowState> = previous.into_iter().take(kept_pages).collect();
+    out.extend(fresh);
+    out
+}
+
+/// Index of the first position where two block sequences differ, or `None` if identical.
+fn first_difference(previous: &[(BlockId, u64)], current: &[(BlockId, u64)]) -> Option<usize> {
+    let common = previous.len().min(current.len());
+    for i in 0..common {
+        if previous[i] != current[i] {
+            return Some(i);
+        }
+    }
+    if previous.len() == current.len() {
+        None
+    } else {
+        Some(common)
+    }
+}
+
+/// Index just past the last position where two block sequences differ.
+///
+/// Everything at or after this index is identical in both, which is what makes reusing a tail of
+/// pages sound.
+fn last_difference(previous: &[(BlockId, u64)], current: &[(BlockId, u64)]) -> usize {
+    if previous.len() != current.len() {
+        // A different block count shifts everything after the change; nothing at a fixed index can
+        // be assumed identical.
+        return current.len();
+    }
+    for i in (0..current.len()).rev() {
+        if previous[i] != current[i] {
+            return i + 1;
+        }
+    }
+    0
+}
+
+/// Page indices whose content differs between two passes.
+fn diff_pages(previous: &[LaidOutPage], current: &[LaidOutPage]) -> Vec<usize> {
+    let mut changed = Vec::new();
+    for (i, page) in current.iter().enumerate() {
+        match previous.get(i) {
+            Some(old) if old.blocks == page.blocks && old.statics == page.statics => {}
+            _ => changed.push(i),
+        }
+    }
+    // Pages that no longer exist also count as changed, so a viewport clears them.
+    for i in current.len()..previous.len() {
+        changed.push(i);
+    }
+    changed
+}
+
+/// A [`Measurer`] that serves repeats from a cache.
+struct CachingMeasurer<'a> {
+    cache: HashMap<MeasureKey, (Measured, f32)>,
+    styles: &'a StyleSheet,
+    measured: usize,
+    hits: usize,
+}
+
+impl Measurer for CachingMeasurer<'_> {
+    fn measure<M: RunMetrics, H: Hyphenator>(
+        &mut self,
+        block: &Block,
+        width: f32,
+        assets: &AssetIndex<'_>,
+        styles: &StyleSheet,
+        metrics: &M,
+        hyphenator: &H,
+    ) -> Option<(Measured, f32)> {
+        let key = MeasureKey {
+            block: block.id(),
+            content: content_fingerprint(block),
+            width_bits: width.to_bits(),
+            style: style_fingerprint(self.styles, block),
+        };
+        if let Some(hit) = self.cache.get(&key) {
+            self.hits += 1;
+            return Some(hit.clone());
+        }
+        let result = measure_block(block, width, assets, styles, metrics, hyphenator);
+        self.measured += 1;
+        if let Some(value) = &result {
+            self.cache.insert(key, value.clone());
+        }
+        result
+    }
+}
+
+/// FNV-1a over the parts of a block that affect its measurement.
+///
+/// The same construction the PDF `/ID` uses. Not cryptographic — a collision would serve a stale
+/// measurement — but the inputs here are a document's own paragraphs, not adversarial input, and a
+/// 64-bit collision across one document's blocks is not a realistic risk.
+fn content_fingerprint(block: &Block) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    match block {
+        Block::Heading {
+            level, text, style, ..
+        } => {
+            eat(b"h");
+            eat(&[*level]);
+            eat(text.as_bytes());
+            eat(style.as_deref().unwrap_or("").as_bytes());
+        }
+        Block::Body { text, style, .. } => {
+            eat(b"b");
+            eat(text.as_bytes());
+            eat(style.as_deref().unwrap_or("").as_bytes());
+        }
+        Block::Image { asset, .. } => {
+            eat(b"i");
+            eat(asset.as_bytes());
+        }
+    }
+    // Colour does not affect measurement, but it does affect the placed block, so a colour-only
+    // edit must still invalidate the cached *result*.
+    if let Block::Heading { color, .. } | Block::Body { color, .. } = block {
+        eat(format!("{color:?}").as_bytes());
+    }
+    h
+}
+
+/// Fingerprint of everything other than block content that layout depends on.
+///
+/// Uses `Debug` formatting rather than a hand-written walk: these types change as the model grows,
+/// and a hand-written fingerprint silently stops covering a field the moment one is added — which
+/// would show up as a document that refuses to re-flow after an edit nobody can see. `Debug` is
+/// derived, so it tracks the struct automatically. It runs once per relayout, against layout that
+/// costs milliseconds.
+fn context_fingerprint(doc: &Document) -> u64 {
+    let text = format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        doc.page_setup, doc.styles, doc.master_pages, doc.default_master
+    );
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Fingerprint of the style a block resolves to.
+fn style_fingerprint(styles: &StyleSheet, block: &Block) -> u64 {
+    let s = styles.resolve(block);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for bits in [
+        s.font_size_pt.to_bits(),
+        s.leading_pt.to_bits(),
+        s.space_before_pt.to_bits(),
+        s.space_after_pt.to_bits(),
+        s.align as u32,
+    ] {
+        h ^= bits as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quill_core_model::{Color, Document};
+    use quill_text_layout::{MonospaceRunMetrics, NoHyphenator};
+
+    const MONO: MonospaceRunMetrics = MonospaceRunMetrics { em_ratio: 0.6 };
+    const INK: Color = Color::Gray { v: 0.0 };
+
+    fn doc_of(n: usize) -> Document {
+        let mut doc = Document::sample();
+        doc.content = (0..n)
+            .map(|i| {
+                Block::body(
+                    format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                    INK,
+                )
+            })
+            .collect();
+        doc.assets.clear();
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    fn edit(doc: &mut Document, index: usize, text: &str) {
+        let id = doc.content[index].id();
+        doc.content[index] = Block::body(text, INK);
+        doc.content[index].set_id(id);
+        doc.bump_revision();
+    }
+
+    #[test]
+    fn a_first_pass_matches_a_full_layout_exactly() {
+        // The session must not be a second layout implementation. If incremental and full layout
+        // could disagree, the document would look different depending on how you arrived at it.
+        let doc = doc_of(200);
+        let mut session = LayoutSession::new();
+        let incremental = session.relayout(&doc, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(incremental.pages, full);
+    }
+
+    #[test]
+    fn an_unchanged_document_reflows_nothing() {
+        let doc = doc_of(200);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(again.stats.pages_reflowed, 0);
+        assert_eq!(again.stats.blocks_measured, 0);
+        assert!(again.changed_pages.is_empty());
+    }
+
+    #[test]
+    fn editing_one_paragraph_reflows_only_a_few_pages() {
+        // The M1 claim, stated as a number. A full pass over this document produces many pages;
+        // editing one paragraph must touch a handful, not all of them.
+        let mut doc = doc_of(600);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        let total = first.pages.len();
+        assert!(total > 10, "need a multi-page document, got {total}");
+
+        edit(&mut doc, 5, "a short replacement paragraph");
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+
+        assert_eq!(after.pages.len(), total, "page count should be stable here");
+        assert!(
+            after.stats.pages_reflowed <= 3,
+            "expected a bounded reflow, got {} of {total} pages",
+            after.stats.pages_reflowed
+        );
+        assert!(
+            after.stats.pages_reused >= total - 3,
+            "expected most pages reused, got {}",
+            after.stats.pages_reused
+        );
+    }
+
+    #[test]
+    fn an_edit_late_in_the_document_reuses_everything_before_it() {
+        let mut doc = doc_of(600);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        let total = first.pages.len();
+
+        let last = doc.content.len() - 1;
+        edit(&mut doc, last, "changed the very last paragraph");
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            after.stats.pages_reused >= total - 2,
+            "an edit on the last page should reuse everything before it, reused {} of {total}",
+            after.stats.pages_reused
+        );
+    }
+
+    #[test]
+    fn incremental_output_equals_a_full_relayout_after_an_edit() {
+        // The correctness property that matters most: whatever the session reuses, the result has
+        // to be what a from-scratch pass would have produced.
+        let mut doc = doc_of(300);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        edit(
+            &mut doc,
+            40,
+            "an edited paragraph of a rather different length than the original",
+        );
+        let incremental = session.relayout(&doc, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            incremental.pages, full,
+            "incremental diverged from full layout"
+        );
+    }
+
+    #[test]
+    fn inserting_a_block_still_matches_a_full_relayout() {
+        let mut doc = doc_of(300);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let id = doc.new_block_id();
+        let mut inserted = Block::body("an inserted paragraph in the middle of the document", INK);
+        inserted.set_id(id);
+        doc.content.insert(100, inserted);
+
+        let incremental = session.relayout(&doc, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(incremental.pages, full);
+    }
+
+    #[test]
+    fn deleting_a_block_still_matches_a_full_relayout() {
+        let mut doc = doc_of(300);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+        doc.content.remove(80);
+        let incremental = session.relayout(&doc, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(incremental.pages, full);
+    }
+
+    #[test]
+    fn the_measurement_cache_serves_unchanged_paragraphs() {
+        let mut doc = doc_of(200);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(first.stats.blocks_measured > 0);
+        // Even a first pass gets hits, and they are not spurious: the flow loop measures a block
+        // once per *candidate frame*, so a block that advances to the next page was measured twice
+        // by the old engine. The cache collapses that second measure — a free win the session picks
+        // up before any editing happens.
+        assert!(
+            first.stats.blocks_from_cache < first.stats.blocks_measured / 10,
+            "first-pass hits should only be page-advance re-measures, got {} of {}",
+            first.stats.blocks_from_cache,
+            first.stats.blocks_measured
+        );
+
+        edit(&mut doc, 3, "short");
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            after.stats.blocks_measured < first.stats.blocks_measured,
+            "an edit must measure fewer blocks than a full pass: {} vs {}",
+            after.stats.blocks_measured,
+            first.stats.blocks_measured
+        );
+    }
+
+    #[test]
+    fn changed_pages_reports_exactly_the_pages_that_differ() {
+        // A viewport repaints what this says and nothing else, so an under-report is a stale screen.
+        let mut doc = doc_of(400);
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).pages;
+
+        edit(
+            &mut doc,
+            30,
+            "an edit that changes this paragraph's length substantially indeed",
+        );
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let truly_changed: Vec<usize> = after
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| match before.get(*i) {
+                Some(old) => old.blocks != p.blocks || old.statics != p.statics,
+                None => true,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(after.changed_pages, truly_changed);
+    }
+
+    #[test]
+    fn a_style_change_invalidates_the_cache() {
+        // Style is part of the measurement key. If it were not, restyling the document would reuse
+        // paragraphs broken at the old size — text drawn at one size in space measured for another.
+        let mut doc = doc_of(100);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let mut body = doc.styles.paragraph["body"];
+        body.font_size_pt = 18.0;
+        body.leading_pt = 22.0;
+        doc.styles.paragraph.insert("body".into(), body);
+
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            after.pages, full,
+            "a restyle must not reuse stale measurements"
+        );
+    }
+
+    #[test]
+    fn a_colour_only_edit_is_still_picked_up() {
+        // Colour does not change *measurement*, but it does change the placed block — so it must
+        // still invalidate the cached result.
+        let mut doc = doc_of(50);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let id = doc.content[10].id();
+        let text = match &doc.content[10] {
+            Block::Body { text, .. } => text.clone(),
+            _ => unreachable!(),
+        };
+        doc.content[10] = Block::body(
+            text,
+            Color::Cmyk {
+                c: 1.0,
+                m: 0.0,
+                y: 0.0,
+                k: 0.0,
+            },
+        );
+        doc.content[10].set_id(id);
+
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(after.pages, full);
+    }
+
+    #[test]
+    fn invalidate_forces_a_full_pass() {
+        let doc = doc_of(100);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        session.invalidate();
+        assert_eq!(session.cached_measurements(), 0);
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(again.pages, first.pages);
+        assert!(again.stats.blocks_measured > 0);
+    }
+
+    #[test]
+    fn a_document_that_shrinks_to_fewer_pages_reports_the_removed_ones() {
+        let mut doc = doc_of(400);
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).pages.len();
+        doc.content.truncate(20);
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(after.pages.len() < before);
+        assert!(
+            after.changed_pages.contains(&(after.pages.len())),
+            "pages that no longer exist must be reported so a viewport clears them"
+        );
+        assert_eq!(after.pages, crate::lay_out(&doc, &MONO, &NoHyphenator));
+    }
+}

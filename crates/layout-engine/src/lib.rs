@@ -8,6 +8,10 @@
 
 use std::collections::BTreeMap;
 
+mod session;
+
+pub use session::{LayoutResult, LayoutSession, LayoutStats};
+
 use quill_core_model::{
     Asset, Block, Color, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle,
     Rect, StyleSheet, TextAlign, PAGE_TOKEN,
@@ -375,7 +379,8 @@ type AssetIndex<'a> = BTreeMap<&'a str, &'a Asset>;
 /// The intrinsic size of a block once broken/measured for a given frame width, plus the payload
 /// needed to place it. Re-computed against each candidate frame the block is tried in, since both
 /// text wrapping and image sizing depend on the frame width (spec 0019 incr. 2).
-enum Measured {
+#[derive(Clone)]
+pub(crate) enum Measured {
     Text {
         lines: Vec<Line>,
         color: Color,
@@ -393,7 +398,7 @@ enum Measured {
 ///
 /// Called once per candidate frame in [`lay_out_in_thread`]'s placement loop so a block that
 /// advances into a different-width frame re-wraps (text) / re-fits (image) to that frame's width.
-fn measure_block(
+pub(crate) fn measure_block(
     block: &Block,
     width: f32,
     assets: &AssetIndex<'_>,
@@ -494,24 +499,136 @@ pub fn lay_out_with_template(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
+    flow(
+        content,
+        assets,
+        styles,
+        template,
+        metrics,
+        hyphenator,
+        FlowState::start(template),
+        &mut NoCache,
+        None,
+    )
+    .pages
+}
+
+/// Where the flow had reached at a page boundary — everything needed to resume from there.
+///
+/// Incremental relayout (spec 0031) resumes from the last checkpoint before an edit instead of
+/// restarting at block 0. That is only sound because this is genuinely *all* the state the loop
+/// carries: capture the wrong subset and resumed layout silently diverges from a full pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FlowState {
+    /// Index into `content` of the next block to place.
+    pub block_idx: usize,
+    pub page_index: usize,
+    pub frame_idx: usize,
+    pub y: f32,
+    pub frame_empty: bool,
+}
+
+impl FlowState {
+    fn start(template: &impl PageTemplate) -> FlowState {
+        FlowState {
+            block_idx: 0,
+            page_index: 0,
+            frame_idx: 0,
+            y: frames_for(template, 0)[0].rect.y_pt,
+            frame_empty: true,
+        }
+    }
+}
+
+/// Fetch a page's frames, refusing an empty list rather than silently dropping content.
+pub(crate) fn frames_for(template: &impl PageTemplate, index: usize) -> Vec<Frame> {
+    let frames = template.frames(index);
+    assert!(
+        !frames.is_empty(),
+        "page template produced no frames for page {index}; content would be dropped"
+    );
+    frames
+}
+
+/// Intercepts measurement so a session can serve repeats from cache. See `session.rs`.
+pub(crate) trait Measurer {
+    fn measure<M: RunMetrics, H: Hyphenator>(
+        &mut self,
+        block: &Block,
+        width: f32,
+        assets: &AssetIndex<'_>,
+        styles: &StyleSheet,
+        metrics: &M,
+        hyphenator: &H,
+    ) -> Option<(Measured, f32)>;
+}
+
+/// The non-caching measurer used by the one-shot path.
+pub(crate) struct NoCache;
+
+impl Measurer for NoCache {
+    fn measure<M: RunMetrics, H: Hyphenator>(
+        &mut self,
+        block: &Block,
+        width: f32,
+        assets: &AssetIndex<'_>,
+        styles: &StyleSheet,
+        metrics: &M,
+        hyphenator: &H,
+    ) -> Option<(Measured, f32)> {
+        measure_block(block, width, assets, styles, metrics, hyphenator)
+    }
+}
+
+/// The result of a flow pass: the pages produced plus the state at each page's start.
+pub(crate) struct FlowResult {
+    pub pages: Vec<LaidOutPage>,
+    /// `checkpoints[i]` is the flow state at the moment page `i` began.
+    pub checkpoints: Vec<FlowState>,
+    /// Set when the flow stopped early because it re-converged with a previous pass. The value is
+    /// the page index in *that* pass whose remaining pages are still valid.
+    pub resynced_at: Option<usize>,
+}
+
+/// Lets an incremental pass stop as soon as it rejoins the previous layout.
+///
+/// Without this, an edit on page 250 of 500 still *walks* all 250 remaining blocks — cheaply, from
+/// cache, but 250 blocks of hashing and lookup is not nothing. Stopping at the boundary is what
+/// makes the cost proportional to the edit rather than to the tail of the document.
+pub(crate) struct Resync<'a> {
+    /// Page-start states from the previous pass.
+    pub checkpoints: &'a [FlowState],
+    /// Index past the last changed block; before it, nothing can be assumed to match.
+    pub last_dirty: usize,
+}
+
+/// The pagination loop, resumable from `start`.
+///
+/// Extracted from `lay_out_with_template` so the one-shot path and the incremental session run
+/// *the same code*. Two implementations would drift, and a divergence between full and incremental
+/// layout is the worst possible bug here: the document would look different depending on how you
+/// arrived at it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flow(
+    content: &[Block],
+    assets: &[Asset],
+    styles: &StyleSheet,
+    template: &impl PageTemplate,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+    start: FlowState,
+    measurer: &mut impl Measurer,
+    resync: Option<Resync<'_>>,
+) -> FlowResult {
     // Build the id → asset index once for the whole pass. `measure_block` runs once per candidate
     // frame per block, and it used to resolve image ids with a linear scan of `assets` — quadratic
     // in an art-heavy document, which is precisely the workload this engine exists for (spec 0026).
     let assets: AssetIndex<'_> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
     let assets = &assets;
 
-    /// Fetch a page's frames, refusing an empty list rather than silently dropping content.
-    fn frames_for(template: &impl PageTemplate, index: usize) -> Vec<Frame> {
-        let frames = template.frames(index);
-        assert!(
-            !frames.is_empty(),
-            "page template produced no frames for page {index}; content would be dropped"
-        );
-        frames
-    }
-
     let mut pages: Vec<LaidOutPage> = Vec::new();
-    let mut page_index: usize = 0;
+    let mut checkpoints: Vec<FlowState> = Vec::new();
+    let mut page_index: usize = start.page_index;
     let mut frames = frames_for(template, page_index);
     let mut page = LaidOutPage {
         index: page_index,
@@ -519,14 +636,16 @@ pub fn lay_out_with_template(
         statics: template.statics(page_index),
     };
     // Which frame on the current page the cursor is filling.
-    let mut frame_idx: usize = 0;
+    let mut frame_idx: usize = start.frame_idx;
     // Absolute y cursor, starting at the current frame's top and reset there on each frame advance.
-    let mut y: f32 = frames[0].rect.y_pt;
+    let mut y: f32 = start.y;
     // Whether the *current* frame has received a block yet — mirrors incr. 1's page-empty guard,
     // now per frame so an oversized block is placed rather than skipped through every frame/page.
-    let mut frame_empty = true;
+    let mut frame_empty = start.frame_empty;
+    checkpoints.push(start);
 
-    for block in content {
+    for (offset, block) in content[start.block_idx..].iter().enumerate() {
+        let block_idx = start.block_idx + offset;
         // Advance frames / pages until the block fits, then place it. The block is re-measured
         // against each candidate frame's width (wrapping/sizing depend on it), so a block that
         // advances into a narrower frame re-wraps to that width rather than keeping a stale
@@ -536,7 +655,7 @@ pub fn lay_out_with_template(
         loop {
             let frame = frames[frame_idx];
             let Some((measured, height)) =
-                measure_block(block, frame.rect.w_pt, assets, styles, metrics, hyphenator)
+                measurer.measure(block, frame.rect.w_pt, assets, styles, metrics, hyphenator)
             else {
                 break; // unresolved image asset → skip this block (no panic)
             };
@@ -558,6 +677,31 @@ pub fn lay_out_with_template(
                         statics: template.statics(page_index),
                     };
                     frame_idx = 0;
+                    // Record where the new page begins, so a later edit can resume from here.
+                    let at_boundary = FlowState {
+                        block_idx,
+                        page_index,
+                        frame_idx: 0,
+                        y: frames[0].rect.y_pt,
+                        frame_empty: true,
+                    };
+                    checkpoints.push(at_boundary);
+
+                    // If this page begins in exactly the state the previous pass's page of the same
+                    // number began in, and nothing past here changed, the rest of the old layout is
+                    // still correct — stop, rather than re-deriving pages we already have.
+                    if let Some(r) = &resync {
+                        if block_idx >= r.last_dirty
+                            && r.checkpoints.get(page_index) == Some(&at_boundary)
+                        {
+                            checkpoints.pop();
+                            return FlowResult {
+                                pages,
+                                checkpoints,
+                                resynced_at: Some(page_index),
+                            };
+                        }
+                    }
                 }
                 y = frames[frame_idx].rect.y_pt;
                 frame_empty = true;
@@ -605,7 +749,11 @@ pub fn lay_out_with_template(
 
     // Always emit the last (possibly empty) page so callers receive >= 1 page.
     pages.push(page);
-    pages
+    FlowResult {
+        pages,
+        checkpoints,
+        resynced_at: None,
+    }
 }
 
 #[cfg(test)]

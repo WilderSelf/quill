@@ -61,5 +61,55 @@ fn main() {
     );
     budgets.check("layout.scaling_ratio", ratio, &mut failures);
 
+    // --- Incremental relayout after a one-paragraph edit (spec 0031) --------------------------
+    // The M1 claim itself. Reported as counters and a ratio against the full pass, never as an
+    // absolute time.
+    let mut session = quill_layout_engine::LayoutSession::new();
+    let first = session.relayout(&doc, &HARNESS_METRICS, &NoHyphenator);
+    let total_pages = first.pages.len();
+
+    let mut edited = doc.clone();
+    let target = edited.content.len() / 2;
+    let id = edited.content[target].id();
+    edited.content[target] = quill_core_model::Block::body(
+        "an edited paragraph, roughly the same length as the one it replaced in the document",
+        quill_core_model::Color::Cmyk {
+            c: 0.0,
+            m: 0.0,
+            y: 0.0,
+            k: 1.0,
+        },
+    );
+    edited.content[target].set_id(id);
+
+    let t_incremental = budget::min_of(3, || {
+        // A fresh session per timed run: re-running `relayout` on the same edited document would
+        // measure the no-op path, not the edit path.
+        let mut s = quill_layout_engine::LayoutSession::new();
+        s.relayout(&doc, &HARNESS_METRICS, &NoHyphenator);
+        std::hint::black_box(s.relayout(&edited, &HARNESS_METRICS, &NoHyphenator));
+    });
+    // Subtract the priming pass to isolate the edit's cost.
+    let edit_only = t_incremental.as_secs_f64() - elapsed.as_secs_f64();
+    let fraction = (edit_only / elapsed.as_secs_f64()).max(0.0);
+
+    let stats = session
+        .relayout(&edited, &HARNESS_METRICS, &NoHyphenator)
+        .stats;
+    println!(
+        "incremental edit: {} of {total_pages} pages reflowed, {} blocks measured, \
+         {} from cache  (~{:.1}% of a full pass)",
+        stats.pages_reflowed,
+        stats.blocks_measured,
+        stats.blocks_from_cache,
+        fraction * 100.0
+    );
+    budgets.check(
+        "layout.incremental_pages_reflowed",
+        stats.pages_reflowed as f64,
+        &mut failures,
+    );
+    budgets.check("layout.incremental_work_fraction", fraction, &mut failures);
+
     budget::report(failures);
 }

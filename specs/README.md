@@ -39,6 +39,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0028 | [Persisted paragraph styles](0028-paragraph-styles.md) | M1 | implemented |
 | 0029 | [Per-page template seam (at parity)](0029-page-template-seam.md) | M1 | implemented |
 | 0030 | [Authored master pages and margins; `FORMAT_VERSION` 2](0030-persisted-masters-format-v2.md) | M1 | implemented |
+| 0031 | [Incremental, dependency-tracked layout](0031-incremental-layout-session.md) | M1 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind
