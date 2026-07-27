@@ -1,0 +1,56 @@
+# Performance budgets — the CI gate for `cargo bench` (spec 0027).
+#
+# These are BLOWUP DETECTORS, not micro-regression detectors. A measurement fails only when it
+# exceeds its ceiling by more than `tolerance_factor`, because shared GitHub runners vary by 10-30%
+# between runs and `rust-toolchain.toml` pins the floating `stable` channel — a tight absolute
+# ceiling would fail on unrelated noise, get raised until it stopped failing, and then measure
+# nothing at all.
+#
+# What this file is really guarding is the *shape* of the algorithms: the ratio entries are the
+# load-bearing ones. A quadratic scan reintroduced into layout, or a proxy cache that stops skipping
+# unchanged assets, changes a ratio by a lot and sails past any noise threshold.
+#
+# Ceilings are recorded from a release build on the reference machine. If a change legitimately
+# makes something slower, update the number in the same commit and say why in the message.
+
+# How far past a ceiling a measurement may go before it fails. 2.0 = "twice the budget".
+tolerance_factor = 2.0
+
+[layout]
+# Full-document `lay_out` over the 500-page synthetic document, per page. Measured 0.475.
+ms_per_page = 0.5
+# Time at 500 pages divided by time at 250 pages. Layout is a single forward pass, so the honest
+# value is ~2.0, and it measures 2.08. This is the single most valuable line in the file: it is what
+# would catch a quadratic scan being reintroduced into the engine.
+scaling_ratio = 2.2
+
+[line_breaking]
+# One Knuth-Plass justification pass over one generated body paragraph. Measured 64.2.
+us_per_paragraph = 70.0
+# An 8x longer paragraph. Measured 35.8x, which is SUPERLINEAR — see the note below. The budget
+# records today's reality so a further regression is still caught; it is not an endorsement.
+length_scaling_ratio = 40.0
+
+[proxy_cache]
+# Decoding and downsampling one 1200x900 linked image into a screen proxy. Measured 6.31.
+ms_per_image = 7.0
+# Reciprocal of the warm/cold speedup, so it reads as a ceiling like every other entry: 0.01 means
+# a re-populate of unchanged assets must be at least 100x cheaper than the cold pass. This is spec
+# 0024's incremental-invalidation claim stated as a number. Measured speedup is ~8300x, so there is
+# enormous headroom — the gate fires only if skipping stops working, which is the point.
+warm_speedup_floor = 0.01
+
+# ---------------------------------------------------------------------------------------------
+# Known issue, found by this harness on its first run
+#
+# `line_breaking.length_scaling_ratio` measures 35.8x for an 8x longer paragraph. Linear would be
+# 8x and fully quadratic 64x, so Knuth-Plass here is behaving closer to O(n^2) than to O(n). The
+# textbook algorithm keeps this near-linear by pruning active nodes that can no longer lead to a
+# feasible break; that pruning appears to be missing or ineffective.
+#
+# Not fixed in spec 0027, deliberately: this increment lands the measuring stick, and changing the
+# line breaker in the same commit would mean changing the thing being measured and the measurement
+# together. It is low-severity in practice — real paragraphs are 30-90 words, where the absolute
+# cost is ~64 us — but it is a genuine cliff for pathological input, such as a stat block or table
+# flattened into one very long paragraph. Tracked in docs/roadmap.md.
+

@@ -1,0 +1,38 @@
+[package]
+name = "quill-testdoc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal: a deterministic synthetic-document generator plus the performance harness
+# that measures against it (spec 0027). Never published.
+publish = false
+
+[dependencies]
+quill-core-model = { workspace = true }
+# The generator measures its output to a page target, so it lays documents out. Nothing depends on
+# this crate in return — the benches live *here* rather than in `layout-engine`, which keeps the
+# dependency edge one-way and avoids a dev-dependency cycle.
+quill-layout-engine = { workspace = true }
+quill-text-layout = { workspace = true }
+quill-render = { workspace = true }
+
+# `harness = false` because these are hand-rolled `std::time::Instant` timings, not libtest
+# benchmarks: criterion would add ~30 transitive crates, against the minimal-graph rule in the
+# workspace manifest. `test = false` keeps `cargo test` from running them — a bench executed as a
+# test would burn CI minutes on every leg of the OS matrix for no signal.
+[[bench]]
+name = "layout"
+harness = false
+test = false
+
+[[bench]]
+name = "line_breaking"
+harness = false
+test = false
+
+[[bench]]
+name = "proxy_cache"
+harness = false
+test = false
