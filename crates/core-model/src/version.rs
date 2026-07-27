@@ -82,17 +82,31 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
         });
     }
 
-    // Migration chain goes here. Each step mutates `obj` from version N to N+1 and falls through to
-    // the next, so the first real bump (spec 0030's FORMAT_VERSION 2) is one added arm:
-    //
-    //     if found < 2 { migrate_1_to_2(obj); }
-    //
-    // Today FORMAT_VERSION is 1 and nothing is older, so there is nothing to run. What matters is
-    // that `migrate` is already on every load path for when that bump lands.
-    let _ = found;
+    // Migration chain. Each step mutates `obj` from version N to N+1 and falls through to the next,
+    // so a future bump is one added arm rather than a redesign.
+    if found < 2 {
+        migrate_1_to_2(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
+}
+
+/// v1 → v2 (spec 0030): master pages, per-page margins.
+///
+/// Structurally a no-op, and deliberately written as one rather than skipped. Every added field is
+/// `serde(default)`, so a v1 manifest already deserializes into the v2 types with the right values —
+/// no margins, no masters, which is precisely what a v1 document meant. Explicitly defaulting them
+/// here rather than relying on that keeps the chain readable as a record of what each version
+/// changed, and means a later step that *does* need to rewrite a field has an obvious place to go.
+fn migrate_1_to_2(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(setup) = obj.get_mut("page_setup").and_then(|v| v.as_object_mut()) {
+        setup
+            .entry("margins")
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    obj.entry("master_pages")
+        .or_insert_with(|| serde_json::json!([]));
 }
 
 #[cfg(test)]
@@ -102,15 +116,53 @@ mod tests {
 
     #[test]
     fn a_newer_format_version_is_refused_not_silently_downgraded() {
-        let json = r#"{"format_version": 2, "page_setup": {"trim": {"w_pt": 1.0, "h_pt": 1.0},
-                       "bleed_pt": 9.0, "facing_pages": true}}"#;
-        match Document::from_json(json) {
+        // Expressed relative to FORMAT_VERSION rather than as a literal, so this keeps testing
+        // "one version newer than we understand" across every future bump. Written with a literal
+        // 2, it silently stopped testing anything the moment spec 0030 bumped to 2.
+        let next = FORMAT_VERSION + 1;
+        let json = format!(
+            r#"{{"format_version": {next}, "page_setup": {{"trim": {{"w_pt": 1.0, "h_pt": 1.0}},
+               "bleed_pt": 9.0, "facing_pages": true}}}}"#
+        );
+        match Document::from_json(&json) {
             Err(LoadError::UnsupportedVersion { found, supported }) => {
-                assert_eq!(found, 2);
+                assert_eq!(found, next);
                 assert_eq!(supported, FORMAT_VERSION);
             }
             other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_v1_manifest_migrates_forward_to_v2() {
+        // The first real exercise of the chain spec 0025 built: a document written before master
+        // pages existed must still open, and must mean what it meant then — no margins, no masters.
+        let json = r#"{
+            "format_version": 1,
+            "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                           "facing_pages": true},
+            "content": [{"kind": "body", "text": "old", "color": {"space": "gray", "v": 0.0}}]
+        }"#;
+        let doc = Document::from_json(json).expect("a v1 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+        assert_eq!(doc.page_setup.margins, crate::Margins::default());
+        assert!(doc.master_pages.is_empty());
+        assert!(doc.default_master.is_none());
+        assert_eq!(doc.content.len(), 1);
+    }
+
+    #[test]
+    fn a_migrated_v1_document_lays_out_as_it_did_before() {
+        // Migration must be behavior-preserving, not merely parse-succeeding: zero margins and no
+        // master reproduce the full-page frame a v1 document was laid out in.
+        let json = r#"{
+            "format_version": 1,
+            "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                           "facing_pages": true}
+        }"#;
+        let doc = Document::from_json(json).expect("load");
+        assert_eq!(doc.page_setup.margins.top_pt, 0.0);
+        assert_eq!(doc.page_setup.margins.inside_pt, 0.0);
     }
 
     #[test]

@@ -18,7 +18,15 @@ pub use version::LoadError;
 pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// **2** since spec 0030 added master pages and margins. The bump is deliberate even though the new
+/// fields are all `serde(default)` and a v1 manifest therefore loads unchanged: the point of a
+/// version is to stop an *older* build from opening a document it would silently mis-lay-out. A
+/// build that predates master pages would ignore `master_pages` entirely and produce a document
+/// without its running heads, folios or column geometry — and could then save that back. Refusing
+/// to open is the correct outcome; quietly dropping the layout is exactly the silent corruption
+/// `CLAUDE.md` forbids.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -68,6 +76,58 @@ pub struct PageSetup {
     pub trim: Size,
     pub bleed_pt: Pt,
     pub facing_pages: bool,
+    /// Page margins. `inside`/`outside` rather than left/right because a bound book's margins are
+    /// relative to the *spine*: the inside margin is at the spine on both sides of a spread, so it
+    /// falls on the left of a recto and the right of a verso. Left/right would force every layout
+    /// rule to special-case parity.
+    #[serde(default)]
+    pub margins: Margins,
+}
+
+/// Page margins in points, expressed relative to the binding.
+///
+/// Defaults to zero on every edge — the pre-spec-0030 behavior, where the text frame was the whole
+/// trim area. Zero margins let text run to the trim edge, which is not a sane *design* default, but
+/// changing it would silently reflow every existing document; it is a template concern (M2), and
+/// the roadmap records it as an explicit open question rather than an oversight.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Margins {
+    #[serde(default)]
+    pub top_pt: Pt,
+    #[serde(default)]
+    pub bottom_pt: Pt,
+    /// The margin at the spine.
+    #[serde(default)]
+    pub inside_pt: Pt,
+    /// The margin at the fore-edge.
+    #[serde(default)]
+    pub outside_pt: Pt,
+}
+
+impl Margins {
+    /// A uniform margin on all four edges.
+    pub fn uniform(pt: Pt) -> Margins {
+        Margins {
+            top_pt: pt,
+            bottom_pt: pt,
+            inside_pt: pt,
+            outside_pt: pt,
+        }
+    }
+
+    /// Resolve `inside`/`outside` into left/right for a given page.
+    ///
+    /// On a facing-pages document, odd (zero-based even) pages are rectos with the spine on the
+    /// left. With facing pages off, every page is treated as a recto — a single-sided document has
+    /// no spread to mirror across.
+    pub fn left_right(&self, page_index: usize, facing_pages: bool) -> (Pt, Pt) {
+        let recto = !facing_pages || page_index.is_multiple_of(2);
+        if recto {
+            (self.inside_pt, self.outside_pt)
+        } else {
+            (self.outside_pt, self.inside_pt)
+        }
+    }
 }
 
 impl Default for PageSetup {
@@ -80,6 +140,7 @@ impl Default for PageSetup {
             },
             bleed_pt: DEFAULT_BLEED_PT,
             facing_pages: true,
+            margins: Margins::default(),
         }
     }
 }
@@ -351,6 +412,69 @@ impl StyleSheet {
     }
 }
 
+/// A repeating element a master page stamps onto each page it governs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MasterStatic {
+    /// A line of text at a fixed position — a running head, a folio, a footer.
+    ///
+    /// `text` may contain `{page}`, replaced with the one-based page number when the page is laid
+    /// out. A token rather than a distinct "folio" variant, so a running head can read
+    /// "The Dungeon — 42" without needing a second element type.
+    Text {
+        /// Where the line sits, relative to the trim box.
+        rect: Rect,
+        text: String,
+        color: Color,
+        /// Paragraph style name, resolved against the document's stylesheet.
+        #[serde(default)]
+        style: Option<String>,
+    },
+    /// A linked image at a fixed position — background art, a border, a decorative rule.
+    Image { rect: Rect, asset: String },
+}
+
+/// The page-number token replaced in [`MasterStatic::Text`].
+pub const PAGE_TOKEN: &str = "{page}";
+
+/// A named page template: the geometry and repeating furniture shared by many pages.
+///
+/// This is the "pro layer" half of the hybrid paradigm — the thing that makes a 500-page book
+/// consistent without touching 500 pages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MasterPage {
+    pub name: String,
+    /// Margins for pages using this master; falls back to the document's when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margins: Option<Margins>,
+    /// Number of columns the text frame is divided into.
+    #[serde(default = "one")]
+    pub columns: usize,
+    /// Horizontal space between columns.
+    #[serde(default)]
+    pub gutter_pt: Pt,
+    /// Repeating elements stamped on every page using this master.
+    #[serde(default)]
+    pub statics: Vec<MasterStatic>,
+}
+
+fn one() -> usize {
+    1
+}
+
+impl MasterPage {
+    /// A single-column master with no furniture — the geometry a document has with no master at all.
+    pub fn plain(name: impl Into<String>) -> MasterPage {
+        MasterPage {
+            name: name.into(),
+            margins: None,
+            columns: 1,
+            gutter_pt: 0.0,
+            statics: Vec::new(),
+        }
+    }
+}
+
 /// The whole document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -377,6 +501,16 @@ pub struct Document {
     /// lays out exactly as it did before they existed.
     #[serde(default)]
     pub styles: StyleSheet,
+    /// Named master pages (spec 0030).
+    #[serde(default)]
+    pub master_pages: Vec<MasterPage>,
+    /// The master applied to every page. `None` — or a name not in `master_pages` — means the
+    /// document's own page setup governs, which is the pre-0030 behavior.
+    ///
+    /// Per-page master assignment is a follow-up; one default master is what makes a consistent
+    /// 500-page book, and is the case worth having first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_master: Option<String>,
 }
 
 impl Document {
@@ -420,6 +554,8 @@ impl Document {
             revision: 0,
             next_block_id: 0,
             styles: StyleSheet::default(),
+            master_pages: Vec::new(),
+            default_master: None,
         };
         // The sample is a *loaded* document as far as everything downstream is concerned, so it
         // carries real ids like one — otherwise every consumer would have to special-case it.

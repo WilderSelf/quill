@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use quill_core_model::{
-    Asset, Block, Color, Document, PageSetup, ParagraphStyle, Rect, StyleSheet, TextAlign,
+    Asset, Block, Color, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle,
+    Rect, StyleSheet, TextAlign, PAGE_TOKEN,
 };
 use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -196,6 +197,122 @@ impl PageTemplate for UniformTemplate {
     }
 }
 
+/// A [`PageTemplate`] built from a document's page setup and its default master page (spec 0030).
+///
+/// This is where authored layout finally reaches the engine: margins, column count and gutter come
+/// from the master, and its statics are stamped onto every page with `{page}` resolved.
+///
+/// With no master and zero margins it produces exactly [`Frame::full_page`], so a document that
+/// declares neither lays out as it always did.
+pub struct DocumentTemplate<'a> {
+    page_setup: &'a PageSetup,
+    master: Option<&'a MasterPage>,
+    styles: &'a StyleSheet,
+}
+
+impl<'a> DocumentTemplate<'a> {
+    pub fn new(doc: &'a Document) -> DocumentTemplate<'a> {
+        // An unknown `default_master` name resolves to no master rather than an error: a renamed
+        // master should degrade to the document's own page setup, not refuse to lay the book out.
+        let master = doc
+            .default_master
+            .as_deref()
+            .and_then(|name| doc.master_pages.iter().find(|m| m.name == name));
+        DocumentTemplate {
+            page_setup: &doc.page_setup,
+            master,
+            styles: &doc.styles,
+        }
+    }
+
+    /// The margins in effect: the master's if it sets them, else the document's.
+    fn margins(&self) -> Margins {
+        self.master
+            .and_then(|m| m.margins)
+            .unwrap_or(self.page_setup.margins)
+    }
+
+    /// The text area of `page_index`, after margins are taken off the trim.
+    fn content_rect(&self, page_index: usize) -> Rect {
+        let m = self.margins();
+        let (left, right) = m.left_right(page_index, self.page_setup.facing_pages);
+        Rect {
+            x_pt: left,
+            y_pt: m.top_pt,
+            w_pt: (self.page_setup.trim.w_pt - left - right).max(0.0),
+            h_pt: (self.page_setup.trim.h_pt - m.top_pt - m.bottom_pt).max(0.0),
+        }
+    }
+}
+
+impl PageTemplate for DocumentTemplate<'_> {
+    fn frames(&self, page_index: usize) -> Vec<Frame> {
+        let area = self.content_rect(page_index);
+        let columns = self.master.map(|m| m.columns).unwrap_or(1).max(1);
+        let gutter = self.master.map(|m| m.gutter_pt).unwrap_or(0.0);
+
+        let col_w = (area.w_pt - (columns - 1) as f32 * gutter) / columns as f32;
+        // A gutter wide enough to consume the text area would give negative-width, overlapping
+        // frames. Rather than panic on an authored document — a user can type any gutter — fall
+        // back to a single column, which is wrong-looking but recoverable and obvious on screen.
+        if col_w <= 0.0 {
+            return vec![Frame { rect: area }];
+        }
+        (0..columns)
+            .map(|i| Frame {
+                rect: Rect {
+                    x_pt: area.x_pt + i as f32 * (col_w + gutter),
+                    y_pt: area.y_pt,
+                    w_pt: col_w,
+                    h_pt: area.h_pt,
+                },
+            })
+            .collect()
+    }
+
+    fn statics(&self, page_index: usize) -> Vec<PlacedBlock> {
+        let Some(master) = self.master else {
+            return Vec::new();
+        };
+        master
+            .statics
+            .iter()
+            .map(|s| match s {
+                MasterStatic::Text {
+                    rect,
+                    text,
+                    color,
+                    style,
+                } => {
+                    // One-based, because that is what a reader sees printed on a page.
+                    let resolved = text.replace(PAGE_TOKEN, &(page_index + 1).to_string());
+                    let ps = style
+                        .as_deref()
+                        .and_then(|n| self.styles.paragraph.get(n).copied())
+                        .unwrap_or_default();
+                    PlacedBlock::Text {
+                        frame: *rect,
+                        // Master furniture is a single line at a fixed position; it is not flowed,
+                        // so it is not broken. A running head that overflows its rect is an
+                        // authoring problem, and one that is visible on screen.
+                        lines: vec![Line {
+                            text: resolved,
+                            space_adjust_pt: 0.0,
+                        }],
+                        color: *color,
+                        font_size_pt: ps.font_size_pt,
+                        leading_pt: ps.leading_pt,
+                    }
+                }
+                MasterStatic::Image { rect, asset } => PlacedBlock::Image {
+                    frame: *rect,
+                    asset_id: asset.clone(),
+                },
+            })
+            .collect()
+    }
+}
+
 /// Lay a document out into pages, flowing its content into the whole-page frame
 /// ([`Frame::full_page`]). Paginates: starts a new page when a block would pass the frame's bottom
 /// edge (the full trim height here). Returns at least one page (even if the document is empty).
@@ -212,13 +329,14 @@ pub fn lay_out(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    // At parity: the whole trim area at the origin, so the produced pages are byte-identical to the
-    // pre-frame implicit column (spec 0019 incr. 1).
-    lay_out_in_frame(
+    // Authored layout reaches the engine here (spec 0030): margins, columns and master furniture
+    // come from the document. With no master and zero margins this is exactly `Frame::full_page`,
+    // so a document declaring neither lays out as it always did.
+    lay_out_with_template(
         &doc.content,
         &doc.assets,
         &doc.styles,
-        &Frame::full_page(&doc.page_setup),
+        &DocumentTemplate::new(doc),
         metrics,
         hyphenator,
     )
@@ -1159,6 +1277,8 @@ mod tests {
             revision: 0,
             next_block_id: 0,
             styles: StyleSheet::default(),
+            master_pages: Vec::new(),
+            default_master: None,
         };
         // Give the blocks ids, as a loaded document would have (spec 0026).
         doc.assign_missing_block_ids().expect("fresh blocks");
@@ -1244,6 +1364,8 @@ mod tests {
             revision: 0,
             next_block_id: 0,
             styles: StyleSheet::default(),
+            master_pages: Vec::new(),
+            default_master: None,
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -1592,6 +1714,211 @@ mod tests {
             &MONO,
             &NoHyphenator,
         );
+    }
+
+    // --- Authored master pages (spec 0030) ----------------------------------------------------
+
+    fn doc_with_master(master: MasterPage, blocks: Vec<Block>) -> Document {
+        let mut doc = doc_with_blocks(blocks);
+        doc.default_master = Some(master.name.clone());
+        doc.master_pages = vec![master];
+        doc
+    }
+
+    #[test]
+    fn a_document_with_no_master_lays_out_in_the_full_page_frame() {
+        // Parity: the pre-0030 behavior must survive a document that declares nothing.
+        let doc = doc_with_blocks(vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => {
+                assert_eq!(frame.x_pt, 0.0);
+                assert_eq!(frame.y_pt, 0.0);
+                assert_eq!(frame.w_pt, doc.page_setup.trim.w_pt);
+            }
+            _ => panic!("expected text"),
+        }
+        assert!(pages[0].statics.is_empty());
+    }
+
+    #[test]
+    fn margins_inset_the_text_frame() {
+        let mut doc = doc_with_blocks(vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        doc.page_setup.margins = Margins::uniform(36.0);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => {
+                assert_eq!(frame.x_pt, 36.0);
+                assert_eq!(frame.y_pt, 36.0);
+                assert_eq!(frame.w_pt, 432.0 - 72.0);
+            }
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn inside_and_outside_margins_mirror_across_a_spread() {
+        // The reason margins are inside/outside rather than left/right: the spine margin has to be
+        // on the left of a recto and the right of a verso, or a bound book's text drifts toward the
+        // gutter on every other page.
+        let mut doc = doc_with_blocks(many_lines(200));
+        doc.page_setup.facing_pages = true;
+        doc.page_setup.margins = Margins {
+            top_pt: 0.0,
+            bottom_pt: 0.0,
+            inside_pt: 60.0,
+            outside_pt: 20.0,
+        };
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 2);
+        let x = |p: &LaidOutPage| match &p.blocks[0] {
+            PlacedBlock::Text { frame, .. } => frame.x_pt,
+            _ => panic!("expected text"),
+        };
+        assert_eq!(x(&pages[0]), 60.0, "recto: spine on the left");
+        assert_eq!(x(&pages[1]), 20.0, "verso: spine on the right");
+    }
+
+    #[test]
+    fn a_single_sided_document_does_not_mirror() {
+        let mut doc = doc_with_blocks(many_lines(200));
+        doc.page_setup.facing_pages = false;
+        doc.page_setup.margins = Margins {
+            top_pt: 0.0,
+            bottom_pt: 0.0,
+            inside_pt: 60.0,
+            outside_pt: 20.0,
+        };
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        for page in pages.iter().take(3) {
+            match &page.blocks[0] {
+                PlacedBlock::Text { frame, .. } => assert_eq!(frame.x_pt, 60.0),
+                _ => panic!("expected text"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_masters_column_count_divides_the_text_area() {
+        let master = MasterPage {
+            columns: 2,
+            gutter_pt: 12.0,
+            ..MasterPage::plain("body-master")
+        };
+        let doc = doc_with_master(master, many_lines(200));
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let xs: Vec<f32> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, .. } => Some(frame.x_pt),
+                _ => None,
+            })
+            .collect();
+        let col_w = (432.0 - 12.0) / 2.0;
+        assert!(xs.contains(&0.0), "expected a left column");
+        assert!(
+            xs.iter().any(|x| (*x - (col_w + 12.0)).abs() < 0.01),
+            "expected a right column at {}, got {xs:?}",
+            col_w + 12.0
+        );
+    }
+
+    #[test]
+    fn a_master_stamps_its_statics_with_the_page_number_resolved() {
+        let master = MasterPage {
+            statics: vec![MasterStatic::Text {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 620.0,
+                    w_pt: 432.0,
+                    h_pt: 12.0,
+                },
+                text: "The Dungeon — {page}".into(),
+                color: Color::Gray { v: 0.0 },
+                style: Some("body".into()),
+            }],
+            ..MasterPage::plain("running-head")
+        };
+        let doc = doc_with_master(master, many_lines(200));
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 2);
+        for (i, page) in pages.iter().enumerate().take(3) {
+            match &page.statics[0] {
+                PlacedBlock::Text { lines, .. } => {
+                    assert_eq!(lines[0].text, format!("The Dungeon — {}", i + 1))
+                }
+                _ => panic!("expected a running head"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_default_master_degrades_to_the_page_setup() {
+        // A renamed master must not refuse to lay the book out.
+        let mut doc = doc_with_blocks(vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        doc.default_master = Some("was-renamed".into());
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => assert_eq!(frame.w_pt, 432.0),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn an_over_wide_gutter_falls_back_to_one_column_instead_of_panicking() {
+        // `Thread::columns` panics on this, which is right for a programmatic caller. Here the
+        // gutter is *authored*, and a user can type any number — a document that cannot be opened
+        // is worse than one that looks wrong and can be fixed.
+        let master = MasterPage {
+            columns: 3,
+            gutter_pt: 1000.0,
+            ..MasterPage::plain("bad")
+        };
+        let doc = doc_with_master(master, vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => assert_eq!(frame.w_pt, 432.0),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn master_statics_and_margins_round_trip_through_the_document() {
+        let master = MasterPage {
+            margins: Some(Margins::uniform(24.0)),
+            columns: 2,
+            gutter_pt: 10.0,
+            statics: vec![MasterStatic::Image {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 432.0,
+                    h_pt: 648.0,
+                },
+                asset: "bg".into(),
+            }],
+            ..MasterPage::plain("full-bleed")
+        };
+        let doc = doc_with_master(master, vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        let back = Document::from_json(&doc.to_json().expect("save")).expect("load");
+        assert_eq!(back.master_pages, doc.master_pages);
+        assert_eq!(back.default_master, doc.default_master);
+    }
+
+    #[test]
+    fn a_master_can_override_the_documents_margins() {
+        let master = MasterPage {
+            margins: Some(Margins::uniform(50.0)),
+            ..MasterPage::plain("wide")
+        };
+        let mut doc = doc_with_master(master, vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        doc.page_setup.margins = Margins::uniform(10.0);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => assert_eq!(frame.x_pt, 50.0),
+            _ => panic!("expected text"),
+        }
     }
 
     #[test]

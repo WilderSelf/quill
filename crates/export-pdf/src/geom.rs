@@ -89,6 +89,7 @@ mod tests {
             },
             bleed_pt: DEFAULT_BLEED_PT,
             facing_pages: facing,
+            ..PageSetup::default()
         }
     }
 
