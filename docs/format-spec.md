@@ -41,6 +41,27 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
 `format_version` is an integer. Readers reject formats newer than they understand and migrate
 older ones forward. Migrations are documented per bump.
 
+Implemented in `quill-core-model` (spec 0025): the gate runs on the untyped JSON *before*
+deserialization, since an older manifest by definition does not fit the current `serde` types. A
+manifest newer than this build is refused with `LoadError::UnsupportedVersion` rather than loaded
+with its unknown fields dropped — a half-loaded document saved back over the original would destroy
+whatever this build did not understand.
+
+| `format_version` | Behavior |
+|---|---|
+| absent | treated as current |
+| older | migrated forward, one step per version |
+| current | loaded as-is |
+| newer | refused |
+
+## Reading a container
+
+`Tpub::read_manifest` reads `document.json` alone; `Tpub::open_into` also extracts the payload to a
+caller-named directory and returns the `asset_root` that relative `Asset.path` values resolve
+against. Extraction is explicit rather than into a hidden temp directory, so "where are this
+document's assets right now" stays answerable. Entry names that would escape the extraction
+directory (`..`, absolute paths, drive prefixes) are refused rather than sanitized.
+
 ## Two linked representations
 
 The model carries both a **semantic content** tree (the easy authoring layer) and a **layout**

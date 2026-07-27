@@ -5,6 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+mod container;
+mod version;
+
+pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
+pub use version::LoadError;
+
 /// Typographic points (1/72 inch) — the internal unit throughout Quill.
 pub type Pt = f32;
 
@@ -186,9 +192,16 @@ impl Document {
         serde_json::to_string_pretty(self)
     }
 
-    /// Parse a manifest from JSON.
-    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
+    /// Parse a manifest from JSON, migrating it forward if it is older than [`FORMAT_VERSION`] and
+    /// refusing it if it is newer.
+    ///
+    /// The version gate runs on the untyped JSON *before* deserialization, because an older
+    /// manifest by definition does not fit the current `serde` types. See [`version::migrate`].
+    pub fn from_json(s: &str) -> Result<Self, LoadError> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| LoadError::Parse(e.to_string()))?;
+        version::migrate(&mut value)?;
+        serde_json::from_value(value).map_err(|e| LoadError::Parse(e.to_string()))
     }
 }
 

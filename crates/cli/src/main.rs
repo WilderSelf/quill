@@ -1,10 +1,11 @@
 //! Headless CLI — exercises the layout/preflight/export pipeline without a GUI. This is the
 //! primary way milestone M0 is built and tested. See `specs/0001-pdf-x-export.md`.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use quill_core_model::Document;
+use quill_core_model::{Document, Tpub};
 use quill_export_pdf::{
     export, preflight, synth_cmyk_profile, ExportOptions, PdfxVersion, PreflightReport, Severity,
 };
@@ -33,6 +34,17 @@ enum Command {
         /// Output path for the `.icc` file.
         output: String,
     },
+    /// Pack a `document.json` and its linked assets into a portable `.tpub` container.
+    Pack(PackArgs),
+}
+
+#[derive(Args)]
+struct PackArgs {
+    /// Path to the `document.json` to pack. Its linked assets are resolved relative to it.
+    input: String,
+    /// Output `.tpub` path.
+    #[arg(short, long)]
+    output: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -77,14 +89,50 @@ struct ExportArgs {
     force: bool,
 }
 
-fn load_doc(input: &Option<String>) -> Result<Document, String> {
-    match input {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
-            Document::from_json(&text).map_err(|e| format!("parsing {path}: {e}"))
-        }
-        None => Ok(Document::sample()),
+/// A loaded document plus the directory its relative asset paths resolve against (spec 0025).
+struct Loaded {
+    doc: Document,
+    asset_root: PathBuf,
+}
+
+/// Load a `.tpub` container or a bare `document.json`.
+///
+/// A `.tpub` is extracted next to itself (`book.tpub` → `book.tpub.d/`) so that repeated opens are
+/// idempotent and the extracted assets are findable rather than hidden in a temp directory that
+/// nothing owns. A bare `document.json` resolves its assets against its own directory — not the
+/// process working directory, which is what the writer used to assume.
+fn load_doc(input: &Option<String>) -> Result<Loaded, String> {
+    let Some(path) = input else {
+        return Ok(Loaded {
+            doc: Document::sample(),
+            asset_root: PathBuf::from("."),
+        });
+    };
+    let path = Path::new(path);
+
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("tpub"))
+    {
+        let extract_to = path.with_extension("tpub.d");
+        let opened = Tpub::open_into(path, &extract_to).map_err(|e| e.to_string())?;
+        return Ok(Loaded {
+            doc: opened.document,
+            asset_root: opened.asset_root,
+        });
     }
+
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let doc = Document::from_json(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Loaded {
+        doc,
+        asset_root: path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
+    })
 }
 
 fn print_report(report: &PreflightReport) {
@@ -114,7 +162,7 @@ fn main() -> ExitCode {
         },
 
         Command::Preflight(args) => {
-            let doc = match load_doc(&args.input) {
+            let loaded = match load_doc(&args.input) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -123,7 +171,13 @@ fn main() -> ExitCode {
             };
             // No ICC supplied here, so the OutputIntent check will report — that is expected
             // for a bare preflight and signals what an export would still need.
-            let report = preflight(&doc, &ExportOptions::default());
+            let report = preflight(
+                &loaded.doc,
+                &ExportOptions {
+                    asset_root: loaded.asset_root,
+                    ..Default::default()
+                },
+            );
             print_report(&report);
             if report.passed() {
                 ExitCode::SUCCESS
@@ -133,18 +187,20 @@ fn main() -> ExitCode {
         }
 
         Command::Export(args) => {
-            let doc = match load_doc(&args.input) {
+            let loaded = match load_doc(&args.input) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
+            let doc = loaded.doc;
             let opts = ExportOptions {
                 version: args.pdfx.into(),
                 output_intent_icc: args.icc,
                 font_path: args.font,
                 force: args.force,
+                asset_root: loaded.asset_root,
             };
             print_report(&preflight(&doc, &opts));
 
@@ -162,6 +218,45 @@ fn main() -> ExitCode {
                 },
                 Err(e) => {
                     eprintln!("export failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(args) => {
+            let loaded = match load_doc(&Some(args.input)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Read every linked asset up front. An asset that cannot be read is a hard failure
+            // here, not a warning: a `.tpub` is meant to be portable, and quietly packing a
+            // container with a missing image produces a document that is broken everywhere else it
+            // is opened.
+            let mut payload: Vec<(String, Vec<u8>)> = Vec::new();
+            for asset in &loaded.doc.assets {
+                let path = loaded.asset_root.join(&asset.path);
+                match std::fs::read(&path) {
+                    Ok(bytes) => payload.push((asset.path.clone(), bytes)),
+                    Err(e) => {
+                        eprintln!("error: asset '{}' ({}): {e}", asset.id, path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            let entries: Vec<(&str, &[u8])> = payload
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            match Tpub::write(&loaded.doc, Path::new(&args.output), &entries) {
+                Ok(()) => {
+                    println!("wrote {} ({} assets)", args.output, entries.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
                     ExitCode::FAILURE
                 }
             }

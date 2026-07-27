@@ -57,8 +57,10 @@ pub fn write_pdf(
     // Color images are converted to CMYK against the OutputIntent profile (spec 0005).
     let cmyk = RgbToCmyk::from_output_profile(&icc_bytes);
 
-    // Decode each distinct placed image once (missing/unsupported → skipped).
-    let base_dir = Path::new(".");
+    // Decode each distinct placed image once (missing/unsupported → skipped). The base directory
+    // comes from the caller (spec 0025) — resolving against the process working directory silently
+    // dropped images whenever the CWD was not the document's own directory.
+    let base_dir: &Path = &opts.asset_root;
     let mut images_by_id: BTreeMap<String, ImageObj> = BTreeMap::new();
     for page in pages {
         for block in &page.blocks {

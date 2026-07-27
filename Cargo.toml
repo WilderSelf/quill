@@ -39,6 +39,16 @@ png = "0.18"
 # fanned out per-asset and rayon would bloat the dep graph for no win at our image sizes.
 jpeg-decoder = { version = "0.3", default-features = false }
 flate2 = "1"
+# The `.tpub` zip container (spec 0025). MIT. default-features off is deliberate: the default set
+# pulls bzip2/zstd/lzma/AES backends (several with C dependencies) that the format never uses —
+# `.tpub` is deflate-only, which is also what `.idml`/ODF readers universally support.
+#
+# The feature is `deflate-flate2`, NOT the umbrella `deflate`. `deflate` expands to
+# `deflate-zopfli + deflate-flate2-zlib-rs`, and that `flate2/zlib-rs` switches flate2's backend for
+# every crate in the workspace via feature unification — including `export-pdf`'s `/FlateDecode`
+# streams, which measurably changed the exported PDF's bytes. Reusing the flate2 already in the
+# graph, with its default backend, keeps press output byte-for-byte what it was.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 # Internal crates (path deps within the workspace).
 quill-core-model = { path = "crates/core-model" }
