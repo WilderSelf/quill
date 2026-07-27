@@ -12,3 +12,9 @@ serde_json = { workspace = true }
 # The `.tpub` container lives here rather than in a separate crate because the container and the
 # manifest schema version in lockstep — a format bump is one change, not two (spec 0025).
 zip = { workspace = true }
+# `zip`'s `deflate-flate2` feature enables `dep:flate2` but selects no compression backend — the
+# backend-selecting variants all force a *different* backend (zlib-rs/zlib-ng), which changes
+# exported PDF bytes workspace-wide through feature unification. Depending on flate2 directly turns
+# on its default pure-Rust backend. Without this line `cargo build -p quill-core-model` fails, and
+# only builds that also pull in `export-pdf` (which brings flate2 with defaults) appear to work.
+flate2 = { workspace = true }
