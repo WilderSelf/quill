@@ -98,7 +98,7 @@ fn draw(ui: &egui::Ui, origin: egui::Pos2, ops: &[PaintOp], zoom: f32) {
             PaintOp::Page { w_pt, h_pt } => {
                 painter.rect_filled(
                     egui::Rect::from_min_size(at(0.0, 0.0), egui::vec2(w_pt * zoom, h_pt * zoom)),
-                    0.0,
+                    0.0_f32,
                     egui::Color32::WHITE,
                 );
             }
@@ -113,8 +113,8 @@ fn draw(ui: &egui::Ui, origin: egui::Pos2, ops: &[PaintOp], zoom: f32) {
                         at(*x_pt, *y_pt),
                         egui::vec2(w_pt * zoom, h_pt * zoom),
                     ),
-                    0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(200)),
+                    0.0_f32,
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(200)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -146,7 +146,7 @@ fn draw(ui: &egui::Ui, origin: egui::Pos2, ops: &[PaintOp], zoom: f32) {
                         at(*x_pt, *y_pt),
                         egui::vec2(w_pt * zoom, h_pt * zoom),
                     ),
-                    0.0,
+                    0.0_f32,
                     egui::Color32::from_gray(220),
                 );
             }
