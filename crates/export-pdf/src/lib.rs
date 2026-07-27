@@ -618,14 +618,14 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    /// Changed by spec 0026: blocks gained an `id` field, so `doc.to_json()` changed, and
-    /// `writer::doc_id_bytes` hashes that JSON into the document identifier.
+    /// Changed by spec 0028: paragraph styles reached the page. The sample'''s h1 heading now sets
+    /// at 24 pt with space above instead of at body size, so the content stream gained a second
+    /// `/F0 24 Tf` and every baseline below the heading moved down.
     ///
-    /// Diffed against the previous build to confirm the change is only what it should be: exactly
-    /// 120 bytes differ, in three places — the XMP `DocumentID`, the XMP `InstanceID`, and the
-    /// trailer `/ID` — all three derived from that one hash. Total length is unchanged (8558) and
-    /// every page content stream, font and image byte is identical.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x69fa_7048_371a_23e6;
+    /// Verified by inspecting the emitted text operators rather than by accepting the new number:
+    /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
+    /// only by being ragged-left.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x660a_23d7_8119_aaf8;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;

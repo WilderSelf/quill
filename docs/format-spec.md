@@ -30,7 +30,7 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
   "page_setup": { "trim": { "w_pt": 468, "h_pt": 720 }, "bleed_pt": 9.0, "facing_pages": true },
   "master_pages": [ ... ],
   "spreads": [ { "pages": [ { "master": "...", "frames": [ ... ] } ] } ],
-  "styles": { "paragraph": { ... }, "character": { ... } },
+  "styles": { "paragraph": { "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" }, "h1": { ... } } },
   "content": [ /* semantic blocks: headings, body, stat blocks, tables, random tables */ ],
   "revision": 0,
   "next_block_id": 4,
