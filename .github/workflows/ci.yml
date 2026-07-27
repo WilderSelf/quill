@@ -72,13 +72,36 @@ jobs:
           grep -aq 'PDF/X-3:2002' /tmp/sample-x3.pdf
           ! grep -aq 'PDF/X-1a' /tmp/sample-x3.pdf
 
+      - name: Export from a .tpub container (spec 0025)
+        run: |
+          set -euo pipefail
+          # The container path must reach the same press output as a bare manifest. This exercises
+          # pack -> open -> extract -> resolve assets against asset_root -> export, end to end;
+          # before spec 0025 asset paths resolved against the process working directory instead.
+          mkdir -p /tmp/doc/assets
+          cargo run -p quill-cli -- sample > /tmp/doc/document.json
+          # The sample manifest links assets/map1.png, and `pack` refuses to build a container
+          # around a missing asset (a portable document with a hole in it is worse than no
+          # container). This is that file: a valid 2x1 RGB PNG, 72 bytes, inline as base64 so the
+          # step carries no whitespace-sensitive heredoc and needs no committed binary fixture.
+          base64 -d > /tmp/doc/assets/map1.png <<'PNG'
+          iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPgqvjwoYILAAolAuXl2MVzAAAAAElFTkSuQmCC
+          PNG
+          cargo run -p quill-cli -- pack /tmp/doc/document.json --output /tmp/doc/book.tpub
+          cargo run -p quill-cli -- export /tmp/doc/book.tpub --output /tmp/from-tpub.pdf \
+            --icc /tmp/cmyk.icc --pdfx x1a
+          test -s /tmp/from-tpub.pdf
+          # Identical press output whichever way the same document was loaded.
+          cmp /tmp/sample.pdf /tmp/from-tpub.pdf
+
       - name: Ghostscript parse check (gate)
         run: |
           set -euo pipefail
           # Fully interpret each PDF; a malformed file makes Ghostscript exit non-zero.
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample.pdf
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample-x3.pdf
-          echo "Ghostscript interpreted both PDFs with no errors."
+          gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/from-tpub.pdf
+          echo "Ghostscript interpreted all three PDFs with no errors."
 
       - name: Ghostscript PDF/X re-distill (informational)
         run: |

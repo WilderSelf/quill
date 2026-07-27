@@ -9,3 +9,6 @@ authors.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The `.tpub` container lives here rather than in a separate crate because the container and the
+# manifest schema version in lockstep — a format bump is one change, not two (spec 0025).
+zip = { workspace = true }

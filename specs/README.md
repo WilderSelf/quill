@@ -33,6 +33,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0022 | [Linked-image proxy pixels (JPEG)](0022-jpeg-proxy-pixels.md) | M1 | implemented |
 | 0023 | [Populate the proxy cache from a document's linked assets](0023-proxy-cache-from-assets.md) | M1 | implemented |
 | 0024 | [Incremental proxy-cache invalidation (skip unchanged assets)](0024-proxy-cache-invalidation.md) | M1 | implemented |
+| 0025 | [`.tpub` container + versioned load contract](0025-tpub-container-and-load-contract.md) | M1 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind

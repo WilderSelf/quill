@@ -8,6 +8,7 @@
 //! `writer`/`fonts`/`images`/`icc`/`xmp`/`geom` modules.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use quill_color::{within_ink_limit, MAX_INK_COVERAGE_PCT};
 use quill_core_model::{Block, Color, Document, DEFAULT_BLEED_PT};
@@ -67,6 +68,14 @@ pub struct ExportOptions {
     /// Path to a user-supplied TrueType (`.ttf`) or CFF OpenType (`.otf`) font to embed. `None`
     /// embeds the bundled Source Serif 4. See specs 0004 (user fonts) and 0011 (CFF).
     pub font_path: Option<String>,
+    /// Directory that [`Asset::path`](quill_core_model::Asset::path) is resolved against.
+    ///
+    /// For a `.tpub` this is the container's extracted [`asset_root`](quill_core_model::OpenedTpub);
+    /// for a bare `document.json` it is the directory holding that file. It was previously
+    /// hardcoded to `.` inside the writer, which silently made asset resolution depend on the
+    /// process's working directory — and a linked image that fails to resolve is silently dropped
+    /// from the export (spec 0025).
+    pub asset_root: PathBuf,
 }
 
 impl Default for ExportOptions {
@@ -76,6 +85,9 @@ impl Default for ExportOptions {
             output_intent_icc: String::new(),
             force: false,
             font_path: None,
+            // `.` preserves the pre-spec-0025 behavior for callers that never set it, so this
+            // change cannot move where an existing caller's images resolve from.
+            asset_root: PathBuf::from("."),
         }
     }
 }
@@ -588,6 +600,146 @@ mod tests {
             },
             path,
         )
+    }
+
+    /// FNV-1a over the exported bytes. Deliberately not SHA-256: this is a tripwire against
+    /// *accidental* change, not a defense against a forged collision, and the workspace's
+    /// minimal-dependency rule (`Cargo.toml`) does not justify a crypto crate to detect a typo.
+    /// The same construction already backs the PDF `/ID` in `writer::doc_id_bytes`.
+    fn digest(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Spec 0025 moved asset resolution off the process working directory. That is exactly the kind
+    /// of change that can silently alter which images embed — and a dropped image reaching a print
+    /// shop is the failure class `CLAUDE.md` forbids. This pins the sample export's bytes so any
+    /// unintended shift in output is a red test rather than a surprise in a PDF.
+    ///
+    /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
+    /// having confirmed the new bytes are the intended ones.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0xb30b_f361_5933_e08e;
+
+    /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
+    const ICC_DATETIME: std::ops::Range<usize> = 24..36;
+
+    /// Write the synthesized CMYK profile with its creation timestamp zeroed, and return options
+    /// pointing at it.
+    ///
+    /// A PDF/X export embeds the OutputIntent profile verbatim, and `synth_cmyk_profile()` stamps
+    /// the current time into the ICC header — so two exports of the same document minutes apart
+    /// differ, in the profile, by a handful of bytes. That is inherent to ICC and not a defect: for
+    /// a real export the user supplies a fixed press profile and output *is* reproducible. But it
+    /// means a digest over a freshly synthesized profile could never be pinned. Zeroing the one
+    /// field that varies makes the writer's own output the only thing the digest measures.
+    fn opts_with_fixed_icc(tag: &str) -> (ExportOptions, std::path::PathBuf) {
+        let mut icc = synth_cmyk_profile();
+        icc[ICC_DATETIME].fill(0);
+        let path = std::env::temp_dir().join(format!("quill_fixed_{tag}.icc"));
+        std::fs::write(&path, &icc).unwrap();
+        (
+            ExportOptions {
+                output_intent_icc: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            path,
+        )
+    }
+
+    #[test]
+    fn a_synthesized_icc_profile_carries_a_creation_timestamp() {
+        // Guards the assumption `opts_with_fixed_icc` rests on. If lcms2 ever stops stamping the
+        // header, this test says so rather than leaving a normalization step nobody understands.
+        let a = synth_cmyk_profile();
+        assert!(
+            a[ICC_DATETIME].iter().any(|b| *b != 0),
+            "expected a non-zero ICC creation timestamp"
+        );
+        let mut normalized = a.clone();
+        normalized[ICC_DATETIME].fill(0);
+        let mut other = synth_cmyk_profile();
+        other[ICC_DATETIME].fill(0);
+        assert_eq!(
+            normalized, other,
+            "with the timestamp zeroed, the synthesized profile must be fully deterministic"
+        );
+    }
+
+    #[test]
+    fn export_of_the_sample_document_is_byte_stable() {
+        let (opts, path) = opts_with_fixed_icc("byte_stable");
+        let mut a = Vec::new();
+        export(&Document::sample(), &opts, &mut a).expect("export");
+        let mut b = Vec::new();
+        export(&Document::sample(), &opts, &mut b).expect("export");
+        let _ = std::fs::remove_file(&path);
+
+        // Determinism first: without it the constant below would be meaningless.
+        assert_eq!(a, b, "export must be deterministic run to run");
+        assert_eq!(
+            digest(&a),
+            SAMPLE_EXPORT_DIGEST,
+            "sample export bytes changed ({} bytes, digest {:#x}); if intended, update \
+             SAMPLE_EXPORT_DIGEST in this commit",
+            a.len(),
+            digest(&a)
+        );
+    }
+
+    #[test]
+    fn asset_root_resolves_relative_asset_paths() {
+        // The knob spec 0025 added: a document's relative asset path resolves against the
+        // document's own root, not the process working directory.
+        let (mut opts, icc_path) = opts_with_real_icc("asset_root");
+        let root = std::env::temp_dir().join(format!("quill_asset_root_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        {
+            let file = std::fs::File::create(root.join("assets/pic.png")).unwrap();
+            let mut enc = png::Encoder::new(file, 2, 1);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[10, 120, 240, 240, 120, 10]).unwrap();
+        }
+
+        let mut doc = Document::sample();
+        doc.assets = vec![Asset {
+            id: "pic".into(),
+            // Relative — meaningless without an asset root.
+            path: "assets/pic.png".into(),
+            px_w: 600,
+            px_h: 600,
+            dpi: 300.0,
+            line_art: false,
+            has_alpha: false,
+        }];
+        doc.content.push(Block::Image {
+            asset: "pic".into(),
+        });
+
+        opts.asset_root = root.clone();
+        let mut found = Vec::new();
+        export(&doc, &opts, &mut found).expect("export");
+        assert!(
+            String::from_utf8_lossy(&found).contains("DeviceCMYK"),
+            "image should embed when asset_root points at the document's root"
+        );
+
+        // And the negative: a wrong root drops the image rather than embedding something else.
+        opts.asset_root = std::env::temp_dir().join("quill_definitely_not_here");
+        let mut missing = Vec::new();
+        export(&doc, &opts, &mut missing).expect("export should still succeed");
+        assert!(
+            !String::from_utf8_lossy(&missing).contains("/Subtype /Image"),
+            "an unresolvable asset must be skipped, not guessed at"
+        );
+
+        let _ = std::fs::remove_file(&icc_path);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
