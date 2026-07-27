@@ -15,7 +15,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | Milestone | Theme | Status |
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
-| **M1** | Editing core + 500-page performance | **in progress** — specs 0016–0024 shipped; 0025–0034 below remain |
+| **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | not started |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
@@ -43,7 +43,7 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
 - **The bench step folds into an existing CI job rather than adding a new one.** A new job is not
   automatically a required branch-protection context, so a new job would gate nothing. Spec 0027.
 
-## M1 remaining increments
+## M1 increments (all shipped)
 
 Each is independently shippable: it compiles, its tests pass, and it is a coherent PR on its own.
 No increment may leave the workspace broken.

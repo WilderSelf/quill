@@ -82,16 +82,23 @@ fn main() {
     );
     edited.content[target].set_id(id);
 
-    let t_incremental = budget::min_of(3, || {
-        // A fresh session per timed run: re-running `relayout` on the same edited document would
-        // measure the no-op path, not the edit path.
+    // Isolating the edit needs two timings of the *same shape*, differing only by the edit. A
+    // fresh session per run is required because re-running `relayout` on an already-edited document
+    // measures the no-op path; and the baseline must be a session priming pass, not a plain
+    // `lay_out` — the session also fingerprints, caches and checkpoints, so subtracting `lay_out`
+    // would charge the edit for the session's own setup. That mistake made this number swing
+    // between 0.2% and 23% run to run.
+    let t_prime = budget::min_of(5, || {
+        let mut s = quill_layout_engine::LayoutSession::new();
+        std::hint::black_box(s.relayout(&doc, &HARNESS_METRICS, &NoHyphenator));
+    });
+    let t_prime_then_edit = budget::min_of(5, || {
         let mut s = quill_layout_engine::LayoutSession::new();
         s.relayout(&doc, &HARNESS_METRICS, &NoHyphenator);
         std::hint::black_box(s.relayout(&edited, &HARNESS_METRICS, &NoHyphenator));
     });
-    // Subtract the priming pass to isolate the edit's cost.
-    let edit_only = t_incremental.as_secs_f64() - elapsed.as_secs_f64();
-    let fraction = (edit_only / elapsed.as_secs_f64()).max(0.0);
+    let edit_only = (t_prime_then_edit.as_secs_f64() - t_prime.as_secs_f64()).max(0.0);
+    let fraction = edit_only / elapsed.as_secs_f64();
 
     let stats = session
         .relayout(&edited, &HARNESS_METRICS, &NoHyphenator)
@@ -109,7 +116,11 @@ fn main() {
         stats.pages_reflowed as f64,
         &mut failures,
     );
-    budgets.check("layout.incremental_work_fraction", fraction, &mut failures);
+    // Reported, not gated. Extracting a sub-millisecond edit by subtracting two ~200 ms timings
+    // amplifies runner noise enormously — measured 4.9%, 5.6%, 9.7% and 23% across runs of
+    // unchanged code. That is exactly what spec 0027 says to avoid, and the counters above state
+    // the claim ("re-flow only affected pages") both precisely and deterministically.
+    println!("  (timing ratio is informational only — too noisy at this magnitude to gate)");
 
     budget::report(failures);
 }

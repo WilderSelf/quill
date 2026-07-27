@@ -6,6 +6,26 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# The editor UI (`egui` shell + Skia document canvas) arrives in a later spec-driven commit.
+# A library plus a thin binary (spec 0034). Everything interesting about the shell — opening a
+# document, viewport mapping, page virtualization, routing an edit into incremental relayout — is
+# logic, and lives in the library where it is unit-testable on every leg of the CI matrix with no
+# display server and no GPU.
 [dependencies]
 quill-core-model = { workspace = true }
+quill-layout-engine = { workspace = true }
+quill-render = { workspace = true }
+quill-fonts = { workspace = true }
+quill-text-layout = { workspace = true }
+# The windowing stack, behind a non-default feature. `eframe` pulls winit/glow, which need system
+# libraries on Linux; keeping it optional means the default workspace build — and therefore the
+# whole three-OS CI matrix — needs none of them.
+eframe = { workspace = true, optional = true }
+
+[features]
+default = []
+gui = ["dep:eframe"]
+
+[[bin]]
+name = "quill-app"
+path = "src/main.rs"
+required-features = ["gui"]
