@@ -308,3 +308,114 @@ mod tests {
         );
     }
 }
+
+/// Convert an authored colour to sRGB for **screen preview** (spec 0033).
+///
+/// This is a preview transform, not a press transform. It is the naive complement of
+/// [`naive_rgb_to_cmyk`] and deliberately does *not* go through the OutputIntent profile: a soft
+/// proof against a real press profile is a separate, later feature, and pretending this is one
+/// would be worse than being plainly approximate. Press output never travels this path — the PDF
+/// writer emits the authored CMYK directly.
+pub fn to_srgb(color: &Color) -> [u8; 3] {
+    fn byte(v: f32) -> u8 {
+        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+    match color {
+        Color::Rgb { r, g, b } => [byte(*r), byte(*g), byte(*b)],
+        Color::Gray { v } => {
+            let g = byte(*v);
+            [g, g, g]
+        }
+        Color::Cmyk { c, m, y, k } => [
+            byte((1.0 - c) * (1.0 - k)),
+            byte((1.0 - m) * (1.0 - k)),
+            byte((1.0 - y) * (1.0 - k)),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod srgb_tests {
+    use super::*;
+
+    #[test]
+    fn full_black_is_black_and_paper_is_white() {
+        assert_eq!(
+            to_srgb(&Color::Cmyk {
+                c: 0.0,
+                m: 0.0,
+                y: 0.0,
+                k: 1.0
+            }),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            to_srgb(&Color::Cmyk {
+                c: 0.0,
+                m: 0.0,
+                y: 0.0,
+                k: 0.0
+            }),
+            [255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn mid_gray_round_trips() {
+        let g = to_srgb(&Color::Gray { v: 0.5 });
+        assert!((g[0] as i32 - 128).abs() <= 2, "got {g:?}");
+        assert_eq!(g[0], g[1]);
+        assert_eq!(g[1], g[2]);
+    }
+
+    #[test]
+    fn primaries_land_in_the_right_corner_of_the_cube() {
+        // Cyan ink absorbs red.
+        let cyan = to_srgb(&Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+        });
+        assert_eq!(cyan, [0, 255, 255]);
+        let magenta = to_srgb(&Color::Cmyk {
+            c: 0.0,
+            m: 1.0,
+            y: 0.0,
+            k: 0.0,
+        });
+        assert_eq!(magenta, [255, 0, 255]);
+    }
+
+    #[test]
+    fn a_naive_round_trip_stays_close() {
+        for (r, g, b) in [
+            (0.2, 0.4, 0.6),
+            (1.0, 0.0, 0.0),
+            (0.5, 0.5, 0.5),
+            (0.9, 0.8, 0.1),
+        ] {
+            let back = to_srgb(&naive_rgb_to_cmyk(r, g, b));
+            for (i, expected) in [r, g, b].iter().enumerate() {
+                let want = (expected * 255.0).round() as i32;
+                assert!(
+                    (back[i] as i32 - want).abs() <= 2,
+                    "channel {i}: got {} want {want} for ({r},{g},{b})",
+                    back[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_passes_through_unchanged() {
+        assert_eq!(
+            to_srgb(&Color::Rgb {
+                r: 1.0,
+                g: 0.5,
+                b: 0.0
+            }),
+            [255, 128, 0]
+        );
+    }
+}

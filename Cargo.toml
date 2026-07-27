@@ -39,6 +39,11 @@ png = "0.18"
 # fanned out per-asset and rayon would bloat the dep graph for no win at our image sizes.
 jpeg-decoder = { version = "0.3", default-features = false }
 flate2 = "1"
+# CPU rasterizer for the screen canvas (spec 0033). BSD-3-Clause — permissive, compatible with the
+# workspace's MIT/Apache-2.0 dual licence. Pure Rust with the same geometry semantics as Skia, and
+# no native C++ build on any leg of the three-OS CI matrix, which is why it was chosen over
+# `skia-safe`. See the decisions log in docs/roadmap.md.
+tiny-skia = "0.12"
 # The `.tpub` zip container (spec 0025). MIT. default-features off is deliberate: the default set
 # pulls bzip2/zstd/lzma/AES backends (several with C dependencies) that the format never uses —
 # `.tpub` is deflate-only, which is also what `.idml`/ODF readers universally support.

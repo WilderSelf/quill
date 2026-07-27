@@ -1,0 +1,364 @@
+//! CPU rasterizer for the screen paint list — see `specs/0033-screen-render.md`.
+//!
+//! Backed by `tiny-skia`: pure Rust, permissive (BSD-3-Clause), the same geometry semantics as
+//! Skia, and — the reason it was chosen over `skia-safe` — no native C++ build on any leg of the
+//! three-OS CI matrix. The paint list in [`crate::paint`] keeps this module swappable; a GPU
+//! backend would replace this file and nothing else.
+
+use quill_fonts::{Font, PathCmd};
+use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform};
+
+use crate::paint::{PaintOp, PAPER};
+use crate::ProxyCache;
+
+/// A rasterized page: non-premultiplied RGBA8, row-major.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Raster {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Rasterize a paint list at `scale` pixels per point.
+///
+/// `scale` is the viewport zoom: 1.0 renders a point as a pixel (72 dpi), 2.0 is a HiDPI or
+/// zoomed-in view. Returns `None` only for a degenerate (zero-area) page.
+pub fn rasterize(ops: &[PaintOp], font: &Font, proxies: &ProxyCache, scale: f32) -> Option<Raster> {
+    let (page_w, page_h) = ops.iter().find_map(|op| match op {
+        PaintOp::Page { w_pt, h_pt } => Some((*w_pt, *h_pt)),
+        _ => None,
+    })?;
+    let width = (page_w * scale).round().max(1.0) as u32;
+    let height = (page_h * scale).round().max(1.0) as u32;
+    let mut pixmap = Pixmap::new(width, height)?;
+
+    for op in ops {
+        match op {
+            PaintOp::Page { w_pt, h_pt } => {
+                fill_rect(&mut pixmap, 0.0, 0.0, *w_pt, *h_pt, PAPER, scale);
+            }
+            PaintOp::TrimGuide { .. } => {
+                // A viewport affordance, not part of the document. Deliberately not drawn into the
+                // raster: `quill render` output is compared against expected page content in CI,
+                // and a guide line would be indistinguishable from real content in that check.
+            }
+            PaintOp::Text {
+                x_pt,
+                baseline_pt,
+                text,
+                size_pt,
+                space_adjust_pt,
+                rgb,
+            } => {
+                draw_text(
+                    &mut pixmap,
+                    font,
+                    &TextRun {
+                        x_pt: *x_pt,
+                        baseline_pt: *baseline_pt,
+                        text,
+                        size_pt: *size_pt,
+                        space_adjust_pt: *space_adjust_pt,
+                        rgb: *rgb,
+                    },
+                    scale,
+                );
+            }
+            PaintOp::Image {
+                x_pt,
+                y_pt,
+                w_pt,
+                h_pt,
+                asset_id,
+                ..
+            } => {
+                draw_proxy(
+                    &mut pixmap,
+                    proxies,
+                    asset_id,
+                    (*x_pt, *y_pt, *w_pt, *h_pt),
+                    scale,
+                );
+            }
+        }
+    }
+
+    // tiny-skia works premultiplied; hand back straight RGBA, which is what `Proxy` uses and what
+    // an image encoder expects.
+    let rgba = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let a = p.alpha();
+            let demul = |c: u8| {
+                if a == 0 {
+                    0
+                } else {
+                    ((c as u32 * 255) / a as u32).min(255) as u8
+                }
+            };
+            [demul(p.red()), demul(p.green()), demul(p.blue()), a]
+        })
+        .collect();
+
+    Some(Raster {
+        width,
+        height,
+        rgba,
+    })
+}
+
+fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, rgb: [u8; 3], scale: f32) {
+    let Some(rect) = Rect::from_xywh(x * scale, y * scale, w * scale, h * scale) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], 255);
+    paint.anti_alias = false;
+    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+}
+
+/// Draw one line of text by shaping it and filling each glyph's outline.
+///
+/// Re-shaping here rather than receiving glyphs from layout is a known wart, recorded in spec 0032:
+/// `text-layout::Line` carries text plus a justification adjustment, not positioned glyphs. It goes
+/// through the *same* shaper the PDF writer uses, so the two agree on advances; the word positions
+/// are derived the same way the writer derives its `TJ` offsets.
+/// One line's worth of drawing parameters, grouped so the call site reads as a unit.
+struct TextRun<'a> {
+    x_pt: f32,
+    baseline_pt: f32,
+    text: &'a str,
+    size_pt: f32,
+    space_adjust_pt: f32,
+    rgb: [u8; 3],
+}
+
+fn draw_text(pixmap: &mut Pixmap, font: &Font, run: &TextRun<'_>, scale: f32) {
+    let TextRun {
+        x_pt,
+        baseline_pt,
+        text,
+        size_pt,
+        space_adjust_pt,
+        rgb,
+    } = *run;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], 255);
+    paint.anti_alias = true;
+
+    // Justification inserts extra space between words, so words are drawn in sequence with the
+    // adjustment added at each gap — mirroring the writer's positioned-`TJ` construction.
+    let mut pen = x_pt;
+    let words: Vec<&str> = text.split(' ').collect();
+    let last = words.len().saturating_sub(1);
+    for (i, word) in words.iter().enumerate() {
+        let piece = if i == last {
+            (*word).to_string()
+        } else {
+            format!("{word} ")
+        };
+        for glyph in font.shape(&piece, size_pt) {
+            if let Some(outline) = font.outline(glyph.gid) {
+                fill_glyph(
+                    pixmap,
+                    &outline.commands,
+                    (pen + glyph.x_pt) * scale,
+                    baseline_pt * scale,
+                    size_pt * scale / font.units_per_em(),
+                    &paint,
+                );
+            }
+        }
+        pen += font
+            .shape(&piece, size_pt)
+            .iter()
+            .map(|g| g.advance_pt)
+            .sum::<f32>();
+        if i != last {
+            pen += space_adjust_pt;
+        }
+    }
+}
+
+/// Fill a glyph outline. Font units are y-up from the baseline; the raster is y-down.
+fn fill_glyph(
+    pixmap: &mut Pixmap,
+    commands: &[PathCmd],
+    origin_x: f32,
+    baseline_y: f32,
+    unit_scale: f32,
+    paint: &Paint,
+) {
+    if commands.is_empty() {
+        return; // a space: advances, draws nothing
+    }
+    let mut pb = PathBuilder::new();
+    let px = |x: f32| origin_x + x * unit_scale;
+    let py = |y: f32| baseline_y - y * unit_scale;
+    for cmd in commands {
+        match cmd {
+            PathCmd::MoveTo { x, y } => pb.move_to(px(*x), py(*y)),
+            PathCmd::LineTo { x, y } => pb.line_to(px(*x), py(*y)),
+            PathCmd::QuadTo { cx, cy, x, y } => pb.quad_to(px(*cx), py(*cy), px(*x), py(*y)),
+            PathCmd::CurveTo {
+                c1x,
+                c1y,
+                c2x,
+                c2y,
+                x,
+                y,
+            } => pb.cubic_to(px(*c1x), py(*c1y), px(*c2x), py(*c2y), px(*x), py(*y)),
+            PathCmd::Close => pb.close(),
+        }
+    }
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Blit a cached screen proxy into the page.
+///
+/// The full-resolution original is never opened here — that is the core performance strategy
+/// (`CLAUDE.md`: never composite full-res on screen). Full-res is touched only at export.
+fn draw_proxy(
+    pixmap: &mut Pixmap,
+    proxies: &ProxyCache,
+    asset_id: &str,
+    rect: (f32, f32, f32, f32),
+    scale: f32,
+) {
+    let (x_pt, y_pt, w_pt, h_pt) = rect;
+    let Some(proxy) = proxies.get(asset_id) else {
+        return;
+    };
+    let Some(mut src) = Pixmap::new(proxy.width, proxy.height) else {
+        return;
+    };
+    for (i, px) in src.pixels_mut().iter_mut().enumerate() {
+        let o = i * 4;
+        let (r, g, b, a) = (
+            proxy.rgba[o],
+            proxy.rgba[o + 1],
+            proxy.rgba[o + 2],
+            proxy.rgba[o + 3],
+        );
+        *px = tiny_skia::ColorU8::from_rgba(r, g, b, a).premultiply();
+    }
+    let sx = w_pt * scale / proxy.width as f32;
+    let sy = h_pt * scale / proxy.height as f32;
+    pixmap.draw_pixmap(
+        0,
+        0,
+        src.as_ref(),
+        &PixmapPaint::default(),
+        Transform::from_row(sx, 0.0, 0.0, sy, x_pt * scale, y_pt * scale),
+        None,
+    );
+}
+
+/// Encode a raster as a PNG.
+pub fn to_png(raster: &Raster) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, raster.width, raster.height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(&raster.rgba).ok()?;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paint::paint_page;
+    use quill_core_model::{page_geom, Document};
+    use quill_layout_engine::lay_out;
+    use quill_text_layout::NoHyphenator;
+
+    /// Rasterize the sample document's first page.
+    fn render(scale: f32) -> (Raster, Font) {
+        let doc = Document::sample();
+        let font = Font::bundled();
+        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let geom = page_geom(&doc.page_setup, 0);
+        let cache = ProxyCache::new();
+        let ops = paint_page(&pages[0], &geom, &font, &cache);
+        let raster = rasterize(&ops, &font, &cache, scale).expect("raster");
+        (raster, font)
+    }
+
+    /// Fraction of pixels that are not paper-white.
+    fn ink_fraction(r: &Raster) -> f32 {
+        let dark = r.rgba.chunks(4).filter(|p| p[0] < 200).count();
+        dark as f32 / (r.width * r.height) as f32
+    }
+
+    #[test]
+    fn dimensions_follow_the_page_and_the_scale() {
+        let (one, _) = render(1.0);
+        let (two, _) = render(2.0);
+        assert_eq!(two.width, one.width * 2);
+        assert_eq!(two.height, one.height * 2);
+        assert_eq!(one.rgba.len(), (one.width * one.height * 4) as usize);
+    }
+
+    #[test]
+    fn the_page_is_paper_coloured_and_not_blank() {
+        // Two failures this catches at once: a page that renders as an empty white sheet (nothing
+        // drawn), and one that renders dark (the paper fill missing or the demultiply inverted).
+        let (raster, _) = render(2.0);
+        let ink = ink_fraction(&raster);
+        assert!(ink > 0.001, "page looks blank ({ink:.4} ink)");
+        assert!(
+            ink < 0.5,
+            "page looks like it rendered dark ({ink:.4} ink) — is the paper fill missing?"
+        );
+    }
+
+    #[test]
+    fn a_corner_pixel_is_paper() {
+        // The margin area outside any text must be paper, which pins down that the fill happened
+        // and that the demultiply round-trips an opaque white.
+        let (raster, _) = render(1.0);
+        let px = &raster.rgba[0..4];
+        assert_eq!(px, &[255, 255, 255, 255], "top-left corner should be paper");
+    }
+
+    #[test]
+    fn rasterizing_is_deterministic() {
+        let (a, _) = render(2.0);
+        let (b, _) = render(2.0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_proxy_image_lands_in_the_raster() {
+        let mut doc = Document::sample();
+        doc.content = vec![quill_core_model::Block::image("map1")];
+        doc.assign_missing_block_ids().unwrap();
+        let mut cache = ProxyCache::new();
+        assert!(cache.insert_png("map1", &crate::tests_support::tiny_png(16, 16)));
+
+        let font = Font::bundled();
+        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let geom = page_geom(&doc.page_setup, 0);
+        let ops = paint_page(&pages[0], &geom, &font, &cache);
+        let raster = rasterize(&ops, &font, &cache, 1.0).expect("raster");
+        assert!(
+            ink_fraction(&raster) > 0.001,
+            "the placed image should put colour on the page"
+        );
+    }
+
+    #[test]
+    fn a_png_round_trips() {
+        let (raster, _) = render(1.0);
+        let png = to_png(&raster).expect("encode");
+        let decoded = crate::decode_png_proxy(&png).expect("the encoder must emit a decodable PNG");
+        assert_eq!(decoded.width, raster.width);
+        assert_eq!(decoded.height, raster.height);
+    }
+}

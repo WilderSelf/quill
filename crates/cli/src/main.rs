@@ -36,6 +36,23 @@ enum Command {
     },
     /// Pack a `document.json` and its linked assets into a portable `.tpub` container.
     Pack(PackArgs),
+    /// Render one page to a PNG, as the on-screen canvas would draw it (spec 0033).
+    Render(RenderArgs),
+}
+
+#[derive(Args)]
+struct RenderArgs {
+    /// Path to a `.tpub` or `document.json` (optional; falls back to the built-in sample).
+    input: Option<String>,
+    /// Zero-based page to render.
+    #[arg(long, default_value_t = 0)]
+    page: usize,
+    /// Pixels per point. 1.0 is 72 dpi; 2.0 is a HiDPI or zoomed view.
+    #[arg(long, default_value_t = 2.0)]
+    scale: f32,
+    /// Output PNG path.
+    #[arg(short, long)]
+    output: String,
 }
 
 #[derive(Args)]
@@ -257,6 +274,63 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Render(args) => {
+            let loaded = match load_doc(&args.input) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let font = quill_fonts::Font::bundled();
+            // Screen layout goes through the same shaper the exporter uses (spec 0032), so what is
+            // drawn here is what the PDF would contain — that is the whole point of the shared crate.
+            let pages =
+                quill_layout_engine::lay_out(&loaded.doc, &font, &quill_text_layout::NoHyphenator);
+            let Some(page) = pages.get(args.page) else {
+                eprintln!(
+                    "error: page {} out of range (document has {})",
+                    args.page,
+                    pages.len()
+                );
+                return ExitCode::FAILURE;
+            };
+
+            // Populate screen proxies from the document's linked assets. A missing link is skipped,
+            // not fatal: on screen it is recoverable and visible.
+            let mut proxies = quill_render::ProxyCache::new();
+            let report = proxies.populate_from_assets(&loaded.doc.assets, &loaded.asset_root);
+
+            let geom = quill_core_model::page_geom(&loaded.doc.page_setup, args.page);
+            let ops = quill_render::paint_page(page, &geom, &font, &proxies);
+            let Some(raster) = quill_render::rasterize(&ops, &font, &proxies, args.scale) else {
+                eprintln!("error: page has no drawable area");
+                return ExitCode::FAILURE;
+            };
+            let Some(png) = quill_render::to_png(&raster) else {
+                eprintln!("error: encoding PNG");
+                return ExitCode::FAILURE;
+            };
+            match std::fs::write(&args.output, &png) {
+                Ok(()) => {
+                    println!(
+                        "wrote {} ({}x{} px, {} ops, {} proxies generated, {} skipped)",
+                        args.output,
+                        raster.width,
+                        raster.height,
+                        ops.len(),
+                        report.generated,
+                        report.skipped
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error writing {}: {e}", args.output);
                     ExitCode::FAILURE
                 }
             }

@@ -103,6 +103,55 @@ jobs:
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/from-tpub.pdf
           echo "Ghostscript interpreted all three PDFs with no errors."
 
+      - name: Screen render (spec 0033)
+        run: |
+          set -euo pipefail
+          # Gives the screen path the same external gate export gets from Ghostscript: it must
+          # actually produce a page, not merely compile. A blank render is the failure this catches
+          # — the paint list can look right while nothing reaches the pixels.
+          cargo run -p quill-cli -- render --page 0 --scale 2 --output /tmp/page0.png
+          test -s /tmp/page0.png
+          python3 - <<'PY'
+          import struct, zlib
+          data = open('/tmp/page0.png', 'rb').read()
+          assert data[:8] == b'\x89PNG\r\n\x1a\n', 'not a PNG'
+          w, h = struct.unpack('>II', data[16:24])
+          assert w > 0 and h > 0, 'zero-sized page'
+          idat = b''
+          i = 8
+          while i < len(data):
+              ln = struct.unpack('>I', data[i:i+4])[0]
+              if data[i+4:i+8] == b'IDAT':
+                  idat += data[i+8:i+8+ln]
+              i += 12 + ln
+          raw = zlib.decompress(idat)
+          # Undo PNG row filters so the pixel test is real rather than reading filter deltas.
+          stride, bpp = w * 4, 4
+          prev, rows = bytearray(stride), []
+          pos = 0
+          for _ in range(h):
+              ft = raw[pos]; pos += 1
+              line = bytearray(raw[pos:pos+stride]); pos += stride
+              for x in range(stride):
+                  a = line[x-bpp] if x >= bpp else 0
+                  b = prev[x]
+                  c = prev[x-bpp] if x >= bpp else 0
+                  if ft == 1: line[x] = (line[x] + a) & 255
+                  elif ft == 2: line[x] = (line[x] + b) & 255
+                  elif ft == 3: line[x] = (line[x] + (a + b) // 2) & 255
+                  elif ft == 4:
+                      p = a + b - c
+                      pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+                      pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                      line[x] = (line[x] + pr) & 255
+              rows.append(bytes(line)); prev = line
+          dark = sum(1 for r in rows for x in range(0, stride, 4) if r[x] < 200)
+          frac = dark / (w * h)
+          print(f'{w}x{h}, ink fraction {frac:.4f}')
+          assert frac > 0.001, 'rendered page is blank'
+          assert frac < 0.5, 'rendered page came out dark - paper fill missing?'
+          PY
+
       - name: Per-crate build (feature-unification guard)
         run: |
           set -euo pipefail

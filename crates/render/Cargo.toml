@@ -16,3 +16,10 @@ jpeg-decoder = { workspace = true }
 # For `Asset` — populating the proxy cache from a document's linked-asset list (spec 0023). Internal,
 # acyclic: `core-model` is the base crate and `render` is downstream of it in the data flow.
 quill-core-model = { workspace = true }
+# The screen canvas (spec 0033): a backend-neutral paint list rasterized by tiny-skia.
+tiny-skia = { workspace = true }
+# One shaper for screen and press, so the two cannot disagree about where a glyph goes (spec 0032).
+quill-fonts = { workspace = true }
+quill-layout-engine = { workspace = true }
+quill-color = { workspace = true }
+quill-text-layout = { workspace = true }

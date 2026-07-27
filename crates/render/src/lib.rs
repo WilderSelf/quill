@@ -13,6 +13,12 @@ use std::time::SystemTime;
 /// Longest edge, in pixels, for cached on-screen image proxies.
 pub const PROXY_MAX_EDGE_PX: u32 = 2048;
 
+pub mod paint;
+pub mod raster;
+
+pub use paint::{paint_page, PaintOp};
+pub use raster::{rasterize, to_png, Raster};
+
 /// A decoded, downsampled screen proxy: RGBA8 pixels at the proxy dimensions. The GPU renderer
 /// uploads `rgba` as a texture; nothing here touches full-resolution art after generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -849,5 +855,24 @@ mod tests {
         );
         assert_eq!(proxy_size(800, 600), (800, 600));
         assert_eq!(proxy_size(0, 0), (0, 0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// A minimal valid RGB PNG, for tests that need a decodable image without an encoder dependency.
+    pub fn tiny_png(width: u32, height: u32) -> Vec<u8> {
+        let mut enc_out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut enc_out, width, height);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            let data: Vec<u8> = (0..width * height)
+                .flat_map(|i| [(i % 256) as u8, 120, 200])
+                .collect();
+            w.write_image_data(&data).unwrap();
+        }
+        enc_out
     }
 }
