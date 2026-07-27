@@ -201,6 +201,8 @@ pub fn document_with_blocks(spec: &SynthSpec, block_count: usize) -> Document {
         revision: 0,
         next_block_id: 0,
         styles: quill_core_model::StyleSheet::default(),
+        master_pages: Vec::new(),
+        default_master: None,
     };
     doc.assign_missing_block_ids()
         .expect("generated blocks are unassigned, so cannot collide");

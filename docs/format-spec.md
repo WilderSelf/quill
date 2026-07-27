@@ -25,10 +25,13 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "metadata": { "title": "...", "authors": ["..."] },
-  "page_setup": { "trim": { "w_pt": 468, "h_pt": 720 }, "bleed_pt": 9.0, "facing_pages": true },
-  "master_pages": [ ... ],
+  "page_setup": { "trim": { "w_pt": 468, "h_pt": 720 }, "bleed_pt": 9.0, "facing_pages": true,
+                  "margins": { "top_pt": 36, "bottom_pt": 36, "inside_pt": 54, "outside_pt": 36 } },
+  "master_pages": [ { "name": "body", "columns": 2, "gutter_pt": 12,
+                      "statics": [ { "kind": "text", "rect": { ... }, "text": "The Dungeon — {page}" } ] } ],
+  "default_master": "body",
   "spreads": [ { "pages": [ { "master": "...", "frames": [ ... ] } ] } ],
   "styles": { "paragraph": { "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" }, "h1": { ... } } },
   "content": [ /* semantic blocks: headings, body, stat blocks, tables, random tables */ ],
@@ -37,6 +40,15 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
   "assets": [ { "id": "...", "path": "assets/....png", "px_w": 1500, "px_h": 1200, "dpi": 300 } ]
 }
 ```
+
+## Margins and master pages
+
+Margins are `inside`/`outside`, not left/right: a bound book's margins are relative to the spine, so
+the inside margin falls on the left of a recto and the right of a verso. A `MasterPage` names the
+margins, column count, gutter and repeating furniture shared by the pages it governs; `{page}` in a
+static's text resolves to the one-based page number. `default_master` names the master applied to
+the document; an unknown name degrades to the document's own page setup rather than refusing to open
+the file.
 
 ## Versioning
 
