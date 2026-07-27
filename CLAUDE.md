@@ -51,6 +51,7 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 | `core-model` | Document tree; open, versioned `.tpub` file format (zip + JSON/TOML manifest + linked `assets/`, `fonts/`). Two linked views: semantic content and layout. |
 | `text-layout` | Shaping (`rustybuzz`), **custom Knuth-Plass line breaking** for press-quality justification, hyphenation, bidi. |
 | `layout-engine` | Frames, text threading, master pages, layers, baseline grid. **Incremental & dependency-tracked.** |
+| `fonts` | Shared shaping, metrics and glyph outlines (`rustybuzz`/`ttf-parser`). One shaper for screen *and* press, so they cannot drift. |
 | `color` | `lcms2`: ICC, RGB→CMYK, grayscale, soft-proof, **ink-coverage (240%) enforcement**. |
 | `render` | On-screen viewport (backend-neutral paint list → `tiny-skia` CPU raster) + **linked-image downsampled proxy cache**. |
 | `export-pdf` | **The differentiator.** PDF/X writer on `pdf-writer` + `subsetter`; preflight. |

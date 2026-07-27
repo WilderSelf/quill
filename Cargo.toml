@@ -52,6 +52,7 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 # Internal crates (path deps within the workspace).
 quill-core-model = { path = "crates/core-model" }
+quill-fonts = { path = "crates/fonts" }
 quill-text-layout = { path = "crates/text-layout" }
 quill-layout-engine = { path = "crates/layout-engine" }
 quill-color = { path = "crates/color" }

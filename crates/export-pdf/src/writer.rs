@@ -358,7 +358,7 @@ fn render_page(
                 let ascent = font.ascent_pt(*font_size_pt);
                 for (li, line) in lines.iter().enumerate() {
                     let top_y = frame.y_pt + ascent + li as f32 * leading_pt;
-                    let (x, y) = g.flip(frame.x_pt, top_y);
+                    let (x, y) = geom::flip(g, frame.x_pt, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
                     show_line(&mut content, font, line, *font_size_pt);

@@ -1,0 +1,20 @@
+[package]
+name = "quill-fonts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Font measurement, shaping and outlines, shared by everything that has to agree about where a
+# glyph goes: the PDF writer, the screen renderer and the app shell (spec 0032).
+#
+# Deliberately contains no PDF types. Subsetting, Identity-H encoding and FontDescriptor flags stay
+# in `export-pdf`, because they are about the *file format*, not about the font — and dragging
+# `pdf-writer` into the screen-rendering path would be exactly the layering mistake this crate
+# exists to prevent.
+[dependencies]
+# Pure-Rust font stack, chosen partly to keep the dependency graph permissive (no FreeType/GPL).
+ttf-parser = { workspace = true }
+rustybuzz = { workspace = true }
+quill-text-layout = { workspace = true }

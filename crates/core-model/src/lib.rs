@@ -9,9 +9,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 mod container;
+mod geom;
 mod version;
 
 pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
+pub use geom::{page_geom, PageGeom};
 pub use version::LoadError;
 
 /// Typographic points (1/72 inch) — the internal unit throughout Quill.
