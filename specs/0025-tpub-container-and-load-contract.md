@@ -118,12 +118,19 @@ program, differently compressed. The fix is to select `deflate-flate2` specifica
 and the lock file gains only `zip` and `typed-path`. Cross-crate feature unification can reach the
 press-output path from a dependency that has nothing to do with it.
 
-**Press exports are not byte-reproducible across time when the OutputIntent profile is synthesized.**
-`synth_cmyk_profile()` stamps the current time into the ICC header (`dateTimeNumber`, header bytes
-24..36), and PDF/X embeds that profile verbatim. This is inherent to ICC, not a defect — a real
-export supplies a fixed press profile and *is* reproducible. But it means the digest test has to zero
-that one field, or it would measure the clock instead of the writer. A companion test asserts the
-timestamp is really there, so the normalization step does not outlive its reason.
+**A synthesized OutputIntent profile varies by clock *and* by host.** PDF/X embeds the profile
+verbatim, so a digest over the export is only meaningful if the profile is constant — and
+`synth_cmyk_profile()` is not. lcms2 stamps the current time into the ICC header (`dateTimeNumber`,
+bytes 24..36) and writes a primary-platform signature that follows the build host (`APPL` on
+Linux/macOS, `MSFT` on Windows, bytes 40..44). The first makes the digest a clock. The second is
+subtler: it produced an identical byte *length* with different content, and only the Windows CI leg
+caught it.
+
+Both are inherent to ICC rather than defects — a real export supplies a fixed press profile and *is*
+reproducible. The fix is a committed 376-byte profile fixture used only by parity assertions, which
+avoids having to enumerate which header fields happen to vary today; every other test still
+exercises the live synthesizer. A companion test asserts both fields really do vary, so the fixture
+does not outlive its reason.
 
 ## Non-goals
 

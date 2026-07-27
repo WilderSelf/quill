@@ -626,21 +626,27 @@ mod tests {
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
+    /// Byte offsets of the ICC header's primary-platform signature (ICC.1 spec, bytes 40..44).
+    const ICC_PLATFORM: std::ops::Range<usize> = 40..44;
 
-    /// Write the synthesized CMYK profile with its creation timestamp zeroed, and return options
-    /// pointing at it.
+    /// A fixed OutputIntent profile, committed so the byte-parity digest measures the *writer*.
     ///
-    /// A PDF/X export embeds the OutputIntent profile verbatim, and `synth_cmyk_profile()` stamps
-    /// the current time into the ICC header — so two exports of the same document minutes apart
-    /// differ, in the profile, by a handful of bytes. That is inherent to ICC and not a defect: for
-    /// a real export the user supplies a fixed press profile and output *is* reproducible. But it
-    /// means a digest over a freshly synthesized profile could never be pinned. Zeroing the one
-    /// field that varies makes the writer's own output the only thing the digest measures.
+    /// A PDF/X export embeds the OutputIntent profile verbatim, so the digest is only meaningful if
+    /// the profile is constant. `synth_cmyk_profile()` is not: lcms2 stamps the current time into
+    /// the ICC header, **and** writes a primary-platform signature that follows the build host
+    /// (`APPL` on Linux/macOS, `MSFT` on Windows). The first makes the digest a clock; the second
+    /// made it fail on the Windows CI leg with an identical byte length.
+    ///
+    /// Both are inherent to ICC rather than defects — a real export supplies a fixed press profile
+    /// and *is* reproducible. Committing one generated profile is the fix that does not require
+    /// enumerating which header fields happen to vary today, per `CLAUDE.md`'s guidance on binary
+    /// test fixtures. It is only used for parity assertions; every other test still exercises the
+    /// live synthesizer.
+    const PARITY_ICC: &[u8] = include_bytes!("../assets/parity-outputintent.icc");
+
     fn opts_with_fixed_icc(tag: &str) -> (ExportOptions, std::path::PathBuf) {
-        let mut icc = synth_cmyk_profile();
-        icc[ICC_DATETIME].fill(0);
         let path = std::env::temp_dir().join(format!("quill_fixed_{tag}.icc"));
-        std::fs::write(&path, &icc).unwrap();
+        std::fs::write(&path, PARITY_ICC).unwrap();
         (
             ExportOptions {
                 output_intent_icc: path.to_string_lossy().into_owned(),
@@ -651,22 +657,35 @@ mod tests {
     }
 
     #[test]
-    fn a_synthesized_icc_profile_carries_a_creation_timestamp() {
-        // Guards the assumption `opts_with_fixed_icc` rests on. If lcms2 ever stops stamping the
-        // header, this test says so rather than leaving a normalization step nobody understands.
+    fn the_parity_profile_is_a_valid_output_intent() {
+        // The fixture must still be a profile the exporter accepts, or the parity test would be
+        // asserting over an export path nothing else takes.
+        icc::check_icc(PARITY_ICC).expect("committed parity profile must pass ICC validation");
+        assert_eq!(PARITY_ICC.len(), synth_cmyk_profile().len());
+    }
+
+    #[test]
+    fn a_synthesized_icc_profile_varies_by_clock_and_host() {
+        // Documents exactly why PARITY_ICC exists. If lcms2 ever stops stamping these fields, this
+        // test says so rather than leaving a committed fixture nobody understands.
         let a = synth_cmyk_profile();
         assert!(
             a[ICC_DATETIME].iter().any(|b| *b != 0),
             "expected a non-zero ICC creation timestamp"
         );
-        let mut normalized = a.clone();
-        normalized[ICC_DATETIME].fill(0);
-        let mut other = synth_cmyk_profile();
-        other[ICC_DATETIME].fill(0);
-        assert_eq!(
-            normalized, other,
-            "with the timestamp zeroed, the synthesized profile must be fully deterministic"
+        assert!(
+            matches!(&a[ICC_PLATFORM], b"APPL" | b"MSFT" | b"SUNW" | b"SGI "),
+            "expected a host-dependent primary-platform signature, got {:?}",
+            &a[ICC_PLATFORM]
         );
+        // Everything outside those two header fields is deterministic within one host.
+        let mut x = synth_cmyk_profile();
+        let mut y = a.clone();
+        for f in [ICC_DATETIME, ICC_PLATFORM] {
+            x[f.clone()].fill(0);
+            y[f].fill(0);
+        }
+        assert_eq!(x, y, "profile body must be deterministic");
     }
 
     #[test]
