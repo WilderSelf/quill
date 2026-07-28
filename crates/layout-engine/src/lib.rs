@@ -13,10 +13,10 @@ mod session;
 pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
-    Asset, Block, BlockId, Color, Document, Margins, MasterPage, MasterStatic, PageSetup,
-    ParagraphStyle, Rect, StatBlock, StyleSheet, Table, TextAlign, PAGE_TOKEN,
-    STATBLOCK_ATTR_STYLE, STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE, TABLE_CELL_STYLE,
-    TABLE_HEADER_STYLE,
+    toc_entry_style_name, Asset, Block, BlockId, Color, Document, Margins, MasterPage,
+    MasterStatic, PageSetup, ParagraphStyle, Rect, StatBlock, StyleSheet, Table, TextAlign,
+    PAGE_TOKEN, STATBLOCK_ATTR_STYLE, STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE,
+    TABLE_CELL_STYLE, TABLE_HEADER_STYLE, TOC_TITLE_STYLE,
 };
 use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -221,6 +221,12 @@ pub struct HeadingEntry {
 ///
 /// Master furniture is skipped: it carries [`BlockId::UNASSIGNED`] and is not content.
 pub fn heading_index(doc: &Document, pages: &[LaidOutPage]) -> Vec<HeadingEntry> {
+    heading_index_of(&doc.content, pages)
+}
+
+/// [`heading_index`] over a bare block list, for callers that have no `Document` — the TOC fixpoint
+/// (spec 0041) runs inside `lay_out_with_template`, which takes content rather than a document.
+pub fn heading_index_of(content: &[Block], pages: &[LaidOutPage]) -> Vec<HeadingEntry> {
     let mut seen: BTreeSet<BlockId> = BTreeSet::new();
     let mut out = Vec::new();
     for page in pages {
@@ -231,7 +237,9 @@ pub fn heading_index(doc: &Document, pages: &[LaidOutPage]) -> Vec<HeadingEntry>
             if !source.is_assigned() || !seen.insert(*source) {
                 continue;
             }
-            let Some(Block::Heading { level, text, .. }) = doc.block(*source) else {
+            let Some(Block::Heading { level, text, .. }) =
+                content.iter().find(|b| b.id() == *source)
+            else {
                 continue;
             };
             out.push(HeadingEntry {
@@ -534,14 +542,32 @@ pub(crate) struct PanelPart {
 ///
 /// Called once per candidate frame in [`lay_out_in_thread`]'s placement loop so a block that
 /// advances into a different-width frame re-wraps (text) / re-fits (image) to that frame's width.
+/// The ambient inputs every block measurement needs, other than the block and its width.
+///
+/// Grouped because they travel together through `flow`, the `Measurer` trait and `measure_block`,
+/// and the list grew by one with each of specs 0026, 0028 and 0041. Passing them as a unit means
+/// the next addition changes one struct rather than five signatures.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockContext<'a> {
+    pub assets: &'a AssetIndex<'a>,
+    pub styles: &'a StyleSheet,
+    /// Where the headings landed, for a contents block to render from (spec 0041). Empty on the
+    /// first pass of the fixpoint, and for every document that has no contents block.
+    pub headings: &'a [HeadingEntry],
+}
+
 pub(crate) fn measure_block(
     block: &Block,
     width: f32,
-    assets: &AssetIndex<'_>,
-    styles: &StyleSheet,
+    ctx: &BlockContext<'_>,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Option<(Measured, f32)> {
+    let BlockContext {
+        assets,
+        styles,
+        headings,
+    } = *ctx;
     match block {
         Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
             // Size, leading and alignment now come from the document's stylesheet rather than from
@@ -575,6 +601,14 @@ pub(crate) fn measure_block(
                 height,
             ))
         }
+        Block::Toc {
+            title,
+            max_level,
+            color,
+            ..
+        } => Some(measure_toc(
+            title, *max_level, *color, width, styles, headings, metrics,
+        )),
         Block::Table { table, color, .. } => Some(measure_table(
             table, *color, width, styles, metrics, hyphenator,
         )),
@@ -856,6 +890,149 @@ fn measure_table(
     )
 }
 
+/// Width reserved at the right edge of a contents line for its page number.
+const TOC_NUMBER_COLUMN_PT: f32 = 26.0;
+
+/// Indent applied per heading level below the first.
+const TOC_INDENT_PT: f32 = 12.0;
+
+/// Gap between the end of an entry's leader and its page number.
+const TOC_LEADER_GAP_PT: f32 = 4.0;
+
+/// Build a table of contents from where the headings actually landed (spec 0041).
+///
+/// The entries are *derived*, never stored: a stored entry is stale the moment anything is edited,
+/// and a contents list whose numbers were right one edit ago is worse than none.
+///
+/// Each entry is two runs — the title, and the page number right-aligned in a reserved column — with
+/// a dot leader between them. Two runs rather than one string of dots because the number has to
+/// land at an exact x, and padding a string with dots would put it wherever the last dot happened
+/// to fall.
+fn measure_toc(
+    title: &str,
+    max_level: u8,
+    color: Color,
+    width: f32,
+    styles: &StyleSheet,
+    headings: &[HeadingEntry],
+    metrics: &impl RunMetrics,
+) -> (Measured, f32) {
+    let mut parts: Vec<PanelPart> = Vec::new();
+    let mut y = 0.0;
+
+    if !title.is_empty() {
+        let style = styles
+            .paragraph
+            .get(TOC_TITLE_STYLE)
+            .copied()
+            .unwrap_or_default();
+        y += style.space_before_pt;
+        parts.push(PanelPart {
+            dx_pt: 0.0,
+            dy_pt: y,
+            w_pt: width,
+            lines: vec![Line {
+                text: title.to_string(),
+                space_adjust_pt: 0.0,
+            }],
+            color,
+            font_size_pt: style.font_size_pt,
+            leading_pt: style.leading_pt,
+        });
+        y += style.leading_pt + style.space_after_pt;
+    }
+
+    for h in headings.iter().filter(|h| h.level <= max_level) {
+        let style = styles
+            .paragraph
+            .get(&toc_entry_style_name(h.level))
+            .copied()
+            .unwrap_or_default();
+        y += style.space_before_pt;
+
+        let indent = (h.level.saturating_sub(1)) as f32 * TOC_INDENT_PT;
+        let number = (h.page_index + 1).to_string();
+        let number_w = metrics.measure_run(&number, style.font_size_pt);
+
+        // Title, clipped to the space before the number column. A long chapter name is truncated
+        // with an ellipsis rather than wrapped: a contents list is scanned, and a two-line entry
+        // whose page number sits beside the first line reads as two entries.
+        let title_max = (width - indent - TOC_NUMBER_COLUMN_PT - TOC_LEADER_GAP_PT).max(1.0);
+        let mut text = h.text.clone();
+        if metrics.measure_run(&text, style.font_size_pt) > title_max {
+            while !text.is_empty()
+                && metrics.measure_run(&format!("{text}…"), style.font_size_pt) > title_max
+            {
+                text.pop();
+            }
+            text.push('…');
+        }
+        let title_w = metrics.measure_run(&text, style.font_size_pt);
+
+        parts.push(PanelPart {
+            dx_pt: indent,
+            dy_pt: y,
+            w_pt: title_max,
+            lines: vec![Line {
+                text: text.clone(),
+                space_adjust_pt: 0.0,
+            }],
+            color,
+            font_size_pt: style.font_size_pt,
+            leading_pt: style.leading_pt,
+        });
+
+        // The leader fills the gap and stops short of the number, so the two never overlap.
+        let leader_x = indent + title_w + TOC_LEADER_GAP_PT;
+        let leader_end = width - number_w - TOC_LEADER_GAP_PT;
+        if leader_end > leader_x {
+            let dot_w = metrics.measure_run(".", style.font_size_pt).max(0.01);
+            let dots = ((leader_end - leader_x) / dot_w).floor().max(0.0) as usize;
+            if dots > 0 {
+                parts.push(PanelPart {
+                    dx_pt: leader_x,
+                    dy_pt: y,
+                    w_pt: leader_end - leader_x,
+                    lines: vec![Line {
+                        text: ".".repeat(dots),
+                        space_adjust_pt: 0.0,
+                    }],
+                    color,
+                    font_size_pt: style.font_size_pt,
+                    leading_pt: style.leading_pt,
+                });
+            }
+        }
+
+        // Right-aligned: the number's *right* edge sits at the measure's right edge, so a 3-digit
+        // page and a 1-digit page end in the same column.
+        parts.push(PanelPart {
+            dx_pt: width - number_w,
+            dy_pt: y,
+            w_pt: number_w,
+            lines: vec![Line {
+                text: number,
+                space_adjust_pt: 0.0,
+            }],
+            color,
+            font_size_pt: style.font_size_pt,
+            leading_pt: style.leading_pt,
+        });
+
+        y += style.leading_pt + style.space_after_pt;
+    }
+
+    (
+        Measured::Panel {
+            fill: None,
+            stroke: None,
+            parts,
+            decorations: Vec::new(),
+        },
+        y,
+    )
+}
+
 /// Flow `content` through a [`Thread`]'s frames, paginating across frames and then pages
 /// (spec 0019 incr. 2). Content fills the first frame top-to-bottom; a block that overflows the
 /// current frame continues into the next frame in the thread, and onto a fresh page — restarting at
@@ -899,18 +1076,94 @@ pub fn lay_out_with_template(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    flow(
-        content,
-        assets,
-        styles,
-        template,
-        metrics,
-        hyphenator,
-        FlowState::start(template),
-        &mut NoCache,
-        None,
+    lay_out_with_toc_status(content, assets, styles, template, metrics, hyphenator).0
+}
+
+/// How the table-of-contents fixpoint resolved (spec 0041).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TocStatus {
+    /// Layout passes run. `1` when the document has no contents block at all.
+    pub iterations: usize,
+    /// Whether the page numbers settled. `false` means the cap was reached and the **last iterate**
+    /// was returned: a laid-out document with nothing missing, whose contents may disagree with a
+    /// page number by one. The caller can see it rather than being told a guess converged.
+    pub converged: bool,
+}
+
+/// The most layout passes a contents fixpoint may take before giving up.
+///
+/// A bound is not optional. A contents entry can push a heading onto the next page, whose longer
+/// number lengthens the entry, which pushes the heading further — or shortens it and pulls the
+/// heading back, forever. Spec 0031 recorded unbounded "reflow until state matches" as the way a
+/// pathological document hangs; a contents list is the case that actually oscillates.
+pub const TOC_MAX_ITERATIONS: usize = 8;
+
+/// [`lay_out_with_template`], reporting how the contents fixpoint resolved.
+///
+/// A table of contents lists page numbers, its own length changes where every later page break
+/// falls, and that changes the numbers it lists. So layout runs to a fixpoint: lay out, read where
+/// the headings landed, regenerate the entries, lay out again, and stop when the index stops
+/// changing.
+///
+/// Documents without a contents block take exactly one pass — the loop is not merely skipped in
+/// spirit, it is not entered, so nothing about the cost or the behaviour of every other document
+/// changes.
+pub fn lay_out_with_toc_status(
+    content: &[Block],
+    assets: &[Asset],
+    styles: &StyleSheet,
+    template: &impl PageTemplate,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> (Vec<LaidOutPage>, TocStatus) {
+    let once = |headings: &[HeadingEntry]| {
+        flow(
+            content,
+            assets,
+            styles,
+            headings,
+            template,
+            metrics,
+            hyphenator,
+            FlowState::start(template),
+            &mut NoCache,
+            None,
+        )
+        .pages
+    };
+
+    let mut pages = once(&[]);
+    if !content.iter().any(|b| matches!(b, Block::Toc { .. })) {
+        return (
+            pages,
+            TocStatus {
+                iterations: 1,
+                converged: true,
+            },
+        );
+    }
+
+    let mut headings: Vec<HeadingEntry> = Vec::new();
+    let mut iterations = 1;
+    let converged = loop {
+        let next = heading_index_of(content, &pages);
+        if next == headings {
+            break true;
+        }
+        if iterations >= TOC_MAX_ITERATIONS {
+            break false;
+        }
+        headings = next;
+        pages = once(&headings);
+        iterations += 1;
+    };
+    (
+        pages,
+        TocStatus {
+            iterations,
+            converged,
+        },
     )
-    .pages
 }
 
 /// Where the flow had reached at a page boundary — everything needed to resume from there.
@@ -956,8 +1209,7 @@ pub(crate) trait Measurer {
         &mut self,
         block: &Block,
         width: f32,
-        assets: &AssetIndex<'_>,
-        styles: &StyleSheet,
+        ctx: &BlockContext<'_>,
         metrics: &M,
         hyphenator: &H,
     ) -> Option<(Measured, f32)>;
@@ -971,12 +1223,11 @@ impl Measurer for NoCache {
         &mut self,
         block: &Block,
         width: f32,
-        assets: &AssetIndex<'_>,
-        styles: &StyleSheet,
+        ctx: &BlockContext<'_>,
         metrics: &M,
         hyphenator: &H,
     ) -> Option<(Measured, f32)> {
-        measure_block(block, width, assets, styles, metrics, hyphenator)
+        measure_block(block, width, ctx, metrics, hyphenator)
     }
 }
 
@@ -1013,6 +1264,7 @@ pub(crate) fn flow(
     content: &[Block],
     assets: &[Asset],
     styles: &StyleSheet,
+    headings: &[HeadingEntry],
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
@@ -1024,7 +1276,11 @@ pub(crate) fn flow(
     // frame per block, and it used to resolve image ids with a linear scan of `assets` — quadratic
     // in an art-heavy document, which is precisely the workload this engine exists for (spec 0026).
     let assets: AssetIndex<'_> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
-    let assets = &assets;
+    let ctx = BlockContext {
+        assets: &assets,
+        styles,
+        headings,
+    };
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut checkpoints: Vec<FlowState> = Vec::new();
@@ -1055,7 +1311,7 @@ pub(crate) fn flow(
         loop {
             let frame = frames[frame_idx];
             let Some((measured, height)) =
-                measurer.measure(block, frame.rect.w_pt, assets, styles, metrics, hyphenator)
+                measurer.measure(block, frame.rect.w_pt, &ctx, metrics, hyphenator)
             else {
                 break; // unresolved image asset → skip this block (no panic)
             };
@@ -3265,6 +3521,213 @@ mod tests {
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
         let placed: usize = pages.iter().map(|p| cells(p).len()).sum();
         assert_eq!(placed, 1000, "every cell of every row must be placed");
+    }
+
+    // --- Generated table of contents (spec 0041) ------------------------------------------------
+
+    fn toc_doc(max_level: u8, chapters: &[(u8, &str)], filler: usize) -> Document {
+        let mut content: Vec<Block> = vec![Block::Toc {
+            id: BlockId::UNASSIGNED,
+            title: "Contents".into(),
+            max_level,
+            color: Color::Gray { v: 0.0 },
+        }];
+        for (level, name) in chapters {
+            content.push(Block::heading(*level, *name, Color::Gray { v: 0.0 }));
+            content.extend(many_lines(filler));
+        }
+        let mut doc = doc_with_blocks(content);
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    /// Every contents entry as `(title, printed page number)`, read back off the page.
+    ///
+    /// The contents block emits, in order: its own title, then per entry a title run, an optional
+    /// dot-leader run, and a page-number run. Dropping the leaders leaves a flat
+    /// `[title, number, title, number, ...]` sequence.
+    fn toc_entries(doc: &Document, pages: &[LaidOutPage]) -> Vec<(String, String)> {
+        // Filtered by source id: a contents block shares its page with whatever follows it, so
+        // reading every text run on page 0 would sweep up the body text too.
+        let toc_id = doc
+            .content
+            .iter()
+            .find(|b| matches!(b, Block::Toc { .. }))
+            .map(|b| b.id())
+            .expect("a contents block");
+        let texts: Vec<String> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, source, .. } if *source == toc_id => {
+                    Some(lines[0].text.clone())
+                }
+                _ => None,
+            })
+            .filter(|t| !t.is_empty() && !t.chars().all(|c| c == '.'))
+            .collect();
+        texts[1..]
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| (c[0].clone(), c[1].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_contents_list_prints_the_pages_the_headings_actually_landed_on() {
+        // The whole feature, and it must be asserted against the FINAL layout. Comparing a
+        // first-pass contents list against first-pass numbers would agree with itself while being
+        // wrong about the document.
+        let doc = toc_doc(2, &[(1, "Alpha"), (1, "Beta"), (1, "Gamma")], 60);
+        let (pages, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged, "the fixpoint must settle: {status:?}");
+
+        let printed = toc_entries(&doc, &pages);
+        let actual = heading_index_of(&doc.content, &pages);
+        assert_eq!(printed.len(), 3, "one entry per heading: {printed:?}");
+        for (entry, heading) in printed.iter().zip(actual.iter()) {
+            assert_eq!(entry.0, heading.text);
+            assert_eq!(
+                entry.1,
+                (heading.page_index + 1).to_string(),
+                "`{}` prints {} but is on page {}",
+                heading.text,
+                entry.1,
+                heading.page_index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn the_fixpoint_settles_in_few_passes() {
+        // "It converged" as a measured claim rather than an assertion of faith.
+        let doc = toc_doc(2, &[(1, "Alpha"), (1, "Beta")], 40);
+        let (_, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged);
+        assert!(
+            status.iterations <= 3,
+            "a one-page contents list should settle quickly, took {}",
+            status.iterations
+        );
+    }
+
+    #[test]
+    fn a_document_without_a_contents_block_takes_exactly_one_pass() {
+        // The loop must not be entered at all, so no other document pays for this feature.
+        let doc = doc_with_blocks(many_lines(200));
+        let (_, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(status.iterations, 1);
+        assert!(status.converged);
+    }
+
+    #[test]
+    fn max_level_omits_deeper_headings() {
+        let doc = toc_doc(2, &[(1, "One"), (2, "Two"), (3, "Three")], 5);
+        let (pages, _) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        let titles: Vec<String> = toc_entries(&doc, &pages).into_iter().map(|e| e.0).collect();
+        assert!(titles.contains(&"One".to_string()));
+        assert!(titles.contains(&"Two".to_string()));
+        assert!(!titles.contains(&"Three".to_string()), "h3 must be omitted");
+    }
+
+    #[test]
+    fn a_page_number_is_right_aligned_to_the_measure() {
+        // Geometry, not appearance: a 1-digit and a 3-digit page must end in the same column.
+        let doc = toc_doc(1, &[(1, "Alpha"), (1, "Beta")], 200);
+        let (pages, _) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        let rights: Vec<f32> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, lines, .. }
+                    if !lines[0].text.is_empty()
+                        && lines[0].text.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    Some(frame.x_pt + frame.w_pt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(rights.len() >= 2, "need two numbers to compare");
+        for r in &rights {
+            assert!(
+                (r - doc.page_setup.trim.w_pt).abs() < 0.01,
+                "page numbers must end at the measure's right edge: {rights:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contents_list_with_no_headings_is_just_its_title() {
+        let doc = toc_doc(2, &[], 0);
+        let (pages, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged);
+        let texts: Vec<String> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, .. } => Some(lines[0].text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Contents"]);
+
+        // And it is set in the contents *title* style, not at entry size — the built-in styles are
+        // what make a generated contents list read as one with no authoring.
+        let size = match &pages[0].blocks[0] {
+            PlacedBlock::Text { font_size_pt, .. } => *font_size_pt,
+            other => panic!("expected the title, got {other:?}"),
+        };
+        assert_eq!(
+            size,
+            doc.styles.paragraph[quill_core_model::TOC_TITLE_STYLE].font_size_pt
+        );
+        assert!(
+            size > doc.styles.paragraph["toc-1"].font_size_pt,
+            "the title must outrank its entries"
+        );
     }
 
     // --- Heading index (spec 0040) --------------------------------------------------------------

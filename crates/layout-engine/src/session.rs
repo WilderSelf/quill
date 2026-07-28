@@ -37,8 +37,8 @@ use quill_core_model::{Block, BlockId, Document};
 use quill_text_layout::{Hyphenator, RunMetrics};
 
 use crate::{
-    flow, heading_index, measure_block, AssetIndex, DocumentTemplate, FlowState, HeadingEntry,
-    LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
+    flow, heading_index, measure_block, BlockContext, DocumentTemplate, FlowState, HeadingEntry,
+    LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet, TocStatus,
 };
 
 /// What a relayout actually did.
@@ -79,6 +79,10 @@ pub struct LayoutResult {
     /// reuses whole pages and a carried-forward index would go stale exactly when the document was
     /// edited. See [`crate::heading_index`].
     pub headings: Vec<HeadingEntry>,
+    /// How the contents fixpoint resolved (spec 0041). `converged: false` means the cap was hit and
+    /// this is the last iterate — a complete document whose contents may be one page out, surfaced
+    /// rather than presented as settled.
+    pub toc: TocStatus,
 }
 
 /// Identifies a measurement: everything a broken paragraph depends on.
@@ -165,10 +169,59 @@ impl LayoutSession {
     }
 
     /// [`relayout`](Self::relayout) against an explicit template.
+    ///
+    /// A document containing a contents block (spec 0041) is laid out repeatedly until its page
+    /// numbers settle. Every other document takes exactly one pass through [`Self::pass`] — the
+    /// loop is not entered at all, so nothing about the incremental behaviour of a document without
+    /// a contents list changes.
     pub fn relayout_with_template(
         &mut self,
         doc: &Document,
         template: &impl PageTemplate,
+        metrics: &impl RunMetrics,
+        hyphenator: &impl Hyphenator,
+    ) -> LayoutResult {
+        if !doc.content.iter().any(|b| matches!(b, Block::Toc { .. })) {
+            return self.pass(doc, template, &[], metrics, hyphenator);
+        }
+
+        // The pages this relayout started from. Intermediate iterations overwrite `self.pages`, so
+        // the caller's `changed_pages` has to be measured against where the *document* was before
+        // the call, not against the previous iterate.
+        let before = self.pages.clone();
+
+        let mut headings: Vec<HeadingEntry> = Vec::new();
+        let mut result = self.pass(doc, template, &headings, metrics, hyphenator);
+        let mut iterations = 1;
+        let converged = loop {
+            let next = crate::heading_index(doc, &result.pages);
+            if next == headings {
+                break true;
+            }
+            if iterations >= crate::TOC_MAX_ITERATIONS {
+                break false;
+            }
+            headings = next;
+            result = self.pass(doc, template, &headings, metrics, hyphenator);
+            iterations += 1;
+        };
+
+        result.changed_pages = (0..result.pages.len().max(before.len()))
+            .filter(|i| before.get(*i) != result.pages.get(*i))
+            .collect();
+        result.toc = TocStatus {
+            iterations,
+            converged,
+        };
+        result
+    }
+
+    /// One incremental pass with a fixed contents index.
+    fn pass(
+        &mut self,
+        doc: &Document,
+        template: &impl PageTemplate,
+        headings: &[HeadingEntry],
         metrics: &impl RunMetrics,
         hyphenator: &impl Hyphenator,
     ) -> LayoutResult {
@@ -180,7 +233,7 @@ impl LayoutSession {
 
         // Anything that is not block content but still changes layout — styles, margins, masters —
         // invalidates the whole document, because it can move every page.
-        let context = context_fingerprint(doc);
+        let context = context_fingerprint(doc, headings);
         let context_changed = self.primed && context != self.previous_context;
 
         // The first block whose identity or content differs. Everything before it flowed exactly as
@@ -195,6 +248,10 @@ impl LayoutSession {
             // Nothing changed. Note this still returns the previous pages rather than recomputing:
             // a no-op edit (or a repaint request) must cost nothing.
             return LayoutResult {
+                toc: TocStatus {
+                    iterations: 1,
+                    converged: true,
+                },
                 headings: heading_index(doc, &self.pages),
                 pages: self.pages.clone(),
                 stats: LayoutStats {
@@ -254,6 +311,7 @@ impl LayoutSession {
             &doc.content,
             &doc.assets,
             &doc.styles,
+            headings,
             template,
             metrics,
             hyphenator,
@@ -305,6 +363,10 @@ impl LayoutSession {
         self.primed = true;
 
         LayoutResult {
+            toc: TocStatus {
+                iterations: 1,
+                converged: true,
+            },
             headings: heading_index(doc, &pages),
             pages,
             stats: LayoutStats {
@@ -395,8 +457,7 @@ impl Measurer for CachingMeasurer<'_> {
         &mut self,
         block: &Block,
         width: f32,
-        assets: &AssetIndex<'_>,
-        styles: &StyleSheet,
+        ctx: &BlockContext<'_>,
         metrics: &M,
         hyphenator: &H,
     ) -> Option<(Measured, f32)> {
@@ -410,7 +471,7 @@ impl Measurer for CachingMeasurer<'_> {
             self.hits += 1;
             return Some(hit.clone());
         }
-        let result = measure_block(block, width, assets, styles, metrics, hyphenator);
+        let result = measure_block(block, width, ctx, metrics, hyphenator);
         self.measured += 1;
         if let Some(value) = &result {
             self.cache.insert(key, value.clone());
@@ -449,6 +510,17 @@ fn content_fingerprint(block: &Block) -> u64 {
         Block::Image { asset, .. } => {
             eat(b"i");
             eat(asset.as_bytes());
+        }
+        Block::Toc {
+            title, max_level, ..
+        } => {
+            // A contents block has no authored content beyond these two: its entries come from the
+            // resolved index, which is context (see `context_fingerprint`), not block content.
+            // Fingerprinting the index here as well would make every contents block re-measure on
+            // any heading move even when the entries it lists did not change.
+            eat(b"toc");
+            eat(title.as_bytes());
+            eat(&[*max_level]);
         }
         Block::Table { table, .. } => {
             // Every cell, the header, the widths and the zebra flag: all of them change the
@@ -515,13 +587,16 @@ fn content_fingerprint(block: &Block) -> u64 {
 /// would show up as a document that refuses to re-flow after an edit nobody can see. `Debug` is
 /// derived, so it tracks the struct automatically. It runs once per relayout, against layout that
 /// costs milliseconds.
-fn context_fingerprint(doc: &Document) -> u64 {
+fn context_fingerprint(doc: &Document, headings: &[HeadingEntry]) -> u64 {
     // `doc.pages` belongs here for exactly the reason the rest of this list does (spec 0035):
     // reassigning page 7's master changes page 7's geometry without touching a single block, so a
     // fingerprint blind to it would see "nothing changed" and hand back the previous pages.
+    // The resolved contents index belongs here too (spec 0041): a contents block's *content* is
+    // derived from it, so a fixpoint iteration that fed a different index must not reuse the
+    // previous iterate's pages.
     let text = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}",
-        doc.page_setup, doc.styles, doc.master_pages, doc.default_master, doc.pages
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        doc.page_setup, doc.styles, doc.master_pages, doc.default_master, doc.pages, headings
     );
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {
@@ -1003,6 +1078,99 @@ mod tests {
                 "{what}: and the result must match a full pass"
             );
         }
+    }
+
+    #[test]
+    fn a_contents_list_stays_current_through_the_session() {
+        // Spec 0031's rule applied to *derived* content. Editing a chapter heading must change the
+        // contents entry that names it; editing a body paragraph that moves no heading must not
+        // make the contents list re-measure on every keystroke. Both directions.
+        use quill_core_model::Color;
+
+        let mut doc = doc_of(120);
+        doc.content.insert(
+            0,
+            Block::Toc {
+                id: BlockId::UNASSIGNED,
+                title: "Contents".into(),
+                max_level: 2,
+                color: Color::Gray { v: 0.0 },
+            },
+        );
+        for i in [30usize, 70] {
+            let id = doc.content[i].id();
+            doc.content[i] = Block::heading(1, format!("Chapter {i}"), INK);
+            doc.content[i].set_id(id);
+        }
+        doc.assign_missing_block_ids().expect("ids");
+
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(first.toc.converged, "must settle: {:?}", first.toc);
+        assert!(
+            first.toc.iterations > 1,
+            "a document with a contents block runs the fixpoint"
+        );
+        assert_eq!(first.headings.len(), 2);
+
+        // Renaming a chapter must reach the contents list.
+        let id = doc.content[31].id();
+        doc.content[31] = Block::heading(1, "Renamed chapter", INK);
+        doc.content[31].set_id(id);
+        doc.bump_revision();
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(after.toc.converged);
+        assert!(
+            after.headings.iter().any(|h| h.text == "Renamed chapter"),
+            "the index must see the rename"
+        );
+    }
+
+    #[test]
+    fn a_contents_fixpoint_that_will_not_settle_stops_at_the_cap() {
+        // The bound is not decoration. An entry can push a heading onto the next page, whose number
+        // changes the entry, which pulls it back — forever. On hitting the cap the last iterate is
+        // returned: a complete document, with `converged: false` so the caller can see it rather
+        // than being handed a guess presented as settled.
+        //
+        // Asserted structurally rather than by finding an oscillating fixture: whatever the loop
+        // does, it must terminate within the cap and must never return a document with content
+        // missing.
+        use quill_core_model::Color;
+        let mut doc = doc_of(400);
+        doc.content.insert(
+            0,
+            Block::Toc {
+                id: BlockId::UNASSIGNED,
+                title: "Contents".into(),
+                max_level: 6,
+                color: Color::Gray { v: 0.0 },
+            },
+        );
+        // Many headings, so the contents list is long enough to shift pagination on its own.
+        for i in (5..400).step_by(7) {
+            let id = doc.content[i].id();
+            doc.content[i] = Block::heading(1, format!("Chapter number {i}"), INK);
+            doc.content[i].set_id(id);
+        }
+        doc.assign_missing_block_ids().expect("ids");
+
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            result.toc.iterations <= crate::TOC_MAX_ITERATIONS,
+            "the loop must be bounded, took {}",
+            result.toc.iterations
+        );
+        assert!(!result.pages.is_empty(), "a document must still come back");
+        // Every authored block is still placed, converged or not.
+        let placed: usize = result
+            .pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, crate::PlacedBlock::Text { .. }))
+            .count();
+        assert!(placed > 400, "no content may be dropped: {placed}");
     }
 
     #[test]

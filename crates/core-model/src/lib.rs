@@ -250,6 +250,22 @@ pub enum Block {
         /// preflight surface for no authoring gain.
         color: Color,
     },
+    /// A generated table of contents (spec 0041).
+    ///
+    /// Carries no entries: they are *derived* from where the headings actually landed, which is not
+    /// known until the document is laid out — and changes when it is. Storing them would mean
+    /// storing something that is stale the moment anything is edited.
+    Toc {
+        #[serde(default)]
+        id: BlockId,
+        /// Heading shown above the entries. Empty for none.
+        #[serde(default)]
+        title: String,
+        /// Deepest heading level listed. `2` lists h1 and h2 and omits h3.
+        #[serde(default = "two")]
+        max_level: u8,
+        color: Color,
+    },
     /// A table — an equipment list, an encounter table, a random table (spec 0039).
     Table {
         #[serde(default)]
@@ -272,7 +288,8 @@ impl Block {
             | Block::Body { id, .. }
             | Block::Image { id, .. }
             | Block::StatBlock { id, .. }
-            | Block::Table { id, .. } => *id,
+            | Block::Table { id, .. }
+            | Block::Toc { id, .. } => *id,
         }
     }
 
@@ -282,7 +299,8 @@ impl Block {
             | Block::Body { id, .. }
             | Block::Image { id, .. }
             | Block::StatBlock { id, .. }
-            | Block::Table { id, .. } => *id = new,
+            | Block::Table { id, .. }
+            | Block::Toc { id, .. } => *id = new,
         }
     }
 
@@ -313,7 +331,10 @@ impl Block {
             Block::Heading { style, .. } | Block::Body { style, .. } => *style = Some(name.into()),
             // Neither has one paragraph to style: an image has none, and a stat block is a
             // composite whose parts resolve `statblock-*` individually.
-            Block::Image { .. } | Block::StatBlock { .. } | Block::Table { .. } => {}
+            Block::Image { .. }
+            | Block::StatBlock { .. }
+            | Block::Table { .. }
+            | Block::Toc { .. } => {}
         }
         self
     }
@@ -392,6 +413,14 @@ pub const STATBLOCK_BODY_STYLE: &str = "statblock-body";
 pub const TABLE_HEADER_STYLE: &str = "table-header";
 /// A table's body cells.
 pub const TABLE_CELL_STYLE: &str = "table-cell";
+
+/// A generated table of contents' own heading (spec 0041).
+pub const TOC_TITLE_STYLE: &str = "toc-title";
+
+/// The style for a contents entry at heading level `level` (`toc-1`..`toc-6`).
+pub fn toc_entry_style_name(level: u8) -> String {
+    format!("toc-{}", level.clamp(1, 6))
+}
 
 /// The style name for a heading of the given level (`h1`..`h6`).
 pub fn heading_style_name(level: u8) -> String {
@@ -493,6 +522,32 @@ impl Default for StyleSheet {
                 space_after_pt: 0.0,
             },
         );
+        // Contents treatment (spec 0041). Deeper levels are set smaller and indented, which is what
+        // makes a contents list scannable without the author styling six levels by hand.
+        paragraph.insert(
+            TOC_TITLE_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: 18.0,
+                leading_pt: 22.0,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 11.0,
+            },
+        );
+        for level in 1u8..=6 {
+            let size = (12.0 - (level as f32 - 1.0) * 0.5).max(8.5);
+            paragraph.insert(
+                toc_entry_style_name(level),
+                ParagraphStyle {
+                    font_size_pt: size,
+                    leading_pt: size + 4.0,
+                    align: TextAlign::Left,
+                    // Level 1 entries get air above them; deeper ones sit tight under their parent.
+                    space_before_pt: if level == 1 { 5.0 } else { 0.0 },
+                    space_after_pt: 0.0,
+                },
+            );
+        }
         StyleSheet { paragraph }
     }
 }
@@ -512,9 +567,10 @@ impl StyleSheet {
             Block::Body { style, .. } => style.clone().unwrap_or_else(|| BODY_STYLE.to_string()),
             // A composite has no single paragraph treatment; its parts resolve `statblock-*`
             // themselves. `resolve` must still be total, so both fall back to the default.
-            Block::Image { .. } | Block::StatBlock { .. } | Block::Table { .. } => {
-                return ParagraphStyle::default()
-            }
+            Block::Image { .. }
+            | Block::StatBlock { .. }
+            | Block::Table { .. }
+            | Block::Toc { .. } => return ParagraphStyle::default(),
         };
         self.paragraph
             .get(&named)
@@ -572,6 +628,10 @@ pub struct MasterPage {
 
 fn one() -> usize {
     1
+}
+
+fn two() -> u8 {
+    2
 }
 
 impl MasterPage {
