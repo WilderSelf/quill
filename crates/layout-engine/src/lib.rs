@@ -510,7 +510,43 @@ pub(crate) enum Measured {
         /// zebra band are the same thing — a filled rectangle at an offset — and one list means the
         /// paint order is decided in one place rather than two.
         decorations: Vec<PanelRect>,
+        /// How this panel may be cut across a frame boundary (spec 0045), or `None` for one that
+        /// must be placed whole.
+        split: Option<PanelSplit>,
     },
+}
+
+/// Where a [`Measured::Panel`] may be cut, and what every continuation has to re-state.
+///
+/// A table's rows and (spec 0046) a stat block's sections are both "a list of pieces that may be
+/// separated, with a prefix that has to be repeated". Holding that as data on the measurement keeps
+/// spec 0044's rule intact: cutting is a derivation over an already-cached value, so nothing here
+/// depends on the available height.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PanelSplit {
+    /// Height of each item, in order.
+    ///
+    /// **Item 0 includes `repeat_h`**, because every fragment begins with the repeated prefix. A
+    /// fit check that forgets this overfills each continuation by exactly one header row — a
+    /// one-line error with a visible symptom and no natural test unless one is written for it.
+    pub items: Vec<f32>,
+    /// Content re-emitted at the top of every continuation: a table's header row and the rule under
+    /// it. Held at panel-local dy in `[0, repeat_h)` and *also* present in `parts`/`decorations`, so
+    /// the first fragment picks it up by ordinary slicing and only continuations pay for the copy.
+    pub repeat_parts: Vec<PanelPart>,
+    pub repeat_decorations: Vec<PanelRect>,
+    pub repeat_h: f32,
+}
+
+impl PanelSplit {
+    /// Panel-local y at which item `k` ends — the cut offset for a fragment of `k` items.
+    ///
+    /// Summed the same way every caller sums it. Slicing `parts` by comparing `dy_pt` against a
+    /// differently-accumulated total would put a cell exactly on the boundary into both halves or
+    /// neither, and both are content-conservation failures.
+    fn cut_at(&self, k: usize) -> f32 {
+        self.items[..k].iter().sum()
+    }
 }
 
 /// The fewest items a fragment or a remainder may contain (spec 0044).
@@ -535,8 +571,10 @@ impl Measured {
     fn break_items(&self) -> Option<Vec<f32>> {
         match self {
             Measured::Text { lines, style, .. } => Some(vec![style.leading_pt; lines.len()]),
-            // A panel learns its rows in spec 0045 and its sections in 0046; an image never splits.
-            Measured::Image { .. } | Measured::Panel { .. } => None,
+            // A table's rows (spec 0045) and a stat block's sections (0046) both arrive as an
+            // authored item list on the measurement; a panel without one is indivisible.
+            Measured::Panel { split, .. } => split.as_ref().map(|s| s.items.clone()),
+            Measured::Image { .. } => None,
         }
     }
 
@@ -545,6 +583,8 @@ impl Measured {
     fn fragment_lead_pt(&self) -> f32 {
         match self {
             Measured::Text { style, .. } => style.space_before_pt,
+            // A panel's repeated prefix is charged inside item 0 rather than as a lead, so that a
+            // *continuation* is charged it too. A lead would be counted once, at the top.
             Measured::Image { .. } | Measured::Panel { .. } => 0.0,
         }
     }
@@ -613,7 +653,71 @@ impl Measured {
                 };
                 Some((head, head_h, tail, tail_h))
             }
-            Measured::Image { .. } | Measured::Panel { .. } => None,
+            Measured::Panel {
+                fill,
+                stroke,
+                parts,
+                decorations,
+                split: Some(split),
+            } => {
+                if at == 0 || at >= split.items.len() {
+                    return None;
+                }
+                let cut = split.cut_at(at);
+                let total: f32 = split.items.iter().sum();
+
+                // The fragment is everything above the cut, unshifted — including the prefix, which
+                // is in `parts`/`decorations` already.
+                let head = Measured::Panel {
+                    fill: *fill,
+                    stroke: *stroke,
+                    parts: parts.iter().filter(|p| p.dy_pt < cut).cloned().collect(),
+                    decorations: decorations
+                        .iter()
+                        .filter(|d| d.dy_pt < cut)
+                        .cloned()
+                        .collect(),
+                    split: None,
+                };
+
+                // The continuation re-states the prefix and then carries everything below the cut,
+                // moved up so the first surviving item sits directly under it. The shift preserves
+                // each decoration's identity, which is why a zebra band keeps the stripe it had:
+                // the bands were computed from each row's index in the *whole* table, and moving
+                // them cannot change that.
+                let shift = cut - split.repeat_h;
+                let mut tail_parts = split.repeat_parts.clone();
+                tail_parts.extend(parts.iter().filter(|p| p.dy_pt >= cut).map(|p| PanelPart {
+                    dy_pt: p.dy_pt - shift,
+                    ..p.clone()
+                }));
+                let mut tail_decorations = split.repeat_decorations.clone();
+                tail_decorations.extend(decorations.iter().filter(|d| d.dy_pt >= cut).map(|d| {
+                    PanelRect {
+                        dy_pt: d.dy_pt - shift,
+                        ..d.clone()
+                    }
+                }));
+
+                // The continuation can be cut again, so it carries its own item list — with the
+                // prefix folded into its first item exactly as the original's was.
+                let mut tail_items: Vec<f32> = split.items[at..].to_vec();
+                tail_items[0] += split.repeat_h;
+                let tail = Measured::Panel {
+                    fill: *fill,
+                    stroke: *stroke,
+                    parts: tail_parts,
+                    decorations: tail_decorations,
+                    split: Some(PanelSplit {
+                        items: tail_items,
+                        repeat_parts: split.repeat_parts.clone(),
+                        repeat_decorations: split.repeat_decorations.clone(),
+                        repeat_h: split.repeat_h,
+                    }),
+                };
+                Some((head, cut, tail, total - shift))
+            }
+            Measured::Image { .. } | Measured::Panel { split: None, .. } => None,
         }
     }
 }
@@ -851,6 +955,9 @@ fn measure_stat_block(
             stroke: Some(STATBLOCK_STROKE),
             parts,
             decorations,
+            // Spec 0046 teaches a stat block its section boundaries. Until then it keeps together
+            // or moves whole, exactly as spec 0038 shipped it.
+            split: None,
         },
         height,
     )
@@ -888,6 +995,7 @@ fn measure_table(
                 stroke: None,
                 parts: Vec::new(),
                 decorations: Vec::new(),
+                split: None,
             },
             0.0,
         );
@@ -921,6 +1029,9 @@ fn measure_table(
     let mut parts: Vec<PanelPart> = Vec::new();
     let mut decorations: Vec<PanelRect> = Vec::new();
     let mut y = 0.0;
+    // Per-row heights, for spec 0045's continuation. Recorded as the rows are laid rather than
+    // recovered afterwards from cell offsets, which would have to re-derive what a row *is*.
+    let mut row_heights: Vec<f32> = Vec::new();
 
     let lay_row =
         |cells: &[String], style: ParagraphStyle, y: &mut f32, parts: &mut Vec<PanelPart>| {
@@ -965,10 +1076,15 @@ fn measure_table(
         });
         y += TABLE_HEADER_RULE_PT;
     }
+    // Everything laid so far is the header and its rule: the prefix every continuation re-states.
+    let repeat_h = y;
+    let repeat_parts = parts.clone();
+    let repeat_decorations = decorations.clone();
 
     for (i, row) in table.rows.iter().enumerate() {
         let band_top = y;
         let h = lay_row(row, cell_style, &mut y, &mut parts);
+        row_heights.push(h);
         if table.zebra && i % 2 == 1 {
             // Behind the row's text. `decorations` are emitted before `parts`, so ordering is
             // structural rather than something each caller has to remember.
@@ -983,12 +1099,23 @@ fn measure_table(
         }
     }
 
+    // The first item carries the header: every fragment begins with it, including a continuation,
+    // so charging it to item 0 is what makes the fit check right on both.
+    if let Some(first) = row_heights.first_mut() {
+        *first += repeat_h;
+    }
     (
         Measured::Panel {
             fill: None,
             stroke: None,
             parts,
             decorations,
+            split: Some(PanelSplit {
+                items: row_heights,
+                repeat_parts,
+                repeat_decorations,
+                repeat_h,
+            }),
         },
         y,
     )
@@ -1132,6 +1259,10 @@ fn measure_toc(
             stroke: None,
             parts,
             decorations: Vec::new(),
+            // A contents block is deliberately indivisible: spec 0041's fixpoint regenerates it
+            // whenever page numbers move, and a half-placed contents list would be re-derived
+            // under its own fragments.
+            split: None,
         },
         y,
     )
@@ -1459,11 +1590,12 @@ pub(crate) fn flow(
             };
             let bottom = frame.rect.y_pt + frame.rect.h_pt;
 
-            if y + height > bottom && !frame_empty {
+            if y + height > bottom {
                 // Fill this frame with as much of the block as legally fits before moving on
                 // (spec 0044) — but only when the continuation lands in a frame of the same width.
                 // The cut is an index into the line list *at this width*, and a frame of another
                 // width re-wraps to a different list against which that index means something else.
+                let mut cut_taken = false;
                 if same_width(
                     frame.rect.w_pt,
                     continuation_width(&frames, frame_idx, template, page_index),
@@ -1478,54 +1610,66 @@ pub(crate) fn flow(
                                 block.id(),
                             ));
                             split_at += k;
+                            cut_taken = true;
                         }
                     }
                 }
-                // Doesn't fit and the current frame has content → move on before placing.
-                if frame_idx + 1 < frames.len() {
-                    frame_idx += 1; // next frame on this page
+                // A block too tall for an *empty* frame used to be placed there and allowed to
+                // overflow, because moving it on would loop past every frame forever. That guard is
+                // still needed for a block that cannot be cut — an image, a single enormous row —
+                // but it is the wrong answer for one that can: spec 0045's 500-row table starts its
+                // own page, so the frame is empty, and placing it whole would run it off the bottom
+                // of the book. A cut advances the absolute offset, so progress is guaranteed and the
+                // guard is not required to reach it (spec 0045, extending 0044).
+                if !cut_taken && frame_empty {
+                    // Cannot be cut and the frame is empty: place it and let it overflow.
                 } else {
-                    // Page exhausted. The next page asks the template for its own geometry, rather
-                    // than reusing this page's — that is the whole point of the seam.
-                    pages.push(page);
-                    page_index += 1;
-                    frames = frames_for(template, page_index);
-                    page = LaidOutPage {
-                        index: page_index,
-                        blocks: Vec::new(),
-                        statics: template.statics(page_index),
-                    };
-                    frame_idx = 0;
-                    // Record where the new page begins, so a later edit can resume from here.
-                    let at_boundary = FlowState {
-                        block_idx,
-                        split_at,
-                        page_index,
-                        frame_idx: 0,
-                        y: frames[0].rect.y_pt,
-                        frame_empty: true,
-                    };
-                    checkpoints.push(at_boundary);
+                    // Doesn't fit → move on before placing.
+                    if frame_idx + 1 < frames.len() {
+                        frame_idx += 1; // next frame on this page
+                    } else {
+                        // Page exhausted. The next page asks the template for its own geometry, rather
+                        // than reusing this page's — that is the whole point of the seam.
+                        pages.push(page);
+                        page_index += 1;
+                        frames = frames_for(template, page_index);
+                        page = LaidOutPage {
+                            index: page_index,
+                            blocks: Vec::new(),
+                            statics: template.statics(page_index),
+                        };
+                        frame_idx = 0;
+                        // Record where the new page begins, so a later edit can resume from here.
+                        let at_boundary = FlowState {
+                            block_idx,
+                            split_at,
+                            page_index,
+                            frame_idx: 0,
+                            y: frames[0].rect.y_pt,
+                            frame_empty: true,
+                        };
+                        checkpoints.push(at_boundary);
 
-                    // If this page begins in exactly the state the previous pass's page of the same
-                    // number began in, and nothing past here changed, the rest of the old layout is
-                    // still correct — stop, rather than re-deriving pages we already have.
-                    if let Some(r) = &resync {
-                        if block_idx >= r.last_dirty
-                            && r.checkpoints.get(page_index) == Some(&at_boundary)
-                        {
-                            checkpoints.pop();
-                            return FlowResult {
-                                pages,
-                                checkpoints,
-                                resynced_at: Some(page_index),
-                            };
+                        // If this page begins in exactly the state the previous pass's page of the same
+                        // number began in, and nothing past here changed, the rest of the old layout is
+                        // still correct — stop, rather than re-deriving pages we already have.
+                        if let Some(r) = &resync {
+                            if block_idx >= r.last_dirty
+                                && r.checkpoints.get(page_index) == Some(&at_boundary)
+                            {
+                                checkpoints.pop();
+                                return FlowResult {
+                                    pages,
+                                    checkpoints,
+                                    resynced_at: Some(page_index),
+                                };
+                            }
                         }
                     }
+                    y = frames[frame_idx].rect.y_pt;
+                    frame_empty = true;
+                    continue; // re-measure against the frame it moved into
                 }
-                y = frames[frame_idx].rect.y_pt;
-                frame_empty = true;
-                continue; // re-measure against the frame it moved into
             }
 
             page.blocks
@@ -1597,6 +1741,7 @@ fn place_measured(
             stroke,
             parts,
             decorations,
+            split: _,
         } => {
             // The panel first, so it sits behind its own text — the same
             // decoration-before-content order the writer and the paint list rely on.
@@ -3766,8 +3911,12 @@ mod tests {
 
     #[test]
     fn a_five_hundred_row_table_places_every_cell() {
-        // Correctness at scale. A table this size overflows its frame — blocks do not split across
-        // frames (the roadmap's known issue) — but no cell may be lost.
+        // Correctness at scale, strengthened by spec 0045 from "every cell is placed somewhere" to
+        // "every cell is placed exactly once, in row order". The old wording was the most that could
+        // honestly be claimed while a table was placed whole and ran off the bottom of the page;
+        // now it paginates, so conservation is a real invariant with a real way to fail — a cut that
+        // drops or duplicates a row produces a random table missing entries, which no geometric
+        // assertion notices.
         let rows: Vec<Vec<String>> = (0..500)
             .map(|i| vec![format!("{i}"), format!("result {i}")])
             .collect();
@@ -3777,8 +3926,192 @@ mod tests {
             ..simple_table()
         });
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
-        let placed: usize = pages.iter().map(|p| cells(p).len()).sum();
-        assert_eq!(placed, 1000, "every cell of every row must be placed");
+        assert!(
+            pages.len() > 1,
+            "a 500-row table must paginate, got {} page(s)",
+            pages.len()
+        );
+
+        let placed: Vec<String> = pages
+            .iter()
+            .flat_map(|p| cells(p).into_iter().map(|(_, _, t)| t))
+            .collect();
+        assert_eq!(placed.len(), 1000, "every cell of every row must be placed");
+        let expected: Vec<String> = (0..500)
+            .flat_map(|i| [format!("{i}"), format!("result {i}")])
+            .collect();
+        assert_eq!(placed, expected, "every cell exactly once, in row order");
+    }
+
+    /// A table of `n` numbered rows, following a one-line paragraph so the frame is not empty.
+    fn table_after_intro(n: usize, header: Option<Vec<String>>, zebra: bool) -> Document {
+        let rows: Vec<Vec<String>> = (0..n)
+            .map(|i| vec![format!("r{i}"), format!("row {i}")])
+            .collect();
+        let mut doc = doc_with_blocks(vec![
+            Block::body("intro", Color::Gray { v: 0.0 }),
+            Block::Table {
+                id: BlockId::UNASSIGNED,
+                table: quill_core_model::Table {
+                    columns: vec![0.25, 0.75],
+                    header,
+                    rows,
+                    zebra,
+                },
+                color: Color::Gray { v: 0.0 },
+            },
+        ]);
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    #[test]
+    fn a_tables_header_repeats_once_at_the_top_of_every_continuation() {
+        // Spec 0039 promised this and could not build it: a table was one block, so it could not
+        // break between rows, and with no continuation there was nothing to repeat onto.
+        let doc = table_after_intro(120, Some(vec!["Roll".into(), "Result".into()]), false);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 3, "need several pages, got {}", pages.len());
+
+        // One "Roll" per fragment and no more. A header that repeated twice, or that appeared on a
+        // page it did not start, would be just as wrong as one that never repeated.
+        let fragments: Vec<Vec<(f32, f32, String)>> =
+            pages.iter().map(cells).filter(|c| !c.is_empty()).collect();
+        let headers: usize = fragments
+            .iter()
+            .map(|c| c.iter().filter(|(_, _, t)| t == "Roll").count())
+            .sum();
+        assert_eq!(
+            headers,
+            fragments.len(),
+            "exactly one header per fragment, got {headers} across {} fragments",
+            fragments.len()
+        );
+        for (i, frag) in fragments.iter().enumerate() {
+            assert_eq!(
+                frag.iter().filter(|(_, _, t)| t == "Roll").count(),
+                1,
+                "fragment {i} must carry exactly one header row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_headerless_table_splits_with_nothing_repeated() {
+        let doc = table_after_intro(120, None, false);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let placed: Vec<String> = pages
+            .iter()
+            .flat_map(|p| cells(p).into_iter().map(|(_, _, t)| t))
+            .filter(|t| t != "intro")
+            .collect();
+        let expected: Vec<String> = (0..120)
+            .flat_map(|i| [format!("r{i}"), format!("row {i}")])
+            .collect();
+        assert_eq!(placed, expected, "no repeat, no loss, row order preserved");
+    }
+
+    #[test]
+    fn zebra_striping_survives_a_page_break() {
+        // The row that starts a continuation must be striped by its index in the *whole* table, not
+        // in the fragment. Getting this wrong puts two same-shaded rows next to each other at a page
+        // boundary — it reads as a rendering bug, and a count of banded rows would never show it.
+        let doc = table_after_intro(120, Some(vec!["Roll".into(), "Result".into()]), true);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 2);
+
+        // Every banded row, identified by the row text sharing its band's y span.
+        let mut banded: Vec<usize> = Vec::new();
+        for page in &pages {
+            let bands: Vec<(f32, f32)> = page
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    PlacedBlock::Rect { frame, fill, .. } if *fill == Some(TABLE_ZEBRA_FILL) => {
+                        Some((frame.y_pt, frame.y_pt + frame.h_pt))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for b in &page.blocks {
+                if let PlacedBlock::Text { frame, lines, .. } = b {
+                    let Some(idx) = lines[0].text.strip_prefix("row ") else {
+                        continue;
+                    };
+                    let Ok(idx) = idx.parse::<usize>() else {
+                        continue;
+                    };
+                    if bands
+                        .iter()
+                        .any(|(t, b)| frame.y_pt >= *t - 0.01 && frame.y_pt < *b + 0.01)
+                    {
+                        banded.push(idx);
+                    }
+                }
+            }
+        }
+        assert!(!banded.is_empty(), "the fixture must actually stripe rows");
+        assert!(
+            banded.iter().all(|i| i % 2 == 1),
+            "every banded row must be odd-indexed in the whole table; got {:?}",
+            &banded[..banded.len().min(12)]
+        );
+    }
+
+    #[test]
+    fn no_table_fragment_overruns_its_frame() {
+        // The off-by-one this increment is most likely to have: the repeated header is charged to
+        // the fragment but not to the continuation (or the reverse), and every continuation
+        // overfills by exactly one header row. That is why `PanelSplit::items[0]` folds `repeat_h`
+        // in. Asserted as "nothing sticks out of its frame", which is the symptom rather than the
+        // arithmetic, and so survives a change to how the arithmetic is written.
+        let doc = table_after_intro(120, Some(vec!["Roll".into(), "Result".into()]), true);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let bottom = Frame::full_page(&doc.page_setup).rect.h_pt;
+        for page in &pages {
+            for b in &page.blocks {
+                let (y, h, what) = match b {
+                    PlacedBlock::Text { frame, lines, .. } => {
+                        (frame.y_pt, frame.h_pt, lines[0].text.clone())
+                    }
+                    PlacedBlock::Rect { frame, .. } => (frame.y_pt, frame.h_pt, "rect".into()),
+                    PlacedBlock::Image { frame, .. } => (frame.y_pt, frame.h_pt, "image".into()),
+                };
+                assert!(
+                    y + h <= bottom + 0.01,
+                    "page {} `{what}` runs to {:.1} past the frame bottom {bottom:.1}",
+                    page.index,
+                    y + h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_table_is_measured_once() {
+        // Spec 0044's cache contract, re-asserted for the variant 0045 taught to split. A table cut
+        // across a dozen frames must not be re-measured once per fragment.
+        let doc = table_after_intro(300, Some(vec!["Roll".into(), "Result".into()]), true);
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(result.pages.len() > 3, "the fixture must span pages");
+        assert_eq!(
+            result.stats.blocks_measured,
+            doc.content.len(),
+            "one measurement per block, however many fragments it produced"
+        );
+    }
+
+    #[test]
+    fn a_table_of_three_rows_never_splits() {
+        // The two-item minimum from spec 0044 applies to rows as it does to lines.
+        let doc = table_after_intro(3, Some(vec!["Roll".into(), "Result".into()]), false);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let with_cells = pages.iter().filter(|p| !cells(p).is_empty()).count();
+        assert_eq!(
+            with_cells, 1,
+            "a three-row table must be placed in one piece"
+        );
     }
 
     // --- Generated table of contents (spec 0041) ------------------------------------------------
@@ -4295,15 +4628,55 @@ mod tests {
         );
     }
 
+    /// Two columns of the same width and different heights, so a test can leave an exact amount of
+    /// room at the foot of the first without also constraining the second.
+    fn split_columns_h(h0: f32, h1: f32) -> Thread {
+        Thread {
+            frames: vec![
+                Frame {
+                    rect: Rect {
+                        x_pt: 0.0,
+                        y_pt: 0.0,
+                        w_pt: 120.0,
+                        h_pt: h0,
+                    },
+                },
+                Frame {
+                    rect: Rect {
+                        x_pt: 144.0,
+                        y_pt: 0.0,
+                        w_pt: 120.0,
+                        h_pt: h1,
+                    },
+                },
+            ],
+        }
+    }
+
+    /// Pieces of `source` placed in the first column of page 0.
+    fn pieces_in_first_column(pages: &[LaidOutPage], source: BlockId) -> usize {
+        pages[0]
+            .blocks
+            .iter()
+            .filter(
+                |b| matches!(b, PlacedBlock::Text { source: s, frame, .. } if *s == source && frame.x_pt == 0.0),
+            )
+            .count()
+    }
+
     #[test]
     fn a_paragraph_never_strands_a_single_line() {
         // Three assertions of one rule. A widow left behind and an orphan carried forward are the
         // same defect seen from two sides, and a splitter that fixes ragged column feet by
         // producing them has made the page worse.
+        //
+        // The second column is deliberately tall enough to take each paragraph whole, so these
+        // assert the widow rule and not the separate question of what happens to a block too big
+        // for an empty frame (spec 0045).
         let ink = Color::Gray { v: 0.0 };
 
-        // Room for exactly one more line at the foot: move whole rather than strand it.
-        let thread = split_columns(2, 24.0);
+        // One line of room at the foot: leave it unset rather than strand a single line there.
+        let thread = split_columns_h(24.0, 240.0);
         let (content, pages) = flow_columns(
             vec![
                 Block::body("intro", ink),
@@ -4311,18 +4684,14 @@ mod tests {
             ],
             &thread,
         );
-        let pieces = pages
-            .iter()
-            .flat_map(|p| p.blocks.iter())
-            .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == content[1].id()))
-            .count();
         assert_eq!(
-            pieces, 1,
+            pieces_in_first_column(&pages, content[1].id()),
+            0,
             "one line of room must not produce a one-line fragment"
         );
 
         // Room for 7 of an 8-line paragraph: cut at 6 so the remainder keeps two, not one.
-        let thread = split_columns(2, 96.0);
+        let thread = split_columns_h(96.0, 240.0);
         let (content, pages) = flow_columns(
             vec![
                 Block::body("intro", ink),
@@ -4346,8 +4715,9 @@ mod tests {
             "the cut must back off to leave two lines"
         );
 
-        // Three lines or fewer never split at all, whatever the room.
-        let thread = split_columns(2, 48.0);
+        // Three lines or fewer never split, whatever the room: two full lines are available at the
+        // foot of the first column and the paragraph still moves whole.
+        let thread = split_columns_h(36.0, 240.0);
         let (content, pages) = flow_columns(
             vec![
                 Block::body("intro", ink),
@@ -4361,6 +4731,7 @@ mod tests {
             .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == content[1].id()))
             .count();
         assert_eq!(pieces, 1, "a three-line paragraph must never split");
+        assert_eq!(pieces_in_first_column(&pages, content[1].id()), 0);
     }
 
     #[test]
