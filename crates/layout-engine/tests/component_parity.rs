@@ -195,17 +195,33 @@ fn corpus() -> Vec<(&'static str, Vec<Block>, f32, f32)> {
 }
 
 /// Re-derived from the pre-change engine. See the module docs before changing any of these.
+///
+/// **Moved once, deliberately, by spec 0060.** Forbidding a ragged line to be drawn past its
+/// measure is a typographic correction, and a stat block is set ragged, so six of these ten
+/// fixtures move. The four table cases that do not move are informative rather than incidental:
+/// their cells are short enough never to have been over-measure, which is what a targeted change
+/// should look like.
+///
+/// | fixture | before 0060 | after 0060 |
+/// |---|---|---|
+/// | statblock whole | `0xbe2e46dbbdfb9c85` | `0x47192e873263f5e9` |
+/// | statblock narrow | `0x0797d2697c5a55d8` | `0xa7e4e0404a9e2d50` |
+/// | statblock absent sections | `0x815ec8aa643567fd` | `0x2326d60454e58af1` |
+/// | statblock split | `0x63ef8f8cf1431973` | `0x61d81882312fbcbf` |
+/// | table wrapped | `0x3d748c61c283efa3` | `0x2f8d138d61822df3` |
+/// | mixed flow | `0xd699cc419ccbd22e` | `0xd75f5e980a5b34ad` |
+/// | table whole / split / headerless / empty | unchanged | unchanged |
 const EXPECTED: &[(&str, u64)] = &[
-    ("statblock whole", 0xbe2e_46db_bdfb_9c85),
-    ("statblock narrow", 0x0797_d269_7c5a_55d8),
-    ("statblock absent sections", 0x815e_c8aa_6435_67fd),
-    ("statblock split", 0x63ef_8f8c_f143_1973),
+    ("statblock whole", 0x4719_2e87_3263_f5e9),
+    ("statblock narrow", 0xa7e4_e040_4a9e_2d50),
+    ("statblock absent sections", 0x2326_d604_54e5_8af1),
+    ("statblock split", 0x61d8_1882_312f_bcbf),
     ("table whole", 0x3fc2_380d_a6ad_2084),
-    ("table wrapped", 0x3d74_8c61_c283_efa3),
+    ("table wrapped", 0x2f8d_138d_6182_2df3),
     ("table split", 0x5b2f_4672_bd73_b52f),
     ("table headerless", 0xcc4e_d109_8b17_8624),
     ("table empty", 0x3acc_4ba6_c367_1efe),
-    ("mixed flow", 0xd699_cc41_9ccb_d22e),
+    ("mixed flow", 0xd75f_5e98_0a5b_34ad),
 ];
 
 #[test]

@@ -90,6 +90,9 @@ fn house_style_book() -> Document {
     doc.content = vec![
         Block::heading(1, HEADING, INK),
         Block::body(PROSE, INK),
+        // A second, much shorter paragraph, so `leading_and_inset` has two body blocks of
+        // differing line count to derive the leading from.
+        Block::body("A short line.", INK),
         // Flow art: content, and must not be extracted.
         Block::image("cover-art"),
     ];
@@ -108,15 +111,31 @@ fn extracted() -> PackManifest {
     )
 }
 
-/// The styling a page exposes: the y-step between consecutive body baselines, and the stat-block
-/// panel inset. Both are direct reads of the *look* rather than of the content.
+/// The styling a page exposes: the body leading, and the stat-block panel inset.
+///
+/// Leading is read from `PlacedBlock::Text::leading_pt`, which is the baseline-to-baseline distance
+/// the writer and the renderer actually position glyphs with — placed geometry, not a style echoed
+/// back. The *body* leading is the one that belongs to the most text blocks on the page, which
+/// distinguishes it from a heading's without the test having to know the type scale it is checking.
+///
+/// An earlier version of this helper inferred leading from block *height*. A text block's height is
+/// `lines × leading + space_before + space_after`, so height conflates the leading with how many
+/// lines the paragraph happened to wrap to — it compared equal only because two unrelated
+/// paragraphs happened to wrap to the same count, and spec 0060's rewrap exposed it.
 fn leading_and_inset(pages: &[LaidOutPage]) -> (f32, f32) {
-    let mut ys: Vec<f32> = Vec::new();
+    let mut by_leading: std::collections::BTreeMap<u32, usize> = Default::default();
     let mut panel_x = None;
     let mut first_run_x = None;
     for b in pages.iter().flat_map(|p| &p.blocks) {
         match b {
-            PlacedBlock::Text { frame, lines, .. } if lines.len() > 1 => ys.push(frame.h_pt),
+            PlacedBlock::Text {
+                frame, leading_pt, ..
+            } => {
+                *by_leading.entry(leading_pt.to_bits()).or_default() += 1;
+                if panel_x.is_some() && first_run_x.is_none() {
+                    first_run_x = Some(frame.x_pt);
+                }
+            }
             PlacedBlock::Rect {
                 frame,
                 stroke: Some(_),
@@ -124,17 +143,17 @@ fn leading_and_inset(pages: &[LaidOutPage]) -> (f32, f32) {
             } => panel_x = Some(frame.x_pt),
             _ => {}
         }
-        if let PlacedBlock::Text { frame, .. } = b {
-            if panel_x.is_some() && first_run_x.is_none() {
-                first_run_x = Some(frame.x_pt);
-            }
-        }
     }
+    let leading = by_leading
+        .into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map(|(bits, _)| f32::from_bits(bits))
+        .unwrap_or(f32::NAN);
     let inset = match (panel_x, first_run_x) {
         (Some(p), Some(r)) => r - p,
         _ => f32::NAN,
     };
-    (ys.first().copied().unwrap_or(f32::NAN), inset)
+    (leading, inset)
 }
 
 /// A *different* book — different words, different creature — set from nothing but the pack.
@@ -147,6 +166,7 @@ fn second_book(pack: &PackManifest) -> Document {
              wraps to more than one line under any reasonable measure.",
             INK,
         ),
+        Block::body("Also short.", INK),
         Block::StatBlock {
             id: BlockId::UNASSIGNED,
             stat: quill_core_model::StatBlock {

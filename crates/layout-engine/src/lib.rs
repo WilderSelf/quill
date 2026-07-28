@@ -3905,6 +3905,24 @@ mod tests {
         );
     }
 
+    /// Lines per group in the narrow-column fixtures below.
+    ///
+    /// **Eight, and it was twenty-two before spec 0060.** The number is a fixture detail; the
+    /// reason is not. `Detail 0 about the creature.` measures 151.2 pt against the panel's 150 pt
+    /// inner measure in a `rulebook` column, and until 0060 the breaker let a ragged line run
+    /// 1.2 pt over on the strength of shrink that ragged setting never applies. Every such run was
+    /// one line; each is two now, so a group is a little over twice as tall.
+    ///
+    /// That moves where spec 0046's *uncuttable* case begins — a section taller than the column
+    /// cannot be cut, so the panel is placed whole and runs off the page. Measured on both builds
+    /// with this exact fixture: **24 fitted and 26 overflowed before; 8 fits and 10 overflows
+    /// now.** The limitation itself is unchanged and is 0046's; the roadmap's open question about
+    /// per-section splitting is where it gets fixed.
+    ///
+    /// [`a_section_taller_than_its_column_is_placed_whole`] pins the other side of the threshold,
+    /// so the limitation is asserted rather than merely survived.
+    const NARROW_COLUMN_SECTIONS: usize = 8;
+
     #[test]
     fn no_stat_block_fragment_overruns_a_narrow_column() {
         // Asserted over the real two-column template rather than a synthetic frame, because the
@@ -3921,7 +3939,7 @@ mod tests {
             ),
             Block::StatBlock {
                 id: BlockId::UNASSIGNED,
-                stat: big_goblin(22),
+                stat: big_goblin(NARROW_COLUMN_SECTIONS),
                 color: Color::Gray { v: 0.0 },
             },
         ];
@@ -3950,6 +3968,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The other side of [`NARROW_COLUMN_SECTIONS`]: a section taller than the column it must fit.
+    ///
+    /// Spec 0046 cuts a stat block **between sections and nowhere else**, so a single section that
+    /// is itself taller than a frame has no legal cut. The panel is then placed whole and runs off
+    /// the bottom of the page. That is a real defect, not a design choice, and the roadmap's open
+    /// question — "does per-section paragraph splitting inside a stat block ever ship?" — is where
+    /// it gets answered; spec 0044's mechanism exists, wiring it through the composite is the open
+    /// part.
+    ///
+    /// It is asserted here rather than left silent because a limitation nobody has written down is
+    /// a limitation that gets rediscovered as a bug. **When per-section splitting ships, this test
+    /// inverts**: the overflow assertion becomes an assertion that it does not overflow.
+    ///
+    /// What must hold either way, and is asserted unconditionally: **no content is lost.** An
+    /// uncuttable panel is placed badly, never dropped.
+    #[test]
+    fn a_section_taller_than_its_column_is_placed_whole() {
+        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let build = |n: usize| {
+            let mut doc = Document::from_template(t);
+            doc.content = vec![
+                Block::body(
+                    "Some introductory prose, so the frame is not empty when the panel arrives \
+                     and the engine has a real decision to make about where it goes.",
+                    Color::Gray { v: 0.0 },
+                ),
+                Block::StatBlock {
+                    id: BlockId::UNASSIGNED,
+                    stat: big_goblin(n),
+                    color: Color::Gray { v: 0.0 },
+                },
+            ];
+            doc.assign_missing_block_ids().expect("ids");
+            doc
+        };
+
+        let doc = build(NARROW_COLUMN_SECTIONS + 2);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+        let mut worst: f32 = 0.0;
+        for page in &pages {
+            let bottom = template
+                .frames(page.index)
+                .iter()
+                .map(|f| f.rect.y_pt + f.rect.h_pt)
+                .fold(0.0_f32, f32::max);
+            for b in &page.blocks {
+                let (y, h) = match b {
+                    PlacedBlock::Text { frame, .. }
+                    | PlacedBlock::Rect { frame, .. }
+                    | PlacedBlock::Image { frame, .. }
+                    | PlacedBlock::Link { frame, .. } => (frame.y_pt, frame.h_pt),
+                };
+                worst = worst.max(y + h - bottom);
+            }
+        }
+        assert!(
+            worst > 0.0,
+            "this fixture is meant to be on the *uncuttable* side of the threshold; if it now \
+             fits, per-section splitting has shipped and this test should be inverted"
+        );
+
+        // Content conservation, which holds on both sides of the threshold. Compared against the
+        // *same* stat block laid into a frame tall enough to need no cut: same lines, same order.
+        // Comparing laid-out lines rather than authored ones is what makes this robust to the
+        // wrapping spec 0060 introduced — the authored `Detail 0 about the creature.` is now two
+        // lines, and an assertion phrased over authored strings would be testing the wrap, not the
+        // conservation.
+        let mut tall = doc.clone();
+        tall.page_setup.trim.h_pt = 4000.0;
+        //
+        // Compared as a *multiset*: `stat_runs` orders by (page, y), and two columns of one page
+        // interleave in y, so run order across columns is not a property worth asserting here.
+        let mut reference = stat_runs(&lay_out(&tall, &MONO, &NoHyphenator), tall.content[1].id());
+        let mut placed = stat_runs(&pages, doc.content[1].id());
+        reference.sort();
+        placed.sort();
+        assert!(!reference.is_empty(), "the reference layout placed nothing");
+        assert_eq!(
+            placed, reference,
+            "an uncuttable panel may be placed badly, never dropped"
+        );
     }
 
     #[test]

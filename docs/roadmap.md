@@ -1789,21 +1789,26 @@ a narrow `rulebook` column, which sends a block down spec 0046's uncuttable path
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
 whose increment ships is deleted in that increment's PR, not left here as a fixed-but-still-listed
-defect — which is why the four entries M3 opened with are gone, and why the hyphenation-parity entry
-M3 found is gone too: spec 0059 shipped it.
+defect — which is why the four entries M3 opened with are gone, and why both entries M3 *found* are
+gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in their place.
 
-- **A paragraph's last line may be drawn past its measure.** `base_demerits` permits a last line up
-  to `measure + shrink`, on the strength of shrink that `justify_paragraph_*` never applies to it:
-  a last line gets `space_adjust_pt: 0.0` and is drawn at its natural width. Measured by spec 0048 —
-  a 120 pt measure with a 12 pt hanging indent draws a last line to 126 pt.
+- **A stat-block section taller than its column cannot be cut, so the panel overflows the page.**
+  Spec 0046 cuts a composite *between sections and nowhere else*, so a single section — a long
+  actions list — that is itself taller than a frame has no legal cut. The panel is placed whole and
+  runs off the bottom. Content is never lost, which is asserted; it is placed badly, which is also
+  asserted (`a_section_taller_than_its_column_is_placed_whole`).
 
-  The fix is one line (`is_last && natural > l` ⇒ infeasible) and it is *correct*, which is what
-  makes it worth its own increment rather than a drive-by. It moves line breaking across the corpus,
-  so spec 0051's equivalence digest has to be re-derived deliberately; and it makes stat-block
-  sections tall enough to stop fitting a narrow `rulebook` column, which sends a block down spec
-  0046's uncuttable path and off the bottom of the page. A 0046 test caught exactly that when it was
-  tried. Not a regression — this has been true since spec 0017 — but an indent makes it easy to hit,
-  which is how it was found.
+  Not new, and not spec 0060's doing — but 0060 moved the threshold, so it is now reachable at a
+  quarter of the section count it used to take. Measured on both builds with the same fixture in a
+  `rulebook` column: 24 sections fitted and 26 overflowed before; 8 fits and 10 overflows now. The
+  cause is that forbidding an over-measure ragged line makes each run in a narrow panel wrap to two
+  lines instead of one.
+
+  The fix is the open question below — per-section paragraph splitting inside a composite. Spec
+  0044's `\vsplit` mechanism already exists; wiring it through the composite so a cut may fall
+  *inside* a section when no section boundary fits is the part that does not. Until then the
+  limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
+  it says in as many words that it inverts when the fix ships.
 
 ## Open questions
 
