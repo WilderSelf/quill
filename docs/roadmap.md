@@ -1522,7 +1522,7 @@ increment's PR, not left here as a fixed-but-still-listed defect.
   and would have carried a model change inside a templates increment.
 
 - **A block never splits across frames — now wanted by three callers.** *(Paragraphs fixed by spec
-  0044; tables and stat blocks remain, scheduled as M3 specs 0045 and 0046.)* The pagination loop
+  0044 and tables by 0045; stat blocks remain, scheduled as M3 spec 0046.)* The pagination loop
   moves a whole block to the next frame when it does not fit, rather than breaking the paragraph
   across the column boundary. On a single-column page this is invisible; on spec 0036's two-column
   `rulebook` template it leaves a visible gap at the foot of a column whenever the next paragraph is
@@ -1542,10 +1542,10 @@ increment's PR, not left here as a fixed-but-still-listed defect.
   question is what the increment would have to answer, and it deserves its own spec.
 
   Spec 0039 then hit it a third time: its roadmap entry promised breaking between rows with the
-  header repeating on the continuation, and both are blocked on exactly this. A table is one block,
-  so it cannot break between rows, and with no continuation there is nothing for a header to repeat
-  onto. **Three callers now want one mechanism** — paragraphs, stat blocks and tables — which is the
-  strongest argument yet that it should be built once, deliberately, rather than three times.
+  header repeating on the continuation, and both were blocked on exactly this. **Three callers
+  wanted one mechanism** — paragraphs, stat blocks and tables — which was the strongest argument yet
+  that it should be built once, deliberately, rather than three times. Spec 0044 built it and
+  0045 gave tables their rows and header repetition; only stat blocks remain, in spec 0046.
 
 - **The screen render and the press export do not hyphenate the same way.** `quill render` lays out
   with `NoHyphenator` (crates/cli/src/main.rs:323) while `export` uses the real en-US
