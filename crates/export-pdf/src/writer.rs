@@ -365,6 +365,42 @@ fn render_page(
                 }
                 content.end_text();
             }
+            PlacedBlock::Rect {
+                frame,
+                fill,
+                stroke,
+            } => {
+                // Degenerate geometry emits nothing at all, rather than an empty path with a `n`
+                // no-op: a content stream should not carry operators that draw nothing.
+                if (fill.is_none() && stroke.is_none()) || frame.w_pt <= 0.0 || frame.h_pt <= 0.0 {
+                    continue;
+                }
+                content.save_state();
+                if let Some(color) = fill {
+                    set_fill(&mut content, color);
+                }
+                if let Some(s) = stroke {
+                    set_stroke(&mut content, &s.color);
+                    // Points, unscaled: no CTM is in effect here, so the operand is the width the
+                    // author asked for. A hairline that silently became device-dependent is the
+                    // classic press bug in this code.
+                    content.set_line_width(s.width_pt);
+                }
+                // PDF's origin is bottom-left; `frame` is top-left, so the rect's PDF y is its
+                // *bottom* edge. Derived through the same offsets `geom::flip` uses, not a second
+                // convention (spec 0013's one-source-of-truth rule).
+                let y_bottom = g.media_h - (g.off_y + frame.y_pt + frame.h_pt);
+                content.rect(g.off_x + frame.x_pt, y_bottom, frame.w_pt, frame.h_pt);
+                // Nonzero winding, not even-odd: identical for a single rectangle, but `f` is the
+                // conventional operator and `f*` in a stream reads as though a subpath was expected.
+                match (fill.is_some(), stroke.is_some()) {
+                    (true, true) => content.fill_nonzero_and_stroke(),
+                    (true, false) => content.fill_nonzero(),
+                    (false, true) => content.stroke(),
+                    (false, false) => unreachable!("guarded above"),
+                };
+                content.restore_state();
+            }
             PlacedBlock::Image { frame, asset_id } => {
                 if let Some(img) = images_by_id.get(asset_id) {
                     // Bottom-left of the image in PDF space, then scale the unit square to size.
@@ -379,6 +415,29 @@ fn render_page(
         }
     }
     content.finish().as_slice().to_vec()
+}
+
+/// Set the non-stroking colour in the authored space.
+///
+/// `Rgb` is unreachable — preflight rejects it before export — but falls back to black rather than
+/// panicking, so a `--force` export can never abort mid-stream. Same posture as the text path.
+fn set_fill(content: &mut Content, color: &Color) {
+    match color {
+        Color::Gray { v } => content.set_fill_gray(*v),
+        Color::Cmyk { c, m, y, k } => content.set_fill_cmyk(*c, *m, *y, *k),
+        Color::Rgb { .. } => content.set_fill_gray(0.0),
+    };
+}
+
+/// Set the stroking colour. Separate from [`set_fill`] because PDF's stroking operators are
+/// distinct (`K`/`G` rather than `k`/`g`) — using the fill operator for a stroke sets the wrong
+/// colour silently, with no error anywhere in the pipeline.
+fn set_stroke(content: &mut Content, color: &Color) {
+    match color {
+        Color::Gray { v } => content.set_stroke_gray(*v),
+        Color::Cmyk { c, m, y, k } => content.set_stroke_cmyk(*c, *m, *y, *k),
+        Color::Rgb { .. } => content.set_stroke_gray(0.0),
+    };
 }
 
 /// Show one laid-out line at the current text position, applying its justification adjustment
@@ -451,6 +510,7 @@ fn doc_id_hex(doc: &Document) -> String {
 mod tests {
     use super::*;
     use quill_core_model::PageSetup;
+    use quill_layout_engine::Stroke;
     use quill_text_layout::{
         BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT,
     };
@@ -486,6 +546,112 @@ mod tests {
         };
         let content = render_page(&page, &g, &font, &BTreeMap::new());
         String::from_utf8_lossy(&content).into_owned()
+    }
+
+    /// Render a page holding a single decoration rect and return the greppable content bytes.
+    fn render_rect(
+        frame: quill_core_model::Rect,
+        fill: Option<Color>,
+        stroke: Option<Stroke>,
+    ) -> String {
+        let setup = PageSetup::default();
+        let g = geom::page_geom(&setup, 0);
+        let font = fonts::build(&BTreeSet::new()).expect("build bundled font");
+        let page = LaidOutPage {
+            index: 0,
+            statics: Vec::new(),
+            blocks: vec![PlacedBlock::Rect {
+                frame,
+                fill,
+                stroke,
+            }],
+        };
+        let content = render_page(&page, &g, &font, &BTreeMap::new());
+        String::from_utf8_lossy(&content).into_owned()
+    }
+
+    const PANEL: quill_core_model::Rect = quill_core_model::Rect {
+        x_pt: 20.0,
+        y_pt: 30.0,
+        w_pt: 100.0,
+        h_pt: 40.0,
+    };
+
+    #[test]
+    fn a_filled_and_stroked_rect_emits_both_colours_and_a_paint_operator() {
+        let s = render_rect(
+            PANEL,
+            Some(Color::Cmyk {
+                c: 0.0,
+                m: 0.0,
+                y: 0.0,
+                k: 0.1,
+            }),
+            Some(Stroke {
+                color: Color::Gray { v: 0.0 },
+                width_pt: 0.5,
+            }),
+        );
+        assert!(
+            s.lines().any(|l| l.ends_with(" k")),
+            "CMYK fill colour: {s}"
+        );
+        assert!(
+            s.lines().any(|l| l.ends_with(" G")),
+            "gray STROKE colour: {s}"
+        );
+        assert!(s.contains(" re"), "rect path: {s}");
+        assert!(s.contains("0.5 w"), "stroke width in points: {s}");
+        assert!(s.lines().any(|l| l == "B"), "fill-and-stroke operator: {s}");
+    }
+
+    #[test]
+    fn rect_geometry_is_flipped_into_pdf_space_exactly() {
+        // Top-left `y = 30`, height 40, on a 648 pt trim. Bleed is on the three *non-binding*
+        // edges only (spec 0013), so on this recto the media box is 666 pt tall with the content
+        // origin 9 pt up, and there is no offset on the bound left edge:
+        //   y = 666 - (9 + 30 + 40) = 587, x = 0 + 20 = 20.
+        let s = render_rect(PANEL, Some(Color::Gray { v: 0.5 }), None);
+        assert!(
+            s.contains("20 587 100 40 re"),
+            "expected exact flipped geometry, got: {s}"
+        );
+        assert!(s.lines().any(|l| l == "f"), "fill-only uses `f`: {s}");
+        assert!(
+            !s.lines().any(|l| l == "B"),
+            "fill-only must not stroke: {s}"
+        );
+    }
+
+    #[test]
+    fn a_stroke_only_rect_uses_the_stroking_operators() {
+        // `S`, not `f` — and the *stroking* colour operator `G`, not the fill `g`. Using the fill
+        // operator for a stroke sets the wrong colour with no error anywhere in the pipeline.
+        let s = render_rect(
+            PANEL,
+            None,
+            Some(Stroke {
+                color: Color::Gray { v: 0.0 },
+                width_pt: 1.0,
+            }),
+        );
+        assert!(
+            s.lines().any(|l| l.ends_with(" G")),
+            "stroking gray operator: {s}"
+        );
+        assert!(s.lines().any(|l| l == "S"), "stroke operator: {s}");
+        assert!(!s.lines().any(|l| l == "f"), "must not fill: {s}");
+    }
+
+    #[test]
+    fn a_rect_that_draws_nothing_emits_nothing() {
+        // No colours, zero width, zero height — none of which may leave a dangling path in the
+        // content stream. An `re` with no paint operator is a malformed stream.
+        assert!(!render_rect(PANEL, None, None).contains("re"));
+        let flat = quill_core_model::Rect { w_pt: 0.0, ..PANEL };
+        assert!(!render_rect(flat, Some(Color::Gray { v: 0.0 }), None).contains("re"));
+        let thin = quill_core_model::Rect { h_pt: 0.0, ..PANEL };
+        assert!(!render_rect(thin, Some(Color::Gray { v: 0.0 }), None).contains("re"));
     }
 
     /// Render a single justified line and return the (uncompressed, greppable) content bytes.

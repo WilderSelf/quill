@@ -42,6 +42,27 @@ pub fn rasterize(ops: &[PaintOp], font: &Font, proxies: &ProxyCache, scale: f32)
                 // raster: `quill render` output is compared against expected page content in CI,
                 // and a guide line would be indistinguishable from real content in that check.
             }
+            PaintOp::Rect {
+                x_pt,
+                y_pt,
+                w_pt,
+                h_pt,
+                fill_rgb,
+                stroke,
+            } => {
+                if let Some(rgb) = fill_rgb {
+                    fill_rect(&mut pixmap, *x_pt, *y_pt, *w_pt, *h_pt, *rgb, scale);
+                }
+                if let Some((rgb, width_pt)) = stroke {
+                    stroke_rect(
+                        &mut pixmap,
+                        (*x_pt, *y_pt, *w_pt, *h_pt),
+                        *rgb,
+                        *width_pt,
+                        scale,
+                    );
+                }
+            }
             PaintOp::Text {
                 x_pt,
                 baseline_pt,
@@ -116,6 +137,35 @@ fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, rgb: [u8; 3], 
     paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], 255);
     paint.anti_alias = false;
     pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+}
+
+/// Stroke a rectangle's outline, centred on the path as PDF's `S` operator does.
+///
+/// Drawn as four filled bars rather than through a stroked path so the screen and the page agree
+/// about which pixels a 0.5 pt line covers: `tiny-skia`'s stroker and PDF's would not have to round
+/// a sub-pixel width the same way, and this is geometry both can state exactly.
+fn stroke_rect(
+    pixmap: &mut Pixmap,
+    r: (f32, f32, f32, f32),
+    rgb: [u8; 3],
+    width_pt: f32,
+    scale: f32,
+) {
+    if width_pt <= 0.0 {
+        return;
+    }
+    let (x, y, w, h) = r;
+    let half = width_pt / 2.0;
+    // Top, bottom, left, right — each extended by `half` at the ends so the corners are square
+    // rather than notched.
+    for (bx, by, bw, bh) in [
+        (x - half, y - half, w + width_pt, width_pt),
+        (x - half, y + h - half, w + width_pt, width_pt),
+        (x - half, y - half, width_pt, h + width_pt),
+        (x + w - half, y - half, width_pt, h + width_pt),
+    ] {
+        fill_rect(pixmap, bx, by, bw, bh, rgb, scale);
+    }
 }
 
 /// Draw one line of text by shaping it and filling each glyph's outline.
@@ -294,6 +344,69 @@ mod tests {
     fn ink_fraction(r: &Raster) -> f32 {
         let dark = r.rgba.chunks(4).filter(|p| p[0] < 200).count();
         dark as f32 / (r.width * r.height) as f32
+    }
+
+    #[test]
+    fn a_filled_decoration_lands_where_it_was_placed() {
+        // Coarse invariants only — a known-colour fill inside the rect and paper outside it — per
+        // spec 0033's rule that pixel goldens are flaky across the three-OS matrix. Anti-aliasing
+        // is off for rect fills, so the inside pixel is exact.
+        let doc = Document::sample();
+        let font = Font::bundled();
+        let geom = page_geom(&doc.page_setup, 0);
+        let cache = ProxyCache::new();
+        let ops = vec![
+            PaintOp::Page {
+                w_pt: geom.media_w,
+                h_pt: geom.media_h,
+            },
+            PaintOp::Rect {
+                x_pt: 100.0,
+                y_pt: 100.0,
+                w_pt: 60.0,
+                h_pt: 40.0,
+                fill_rgb: Some([0, 0, 0]),
+                stroke: None,
+            },
+        ];
+        let r = rasterize(&ops, &font, &cache, 1.0).expect("raster");
+        let px = |x: u32, y: u32| {
+            let i = ((y * r.width + x) * 4) as usize;
+            [r.rgba[i], r.rgba[i + 1], r.rgba[i + 2]]
+        };
+        assert_eq!(px(130, 120), [0, 0, 0], "inside the rect must be filled");
+        assert_ne!(px(50, 50), [0, 0, 0], "outside the rect must stay paper");
+        assert_ne!(px(200, 200), [0, 0, 0], "and past it too");
+    }
+
+    #[test]
+    fn a_stroked_decoration_draws_its_edges_and_not_its_middle() {
+        let doc = Document::sample();
+        let font = Font::bundled();
+        let geom = page_geom(&doc.page_setup, 0);
+        let cache = ProxyCache::new();
+        let ops = vec![
+            PaintOp::Page {
+                w_pt: geom.media_w,
+                h_pt: geom.media_h,
+            },
+            PaintOp::Rect {
+                x_pt: 100.0,
+                y_pt: 100.0,
+                w_pt: 60.0,
+                h_pt: 40.0,
+                fill_rgb: None,
+                stroke: Some(([0, 0, 0], 4.0)),
+            },
+        ];
+        let r = rasterize(&ops, &font, &cache, 1.0).expect("raster");
+        let px = |x: u32, y: u32| {
+            let i = ((y * r.width + x) * 4) as usize;
+            [r.rgba[i], r.rgba[i + 1], r.rgba[i + 2]]
+        };
+        assert_eq!(px(130, 100), [0, 0, 0], "the top edge is stroked");
+        assert_eq!(px(100, 120), [0, 0, 0], "the left edge is stroked");
+        assert_ne!(px(130, 120), [0, 0, 0], "the middle is not filled");
     }
 
     #[test]
