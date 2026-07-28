@@ -6,6 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+/// Re-exported so consumers get the component types from the model they appear in, rather than
+/// having to add a dependency on `quill-components-ttrpg` to name a field of `Block` (spec 0038).
+pub use quill_components_ttrpg::{RandomTable, StatBlock, TableEntry};
 use serde::{Deserialize, Serialize};
 
 mod container;
@@ -232,6 +235,21 @@ pub enum Block {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<String>,
     },
+    /// A creature or NPC stat block — the TTRPG-native content object this product exists for
+    /// (spec 0038).
+    ///
+    /// Carries the portable [`StatBlock`] verbatim rather than flattening it into fields, so the
+    /// same value can be authored, exchanged and rolled on without a document in sight. The
+    /// document adds only what placing it on a page needs: identity and ink.
+    StatBlock {
+        #[serde(default)]
+        id: BlockId,
+        stat: StatBlock,
+        /// The ink every line in the block is set in. One colour rather than one per section: a
+        /// stat block is a single typographic object, and per-line colour would multiply the
+        /// preflight surface for no authoring gain.
+        color: Color,
+    },
     Image {
         #[serde(default)]
         id: BlockId,
@@ -243,15 +261,19 @@ impl Block {
     /// This block's stable identity. [`BlockId::UNASSIGNED`] until the document assigns one.
     pub fn id(&self) -> BlockId {
         match self {
-            Block::Heading { id, .. } | Block::Body { id, .. } | Block::Image { id, .. } => *id,
+            Block::Heading { id, .. }
+            | Block::Body { id, .. }
+            | Block::Image { id, .. }
+            | Block::StatBlock { id, .. } => *id,
         }
     }
 
     pub fn set_id(&mut self, new: BlockId) {
         match self {
-            Block::Heading { id, .. } | Block::Body { id, .. } | Block::Image { id, .. } => {
-                *id = new
-            }
+            Block::Heading { id, .. }
+            | Block::Body { id, .. }
+            | Block::Image { id, .. }
+            | Block::StatBlock { id, .. } => *id = new,
         }
     }
 
@@ -280,7 +302,9 @@ impl Block {
     pub fn with_style(mut self, name: impl Into<String>) -> Block {
         match &mut self {
             Block::Heading { style, .. } | Block::Body { style, .. } => *style = Some(name.into()),
-            Block::Image { .. } => {}
+            // Neither has one paragraph to style: an image has none, and a stat block is a
+            // composite whose parts resolve `statblock-*` individually.
+            Block::Image { .. } | Block::StatBlock { .. } => {}
         }
         self
     }
@@ -348,6 +372,13 @@ impl Default for ParagraphStyle {
 /// The style name applied to body paragraphs when a block names none.
 pub const BODY_STYLE: &str = "body";
 
+/// The stat block's name line (spec 0038).
+pub const STATBLOCK_TITLE_STYLE: &str = "statblock-title";
+/// A stat block's `Key  Value` attribute lines.
+pub const STATBLOCK_ATTR_STYLE: &str = "statblock-attr";
+/// A stat block's prose sections — overview, details, actions, reactions.
+pub const STATBLOCK_BODY_STYLE: &str = "statblock-body";
+
 /// The style name for a heading of the given level (`h1`..`h6`).
 pub fn heading_style_name(level: u8) -> String {
     format!("h{}", level.clamp(1, 6))
@@ -389,6 +420,41 @@ impl Default for StyleSheet {
                 },
             );
         }
+        // Stat-block treatment (spec 0038). Built in rather than left to the author, because the
+        // point of a first-class component is that dropping one in produces something that already
+        // looks like a stat block. Restyling the whole book is still one edit — these three names.
+        paragraph.insert(
+            STATBLOCK_TITLE_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: 13.0,
+                leading_pt: 16.0,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 3.0,
+            },
+        );
+        paragraph.insert(
+            STATBLOCK_ATTR_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: 9.0,
+                leading_pt: 11.0,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+            },
+        );
+        paragraph.insert(
+            STATBLOCK_BODY_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: 9.0,
+                leading_pt: 11.5,
+                // Ragged, not justified: a stat block sits in a narrow panel where justification
+                // opens rivers the surrounding body text would not show.
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 3.0,
+            },
+        );
         StyleSheet { paragraph }
     }
 }
@@ -406,7 +472,9 @@ impl StyleSheet {
                 style.clone().unwrap_or_else(|| heading_style_name(*level))
             }
             Block::Body { style, .. } => style.clone().unwrap_or_else(|| BODY_STYLE.to_string()),
-            Block::Image { .. } => return ParagraphStyle::default(),
+            // A composite has no single paragraph treatment; its parts resolve `statblock-*`
+            // themselves. `resolve` must still be total, so both fall back to the default.
+            Block::Image { .. } | Block::StatBlock { .. } => return ParagraphStyle::default(),
         };
         self.paragraph
             .get(&named)
@@ -1064,6 +1132,52 @@ mod tests {
             master: Some("opener".into()),
         }));
         assert_eq!(doc.master_for(0).map(|m| m.name.as_str()), Some("opener"));
+    }
+
+    #[test]
+    fn a_stat_block_round_trips_through_the_manifest() {
+        let mut doc = Document::sample();
+        doc.content.push(Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: StatBlock {
+                name: "Goblin".into(),
+                overview: vec!["Small humanoid, chaotic".into()],
+                attributes: vec![("AC".into(), "15".into()), ("HP".into(), "7".into())],
+                details: vec!["Nimble Escape.".into()],
+                actions: vec!["Scimitar. +4 to hit.".into()],
+                reactions: vec![],
+            },
+            color: Color::Gray { v: 0.0 },
+        });
+        doc.assign_missing_block_ids().expect("ids");
+
+        let back = Document::from_json(&doc.to_json().expect("save")).expect("load");
+        assert_eq!(back, doc);
+        // The component survives as a component, not as flattened text.
+        let Block::StatBlock { stat, .. } = &back.content[2] else {
+            panic!("expected a stat block")
+        };
+        assert_eq!(stat.attributes.len(), 2);
+        assert_eq!(stat.name, "Goblin");
+    }
+
+    #[test]
+    fn the_built_in_stat_block_styles_exist_and_are_ordered() {
+        // A stat block resolves these three by name. If one were missing it would fall back to
+        // `body` and the block would come out looking like a paragraph.
+        let sheet = StyleSheet::default();
+        for name in [
+            STATBLOCK_TITLE_STYLE,
+            STATBLOCK_ATTR_STYLE,
+            STATBLOCK_BODY_STYLE,
+        ] {
+            assert!(sheet.paragraph.contains_key(name), "missing `{name}`");
+        }
+        assert!(
+            sheet.paragraph[STATBLOCK_TITLE_STYLE].font_size_pt
+                > sheet.paragraph[STATBLOCK_BODY_STYLE].font_size_pt,
+            "the name must be set larger than the prose"
+        );
     }
 
     #[test]

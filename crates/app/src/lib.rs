@@ -241,9 +241,11 @@ impl AppState {
                         }
                         b
                     }
-                    // An image block has no text to edit; leave it alone rather than replacing it
-                    // with something the caller did not ask for.
-                    Block::Image { .. } => return EditOutcome::default(),
+                    // Neither has a single text to edit: an image has none, and a stat block has
+                    // six independently editable sections, so replacing it from one string would
+                    // silently discard five of them. Leave both alone rather than doing something
+                    // the caller did not ask for; a stat-block editor is its own affordance.
+                    Block::Image { .. } | Block::StatBlock { .. } => return EditOutcome::default(),
                 };
                 *block = replacement;
                 block.set_id(id);
