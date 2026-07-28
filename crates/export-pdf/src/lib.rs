@@ -6,6 +6,10 @@
 //! [`ExportOptions::version`]) through `pdf-writer` (object graph) + `subsetter` (embedded subset
 //! font), with `lcms2` validating the ICC OutputIntent. The writer internals live in the
 //! `writer`/`fonts`/`images`/`icc`/`xmp`/`geom` modules.
+//!
+//! [`ExportOptions::profile`] selects which of the two files a publisher ships (spec 0052):
+//! [`ExportProfile::Press`] — the default, PDF/X, no annotations — or [`ExportProfile::Screen`],
+//! which carries clickable contents links and claims no conformance. See [`ExportProfile`].
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -58,10 +62,48 @@ impl PdfxVersion {
     }
 }
 
+/// Which of the two files a publisher ships this export is (spec 0052).
+///
+/// PDF/X-1a requires annotations to sit **outside the BleedBox**, and quill writes
+/// `MediaBox == BleedBox` (spec 0013), so a clickable contents entry — which sits in the middle of
+/// the text block by definition — and a press-conformant file are mutually exclusive on the same
+/// page. Two profiles is the honest answer; a single compromised file is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExportProfile {
+    /// Press-ready PDF/X at [`ExportOptions::version`]. The default, and unchanged by spec 0052:
+    /// no annotations, a required ICC OutputIntent, and the `GTS_PDFX*` identification keys.
+    #[default]
+    Press,
+    /// The customer's file. Carries `/Link` annotations for contents entries, claims **no** PDF/X
+    /// conformance (no `GTS_PDFXVersion`, no OutputIntent), and relaxes nothing else.
+    ///
+    /// Deliberately **not** an RGB profile. Colour conversion is a separate question and converting
+    /// is how you ship the wrong colours; content stays CMYK/grayscale, byte-for-byte the same ink
+    /// the press file carries. Compression, reader spreads, downsampling and external links are all
+    /// out of scope for the same reason: each is its own decision, and a profile that grows them
+    /// never closes.
+    Screen,
+}
+
+impl ExportProfile {
+    /// The PDF/X level this profile identifies as, or `None` when it claims no conformance.
+    ///
+    /// The single place the two profiles' conformance behaviour differs, so the info dict and the
+    /// XMP packet cannot drift apart about it.
+    pub fn pdfx(self, version: PdfxVersion) -> Option<PdfxVersion> {
+        match self {
+            ExportProfile::Press => Some(version),
+            ExportProfile::Screen => None,
+        }
+    }
+}
+
 /// Options controlling an export.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     pub version: PdfxVersion,
+    /// Press (default) or screen. See [`ExportProfile`].
+    pub profile: ExportProfile,
     /// Path to the ICC profile used as the PDF/X OutputIntent (e.g. a CMYK press profile).
     pub output_intent_icc: String,
     /// Export even if preflight fails.
@@ -83,6 +125,9 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             version: PdfxVersion::X1a2001,
+            // Press by default, in the `Default` impl and in the CLI, so no caller can reach the
+            // screen profile by omission — the press file is the one that must never be a surprise.
+            profile: ExportProfile::Press,
             output_intent_icc: String::new(),
             force: false,
             font_path: None,
@@ -113,6 +158,22 @@ pub enum CheckId {
     IccProfileInvalid,
 }
 
+impl CheckId {
+    /// Every check, in declaration order. Used to derive [`PreflightReport::applied`] from the
+    /// skip list, so the two can never disagree about what preflight covers.
+    pub const ALL: [CheckId; 9] = [
+        CheckId::ColorSpace,
+        CheckId::FontEmbedding,
+        CheckId::Bleed,
+        CheckId::ImageResolution,
+        CheckId::InkCoverage,
+        CheckId::Marks,
+        CheckId::OutputIntent,
+        CheckId::Transparency,
+        CheckId::IccProfileInvalid,
+    ];
+}
+
 /// Severity of a preflight finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -128,13 +189,38 @@ pub struct Finding {
     pub message: String,
 }
 
+/// A check that did not run under the selected profile, and why (spec 0052).
+///
+/// A preflight that quietly examines less than it used to is worse than one that fails: the report
+/// looks identical and means something else. Recording the omission — with its reason and its
+/// consequence — is what keeps "no findings" honest under a profile that checks fewer things.
+#[derive(Debug, Clone)]
+pub struct Skipped {
+    pub check: CheckId,
+    pub reason: String,
+}
+
 /// The outcome of preflighting a document.
 #[derive(Debug, Clone, Default)]
 pub struct PreflightReport {
     pub findings: Vec<Finding>,
+    /// Checks the profile did not run. Always empty under [`ExportProfile::Press`].
+    pub skipped: Vec<Skipped>,
 }
 
 impl PreflightReport {
+    /// The checks that actually ran, in `CheckId` declaration order.
+    ///
+    /// The complement of [`Self::skipped`] over the full check list, derived rather than
+    /// maintained by hand — a second hand-written list is how the two come to disagree.
+    pub fn applied(&self) -> Vec<CheckId> {
+        CheckId::ALL
+            .iter()
+            .copied()
+            .filter(|c| !self.skipped.iter().any(|s| s.check == *c))
+            .collect()
+    }
+
     /// True when no `Error`-severity findings are present.
     pub fn passed(&self) -> bool {
         !self.findings.iter().any(|f| f.severity == Severity::Error)
@@ -187,6 +273,13 @@ fn min_dpi(line_art: bool) -> f32 {
 }
 
 /// Validate a document against the PDF/X / DriveThruRPG requirements from spec 0001.
+///
+/// Under [`ExportProfile::Screen`] with no ICC supplied, the two OutputIntent-related checks are
+/// recorded in [`PreflightReport::skipped`] instead of run — see spec 0052. **Everything else still
+/// runs**: colour space, ink coverage, bleed, image resolution, font embedding, transparency and
+/// marks are the same checks over the same document. The screen profile relaxes the PDF/X
+/// identification and the OutputIntent requirement, because those are what an annotation is
+/// incompatible with, and nothing else.
 pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     let mut report = PreflightReport::default();
 
@@ -252,8 +345,23 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
         }
     }
 
-    // An ICC OutputIntent is required for PDF/X.
-    if opts.output_intent_icc.trim().is_empty() {
+    // An ICC OutputIntent is required for PDF/X. The screen profile claims no PDF/X conformance and
+    // writes no OutputIntent (spec 0052), so with no profile supplied there is nothing to require
+    // and nothing to validate — but the omission is *recorded*, with what it costs, rather than
+    // quietly making the report shorter.
+    if opts.output_intent_icc.trim().is_empty() && opts.profile == ExportProfile::Screen {
+        report.skipped.push(Skipped {
+            check: CheckId::OutputIntent,
+            reason: "the screen profile writes no OutputIntent and claims no PDF/X conformance"
+                .into(),
+        });
+        report.skipped.push(Skipped {
+            check: CheckId::IccProfileInvalid,
+            reason: "no ICC profile supplied; RGB images convert through the naive CMYK fallback \
+                     rather than a press profile"
+                .into(),
+        });
+    } else if opts.output_intent_icc.trim().is_empty() {
         push_error(
             &mut report,
             CheckId::OutputIntent,
@@ -1556,5 +1664,451 @@ mod tests {
         let _ = std::fs::remove_file(&icc_path);
         assert!(matches!(e, ExportError::Font(_)));
         assert!(sink.is_empty(), "nothing should be written on font failure");
+    }
+
+    // --- The screen profile (spec 0052) --------------------------------------------------------
+
+    /// Titles of the two chapters the linked-document fixture carries.
+    const CH1: &str = "The First Chapter";
+    const CH2: &str = "The Second Chapter";
+
+    /// A document with a contents list and two chapters far enough apart that the second lands on a
+    /// later page — so a destination test can distinguish "the right page" from "page one".
+    fn linked_doc() -> Document {
+        let mut doc = Document::sample();
+        doc.content = vec![Block::Toc {
+            id: quill_core_model::BlockId::UNASSIGNED,
+            title: "Contents".into(),
+            max_level: 2,
+            color: Color::Gray { v: 0.0 },
+        }];
+        for title in [CH1, CH2] {
+            doc.content
+                .push(Block::heading(1, title, Color::Gray { v: 0.0 }));
+            for _ in 0..40 {
+                doc.content.push(Block::body(
+                    "Filler copy that exists only to consume vertical space so the chapters do \
+                     not share a page.",
+                    Color::Gray { v: 0.0 },
+                ));
+            }
+        }
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    /// Lay a document out exactly as [`export`] does — same font, same shaper, same hyphenator — so
+    /// a test can compare the emitted PDF against the geometry the writer was actually handed.
+    fn lay_out_like_export(doc: &Document, opts: &ExportOptions) -> Vec<LaidOutPage> {
+        let font = build_font(opts, &collect_doc_chars(doc)).expect("font");
+        let shaper = font.shaper();
+        quill_layout_engine::lay_out(doc, &shaper, &hyphenate::HypherHyphenator)
+    }
+
+    /// Every `<n> 0 obj … endobj` body in the file, keyed by object number.
+    ///
+    /// A deliberately small parser: the assertions below need to *follow references*, and a
+    /// substring match cannot do that — it can only confirm that some bytes appear somewhere.
+    fn objects(bytes: &[u8]) -> std::collections::BTreeMap<u32, String> {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let mut out = std::collections::BTreeMap::new();
+        let mut rest = text.as_str();
+        let mut consumed = 0usize;
+        while let Some(at) = rest.find(" 0 obj") {
+            // Walk back over the object number.
+            let head = &rest[..at];
+            let start = head
+                .rfind(|c: char| !c.is_ascii_digit())
+                .map_or(0, |i| i + 1);
+            let number: u32 = match head[start..].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    rest = &rest[at + 6..];
+                    consumed += at + 6;
+                    continue;
+                }
+            };
+            let body_start = consumed + at + 6;
+            let end = text[body_start..]
+                .find("endobj")
+                .map(|e| body_start + e)
+                .unwrap_or(text.len());
+            out.insert(number, text[body_start..end].to_string());
+            rest = &text[end..];
+            consumed = end;
+        }
+        out
+    }
+
+    /// `[9 0 R, 12 0 R]` → `[9, 12]`, for the array named by `key` in `body`.
+    fn ref_array(body: &str, key: &str) -> Vec<u32> {
+        let Some(at) = body.find(key) else {
+            return Vec::new();
+        };
+        let after = &body[at + key.len()..];
+        let Some(open) = after.find('[') else {
+            return Vec::new();
+        };
+        let Some(close) = after[open..].find(']') else {
+            return Vec::new();
+        };
+        after[open + 1..open + close]
+            .split(" R")
+            .filter_map(|item| item.split_whitespace().next()?.parse().ok())
+            .collect()
+    }
+
+    /// The page objects in page-tree order, so an object number can be turned into a page *index*.
+    fn page_order(objs: &std::collections::BTreeMap<u32, String>) -> Vec<u32> {
+        let tree = objs
+            .values()
+            .find(|b| b.contains("/Type /Pages"))
+            .expect("a page tree");
+        ref_array(tree, "/Kids")
+    }
+
+    /// The four numbers of the `/Rect` array in an annotation body.
+    fn rect_of(body: &str) -> [f32; 4] {
+        let at = body.find("/Rect").expect("an annotation has a /Rect");
+        let after = &body[at + 5..];
+        let open = after.find('[').expect("/Rect array");
+        let close = after[open..].find(']').expect("/Rect array end");
+        let nums: Vec<f32> = after[open + 1..open + close]
+            .split_whitespace()
+            .map(|n| n.parse().expect("a number"))
+            .collect();
+        [nums[0], nums[1], nums[2], nums[3]]
+    }
+
+    #[test]
+    fn the_press_profile_emits_no_annotations_at_all() {
+        // THE load-bearing assertion of spec 0052, and deliberately a *press* test.
+        //
+        // The document does have a contents list, so the layout engine really does produce link
+        // candidates — this is not vacuous. It is asserted **structurally over the emitted bytes**:
+        // any `/Annots` key anywhere in the file fails it. A test that checked "the annotation
+        // builder returned nothing" would pass for a writer that emitted annotations by some other
+        // route, and would stop meaning anything the moment the code was reorganised. Scanning the
+        // output cannot rot that way.
+        let (opts, icc) = opts_with_real_icc("press_no_annots");
+        let doc = linked_doc();
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("export");
+        let _ = std::fs::remove_file(icc);
+
+        assert!(
+            !bytes.windows(7).any(|w| w == b"/Annots"),
+            "a PDF/X file must contain no /Annots key at all — not even an empty array"
+        );
+        assert!(
+            !bytes.windows(6).any(|w| w == b"/Annot"),
+            "and no annotation object either"
+        );
+        // The candidates exist: this proves the emptiness above is the writer's doing, not an
+        // accident of a document that had nothing to link.
+        let pages = lay_out_like_export(&doc, &opts);
+        let candidates = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Link { .. }))
+            .count();
+        assert!(
+            candidates > 0,
+            "the fixture must actually produce link candidates, or this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_screen_export_links_a_contents_entry_to_the_page_its_heading_is_on() {
+        // Three things, each of which can be wrong independently:
+        //   1. the entry is a `/Link` annotation at all;
+        //   2. its `/Rect` covers the *placed text* of that entry — asserted against the run's own
+        //      laid-out frame, so a link that has drifted off its text fails even though it exists;
+        //   3. its destination *resolves* to the page the heading is on — followed through the
+        //      reference into the page tree, not pattern-matched against an object number, which
+        //      would pin an allocation order rather than a destination.
+        let opts = ExportOptions {
+            profile: ExportProfile::Screen,
+            ..Default::default()
+        };
+        let doc = linked_doc();
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("screen export needs no ICC");
+
+        let pages = lay_out_like_export(&doc, &opts);
+        let headings = quill_layout_engine::heading_index(&doc, &pages);
+        let ch2 = headings
+            .iter()
+            .find(|h| h.text == CH2)
+            .expect("the second chapter is indexed");
+        assert!(
+            ch2.page_index > 0,
+            "the fixture must span pages, or 'the right page' and 'page one' are the same claim"
+        );
+
+        // The entry's placed text: the contents run whose text is the chapter title.
+        let (toc_page, text_frame) = pages
+            .iter()
+            .find_map(|p| {
+                p.blocks.iter().find_map(|b| match b {
+                    PlacedBlock::Text { frame, lines, .. }
+                        if lines.len() == 1
+                            && lines[0].text == CH2
+                            && p.index != ch2.page_index =>
+                    {
+                        Some((p.index, *frame))
+                    }
+                    _ => None,
+                })
+            })
+            .expect("a contents entry for the second chapter");
+
+        let objs = objects(&bytes);
+        let order = page_order(&objs);
+        let page_obj = order[toc_page];
+        let annot_ids = ref_array(&objs[&page_obj], "/Annots");
+        assert!(
+            !annot_ids.is_empty(),
+            "the contents page must carry link annotations"
+        );
+
+        // The annotation whose rect sits at this entry's text.
+        let g = quill_core_model::page_geom(&doc.page_setup, toc_page);
+        let expect_top = g.media_h - (g.off_y + text_frame.y_pt);
+        let expect = [
+            g.off_x + text_frame.x_pt,
+            expect_top - text_frame.h_pt,
+            g.off_x + text_frame.x_pt + text_frame.w_pt,
+            expect_top,
+        ];
+        let mut matched = None;
+        for id in &annot_ids {
+            let body = &objs[id];
+            assert!(body.contains("/Subtype /Link"), "not a link: {body}");
+            let r = rect_of(body);
+            if r.iter().zip(expect).all(|(a, b)| (a - b).abs() < 0.01) {
+                matched = Some(body.clone());
+            }
+        }
+        let body = matched.unwrap_or_else(|| {
+            panic!(
+                "no /Link rect covers the entry's placed text at {expect:?}; annotations were {:?}",
+                annot_ids
+                    .iter()
+                    .map(|i| rect_of(&objs[i]))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+        // Follow the destination: `/D [<n> 0 R /Fit]` → the page object → its index in `/Kids`.
+        assert!(body.contains("/S /GoTo"), "a GoTo action: {body}");
+        let dest = ref_array(&body, "/D");
+        assert_eq!(dest.len(), 1, "one destination page reference: {body}");
+        let landed = order
+            .iter()
+            .position(|p| *p == dest[0])
+            .expect("the destination must be a page in the page tree");
+        assert_eq!(
+            landed, ch2.page_index,
+            "the link must resolve to the page the heading is actually on"
+        );
+    }
+
+    #[test]
+    fn the_pdfx_identification_is_present_under_press_and_absent_under_screen() {
+        // Both directions, in both places the identification lives. Asserting only the presence
+        // would pass for a writer that stamped PDF/X on everything; only the absence would pass for
+        // one that stamped it on nothing.
+        let (press_opts, icc) = opts_with_real_icc("ident_press");
+        let doc = linked_doc();
+        let mut press = Vec::new();
+        export(&doc, &press_opts, &mut press).expect("press export");
+        let _ = std::fs::remove_file(icc);
+        let press = String::from_utf8_lossy(&press).into_owned();
+
+        let mut screen = Vec::new();
+        export(
+            &doc,
+            &ExportOptions {
+                profile: ExportProfile::Screen,
+                ..Default::default()
+            },
+            &mut screen,
+        )
+        .expect("screen export");
+        let screen = String::from_utf8_lossy(&screen).into_owned();
+
+        // Info dictionary.
+        assert!(press.contains("/GTS_PDFXVersion"), "press info key");
+        assert!(
+            !screen.contains("GTS_PDFXVersion"),
+            "a screen file must claim no PDF/X version anywhere"
+        );
+        assert!(press.contains("/GTS_PDFXConformance"), "press conformance");
+        assert!(!screen.contains("GTS_PDFXConformance"));
+        // XMP packet (uncompressed, so both directions are greppable).
+        assert!(press.contains("npes.org/pdfx/ns/id/"), "press XMP schema");
+        assert!(!screen.contains("npes.org"), "no XMP identification schema");
+        // OutputIntent.
+        assert!(press.contains("/OutputIntents"), "press output intent");
+        assert!(
+            !screen.contains("/OutputIntents") && !screen.contains("/DestOutputProfile"),
+            "a screen file states no output condition"
+        );
+        // And the mirror of the press test above: the screen file *does* have the links.
+        assert!(screen.contains("/Annots"), "screen links");
+        assert!(screen.contains("/Subtype /Link"), "screen link subtype");
+    }
+
+    #[test]
+    fn a_screen_export_needs_no_icc_and_a_press_export_still_does() {
+        let doc = Document::sample();
+        let mut screen = Vec::new();
+        export(
+            &doc,
+            &ExportOptions {
+                profile: ExportProfile::Screen,
+                ..Default::default()
+            },
+            &mut screen,
+        )
+        .expect("the screen profile requires no OutputIntent");
+        assert!(screen.starts_with(b"%PDF-1.3"));
+
+        // The press profile is untouched by any of this: no ICC is still a preflight failure.
+        let mut press = Vec::new();
+        let e = export(&doc, &ExportOptions::default(), &mut press).unwrap_err();
+        assert!(matches!(e, ExportError::PreflightFailed(_)));
+        assert!(press.is_empty());
+    }
+
+    #[test]
+    fn screen_preflight_records_what_it_skipped_and_still_runs_everything_else() {
+        // "No findings" over an unstated subset of the checks is the shape of a false pass, so the
+        // omission is data in the report. The second half is what keeps the relaxation *narrow*: a
+        // profile that skipped everything would also pass the first half.
+        let mut doc = Document::sample();
+        let screen = ExportOptions {
+            profile: ExportProfile::Screen,
+            ..Default::default()
+        };
+        let report = preflight(&doc, &screen);
+        assert!(report.passed(), "unexpected: {:?}", report.findings);
+        let skipped: Vec<CheckId> = report.skipped.iter().map(|s| s.check).collect();
+        assert_eq!(
+            skipped,
+            vec![CheckId::OutputIntent, CheckId::IccProfileInvalid],
+            "exactly the two OutputIntent-related checks, and no others"
+        );
+        assert!(
+            report.skipped.iter().all(|s| !s.reason.trim().is_empty()),
+            "a skipped check must say why"
+        );
+        assert!(
+            !report.applied().contains(&CheckId::OutputIntent),
+            "applied() is the complement of skipped()"
+        );
+        for c in [
+            CheckId::ColorSpace,
+            CheckId::InkCoverage,
+            CheckId::Bleed,
+            CheckId::ImageResolution,
+            CheckId::FontEmbedding,
+        ] {
+            assert!(report.applied().contains(&c), "{c:?} must still be applied");
+        }
+
+        // And they are applied in the sense that matters: they still fail on bad input.
+        doc.page_setup.bleed_pt = 2.0;
+        doc.fonts_embeddable = false;
+        doc.content.push(Block::body(
+            "oops",
+            Color::Rgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+            },
+        ));
+        doc.assets = vec![Asset {
+            id: "blurry".into(),
+            path: "assets/blurry.png".into(),
+            px_w: 10,
+            px_h: 10,
+            dpi: 72.0,
+            line_art: false,
+            has_alpha: false,
+        }];
+        let report = preflight(&doc, &screen);
+        assert!(!report.passed(), "the screen profile is not a blanket pass");
+        for c in [
+            CheckId::ColorSpace,
+            CheckId::Bleed,
+            CheckId::ImageResolution,
+            CheckId::FontEmbedding,
+        ] {
+            assert!(
+                report.findings.iter().any(|f| f.check == c),
+                "{c:?} must still be reported under the screen profile"
+            );
+        }
+    }
+
+    #[test]
+    fn an_icc_supplied_to_the_screen_profile_is_validated_but_writes_no_output_intent() {
+        // Giving the screen profile a profile un-skips the ICC checks (it is now something that can
+        // be wrong) without making the file claim conformance it does not have.
+        let (mut opts, icc) = opts_with_real_icc("screen_with_icc");
+        opts.profile = ExportProfile::Screen;
+        let report = preflight(&Document::sample(), &opts);
+        assert!(
+            report.skipped.is_empty(),
+            "with a profile supplied there is nothing to skip: {:?}",
+            report.skipped
+        );
+
+        let mut bytes = Vec::new();
+        export(&linked_doc(), &opts, &mut bytes).expect("export");
+        let _ = std::fs::remove_file(icc);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("/OutputIntents"), "still no output intent");
+        assert!(!text.contains("GTS_PDFXVersion"), "still no PDF/X claim");
+        assert!(text.contains("/Subtype /Link"), "still linked");
+    }
+
+    #[test]
+    fn every_listed_contents_entry_gets_exactly_one_link() {
+        // The count is the property: a link per entry, no more (a duplicate would make a viewer's
+        // hit-testing depend on z-order) and no fewer.
+        let opts = ExportOptions {
+            profile: ExportProfile::Screen,
+            ..Default::default()
+        };
+        let doc = linked_doc();
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("export");
+
+        let pages = lay_out_like_export(&doc, &opts);
+        let entries = quill_layout_engine::heading_index(&doc, &pages).len();
+        assert_eq!(entries, 2, "the fixture lists two chapters");
+
+        let objs = objects(&bytes);
+        let links = objs
+            .values()
+            .filter(|b| b.contains("/Subtype /Link"))
+            .count();
+        assert_eq!(links, entries, "one link annotation per listed entry");
+    }
+
+    #[test]
+    fn the_press_profile_is_the_default() {
+        // Stated as a test because it is the whole safety argument: no caller reaches the screen
+        // profile by omission, so no existing path can start emitting annotations by accident.
+        assert_eq!(ExportOptions::default().profile, ExportProfile::Press);
+        assert_eq!(ExportProfile::default(), ExportProfile::Press);
+        assert_eq!(
+            ExportProfile::Press.pdfx(PdfxVersion::X3_2002),
+            Some(PdfxVersion::X3_2002)
+        );
+        assert_eq!(ExportProfile::Screen.pdfx(PdfxVersion::X3_2002), None);
     }
 }

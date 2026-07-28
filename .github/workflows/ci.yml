@@ -104,6 +104,53 @@ jobs:
           # Identical press output whichever way the same document was loaded.
           cmp /tmp/sample.pdf /tmp/from-tpub.pdf
 
+      - name: Screen export profile (spec 0052)
+        run: |
+          set -euo pipefail
+          # The second file a publisher ships. Built from a document that actually has a contents
+          # list, because a screen export of a document with nothing to link would assert nothing.
+          # Note there is no --icc: the screen profile must work without one.
+          mkdir -p /tmp/screen
+          cat > /tmp/screen/book.md <<'MD'
+          :::toc
+          title: Contents
+          max_level: 2
+          :::
+
+          # The First Chapter
+
+          Body copy so the chapter occupies part of a page.
+
+          # The Second Chapter
+
+          More body copy, so the contents list has two entries to point at.
+          MD
+          cargo run -p quill-cli -- import /tmp/screen/book.md \
+            --output /tmp/screen/book.tpub --template rulebook
+          cargo run -p quill-cli -- export /tmp/screen/book.tpub \
+            --profile screen --output /tmp/screen.pdf
+          test -s /tmp/screen.pdf
+          head -c 8 /tmp/screen.pdf | grep -q '%PDF-1.3'
+          # It is a *linked* file: contents entries are real link annotations.
+          grep -aq '/Annots' /tmp/screen.pdf
+          grep -aq '/Subtype /Link' /tmp/screen.pdf
+          # And it claims no PDF/X conformance — neither in the info dict nor in the XMP packet
+          # (which is written uncompressed precisely so this absence is checkable).
+          ! grep -aq 'GTS_PDFXVersion' /tmp/screen.pdf
+          ! grep -aq 'npes.org' /tmp/screen.pdf
+          ! grep -aq '/OutputIntents' /tmp/screen.pdf
+          # The other direction, in the same job: the press file still identifies as PDF/X and
+          # still carries no annotation at all. Asserting only one side would pass for a writer
+          # that had collapsed the two profiles into one.
+          grep -aq 'PDF/X-1a:2001' /tmp/sample.pdf
+          ! grep -aq '/Annots' /tmp/sample.pdf
+          # And the press export of the *same, contents-carrying* document — the one that really
+          # does produce link candidates — must also be annotation-free.
+          cargo run -p quill-cli -- export /tmp/screen/book.tpub \
+            --output /tmp/screen-as-press.pdf --icc /tmp/cmyk.icc --pdfx x1a
+          ! grep -aq '/Annots' /tmp/screen-as-press.pdf
+          grep -aq 'PDF/X-1a:2001' /tmp/screen-as-press.pdf
+
       - name: Ghostscript parse check (gate)
         run: |
           set -euo pipefail
@@ -111,7 +158,13 @@ jobs:
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample.pdf
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/sample-x3.pdf
           gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/from-tpub.pdf
-          echo "Ghostscript interpreted all three PDFs with no errors."
+          # The screen file is a valid PDF even though it is not PDF/X (spec 0052) — the second
+          # Ghostscript invocation this increment adds. A link annotation is exactly the kind of
+          # object that is easy to emit as a dangling reference, which an interpreter catches and a
+          # substring grep does not.
+          gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/screen.pdf
+          gs -dBATCH -dNOPAUSE -dPDFSTOPONERROR -sDEVICE=nullpage /tmp/screen-as-press.pdf
+          echo "Ghostscript interpreted all five PDFs with no errors."
 
       - name: Screen render (spec 0033)
         run: |

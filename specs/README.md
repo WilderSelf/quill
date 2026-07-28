@@ -58,6 +58,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0047 | [Master statics: alignment and page-parity mirroring; `FORMAT_VERSION` 3](0047-master-static-alignment.md) | M3 | implemented |
 | 0048 | [Hanging indent and non-breaking spaces](0048-hanging-indent.md) | M3 | implemented |
 | 0051 | [Knuth-Plass active-node pruning](0051-line-break-pruning.md) | M3 | implemented |
+| 0052 | [The screen export profile — clickable internal links](0052-screen-profile.md) | M3 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind
