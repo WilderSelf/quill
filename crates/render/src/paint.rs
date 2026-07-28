@@ -110,6 +110,7 @@ pub fn paint_page(
                 color,
                 font_size_pt,
                 leading_pt,
+                ..
             } => {
                 let rgb = quill_color::to_srgb(color);
                 // The baseline comes from the shared font crate, which is also where the PDF writer
@@ -148,7 +149,9 @@ pub fn paint_page(
                         .map(|s| (quill_color::to_srgb(&s.color), s.width_pt)),
                 });
             }
-            PlacedBlock::Image { frame, asset_id } => {
+            PlacedBlock::Image {
+                frame, asset_id, ..
+            } => {
                 let Some(proxy) = proxies.get(asset_id) else {
                     continue; // no proxy yet, or an unresolvable link — draw nothing
                 };
@@ -422,6 +425,7 @@ mod tests {
         let font = Font::bundled();
         let mut page = lay_out(&doc, &font, &NoHyphenator)[0].clone();
         page.statics = vec![PlacedBlock::Text {
+            source: quill_core_model::BlockId::UNASSIGNED,
             frame: quill_core_model::Rect {
                 x_pt: 0.0,
                 y_pt: 600.0,

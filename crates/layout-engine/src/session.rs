@@ -37,8 +37,8 @@ use quill_core_model::{Block, BlockId, Document};
 use quill_text_layout::{Hyphenator, RunMetrics};
 
 use crate::{
-    flow, measure_block, AssetIndex, DocumentTemplate, FlowState, LaidOutPage, Measured, Measurer,
-    PageTemplate, StyleSheet,
+    flow, heading_index, measure_block, AssetIndex, DocumentTemplate, FlowState, HeadingEntry,
+    LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
 };
 
 /// What a relayout actually did.
@@ -73,6 +73,12 @@ pub struct LayoutResult {
     /// Indices of pages whose content differs from the previous pass — what a viewport needs to
     /// repaint, and nothing more.
     pub changed_pages: Vec<usize>,
+    /// Which page each heading landed on (spec 0040), in document order.
+    ///
+    /// Rebuilt from `pages` on every pass rather than carried forward, because an incremental pass
+    /// reuses whole pages and a carried-forward index would go stale exactly when the document was
+    /// edited. See [`crate::heading_index`].
+    pub headings: Vec<HeadingEntry>,
 }
 
 /// Identifies a measurement: everything a broken paragraph depends on.
@@ -189,6 +195,7 @@ impl LayoutSession {
             // Nothing changed. Note this still returns the previous pages rather than recomputing:
             // a no-op edit (or a repaint request) must cost nothing.
             return LayoutResult {
+                headings: heading_index(doc, &self.pages),
                 pages: self.pages.clone(),
                 stats: LayoutStats {
                     pages_reused: self.pages.len(),
@@ -298,6 +305,7 @@ impl LayoutSession {
         self.primed = true;
 
         LayoutResult {
+            headings: heading_index(doc, &pages),
             pages,
             stats: LayoutStats {
                 blocks_measured: measured,
@@ -769,6 +777,113 @@ mod tests {
             settled.stats.blocks_measured, 0,
             "a page list that did not change must not invalidate either"
         );
+    }
+
+    #[test]
+    fn the_heading_index_survives_an_incremental_pass() {
+        // The load-bearing test for spec 0040, and the reason the index is derived from the final
+        // pages rather than accumulated during pagination.
+        //
+        // An incremental pass reuses whole pages, so an index built up as blocks were placed would
+        // be missing every heading on a reused page — and missing them exactly when the document had
+        // just been edited, which is always. Here 495+ of 500-odd pages are reused and the index
+        // must still be complete and still agree with a cold pass.
+        let mut doc = doc_of(400);
+        for i in [0usize, 100, 200, 300] {
+            let id = doc.content[i].id();
+            doc.content[i] = Block::heading(1, format!("Chapter at {i}"), INK);
+            doc.content[i].set_id(id);
+        }
+
+        let mut session = LayoutSession::new();
+        let cold = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(cold.headings.len(), 4, "all four headings on the cold pass");
+        assert_eq!(
+            cold.headings,
+            crate::heading_index(&doc, &crate::lay_out(&doc, &MONO, &NoHyphenator)),
+            "the session and the one-shot path must agree"
+        );
+
+        // Edit one paragraph late in the document. Most pages are reused.
+        edit(
+            &mut doc,
+            350,
+            "an edited paragraph with quite a few more words in it than before",
+        );
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            after.stats.pages_reused > 0,
+            "the fixture must actually reuse pages, or this proves nothing"
+        );
+        assert_eq!(
+            after.headings.len(),
+            4,
+            "a reused page's headings must not vanish from the index"
+        );
+        assert_eq!(
+            after.headings,
+            crate::heading_index(&doc, &crate::lay_out(&doc, &MONO, &NoHyphenator)),
+            "and the incremental index must equal a full pass's"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_moves_a_heading_updates_its_page_number() {
+        // The other direction: the index must not merely survive, it must be current. A heading
+        // pushed onto a later page has to report the later page, or a table of contents built on
+        // this would print numbers that were right one edit ago.
+        let mut doc = doc_of(200);
+        let id = doc.content[150].id();
+        doc.content[150] = Block::heading(1, "Late chapter", INK);
+        doc.content[150].set_id(id);
+
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).headings[0].page_index;
+
+        // Insert a page's worth of content ahead of it.
+        let mut inserted: Vec<Block> = (0..120)
+            .map(|i| {
+                Block::body(
+                    format!("inserted paragraph number {i} with several words"),
+                    INK,
+                )
+            })
+            .collect();
+        for b in &mut inserted {
+            let fresh = doc.new_block_id();
+            b.set_id(fresh);
+        }
+        doc.content.splice(10..10, inserted);
+        doc.bump_revision();
+
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(after.headings.len(), 1);
+        assert!(
+            after.headings[0].page_index > before,
+            "the heading moved to a later page ({before} -> {}) and the index must say so",
+            after.headings[0].page_index
+        );
+        assert_eq!(
+            after.headings,
+            crate::heading_index(&doc, &crate::lay_out(&doc, &MONO, &NoHyphenator))
+        );
+    }
+
+    #[test]
+    fn a_no_op_relayout_still_reports_the_headings() {
+        // The early-return path returns the previous pages without recomputing. It must still hand
+        // back an index, or a caller that repaints without editing would see the TOC empty itself.
+        let mut doc = doc_of(50);
+        let id = doc.content[10].id();
+        doc.content[10] = Block::heading(1, "A chapter", INK);
+        doc.content[10].set_id(id);
+
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(again.stats.blocks_measured, 0, "must be the no-op path");
+        assert_eq!(again.headings, first.headings);
+        assert_eq!(again.headings.len(), 1);
     }
 
     #[test]
