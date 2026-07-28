@@ -19,7 +19,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
-| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | in progress — 0062, 0063, 0064 and 0066 shipped; 0065 and 0067 remain |
+| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | complete — specs 0062–0067 shipped; the contents-list re-expression of 0067 is carried as a known issue |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
@@ -2147,7 +2147,7 @@ just edited.
 
 ### 0067 tabs-and-leaders
 
-**Tab stops and leaders** · size: medium · branch: `feat/tabs-and-leaders`
+**Tab stops and leaders** · size: medium · branch: `feat/tabs-and-leaders` · **shipped (mechanism)**
 
 A paragraph gains an ordered list of tab stops, each with a position, an alignment (left, centre,
 right, decimal) and an optional leader character. A `\t` in a run advances to the next stop.
@@ -2229,6 +2229,18 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   measure can still be drawn past it. The fix is to emit the kerning as `TJ` adjustments — the same
   array justification already uses — which moves every export byte-hash in the workspace and so is
   an increment with a re-derivation, not a patch.
+
+- **The generated contents list is not yet re-expressed through spec 0067's tab mechanism.** 0067
+  ships the mechanism and 0041's hand-rolled version still stands beside it. The analysis is done:
+  laying `"{clipped title}\t{number}"` against one right stop at `width - indent`, with a `.` leader
+  of `gap_pt: TOC_LEADER_GAP_PT`, reproduces every **x position** and the leader's dot count exactly.
+  Two **widths** do not. `measure_toc` gives the title part `w_pt: title_max` — the column it was
+  clipped to, not the text's width — and the leader part `w_pt: leader_end - leader_x`, the gap
+  rather than the drawn dots; the mechanism reports each segment's measured width. Those fields are
+  placed geometry that spec 0050's preflight reads, so the choice is a real one about what `w_pt` on
+  a placed part *means*, and it should be made with the preflight consequences looked at rather than
+  settled by whichever value keeps a digest green. The ellipsis clipping stays contents-specific
+  either way: it is not a tab rule, it is "an entry does not wrap".
 
 ## Open questions
 

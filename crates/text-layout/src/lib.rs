@@ -2604,3 +2604,308 @@ mod format_tests {
         assert!((offsets[1] - 22.0).abs() < 0.001, "got {}", offsets[1]);
     }
 }
+
+// --- spec 0067: tab stops and leaders ---------------------------------------------------------
+
+/// Where a tab stops, how the text there is aligned, and what fills the gap before it.
+///
+/// This crate's own copy of the model's `TabStop`, for the reason `RunFormat` is: `text-layout`
+/// depends on no other quill crate, and the mechanism needs four numbers rather than a document.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabStop {
+    pub position_pt: f32,
+    pub align: TabAlign,
+    pub leader: Option<Leader>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabAlign {
+    #[default]
+    Left,
+    Centre,
+    Right,
+    Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Leader {
+    pub glyph: char,
+    pub gap_pt: f32,
+}
+
+/// One stretch of a tabbed line, placed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabSegment {
+    /// Byte range in the line's text, or `None` for a leader this crate synthesized.
+    pub range: Option<(usize, usize)>,
+    /// The text to draw — a slice of the line for a real segment, repeated glyphs for a leader.
+    pub text: String,
+    /// Offset from the line's origin, in points.
+    pub x_pt: f32,
+    /// Measured width of `text`.
+    pub w_pt: f32,
+    pub is_leader: bool,
+}
+
+/// The decimal separator, stated rather than taken from a locale (spec 0067).
+///
+/// Layout must not depend on the machine that runs it: a document laid out in one locale and
+/// exported in another would put the same number in two places, and the second one is a press file.
+/// `.` is the separator, and a segment with none aligns by its right edge — which is what a bare
+/// integer in a decimal column wants anyway.
+pub const DECIMAL_SEPARATOR: char = '.';
+
+/// Lay a tabbed line against its stops (spec 0067).
+///
+/// `text` is one line, its stretches separated by `\t`. The first stretch starts at the line's
+/// origin; each later one is placed at the first stop past where the previous stretch ended, which
+/// is the standard overrun rule: text that runs past its stop goes to the *next* stop rather than
+/// overlapping what is already there. A stretch with no stop left to go to is placed immediately
+/// after the previous one, so nothing is ever dropped.
+///
+/// Widths come from `measure`, so the caller decides what a segment is measured in — which is how a
+/// tabbed line in a mixed-face paragraph measures each stretch in its own face (spec 0064).
+pub fn lay_tabs(text: &str, stops: &[TabStop], measure: &dyn Fn(&str) -> f32) -> Vec<TabSegment> {
+    let mut out: Vec<TabSegment> = Vec::new();
+    let mut pen = 0.0f32;
+    let mut at = 0usize;
+    let mut next_stop = 0usize;
+
+    for (i, piece) in text.split('\t').enumerate() {
+        let start = at;
+        let end = start + piece.len();
+        at = end + 1; // past the '\t'
+        let w = measure(piece);
+
+        if i == 0 {
+            out.push(TabSegment {
+                range: Some((start, end)),
+                text: piece.to_string(),
+                x_pt: 0.0,
+                w_pt: w,
+                is_leader: false,
+            });
+            pen = w;
+            continue;
+        }
+
+        // The first stop strictly past the pen. Stops already passed are consumed, which is what
+        // makes an overrunning segment land on the *next* one.
+        while next_stop < stops.len() && stops[next_stop].position_pt <= pen {
+            next_stop += 1;
+        }
+        let Some(stop) = stops.get(next_stop).copied() else {
+            // No stop left: butt the segment against what came before rather than lose it.
+            out.push(TabSegment {
+                range: Some((start, end)),
+                text: piece.to_string(),
+                x_pt: pen,
+                w_pt: w,
+                is_leader: false,
+            });
+            pen += w;
+            continue;
+        };
+        next_stop += 1;
+
+        let x = match stop.align {
+            TabAlign::Left => stop.position_pt,
+            TabAlign::Centre => stop.position_pt - w / 2.0,
+            TabAlign::Right => stop.position_pt - w,
+            TabAlign::Decimal => {
+                // The separator sits *at* the stop. A segment with none aligns by its right edge.
+                match piece.find(DECIMAL_SEPARATOR) {
+                    Some(dot) => stop.position_pt - measure(&piece[..dot]),
+                    None => stop.position_pt - w,
+                }
+            }
+        };
+        // Alignment may pull a segment back over what precedes it; the pen wins, because two
+        // stretches of text in the same place is the one outcome no rule here may produce.
+        let x = x.max(pen);
+
+        if let Some(leader) = stop.leader {
+            if let Some(seg) = fill_leader(leader, pen, x, measure) {
+                out.push(seg);
+            }
+        }
+        out.push(TabSegment {
+            range: Some((start, end)),
+            text: piece.to_string(),
+            x_pt: x,
+            w_pt: w,
+            is_leader: false,
+        });
+        pen = x + w;
+    }
+    out
+}
+
+/// A leader filling `from`..`to`, inset by its own gap at each end.
+///
+/// A whole number of repetitions, clipped to the gap: a half-drawn dot at the end of a contents
+/// entry is the thing a reader notices. `None` when there is no room for even one.
+fn fill_leader(
+    leader: Leader,
+    from: f32,
+    to: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> Option<TabSegment> {
+    let start = from + leader.gap_pt;
+    let end = to - leader.gap_pt;
+    if end <= start {
+        return None;
+    }
+    let one = measure(&leader.glyph.to_string());
+    if one <= 0.0 {
+        return None;
+    }
+    let n = ((end - start) / one).floor().max(0.0) as usize;
+    if n == 0 {
+        return None;
+    }
+    let text: String = std::iter::repeat_n(leader.glyph, n).collect();
+    Some(TabSegment {
+        range: None,
+        text,
+        x_pt: start,
+        w_pt: one * n as f32,
+        is_leader: true,
+    })
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    /// Six points per character, so every expected number below is arithmetic a reader can check.
+    fn mono(s: &str) -> f32 {
+        6.0 * s.chars().count() as f32
+    }
+
+    fn stop(position_pt: f32, align: TabAlign) -> TabStop {
+        TabStop {
+            position_pt,
+            align,
+            leader: None,
+        }
+    }
+
+    fn placed(text: &str, stops: &[TabStop]) -> Vec<TabSegment> {
+        lay_tabs(text, stops, &mono)
+    }
+
+    #[test]
+    fn each_alignment_places_its_segment_to_a_hundredth_of_a_point() {
+        // "ab" is 12 pt wide against a stop at 100.
+        let cases = [
+            (TabAlign::Left, 100.0),
+            (TabAlign::Centre, 94.0),
+            (TabAlign::Right, 88.0),
+        ];
+        for (align, want) in cases {
+            let segs = placed("x\tab", &[stop(100.0, align)]);
+            assert_eq!(segs.len(), 2);
+            assert!(
+                (segs[1].x_pt - want).abs() < 0.01,
+                "{align:?}: expected {want}, got {}",
+                segs[1].x_pt
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_stop_aligns_the_separator_and_not_the_segment() {
+        // "12.50" — the '.' is the third character, so its left edge is 12 pt into the segment and
+        // the segment starts 12 pt before the stop.
+        let segs = placed("x\t12.50", &[stop(100.0, TabAlign::Decimal)]);
+        assert!((segs[1].x_pt - 88.0).abs() < 0.01, "got {}", segs[1].x_pt);
+
+        // Two numbers with different digit counts put their separators in the same place.
+        let a = placed("x\t7.5", &[stop(100.0, TabAlign::Decimal)]);
+        let b = placed("x\t1234.5", &[stop(100.0, TabAlign::Decimal)]);
+        let sep = |segs: &[TabSegment]| {
+            let s = &segs[1];
+            s.x_pt + mono(&s.text[..s.text.find('.').unwrap()])
+        };
+        assert!((sep(&a) - sep(&b)).abs() < 0.01);
+
+        // A segment with no separator aligns by its right edge, which is what a bare integer in a
+        // decimal column wants.
+        let n = placed("x\t42", &[stop(100.0, TabAlign::Decimal)]);
+        assert!((n[1].x_pt - 88.0).abs() < 0.01, "got {}", n[1].x_pt);
+    }
+
+    #[test]
+    fn text_that_overruns_its_stop_goes_to_the_next_one() {
+        // The first stretch is 120 pt wide, past the 100 pt stop, so the second stretch takes the
+        // 200 pt stop instead of overlapping.
+        let stops = [stop(100.0, TabAlign::Left), stop(200.0, TabAlign::Left)];
+        let segs = placed("aaaaaaaaaaaaaaaaaaaa\tb", &stops);
+        assert!((segs[1].x_pt - 200.0).abs() < 0.01, "got {}", segs[1].x_pt);
+    }
+
+    #[test]
+    fn a_segment_with_no_stop_left_is_placed_rather_than_lost() {
+        let segs = placed("a\tb\tc", &[stop(100.0, TabAlign::Left)]);
+        assert_eq!(segs.len(), 3);
+        assert!((segs[1].x_pt - 100.0).abs() < 0.01);
+        // "b" is 6 pt wide, so "c" butts against it at 106.
+        assert!((segs[2].x_pt - 106.0).abs() < 0.01, "got {}", segs[2].x_pt);
+        assert_eq!(segs[2].text, "c");
+    }
+
+    #[test]
+    fn a_leader_fills_whole_repetitions_and_never_overlaps_either_side() {
+        // Pen at 6 ("a"), stop at 100 right-aligned with "b" (6 pt) → segment at 94. Gap 2 pt each
+        // side leaves 8..92, i.e. 84 pt, i.e. 14 whole dots.
+        let stops = [TabStop {
+            position_pt: 100.0,
+            align: TabAlign::Right,
+            leader: Some(Leader {
+                glyph: '.',
+                gap_pt: 2.0,
+            }),
+        }];
+        let segs = placed("a\tb", &stops);
+        assert_eq!(segs.len(), 3);
+        let leader = &segs[1];
+        assert!(leader.is_leader);
+        assert_eq!(leader.text.chars().count(), 14);
+        assert!((leader.x_pt - 8.0).abs() < 0.01, "got {}", leader.x_pt);
+        // Clipped: the drawn leader ends before the text, with the gap intact.
+        assert!(leader.x_pt + leader.w_pt <= 92.0 + 0.01);
+        assert!(leader.x_pt >= 6.0 + 2.0 - 0.01);
+        assert!(segs[2].x_pt >= leader.x_pt + leader.w_pt);
+    }
+
+    #[test]
+    fn a_leader_with_no_room_draws_nothing_rather_than_a_partial_glyph() {
+        let stops = [TabStop {
+            position_pt: 10.0,
+            align: TabAlign::Left,
+            leader: Some(Leader {
+                glyph: '.',
+                gap_pt: 2.0,
+            }),
+        }];
+        // Pen at 6, stop at 10: 4 pt of gap, 2 pt each side leaves nothing.
+        let segs = placed("a\tb", &stops);
+        assert!(segs.iter().all(|s| !s.is_leader), "{segs:?}");
+    }
+
+    #[test]
+    fn alignment_may_not_pull_a_segment_back_over_the_text_before_it() {
+        // A right stop at 20 with a 60 pt segment would start at -40; the pen wins.
+        let segs = placed("aa\tbbbbbbbbbb", &[stop(20.0, TabAlign::Right)]);
+        assert!((segs[1].x_pt - 12.0).abs() < 0.01, "got {}", segs[1].x_pt);
+    }
+
+    #[test]
+    fn a_line_with_no_tab_is_one_segment_at_the_origin() {
+        let segs = placed("just some prose", &[stop(100.0, TabAlign::Left)]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].x_pt, 0.0);
+        assert_eq!(segs[0].range, Some((0, "just some prose".len())));
+    }
+}

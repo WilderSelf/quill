@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M4 complete; M5 in progress.** M0 (headless PDF/X export) is
+**Status: M0–M5 complete.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -129,8 +129,8 @@ content packs) → **M5** the general typographic core (the neutral core, inline
 styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
 an index, a book) → **M7** graphics and colour.
 **M0–M4 done**; M0's sole open item is the manual POD upload. **M5 is decomposed** into specs
-0062–0067, of which 0062 (the neutral core), 0063 (inline runs), 0064 (the font family), 0065
-(character styles) and 0066 (lists) have shipped; 0067 (tabs and leaders) remains. M6–M7 are named,
+0062–0067, **all of which have shipped**; 0067 ships the tab mechanism and carries the
+contents-list re-expression as a named known issue. M6–M7 are named,
 not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
