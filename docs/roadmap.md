@@ -16,7 +16,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0038 and 0040 shipped |
+| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0040 shipped; 0041–0043 remain |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
 
@@ -931,6 +931,12 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   height into the measurement-cache key, where the same block against a half-full frame and an empty
   one becomes two entries — thrashing the hot path spec 0031 exists to keep cold. That design
   question is what the increment would have to answer, and it deserves its own spec.
+
+  Spec 0039 then hit it a third time: its roadmap entry promised breaking between rows with the
+  header repeating on the continuation, and both are blocked on exactly this. A table is one block,
+  so it cannot break between rows, and with no continuation there is nothing for a header to repeat
+  onto. **Three callers now want one mechanism** — paragraphs, stat blocks and tables — which is the
+  strongest argument yet that it should be built once, deliberately, rather than three times.
 
 - **A stat block's attribute keys wrap mid-key in a narrow measure.** `Armour Class: 15 (leather,
   shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so

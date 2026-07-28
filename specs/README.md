@@ -47,6 +47,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0036 | [Document templates + `quill new`](0036-document-templates.md) | M2 | implemented |
 | 0037 | [Decoration primitive: fills, rules, borders](0037-decoration-primitive.md) | M2 | implemented |
 | 0038 | [`Block::StatBlock`](0038-stat-block.md) | M2 | implemented |
+| 0039 | [`Block::Table` — tables and random tables](0039-tables.md) | M2 | implemented |
 | 0040 | [Heading index](0040-heading-index.md) | M2 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).

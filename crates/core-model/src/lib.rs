@@ -8,7 +8,7 @@ use std::fmt;
 
 /// Re-exported so consumers get the component types from the model they appear in, rather than
 /// having to add a dependency on `quill-components-ttrpg` to name a field of `Block` (spec 0038).
-pub use quill_components_ttrpg::{RandomTable, StatBlock, TableEntry};
+pub use quill_components_ttrpg::{RandomTable, StatBlock, Table, TableEntry};
 use serde::{Deserialize, Serialize};
 
 mod container;
@@ -250,6 +250,13 @@ pub enum Block {
         /// preflight surface for no authoring gain.
         color: Color,
     },
+    /// A table — an equipment list, an encounter table, a random table (spec 0039).
+    Table {
+        #[serde(default)]
+        id: BlockId,
+        table: Table,
+        color: Color,
+    },
     Image {
         #[serde(default)]
         id: BlockId,
@@ -264,7 +271,8 @@ impl Block {
             Block::Heading { id, .. }
             | Block::Body { id, .. }
             | Block::Image { id, .. }
-            | Block::StatBlock { id, .. } => *id,
+            | Block::StatBlock { id, .. }
+            | Block::Table { id, .. } => *id,
         }
     }
 
@@ -273,7 +281,8 @@ impl Block {
             Block::Heading { id, .. }
             | Block::Body { id, .. }
             | Block::Image { id, .. }
-            | Block::StatBlock { id, .. } => *id = new,
+            | Block::StatBlock { id, .. }
+            | Block::Table { id, .. } => *id = new,
         }
     }
 
@@ -304,7 +313,7 @@ impl Block {
             Block::Heading { style, .. } | Block::Body { style, .. } => *style = Some(name.into()),
             // Neither has one paragraph to style: an image has none, and a stat block is a
             // composite whose parts resolve `statblock-*` individually.
-            Block::Image { .. } | Block::StatBlock { .. } => {}
+            Block::Image { .. } | Block::StatBlock { .. } | Block::Table { .. } => {}
         }
         self
     }
@@ -378,6 +387,11 @@ pub const STATBLOCK_TITLE_STYLE: &str = "statblock-title";
 pub const STATBLOCK_ATTR_STYLE: &str = "statblock-attr";
 /// A stat block's prose sections — overview, details, actions, reactions.
 pub const STATBLOCK_BODY_STYLE: &str = "statblock-body";
+
+/// A table's header row (spec 0039).
+pub const TABLE_HEADER_STYLE: &str = "table-header";
+/// A table's body cells.
+pub const TABLE_CELL_STYLE: &str = "table-cell";
 
 /// The style name for a heading of the given level (`h1`..`h6`).
 pub fn heading_style_name(level: u8) -> String {
@@ -455,6 +469,30 @@ impl Default for StyleSheet {
                 space_after_pt: 3.0,
             },
         );
+        // Table treatment (spec 0039), on the same principle as the stat block's: a table dropped
+        // into a document should already read as one.
+        paragraph.insert(
+            TABLE_HEADER_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: 9.0,
+                leading_pt: 11.5,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+            },
+        );
+        paragraph.insert(
+            TABLE_CELL_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: 9.0,
+                leading_pt: 11.5,
+                // Ragged: a table cell is a narrow measure, and justifying one opens rivers a
+                // paragraph of the same text would not show.
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+            },
+        );
         StyleSheet { paragraph }
     }
 }
@@ -474,7 +512,9 @@ impl StyleSheet {
             Block::Body { style, .. } => style.clone().unwrap_or_else(|| BODY_STYLE.to_string()),
             // A composite has no single paragraph treatment; its parts resolve `statblock-*`
             // themselves. `resolve` must still be total, so both fall back to the default.
-            Block::Image { .. } | Block::StatBlock { .. } => return ParagraphStyle::default(),
+            Block::Image { .. } | Block::StatBlock { .. } | Block::Table { .. } => {
+                return ParagraphStyle::default()
+            }
         };
         self.paragraph
             .get(&named)

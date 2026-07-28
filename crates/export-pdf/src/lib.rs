@@ -195,7 +195,8 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
         let color = match block {
             Block::Heading { color, .. }
             | Block::Body { color, .. }
-            | Block::StatBlock { color, .. } => Some(color),
+            | Block::StatBlock { color, .. }
+            | Block::Table { color, .. } => Some(color),
             Block::Image { .. } => None,
         };
         let Some(color) = color else { continue };
@@ -425,6 +426,18 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
                 ] {
                     for line in section {
                         set.extend(line.chars());
+                    }
+                }
+            }
+            Block::Table { table, .. } => {
+                // Same silent-failure surface as the stat block: a header or cell this collector
+                // misses renders as `.notdef` boxes with no error anywhere.
+                for cell in table.header.iter().flatten() {
+                    set.extend(cell.chars());
+                }
+                for row in &table.rows {
+                    for cell in row {
+                        set.extend(cell.chars());
                     }
                 }
             }
@@ -908,7 +921,12 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    /// Changed by spec 0038: `StyleSheet::default()` gained the three built-in `statblock-*`
+    /// Changed by spec 0039: `StyleSheet::default()` gained the two built-in `table-*` styles, so
+    /// `doc.to_json()` changed and with it the document identifier. Verified the same way as spec
+    /// 0038's move: both files are 8559 bytes and differ in exactly 120, every one inside the XMP
+    /// `DocumentID`/`InstanceID` or the trailer `/ID`. No content stream moved.
+    ///
+    /// Previously changed by spec 0038: `StyleSheet::default()` gained the three built-in `statblock-*`
     /// styles, so `doc.to_json()` changed and with it the document identifier. Verified as
     /// identifier-only rather than accepted: exporting the sample against the committed parity ICC
     /// before and after gives files of identical length (8559 bytes) differing in exactly 108
@@ -927,7 +945,7 @@ mod tests {
     /// Verified by inspecting the emitted text operators rather than by accepting the new number:
     /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
     /// only by being ragged-left.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x228f_8f78_c1fc_fd8e;
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x6169_f912_df20_71ee;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
