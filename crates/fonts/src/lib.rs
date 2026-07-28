@@ -17,6 +17,10 @@
 //! `export-pdf` measures through this crate too, so there is exactly one shaper in the workspace
 //! and no way for the two paths to drift.
 
+mod hyphenate;
+
+pub use hyphenate::HypherHyphenator;
+
 use quill_text_layout::{CharMetrics, RunMetrics};
 use ttf_parser::{Face as TtfFace, GlyphId};
 
@@ -214,6 +218,12 @@ impl CharMetrics for Font {
 /// Run measurement backed by real shaping: kerning and ligatures are accounted for across the whole
 /// run, unlike a per-character sum.
 impl RunMetrics for Font {
+    /// The font's own ascent, so a baseline snapped by the layout engine (spec 0058) lands where
+    /// the writer and the renderer actually draw it — all three read this one number.
+    fn ascent_pt(&self, size_pt: f32) -> f32 {
+        Font::ascent_pt(self, size_pt)
+    }
+
     fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
         let Some(face) = rustybuzz::Face::from_slice(&self.program, 0) else {
             // Degrade to the kerning-free per-char sum rather than panic.

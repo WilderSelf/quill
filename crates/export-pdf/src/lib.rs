@@ -17,13 +17,41 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use quill_color::within_ink_limit_pct;
-use quill_core_model::{page_geom, Asset, Block, Color, Document, PageGeom, PageSetup, Rect};
+use quill_core_model::{
+    page_geom, Asset, Block, Color, Document, FieldValue, PageGeom, PageSetup, Rect,
+};
+
+/// Lay a document out **for the press**: exactly what [`export`] hands the writer.
+///
+/// The counterpart of [`quill_render::lay_out_for_screen`], and the reason both exist: the defect
+/// spec 0059 fixed was two call sites disagreeing about a layout input, and two named functions is
+/// what lets a test assert they do not. The only difference between them is that this measures
+/// through the *subset* font built from the document's used characters — and a subset carries the
+/// same advances, so the two agree about every line break.
+pub fn lay_out_for_press(
+    doc: &Document,
+    opts: &ExportOptions,
+) -> Result<Vec<quill_layout_engine::LaidOutPage>, ExportError> {
+    let font = build_font(opts, &collect_doc_chars(doc))?;
+    let shaper = font.shaper();
+    Ok(quill_layout_engine::lay_out(
+        doc,
+        &shaper,
+        &quill_fonts::HypherHyphenator,
+    ))
+}
+
+/// Re-exported from its new home in `quill-fonts` (spec 0059).
+///
+/// It used to live here, private, which is exactly why `quill render` could not reach it and laid
+/// out with `NoHyphenator` — screen and press then broke lines differently. The re-export keeps the
+/// old path working for anything that named it.
+pub use quill_fonts::HypherHyphenator;
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 use thiserror::Error;
 
 mod fonts;
 mod geom;
-mod hyphenate;
 mod icc;
 mod images;
 mod preset;
@@ -319,6 +347,7 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
             | Block::Body { color, .. }
             | Block::StatBlock { color, .. }
             | Block::Table { color, .. }
+            | Block::Component { color, .. }
             | Block::Toc { color, .. } => Some(color),
             Block::Image { .. } => None,
         };
@@ -475,9 +504,9 @@ pub fn export(
     let used_chars = collect_doc_chars(doc);
     let font = build_font(opts, &used_chars)?;
     let shaper = font.shaper();
-    // Real en-US hyphenation (spec 0018 incr. 2): words break at legal syllable points, tightening
-    // lines and splitting over-wide words. Built once (stateless), passed to the layout pass.
-    let hyphenator = hyphenate::HypherHyphenator;
+    // Real en-US hyphenation (spec 0018 incr. 2, shared with the screen path by spec 0059): words
+    // break at legal syllable points, tightening lines and splitting over-wide words.
+    let hyphenator = quill_fonts::HypherHyphenator;
     let pages = quill_layout_engine::lay_out(doc, &shaper, &hyphenator);
 
     // Colour checks on the *model* cannot see geometry the engine synthesized (spec 0037). A
@@ -777,6 +806,36 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
                 set.extend('0'..='9');
                 set.insert('.');
                 set.insert('…');
+            }
+            Block::Component { fields, .. } => {
+                // Every authored field of every instance (spec 0054). Same silent-failure surface
+                // as the two bundled components: a character this collector misses renders as a
+                // `.notdef` box with no error anywhere, so the walk is exhaustive over the value
+                // kinds rather than over the ones the bundled definitions happen to use.
+                for value in fields.values() {
+                    match value {
+                        FieldValue::Text(t) => set.extend(t.chars()),
+                        FieldValue::Lines(lines) => {
+                            for l in lines {
+                                set.extend(l.chars());
+                            }
+                        }
+                        FieldValue::Pairs(pairs) => {
+                            for (k, v) in pairs {
+                                set.extend(k.chars());
+                                set.extend(v.chars());
+                            }
+                        }
+                        FieldValue::Rows(rows) => {
+                            for row in rows {
+                                for cell in row {
+                                    set.extend(cell.chars());
+                                }
+                            }
+                        }
+                        FieldValue::Widths(_) | FieldValue::Flag(_) => {}
+                    }
+                }
             }
             Block::Image { .. } => {}
         }
@@ -1909,9 +1968,7 @@ mod tests {
     /// Lay a document out exactly as [`export`] does — same font, same shaper, same hyphenator — so
     /// a test can compare the emitted PDF against the geometry the writer was actually handed.
     fn lay_out_like_export(doc: &Document, opts: &ExportOptions) -> Vec<LaidOutPage> {
-        let font = build_font(opts, &collect_doc_chars(doc)).expect("font");
-        let shaper = font.shaper();
-        quill_layout_engine::lay_out(doc, &shaper, &hyphenate::HypherHyphenator)
+        super::lay_out_for_press(doc, opts).expect("press layout")
     }
 
     /// Every `<n> 0 obj … endobj` body in the file, keyed by object number.

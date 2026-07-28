@@ -35,8 +35,14 @@ enum Command {
         /// Output path for the `.icc` file.
         output: String,
     },
-    /// Pack a `document.json` and its linked assets into a portable `.tpub` container.
-    Pack(PackArgs),
+    /// Bundle a `document.json` and its linked assets into a portable `.tpub` container.
+    ///
+    /// Named for the artifact it makes rather than the verb: `pack` now means the `.qpack` content
+    /// pack (spec 0055), which is a different thing entirely.
+    Tpub(TpubArgs),
+    /// Work with `.qpack` content packs (spec 0055).
+    #[command(subcommand)]
+    Pack(PackCommand),
     /// Render one page to a PNG, as the on-screen canvas would draw it (spec 0033).
     Render(RenderArgs),
     /// Start a new document from a built-in template (spec 0036).
@@ -98,12 +104,63 @@ struct RenderArgs {
 }
 
 #[derive(Args)]
-struct PackArgs {
-    /// Path to the `document.json` to pack. Its linked assets are resolved relative to it.
+struct TpubArgs {
+    /// Path to the `document.json` to bundle. Its linked assets are resolved relative to it.
     input: String,
     /// Output `.tpub` path.
     #[arg(short, long)]
     output: String,
+}
+
+#[derive(Subcommand)]
+enum PackCommand {
+    /// Show a pack's identity, provenance and contents.
+    Info {
+        /// Path to the `.qpack` file.
+        input: String,
+    },
+    /// Install a `.qpack` so documents that require it can resolve it (spec 0056).
+    Install {
+        /// Path to the `.qpack` file.
+        input: String,
+        /// Pack root. Defaults to `$QUILL_PACKS`, then the platform data directory.
+        #[arg(long)]
+        packs: Option<String>,
+        /// Replace a different pack already installed at this name and version.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Turn a finished book into a reusable pack (spec 0057).
+    ///
+    /// Its templates, styles and component definitions travel; its content does not.
+    Extract {
+        /// Path to the document (`document.json` or `.tpub`) to extract the look from.
+        input: String,
+        /// Pack slug, e.g. `ashen-vault`.
+        #[arg(long)]
+        name: String,
+        /// Human-readable title. Defaults to the slug.
+        #[arg(long)]
+        title: Option<String>,
+        /// The pack's own content version, e.g. `1.0.0`.
+        #[arg(long)]
+        version: String,
+        /// Where this pack comes from. Required: a pack with no provenance cannot be installed.
+        #[arg(long)]
+        source: String,
+        /// The licence the content is offered under. Required, for the same reason.
+        #[arg(long)]
+        license: String,
+        /// Output `.qpack` path.
+        #[arg(short, long)]
+        output: String,
+    },
+    /// List installed packs with their provenance.
+    List {
+        /// Pack root. Defaults to `$QUILL_PACKS`, then the platform data directory.
+        #[arg(long)]
+        packs: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -194,6 +251,18 @@ struct Loaded {
 /// nothing owns. A bare `document.json` resolves its assets against its own directory — not the
 /// process working directory, which is what the writer used to assume.
 fn load_doc(input: &Option<String>) -> Result<Loaded, String> {
+    let mut loaded = load_doc_unresolved(input)?;
+    // Content packs are resolved at load, before anything can lay the document out (spec 0056).
+    // A requirement that does not resolve stops here with a typed error naming the pack: falling
+    // back to the default face would produce a book that looks subtly wrong and is discovered at
+    // the print shop.
+    let root = quill_core_model::pack_root(None);
+    let packs = loaded.doc.resolve_packs(&root).map_err(|e| e.to_string())?;
+    loaded.doc.apply_packs(&packs).map_err(|e| e.to_string())?;
+    Ok(loaded)
+}
+
+fn load_doc_unresolved(input: &Option<String>) -> Result<Loaded, String> {
     let Some(path) = input else {
         return Ok(Loaded {
             doc: Document::sample(),
@@ -251,6 +320,31 @@ fn resolve_preset(name: &Option<String>) -> Result<PodPreset, String> {
         );
     }
     Ok(preset)
+}
+
+/// Styles whose leading is not a whole multiple of the document's baseline grid (spec 0058).
+///
+/// Printed rather than returned as a finding: it is a *design* note, not a press failure — the file
+/// will print correctly, it just will not be on the grid its author asked for. A silent
+/// misalignment is the failure mode this exists to prevent; a list of the styles that need their
+/// leading rounded is a fix that takes a minute.
+fn print_grid_note(doc: &Document) {
+    let Some(grid) = doc.page_setup.baseline_grid else {
+        return;
+    };
+    let off = grid.off_grid_styles(&doc.styles);
+    if off.is_empty() {
+        return;
+    }
+    println!(
+        "baseline grid: {} style(s) have a leading that is not a multiple of {:.2}pt, so only \
+         their first line lands on the grid:",
+        off.len(),
+        grid.step_pt
+    );
+    for (name, leading) in off {
+        println!("  {name}: leading {leading:.2}pt");
+    }
 }
 
 fn print_report(report: &PreflightReport) {
@@ -312,10 +406,11 @@ fn main() -> ExitCode {
             };
             // No ICC supplied here, so the OutputIntent check will report — that is expected
             // for a bare preflight and signals what an export would still need.
+            print_grid_note(&loaded.doc);
             let report = preflight(
                 &loaded.doc,
                 &ExportOptions {
-                    asset_root: loaded.asset_root,
+                    asset_root: loaded.asset_root.clone(),
                     preset,
                     ..Default::default()
                 },
@@ -395,7 +490,7 @@ fn main() -> ExitCode {
             }
         }
 
-        Command::Pack(args) => {
+        Command::Tpub(args) => {
             let loaded = match load_doc(&Some(args.input)) {
                 Ok(d) => d,
                 Err(e) => {
@@ -434,6 +529,203 @@ fn main() -> ExitCode {
             }
         }
 
+        Command::Pack(PackCommand::Info { input }) => {
+            let path = Path::new(&input);
+            let read = if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+            {
+                std::fs::read_to_string(path)
+                    .map_err(|e| quill_core_model::LoadError::Container(e.to_string()))
+                    .and_then(|t| quill_core_model::PackManifest::from_json(&t))
+            } else {
+                quill_core_model::Qpack::read_manifest(path)
+            };
+            match read {
+                Ok(m) => {
+                    println!("{} {} — {}", m.name, m.version, m.title);
+                    if !m.description.is_empty() {
+                        println!("  {}", m.description);
+                    }
+                    // Provenance first and always, not folded in with the counts: a pack is
+                    // content from a stranger, and where it came from is the thing a person needs
+                    // to see before they install it (spec 0055).
+                    println!("  source:   {}", m.source);
+                    println!("  licence:  {}", m.license);
+                    println!("  format:   pack_version {}", m.pack_version);
+                    println!(
+                        "  contents: {} template(s), {} component definition(s), {} style(s), \
+                         {} asset(s)",
+                        m.templates.len(),
+                        m.components.len(),
+                        m.styles.paragraph.len(),
+                        m.assets.len()
+                    );
+                    for t in &m.templates {
+                        println!("    template  {} — {}", t.name, t.title);
+                    }
+                    for name in m.components.keys() {
+                        println!("    component {name}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {}: {e}", input);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(PackCommand::Install {
+            input,
+            packs,
+            force,
+        }) => {
+            let root = quill_core_model::pack_root(packs.as_deref().map(Path::new));
+            // Extract beside the destination, then install what the manifest declares. The two
+            // steps are separate because the container is validated *before* anything is written
+            // to the pack root — a pack this build refuses must not half-install.
+            let staging = root.join(".staging");
+            let path = Path::new(&input);
+            // A bare `pack.json` installs too, not only a zipped `.qpack`. That is what a pack
+            // *author* has on disk while they are writing one, and making them zip it to try it
+            // would put a build step between an edit and seeing the result (spec 0061).
+            let opened = if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+            {
+                match std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| {
+                        quill_core_model::PackManifest::from_json(&t).map_err(|e| e.to_string())
+                    }) {
+                    Ok(manifest) => quill_core_model::OpenedPack {
+                        manifest,
+                        // Assets resolve beside the manifest, exactly as a document's do.
+                        asset_root: path
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or(Path::new("."))
+                            .to_path_buf(),
+                    },
+                    Err(e) => {
+                        eprintln!("error: {input}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                match quill_core_model::Qpack::open_into(path, &staging) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("error: {input}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            };
+            let result =
+                quill_core_model::install(&opened.manifest, &opened.asset_root, &root, force);
+            let _ = std::fs::remove_dir_all(&staging);
+            match result {
+                Ok(dest) => {
+                    println!(
+                        "installed {} {} to {}",
+                        opened.manifest.name,
+                        opened.manifest.version,
+                        dest.display()
+                    );
+                    println!("  source:  {}", opened.manifest.source);
+                    println!("  licence: {}", opened.manifest.license);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(PackCommand::Extract {
+            input,
+            name,
+            title,
+            version,
+            source,
+            license,
+            output,
+        }) => {
+            let loaded = match load_doc(&Some(input)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let title = title.unwrap_or_else(|| name.clone());
+            let manifest = quill_core_model::PackManifest::extract_from(
+                &loaded.doc,
+                &name,
+                &title,
+                &version,
+                &source,
+                &license,
+            );
+            // Only the furniture art the manifest kept — the same rule the extraction applied, so
+            // the container cannot end up carrying an asset the manifest does not declare.
+            let mut payload: Vec<(String, Vec<u8>)> = Vec::new();
+            for asset in &manifest.assets {
+                let path = loaded.asset_root.join(&asset.path);
+                match std::fs::read(&path) {
+                    Ok(bytes) => payload.push((asset.path.clone(), bytes)),
+                    Err(e) => {
+                        eprintln!("error: asset '{}' ({}): {e}", asset.id, path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            let entries: Vec<(&str, &[u8])> = payload
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            match quill_core_model::Qpack::write(&manifest, Path::new(&output), &entries) {
+                Ok(()) => {
+                    println!(
+                        "wrote {output}: {} {} — {} template(s), {} component definition(s), \
+                         {} style(s), {} furniture asset(s)",
+                        manifest.name,
+                        manifest.version,
+                        manifest.templates.len(),
+                        manifest.components.len(),
+                        manifest.styles.paragraph.len(),
+                        manifest.assets.len()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(PackCommand::List { packs }) => {
+            let root = quill_core_model::pack_root(packs.as_deref().map(Path::new));
+            let found = quill_core_model::installed(&root);
+            if found.is_empty() {
+                println!("no packs installed in {}", root.display());
+                return ExitCode::SUCCESS;
+            }
+            println!("{} pack(s) in {}", found.len(), root.display());
+            for p in &found {
+                println!(
+                    "  {} {} — {}",
+                    p.manifest.name, p.manifest.version, p.manifest.title
+                );
+                println!("    source:  {}", p.manifest.source);
+                println!("    licence: {}", p.manifest.license);
+            }
+            ExitCode::SUCCESS
+        }
+
         Command::Render(args) => {
             let loaded = match load_doc(&args.input) {
                 Ok(d) => d,
@@ -443,10 +735,12 @@ fn main() -> ExitCode {
                 }
             };
             let font = quill_fonts::Font::bundled();
-            // Screen layout goes through the same shaper the exporter uses (spec 0032), so what is
-            // drawn here is what the PDF would contain — that is the whole point of the shared crate.
-            let pages =
-                quill_layout_engine::lay_out(&loaded.doc, &font, &quill_text_layout::NoHyphenator);
+            // Screen layout goes through the same shaper *and the same hyphenator* the exporter
+            // uses (specs 0032, 0059), so what is drawn here is what the PDF would contain — that
+            // is the whole point of the shared crate. Until spec 0059 this passed `NoHyphenator`,
+            // and a document could have a different page count on screen than in the file that went
+            // to the printer.
+            let pages = quill_render::lay_out_for_screen(&loaded.doc, &font);
             let Some(page) = pages.get(args.page) else {
                 eprintln!(
                     "error: page {} out of range (document has {})",

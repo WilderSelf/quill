@@ -8,20 +8,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod component;
 mod session;
 
+use component::measure_component;
 pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
-    toc_entry_style_name, Asset, Block, BlockId, Color, Document, Margins, MasterPage,
-    MasterStatic, PageSetup, ParagraphStyle, Rect, StatBlock, StyleSheet, Table, TextAlign,
-    PAGE_TOKEN, STATBLOCK_ATTR_STYLE, STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE,
-    TABLE_CELL_STYLE, TABLE_HEADER_STYLE, TOC_TITLE_STYLE,
+    builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, Color,
+    ComponentLibrary, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle, Rect,
+    StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
 };
-use quill_text_layout::{
-    justify_paragraph_hyphenated, justify_paragraph_indented, Alignment, Hyphenator, Line,
-    RunMetrics,
-};
+use quill_text_layout::{justify_paragraph_indented, Alignment, Hyphenator, Line, RunMetrics};
 
 /// A positioned rectangular region that content flows into. The layout engine fills a frame
 /// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
@@ -299,6 +297,15 @@ pub trait PageTemplate {
     fn statics(&self, _page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
         Vec::new()
     }
+
+    /// The baseline grid this template's pages are set to (spec 0058), or `None` for none.
+    ///
+    /// On the template rather than passed alongside it, because a grid is page geometry and the
+    /// template is what owns page geometry. Defaulted to `None`, so every existing implementation —
+    /// and every ungridded document — is unchanged.
+    fn baseline_grid(&self) -> Option<BaselineGrid> {
+        None
+    }
 }
 
 /// A template that gives every page the same frames and no static content.
@@ -400,6 +407,14 @@ impl PageTemplate for DocumentTemplate<'_> {
             .collect()
     }
 
+    fn baseline_grid(&self) -> Option<BaselineGrid> {
+        // Measured from the top of the trim box, which is the space the flow cursor already lives
+        // in — so two columns of one page and the two pages of a spread share one ladder.
+        self.page_setup
+            .baseline_grid
+            .filter(BaselineGrid::is_usable)
+    }
+
     fn statics(&self, page_index: usize, metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
         let Some(master) = self.master(page_index) else {
             return Vec::new();
@@ -482,14 +497,31 @@ pub fn lay_out(
     // Authored layout reaches the engine here (spec 0030): margins, columns and master furniture
     // come from the document. With no master and zero margins this is exactly `Frame::full_page`,
     // so a document declaring neither lays out as it always did.
-    lay_out_with_template(
+    assert!(
+        doc.requires.is_empty(),
+        "this document requires content packs that have not been resolved: {}. Call \
+         `Document::apply_packs` with the result of `Document::resolve_packs` before laying it \
+         out — laying it out anyway would set the book in the default face, which is the silent \
+         fallback spec 0056 exists to prevent.",
+        doc.requires
+            .iter()
+            .map(|r| format!("`{}` {}", r.name, r.version))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    lay_out_with_library(
         &doc.content,
         &doc.assets,
         &doc.styles,
+        // The document's own definitions shadow the bundled ones (spec 0054). Built here rather
+        // than inside `flow`, so it is built once per layout rather than once per pass of the
+        // contents fixpoint.
+        &doc.component_library(),
         &DocumentTemplate::new(doc),
         metrics,
         hyphenator,
     )
+    .0
 }
 
 /// Flow `content` into a single [`Frame`], paginating vertically. Equivalent to
@@ -586,8 +618,8 @@ pub(crate) struct PanelSplit {
     /// a *continuation* reserves above its first. Zero for a table, which has no panel edge.
     pub trailing_pt: f32,
     /// The fewest items this panel's fragments may contain — a table's rows and a stat block's
-    /// sections want different answers. See [`MIN_ROWS_PER_FRAGMENT`] and
-    /// [`MIN_SECTIONS_PER_FRAGMENT`].
+    /// sections want different answers, and each definition states its own (spec 0054's
+    /// `SplitDef::min_items`).
     pub min_items: usize,
     /// Prefer moving whole to the next frame over cutting, when the block would fit there entire
     /// (spec 0046).
@@ -618,21 +650,28 @@ impl PanelSplit {
 /// introducing a worse one.
 pub(crate) const MIN_LINES_PER_FRAGMENT: usize = 2;
 
-/// The fewest *sections* a stat-block fragment may contain (spec 0046).
-///
-/// One, not two, and the difference matters. A section is coarse — a whole attributes list, a whole
-/// actions list — so demanding two per fragment can make the smallest legal cut larger than a frame,
-/// at which point nothing is cut and the panel runs off the bottom of the page. That is not a
-/// theoretical worry: it is what the first version of this increment rendered. A widow rule protects
-/// against a stranded *line*; a section is never stranded, because it is a unit the reader
-/// recognises.
-pub(crate) const MIN_SECTIONS_PER_FRAGMENT: usize = 1;
-
-/// The fewest *rows* a table fragment may contain (spec 0045). Two, for the same reason as lines:
-/// one row alone under a repeated header reads as a mistake.
-pub(crate) const MIN_ROWS_PER_FRAGMENT: usize = 2;
-
 impl Measured {
+    /// Distance from this block's flow position `y` down to its **first baseline** (spec 0058), or
+    /// `None` for a block that has no baseline.
+    ///
+    /// Mirrors `place_measured` exactly, and has to: a text block is drawn below its style's
+    /// space-above, and a panel's first run sits at its own `dy_pt` inside the panel. Snapping the
+    /// block's *top* instead would put the box on the grid and the type a few points off it, which
+    /// is the error that looks almost right.
+    pub(crate) fn first_baseline_offset(&self, metrics: &impl RunMetrics) -> Option<f32> {
+        match self {
+            Measured::Text { style, .. } => {
+                Some(style.space_before_pt + metrics.ascent_pt(style.font_size_pt))
+            }
+            Measured::Panel { parts, .. } => parts
+                .first()
+                .map(|p| p.dy_pt + metrics.ascent_pt(p.font_size_pt)),
+            // An image has no baseline. Its top snaps instead, so the block after it starts from a
+            // grid position rather than from wherever the image happened to end.
+            Measured::Image { .. } => None,
+        }
+    }
+
     /// The heights of the items this measurement may be cut between, in order. `None` means
     /// indivisible.
     ///
@@ -881,6 +920,9 @@ pub(crate) struct BlockContext<'a> {
     /// Where the headings landed, for a contents block to render from (spec 0041). Empty on the
     /// first pass of the fixpoint, and for every document that has no contents block.
     pub headings: &'a [HeadingEntry],
+    /// The component definitions this document can resolve (spec 0054): the bundled two, plus
+    /// whatever it or its packs supply.
+    pub components: &'a ComponentLibrary,
 }
 
 pub(crate) fn measure_block(
@@ -894,6 +936,7 @@ pub(crate) fn measure_block(
         assets,
         styles,
         headings,
+        components,
     } = *ctx;
     match block {
         Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
@@ -940,11 +983,40 @@ pub(crate) fn measure_block(
         } => Some(measure_toc(
             title, *max_level, *color, width, styles, headings, metrics,
         )),
-        Block::Table { table, color, .. } => Some(measure_table(
-            table, *color, width, styles, metrics, hyphenator,
+        // The two bundled components are *sugar*: they keep the authored shape a person would
+        // rather write by hand, and convert to definition + fields here (spec 0054), so nothing
+        // measures a stat block or a table twice.
+        Block::Table { table, color, .. } => Some(measure_component(
+            components.get(TABLE_COMPONENT)?,
+            &table.to_fields(),
+            *color,
+            width,
+            styles,
+            metrics,
+            hyphenator,
         )),
-        Block::StatBlock { stat, color, .. } => Some(measure_stat_block(
-            stat, *color, width, styles, metrics, hyphenator,
+        Block::StatBlock { stat, color, .. } => Some(measure_component(
+            components.get(STATBLOCK_COMPONENT)?,
+            &stat.to_fields(),
+            *color,
+            width,
+            styles,
+            metrics,
+            hyphenator,
+        )),
+        Block::Component {
+            def, fields, color, ..
+        } => Some(measure_component(
+            // A definition that does not resolve is skipped, exactly as an unresolved image asset
+            // is. Layout has no error channel by design; a *malformed* definition is refused at
+            // load, where there is one.
+            components.get(def.as_str())?,
+            fields,
+            *color,
+            width,
+            styles,
+            metrics,
+            hyphenator,
         )),
         Block::Image { asset, .. } => {
             // Resolve the asset id. If not found, skip this block (no panic).
@@ -961,328 +1033,6 @@ pub(crate) fn measure_block(
             ))
         }
     }
-}
-
-/// Padding between a stat block's panel edge and its text, on all four sides.
-///
-/// A constant rather than an authored field: the panel is a built-in component whose whole value is
-/// that it looks right with no authoring, and a padding a user could set to zero would let text sit
-/// on the rule.
-pub const STATBLOCK_PADDING_PT: f32 = 6.0;
-
-/// The panel's background tint. 8% black — enough to read as a panel on paper, far enough inside
-/// the ink limit that it can never be the thing that fails preflight.
-const STATBLOCK_FILL: Color = Color::Gray { v: 0.92 };
-
-/// The panel's outer rule.
-const STATBLOCK_STROKE: Stroke = Stroke {
-    color: Color::Gray { v: 0.35 },
-    width_pt: 0.75,
-};
-
-/// Thickness of the hairlines that separate a stat block's sections.
-const SECTION_RULE_PT: f32 = 0.5;
-
-/// Space above and below each section rule.
-const SECTION_RULE_GAP_PT: f32 = 2.5;
-
-/// Break a stat block into a padded, tinted, ruled panel of styled runs (spec 0038).
-///
-/// The sections are laid in the order a table reads them — name, attributes, then the prose
-/// sections — each through the same Knuth-Plass path as body text, so a stat block's justification,
-/// hyphenation and metrics are the document's and not a second implementation.
-fn measure_stat_block(
-    stat: &StatBlock,
-    color: Color,
-    width: f32,
-    styles: &StyleSheet,
-    metrics: &impl RunMetrics,
-    hyphenator: &impl Hyphenator,
-) -> (Measured, f32) {
-    let inner_w = (width - STATBLOCK_PADDING_PT * 2.0).max(1.0);
-    let mut parts: Vec<PanelPart> = Vec::new();
-    let mut y = STATBLOCK_PADDING_PT;
-
-    // Name, overview, attributes, details, actions, reactions — the order `StatBlock`'s own doc
-    // comment states, which is the order the compact layout this mirrors reads in. Getting it wrong
-    // puts the creature's type *after* its armour class, which is visibly not a stat block; the
-    // first draft did exactly that and only the render showed it.
-    //
-    // `Section` marks where a rule goes: after the name, and between each group that follows.
-    let mut runs: Vec<(String, &str, bool)> =
-        vec![(stat.name.clone(), STATBLOCK_TITLE_STYLE, true)];
-    let push_group = |runs: &mut Vec<(String, &str, bool)>, lines: Vec<String>| {
-        for (i, line) in lines.into_iter().enumerate() {
-            runs.push((line, STATBLOCK_BODY_STYLE, i == 0));
-        }
-    };
-    push_group(&mut runs, stat.overview.clone());
-    for (i, (k, v)) in stat.attributes.iter().enumerate() {
-        // A colon, not the two spaces this first used: `break_by_width` normalizes every run of
-        // inter-word whitespace to a single U+0020, so the intended visual gap collapsed to an
-        // ordinary word space and "Armour Class 15 (leather, shield)" read as one sentence. With no
-        // bold weight available, punctuation is what distinguishes the key.
-        // The key's own words are joined by U+00A0, so `Armour Class:` is one unbreakable box
-        // (spec 0048). Before this, a ~150 pt column broke after `Armour` and the key/value pairing
-        // was lost — found by rendering spec 0038's panel, not by any assertion. The style's
-        // hanging indent then lines a wrapped value up under the value rather than under the key.
-        let key = k.split_whitespace().collect::<Vec<_>>().join("\u{a0}");
-        runs.push((format!("{key}:\u{a0}{v}"), STATBLOCK_ATTR_STYLE, i == 0));
-    }
-    for section in [&stat.details, &stat.actions, &stat.reactions] {
-        push_group(&mut runs, section.clone());
-    }
-
-    let mut decorations: Vec<PanelRect> = Vec::new();
-    // Where each section begins, in panel-local dy — the only places this block may be cut
-    // (spec 0046). Section 0 is recorded at 0 rather than at the padding, so that the panel's top
-    // inset is charged to the first item and therefore to a continuation's first item too.
-    let mut section_tops: Vec<f32> = vec![0.0];
-    for (idx, (text, style_name, starts_section)) in runs.into_iter().enumerate() {
-        let style = styles
-            .paragraph
-            .get(style_name)
-            .copied()
-            .unwrap_or_default();
-        // Honours the style's indent (spec 0048), which is what lets `statblock-attr` hang its
-        // wrapped value under the value rather than under the key.
-        let lines = justify_paragraph_indented(
-            &text,
-            inner_w,
-            quill_text_layout::Indent {
-                first_pt: style.indent.first_pt,
-                rest_pt: style.indent.rest_pt,
-            },
-            style.font_size_pt,
-            Alignment::Left,
-            metrics,
-            hyphenator,
-        );
-        // A cut may fall here and nowhere else: never inside a section, so an attributes list is
-        // never separated from itself and a prose section never breaks mid-run.
-        if starts_section && idx > 0 {
-            section_tops.push(y);
-        }
-        y += style.space_before_pt;
-        // A rule separates each section from the one above. Not before the first run, which has
-        // the panel's own edge above it.
-        if starts_section && idx > 0 {
-            y += SECTION_RULE_GAP_PT;
-            decorations.push(PanelRect {
-                dx_pt: STATBLOCK_PADDING_PT,
-                dy_pt: y,
-                w_pt: inner_w,
-                h_pt: SECTION_RULE_PT,
-                fill: Some(STATBLOCK_STROKE.color),
-                stroke: None,
-            });
-            y += SECTION_RULE_GAP_PT;
-        }
-        let n = lines.len();
-        parts.push(PanelPart {
-            dx_pt: STATBLOCK_PADDING_PT,
-            dy_pt: y,
-            w_pt: inner_w,
-            lines,
-            color,
-            font_size_pt: style.font_size_pt,
-            leading_pt: style.leading_pt,
-            link_page: None,
-        });
-        y += n as f32 * style.leading_pt + style.space_after_pt;
-    }
-
-    let height = y + STATBLOCK_PADDING_PT;
-    // Section heights, as gaps between the recorded tops. The last runs to the end of the content;
-    // the panel's bottom padding is `trailing_pt`, charged to whichever fragment ends the block.
-    let mut items: Vec<f32> = Vec::with_capacity(section_tops.len());
-    for i in 0..section_tops.len() {
-        let end = section_tops.get(i + 1).copied().unwrap_or(y);
-        items.push(end - section_tops[i]);
-    }
-    (
-        Measured::Panel {
-            fill: Some(STATBLOCK_FILL),
-            stroke: Some(STATBLOCK_STROKE),
-            parts,
-            decorations,
-            split: Some(PanelSplit {
-                items,
-                // Nothing is re-stated at the top of a continuation except the panel's own inset:
-                // a stat block has no header row to repeat, but its text may not sit on the rule.
-                repeat_parts: Vec::new(),
-                repeat_decorations: Vec::new(),
-                repeat_h: STATBLOCK_PADDING_PT,
-                trailing_pt: STATBLOCK_PADDING_PT,
-                min_items: MIN_SECTIONS_PER_FRAGMENT,
-                keep_together: true,
-            }),
-        },
-        height,
-    )
-}
-
-/// Padding inside each table cell, so text never touches a rule or its neighbour's column.
-pub const TABLE_CELL_PADDING_PT: f32 = 3.0;
-
-/// The shade behind alternate rows. Light enough that 9 pt text stays legible over it, and far
-/// enough inside the ink limit that it can never be what fails preflight.
-const TABLE_ZEBRA_FILL: Color = Color::Gray { v: 0.94 };
-
-/// The rule under a table's header row.
-const TABLE_HEADER_RULE_PT: f32 = 0.75;
-
-/// Break a table into cells, row bands and a header rule (spec 0039).
-///
-/// Rows are measured to the tallest cell in the row, so a wrapped cell pushes its whole row down
-/// rather than overlapping the row beneath. Reuses spec 0038's panel seam: a cell is a `PanelPart`
-/// and a zebra band is a `PanelRect`, so tables and stat blocks share one placement path.
-fn measure_table(
-    table: &Table,
-    color: Color,
-    width: f32,
-    styles: &StyleSheet,
-    metrics: &impl RunMetrics,
-    hyphenator: &impl Hyphenator,
-) -> (Measured, f32) {
-    let count = table.column_count();
-    if count == 0 || table.rows.is_empty() && table.header.is_none() {
-        // An empty table occupies nothing rather than drawing an empty box.
-        return (
-            Measured::Panel {
-                fill: None,
-                stroke: None,
-                parts: Vec::new(),
-                decorations: Vec::new(),
-                split: None,
-            },
-            0.0,
-        );
-    }
-
-    let fractions = table.normalized_columns(count);
-    // Column x offsets and widths, in points, with the cell padding taken off the *measure* so a
-    // wrapped cell stays inside its column rather than being broken wide and then drawn inset.
-    let mut x = 0.0;
-    let mut columns: Vec<(f32, f32)> = Vec::with_capacity(count);
-    for f in &fractions {
-        let w = width * f;
-        columns.push((
-            x + TABLE_CELL_PADDING_PT,
-            (w - TABLE_CELL_PADDING_PT * 2.0).max(1.0),
-        ));
-        x += w;
-    }
-
-    let header_style = styles
-        .paragraph
-        .get(TABLE_HEADER_STYLE)
-        .copied()
-        .unwrap_or_default();
-    let cell_style = styles
-        .paragraph
-        .get(TABLE_CELL_STYLE)
-        .copied()
-        .unwrap_or_default();
-
-    let mut parts: Vec<PanelPart> = Vec::new();
-    let mut decorations: Vec<PanelRect> = Vec::new();
-    let mut y = 0.0;
-    // Per-row heights, for spec 0045's continuation. Recorded as the rows are laid rather than
-    // recovered afterwards from cell offsets, which would have to re-derive what a row *is*.
-    let mut row_heights: Vec<f32> = Vec::new();
-
-    let lay_row =
-        |cells: &[String], style: ParagraphStyle, y: &mut f32, parts: &mut Vec<PanelPart>| {
-            let mut row_h: f32 = style.leading_pt;
-            for (i, cell) in cells.iter().enumerate().take(count) {
-                let (cx, cw) = columns[i];
-                let lines = justify_paragraph_hyphenated(
-                    cell,
-                    cw,
-                    style.font_size_pt,
-                    Alignment::Left,
-                    metrics,
-                    hyphenator,
-                );
-                row_h = row_h.max(lines.len() as f32 * style.leading_pt);
-                parts.push(PanelPart {
-                    dx_pt: cx,
-                    dy_pt: *y + TABLE_CELL_PADDING_PT,
-                    w_pt: cw,
-                    lines,
-                    color,
-                    font_size_pt: style.font_size_pt,
-                    leading_pt: style.leading_pt,
-                    link_page: None,
-                });
-            }
-            // The row's height is its tallest cell: a wrapped cell must push the row down, not overlap
-            // the one beneath it.
-            let h = row_h + TABLE_CELL_PADDING_PT * 2.0;
-            *y += h;
-            h
-        };
-
-    if let Some(header) = &table.header {
-        lay_row(header, header_style, &mut y, &mut parts);
-        decorations.push(PanelRect {
-            dx_pt: 0.0,
-            dy_pt: y,
-            w_pt: width,
-            h_pt: TABLE_HEADER_RULE_PT,
-            fill: Some(Color::Gray { v: 0.35 }),
-            stroke: None,
-        });
-        y += TABLE_HEADER_RULE_PT;
-    }
-    // Everything laid so far is the header and its rule: the prefix every continuation re-states.
-    let repeat_h = y;
-    let repeat_parts = parts.clone();
-    let repeat_decorations = decorations.clone();
-
-    for (i, row) in table.rows.iter().enumerate() {
-        let band_top = y;
-        let h = lay_row(row, cell_style, &mut y, &mut parts);
-        row_heights.push(h);
-        if table.zebra && i % 2 == 1 {
-            // Behind the row's text. `decorations` are emitted before `parts`, so ordering is
-            // structural rather than something each caller has to remember.
-            decorations.push(PanelRect {
-                dx_pt: 0.0,
-                dy_pt: band_top,
-                w_pt: width,
-                h_pt: h,
-                fill: Some(TABLE_ZEBRA_FILL),
-                stroke: None,
-            });
-        }
-    }
-
-    // The first item carries the header: every fragment begins with it, including a continuation,
-    // so charging it to item 0 is what makes the fit check right on both.
-    if let Some(first) = row_heights.first_mut() {
-        *first += repeat_h;
-    }
-    (
-        Measured::Panel {
-            fill: None,
-            stroke: None,
-            parts,
-            decorations,
-            split: Some(PanelSplit {
-                items: row_heights,
-                repeat_parts,
-                repeat_decorations,
-                repeat_h,
-                // A table has no panel edge of its own, so nothing to close below its last row.
-                trailing_pt: 0.0,
-                min_items: MIN_ROWS_PER_FRAGMENT,
-                keep_together: true,
-            }),
-        },
-        y,
-    )
 }
 
 /// Width reserved at the right edge of a contents line for its page number.
@@ -1490,6 +1240,27 @@ pub fn lay_out_with_template(
     lay_out_with_toc_status(content, assets, styles, template, metrics, hyphenator).0
 }
 
+/// [`lay_out_with_toc_status`] over an explicit component library (spec 0054).
+///
+/// The frame-level entry points above deliberately do not take one: a frame primitive lays out the
+/// *bundled* components, which is what every one of its callers wants, and threading a library
+/// through them would add a parameter to forty call sites to say "the default" forty times. A
+/// document that carries its own definitions reaches layout through [`lay_out`], which builds the
+/// library from the document.
+pub fn lay_out_with_library(
+    content: &[Block],
+    assets: &[Asset],
+    styles: &StyleSheet,
+    components: &ComponentLibrary,
+    template: &impl PageTemplate,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> (Vec<LaidOutPage>, TocStatus) {
+    lay_out_resolved(
+        content, assets, styles, components, template, metrics, hyphenator,
+    )
+}
+
 /// How the table-of-contents fixpoint resolved (spec 0041).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TocStatus {
@@ -1527,11 +1298,33 @@ pub fn lay_out_with_toc_status(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> (Vec<LaidOutPage>, TocStatus) {
+    lay_out_resolved(
+        content,
+        assets,
+        styles,
+        &builtin_components(),
+        template,
+        metrics,
+        hyphenator,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lay_out_resolved(
+    content: &[Block],
+    assets: &[Asset],
+    styles: &StyleSheet,
+    components: &ComponentLibrary,
+    template: &impl PageTemplate,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> (Vec<LaidOutPage>, TocStatus) {
     let once = |headings: &[HeadingEntry]| {
         flow(
             content,
             assets,
             styles,
+            components,
             headings,
             template,
             metrics,
@@ -1706,6 +1499,7 @@ pub(crate) fn flow(
     content: &[Block],
     assets: &[Asset],
     styles: &StyleSheet,
+    components: &ComponentLibrary,
     headings: &[HeadingEntry],
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
@@ -1722,7 +1516,9 @@ pub(crate) fn flow(
         assets: &assets,
         styles,
         headings,
+        components,
     };
+    let grid = template.baseline_grid().filter(BaselineGrid::is_usable);
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut checkpoints: Vec<FlowState> = Vec::new();
@@ -1767,6 +1563,14 @@ pub(crate) fn flow(
                 Some((_, _, remainder, remainder_h)) => (remainder, remainder_h),
                 None => (whole, whole_height),
             };
+            // Snap to the baseline grid (spec 0058), before the fit check rather than after: a
+            // block pushed down by the snap may no longer fit, and must then move on like any
+            // other. `O(1)`, reading one number and writing one — the grid is per frame and local,
+            // and a global recompute is a named non-goal.
+            if let Some(grid) = grid {
+                let off = measured.first_baseline_offset(metrics).unwrap_or(0.0);
+                y = grid.snap_down(y + off) - off;
+            }
             let bottom = frame.rect.y_pt + frame.rect.h_pt;
 
             if y + height > bottom {
@@ -1989,6 +1793,39 @@ fn place_measured(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quill_core_model::{DefColor, SectionShape, STATBLOCK_PADDING_PT};
+    use quill_text_layout::justify_paragraph_hyphenated;
+
+    /// A definition's declared colour as the engine's own, so a test asserts against the
+    /// *definition* rather than against a number copied out of it. A duplicated literal stops
+    /// testing anything the moment the definition changes (spec 0054).
+    fn ink(c: DefColor) -> Color {
+        match c {
+            DefColor::Gray { v } => Color::Gray { v },
+            DefColor::Cmyk { c, m, y, k } => Color::Cmyk { c, m, y, k },
+        }
+    }
+
+    /// The bundled stat block's panel tint.
+    #[allow(non_snake_case)]
+    fn STATBLOCK_FILL() -> Color {
+        ink(quill_core_model::statblock_definition()
+            .panel
+            .fill
+            .expect("the bundled stat block declares a panel fill"))
+    }
+
+    /// The bundled table's zebra shade.
+    #[allow(non_snake_case)]
+    fn TABLE_ZEBRA_FILL() -> Color {
+        let def = quill_core_model::table_definition();
+        for section in &def.sections {
+            if let SectionShape::Rows { zebra: Some(z), .. } = &section.shape {
+                return ink(z.fill);
+            }
+        }
+        panic!("the bundled table declares zebra banding");
+    }
     use quill_core_model::{
         Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size, StaticAlign,
         BODY_STYLE,
@@ -2660,6 +2497,8 @@ mod tests {
             assets: vec![],
             fonts_embeddable: false,
             revision: 0,
+            components: Default::default(),
+            requires: Vec::new(),
             next_block_id: 0,
             styles: StyleSheet::default(),
             master_pages: Vec::new(),
@@ -2746,6 +2585,8 @@ mod tests {
                 line_art: false,
                 has_alpha: false,
             }],
+            components: Default::default(),
+            requires: Vec::new(),
             fonts_embeddable: false,
             revision: 0,
             next_block_id: 0,
@@ -4093,7 +3934,7 @@ mod tests {
         for page in &pages {
             for b in &page.blocks {
                 if let PlacedBlock::Rect { frame, fill, .. } = b {
-                    if *fill == Some(STATBLOCK_FILL) {
+                    if *fill == Some(STATBLOCK_FILL()) {
                         panels += 1;
                         assert!(
                             frame.y_pt + frame.h_pt <= bottom + 0.01,
@@ -4111,6 +3952,24 @@ mod tests {
         );
     }
 
+    /// Lines per group in the narrow-column fixtures below.
+    ///
+    /// **Eight, and it was twenty-two before spec 0060.** The number is a fixture detail; the
+    /// reason is not. `Detail 0 about the creature.` measures 151.2 pt against the panel's 150 pt
+    /// inner measure in a `rulebook` column, and until 0060 the breaker let a ragged line run
+    /// 1.2 pt over on the strength of shrink that ragged setting never applies. Every such run was
+    /// one line; each is two now, so a group is a little over twice as tall.
+    ///
+    /// That moves where spec 0046's *uncuttable* case begins — a section taller than the column
+    /// cannot be cut, so the panel is placed whole and runs off the page. Measured on both builds
+    /// with this exact fixture: **24 fitted and 26 overflowed before; 8 fits and 10 overflows
+    /// now.** The limitation itself is unchanged and is 0046's; the roadmap's open question about
+    /// per-section splitting is where it gets fixed.
+    ///
+    /// [`a_section_taller_than_its_column_is_placed_whole`] pins the other side of the threshold,
+    /// so the limitation is asserted rather than merely survived.
+    const NARROW_COLUMN_SECTIONS: usize = 8;
+
     #[test]
     fn no_stat_block_fragment_overruns_a_narrow_column() {
         // Asserted over the real two-column template rather than a synthetic frame, because the
@@ -4127,7 +3986,7 @@ mod tests {
             ),
             Block::StatBlock {
                 id: BlockId::UNASSIGNED,
-                stat: big_goblin(22),
+                stat: big_goblin(NARROW_COLUMN_SECTIONS),
                 color: Color::Gray { v: 0.0 },
             },
         ];
@@ -4158,6 +4017,90 @@ mod tests {
         }
     }
 
+    /// The other side of [`NARROW_COLUMN_SECTIONS`]: a section taller than the column it must fit.
+    ///
+    /// Spec 0046 cuts a stat block **between sections and nowhere else**, so a single section that
+    /// is itself taller than a frame has no legal cut. The panel is then placed whole and runs off
+    /// the bottom of the page. That is a real defect, not a design choice, and the roadmap's open
+    /// question — "does per-section paragraph splitting inside a stat block ever ship?" — is where
+    /// it gets answered; spec 0044's mechanism exists, wiring it through the composite is the open
+    /// part.
+    ///
+    /// It is asserted here rather than left silent because a limitation nobody has written down is
+    /// a limitation that gets rediscovered as a bug. **When per-section splitting ships, this test
+    /// inverts**: the overflow assertion becomes an assertion that it does not overflow.
+    ///
+    /// What must hold either way, and is asserted unconditionally: **no content is lost.** An
+    /// uncuttable panel is placed badly, never dropped.
+    #[test]
+    fn a_section_taller_than_its_column_is_placed_whole() {
+        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let build = |n: usize| {
+            let mut doc = Document::from_template(t);
+            doc.content = vec![
+                Block::body(
+                    "Some introductory prose, so the frame is not empty when the panel arrives \
+                     and the engine has a real decision to make about where it goes.",
+                    Color::Gray { v: 0.0 },
+                ),
+                Block::StatBlock {
+                    id: BlockId::UNASSIGNED,
+                    stat: big_goblin(n),
+                    color: Color::Gray { v: 0.0 },
+                },
+            ];
+            doc.assign_missing_block_ids().expect("ids");
+            doc
+        };
+
+        let doc = build(NARROW_COLUMN_SECTIONS + 2);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+        let mut worst: f32 = 0.0;
+        for page in &pages {
+            let bottom = template
+                .frames(page.index)
+                .iter()
+                .map(|f| f.rect.y_pt + f.rect.h_pt)
+                .fold(0.0_f32, f32::max);
+            for b in &page.blocks {
+                let (y, h) = match b {
+                    PlacedBlock::Text { frame, .. }
+                    | PlacedBlock::Rect { frame, .. }
+                    | PlacedBlock::Image { frame, .. }
+                    | PlacedBlock::Link { frame, .. } => (frame.y_pt, frame.h_pt),
+                };
+                worst = worst.max(y + h - bottom);
+            }
+        }
+        assert!(
+            worst > 0.0,
+            "this fixture is meant to be on the *uncuttable* side of the threshold; if it now \
+             fits, per-section splitting has shipped and this test should be inverted"
+        );
+
+        // Content conservation, which holds on both sides of the threshold. Compared against the
+        // *same* stat block laid into a frame tall enough to need no cut: same lines, same order.
+        // Comparing laid-out lines rather than authored ones is what makes this robust to the
+        // wrapping spec 0060 introduced — the authored `Detail 0 about the creature.` is now two
+        // lines, and an assertion phrased over authored strings would be testing the wrap, not the
+        // conservation.
+        let mut tall = doc.clone();
+        tall.page_setup.trim.h_pt = 4000.0;
+        //
+        // Compared as a *multiset*: `stat_runs` orders by (page, y), and two columns of one page
+        // interleave in y, so run order across columns is not a property worth asserting here.
+        let mut reference = stat_runs(&lay_out(&tall, &MONO, &NoHyphenator), tall.content[1].id());
+        let mut placed = stat_runs(&pages, doc.content[1].id());
+        reference.sort();
+        placed.sort();
+        assert!(!reference.is_empty(), "the reference layout placed nothing");
+        assert_eq!(
+            placed, reference,
+            "an uncuttable panel may be placed badly, never dropped"
+        );
+    }
+
     #[test]
     fn a_three_section_stat_block_still_splits() {
         // Why the section minimum is one and not two (spec 0046). With a two-section minimum a
@@ -4184,7 +4127,7 @@ mod tests {
             .iter()
             .flat_map(|p| p.blocks.iter())
             .filter(
-                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL)),
+                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL())),
             )
             .count();
         assert!(
@@ -4224,7 +4167,7 @@ mod tests {
             .iter()
             .flat_map(|p| p.blocks.iter())
             .filter(
-                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL)),
+                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL())),
             )
             .count();
         assert_eq!(panels, 1, "one section ⇒ no legal cut ⇒ placed whole");
@@ -4599,7 +4542,7 @@ mod tests {
                 .blocks
                 .iter()
                 .filter_map(|b| match b {
-                    PlacedBlock::Rect { frame, fill, .. } if *fill == Some(TABLE_ZEBRA_FILL) => {
+                    PlacedBlock::Rect { frame, fill, .. } if *fill == Some(TABLE_ZEBRA_FILL()) => {
                         Some((frame.y_pt, frame.y_pt + frame.h_pt))
                     }
                     _ => None,

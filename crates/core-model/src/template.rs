@@ -153,6 +153,7 @@ impl Template {
     pub fn seeded_with(&self, seed: PageGeometrySeed) -> Template {
         Template {
             page_setup: PageSetup {
+                baseline_grid: None,
                 bleed_pt: self.page_setup.bleed_pt.max(seed.bleed_pt),
                 ..self.page_setup
             },
@@ -194,6 +195,8 @@ impl Document {
             master_pages: template.master_pages.clone(),
             default_master: template.default_master.clone(),
             pages: template.pages.clone(),
+            components: Default::default(),
+            requires: Vec::new(),
         };
         // Normalize exactly as `Document::sample()` does, and for the same reason: everything
         // downstream treats what it is handed as a *loaded* document, so one built in memory must
@@ -205,6 +208,34 @@ impl Document {
         doc.assign_missing_block_ids()
             .expect("a template has no blocks, so no ids can collide");
         doc
+    }
+}
+
+impl Template {
+    /// The exact inverse of [`Document::from_template`]: everything a document has *except its
+    /// content*, lifted back out (spec 0057).
+    ///
+    /// The round-trip is asserted rather than assumed. Without it, `from_template` and
+    /// `from_document` are two functions that happen to share field names, and the day one grows a
+    /// field the other does not is the day an extracted pack quietly stops carrying part of the
+    /// look.
+    pub fn from_document(
+        doc: &Document,
+        name: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Template {
+        Template {
+            template_version: TEMPLATE_VERSION,
+            name: name.into(),
+            title: title.into(),
+            description: description.into(),
+            page_setup: doc.page_setup,
+            styles: doc.styles.clone(),
+            master_pages: doc.master_pages.clone(),
+            default_master: doc.default_master.clone(),
+            pages: doc.pages.clone(),
+        }
     }
 }
 
@@ -318,6 +349,7 @@ fn adventure() -> Template {
         title: "Adventure module (6×9)".into(),
         description: "Single-column 6×9 digest with a chapter opener and page numbers.".into(),
         page_setup: PageSetup {
+            baseline_grid: None,
             trim: DIGEST,
             bleed_pt: DEFAULT_BLEED_PT,
             facing_pages: true,
@@ -367,6 +399,7 @@ fn rulebook() -> Template {
         title: "Rulebook (6×9, two columns)".into(),
         description: "Two-column 6×9 reference book with a chapter opener and page numbers.".into(),
         page_setup: PageSetup {
+            baseline_grid: None,
             trim: DIGEST,
             bleed_pt: DEFAULT_BLEED_PT,
             facing_pages: true,
@@ -411,6 +444,7 @@ fn playtest() -> Template {
         title: "Playtest document (US Letter)".into(),
         description: "Single-column US Letter draft for hand-outs and playtest packets.".into(),
         page_setup: PageSetup {
+            baseline_grid: None,
             trim: LETTER,
             bleed_pt: DEFAULT_BLEED_PT,
             // A playtest packet is read single-sided and printed at home, so there is no spine to

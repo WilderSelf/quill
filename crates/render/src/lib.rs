@@ -360,6 +360,23 @@ impl ProxyCache {
     }
 }
 
+/// Lay a document out **for the screen**: the shared shaper, and the shared en-US hyphenator.
+///
+/// One function rather than a call each in the CLI and the app shell, because the defect spec 0059
+/// fixes was precisely two call sites disagreeing about a layout input. Screen and press now differ
+/// in exactly one thing — press measures through a *subset* font built from the document's used
+/// characters — and a subset carries the same advances, so the two agree about every line break.
+///
+/// If a future input has to differ between the two paths, it belongs here and in `export`'s
+/// equivalent, where the difference is visible, rather than in whichever caller happened to be
+/// written last.
+pub fn lay_out_for_screen(
+    doc: &quill_core_model::Document,
+    font: &quill_fonts::Font,
+) -> Vec<quill_layout_engine::LaidOutPage> {
+    quill_layout_engine::lay_out(doc, font, &quill_fonts::HypherHyphenator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

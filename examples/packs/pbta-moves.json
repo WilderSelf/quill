@@ -1,0 +1,241 @@
+{
+  "pack_version": 1,
+  "name": "pbta-moves",
+  "title": "PbtA Moves",
+  "description": "A `move` component: a name, a trigger, and the outcomes by roll.",
+  "version": "1.0.0",
+  "source": "https://github.com/WilderSelf/quill/tree/main/examples/packs",
+  "license": "MIT OR Apache-2.0",
+  "styles": {
+    "paragraph": {
+      "body": {
+        "font_size_pt": 10.0,
+        "leading_pt": 12.0,
+        "align": "justified",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "h1": {
+        "font_size_pt": 24.0,
+        "leading_pt": 28.0,
+        "align": "left",
+        "space_before_pt": 21.0,
+        "space_after_pt": 7.0
+      },
+      "h2": {
+        "font_size_pt": 18.0,
+        "leading_pt": 22.0,
+        "align": "left",
+        "space_before_pt": 16.5,
+        "space_after_pt": 5.5
+      },
+      "h3": {
+        "font_size_pt": 14.0,
+        "leading_pt": 18.0,
+        "align": "left",
+        "space_before_pt": 13.5,
+        "space_after_pt": 4.5
+      },
+      "h4": {
+        "font_size_pt": 12.0,
+        "leading_pt": 15.0,
+        "align": "left",
+        "space_before_pt": 11.25,
+        "space_after_pt": 3.75
+      },
+      "h5": {
+        "font_size_pt": 11.0,
+        "leading_pt": 14.0,
+        "align": "left",
+        "space_before_pt": 10.5,
+        "space_after_pt": 3.5
+      },
+      "h6": {
+        "font_size_pt": 10.0,
+        "leading_pt": 13.0,
+        "align": "left",
+        "space_before_pt": 9.75,
+        "space_after_pt": 3.25
+      },
+      "move-name": {
+        "font_size_pt": 12.0,
+        "leading_pt": 15.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 2.0
+      },
+      "move-outcome": {
+        "font_size_pt": 9.5,
+        "leading_pt": 12.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 2.0,
+        "indent": {
+          "first_pt": 0.0,
+          "rest_pt": 12.0
+        }
+      },
+      "move-trigger": {
+        "font_size_pt": 9.5,
+        "leading_pt": 12.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 3.0
+      },
+      "statblock-attr": {
+        "font_size_pt": 9.0,
+        "leading_pt": 11.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0,
+        "indent": {
+          "first_pt": 0.0,
+          "rest_pt": 10.0
+        }
+      },
+      "statblock-body": {
+        "font_size_pt": 9.0,
+        "leading_pt": 11.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 3.0
+      },
+      "statblock-title": {
+        "font_size_pt": 13.0,
+        "leading_pt": 16.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 3.0
+      },
+      "table-cell": {
+        "font_size_pt": 9.0,
+        "leading_pt": 11.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "table-header": {
+        "font_size_pt": 9.0,
+        "leading_pt": 11.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-1": {
+        "font_size_pt": 12.0,
+        "leading_pt": 16.0,
+        "align": "left",
+        "space_before_pt": 5.0,
+        "space_after_pt": 0.0
+      },
+      "toc-2": {
+        "font_size_pt": 11.5,
+        "leading_pt": 15.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-3": {
+        "font_size_pt": 11.0,
+        "leading_pt": 15.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-4": {
+        "font_size_pt": 10.5,
+        "leading_pt": 14.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-5": {
+        "font_size_pt": 10.0,
+        "leading_pt": 14.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-6": {
+        "font_size_pt": 9.5,
+        "leading_pt": 13.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-title": {
+        "font_size_pt": 18.0,
+        "leading_pt": 22.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 11.0
+      }
+    }
+  },
+  "components": {
+    "move": {
+      "version": 1,
+      "name": "move",
+      "panel": {
+        "fill": {
+          "space": "gray",
+          "v": 0.94
+        },
+        "stroke": {
+          "color": {
+            "space": "gray",
+            "v": 0.4
+          },
+          "width_pt": 0.75
+        },
+        "padding_pt": 8.0
+      },
+      "sections": [
+        {
+          "source": "name",
+          "style": "move-name",
+          "shape": "text",
+          "repeat": false
+        },
+        {
+          "source": "trigger",
+          "style": "move-trigger",
+          "shape": "lines",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.45
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 3.0,
+            "gap_below_pt": 3.0,
+            "full_width": false
+          },
+          "repeat": false
+        },
+        {
+          "source": "outcomes",
+          "style": "move-outcome",
+          "shape": "pairs",
+          "separator": ": ",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.45
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 3.0,
+            "gap_below_pt": 3.0,
+            "full_width": false
+          },
+          "repeat": false
+        }
+      ],
+      "split": {
+        "granularity": "sections",
+        "min_items": 1,
+        "keep_together": true
+      }
+    }
+  }
+}

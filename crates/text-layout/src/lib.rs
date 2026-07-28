@@ -104,6 +104,21 @@ impl CharMetrics for MonospaceMetrics {
 pub trait RunMetrics {
     /// Total shaped advance width of `text` at `size_pt`, in points.
     fn measure_run(&self, text: &str, size_pt: f32) -> f32;
+
+    /// Distance from the top of a line's box down to its **baseline**, at `size_pt` (spec 0058).
+    ///
+    /// The layout engine needs this to snap a baseline to a grid line: a `PlacedBlock::Text` is
+    /// drawn with its first baseline at `frame.y_pt + ascent_pt(size)`, by the PDF writer and the
+    /// screen renderer alike (spec 0032), so putting the *baseline* on the grid means solving for
+    /// the frame top rather than snapping it directly.
+    ///
+    /// Defaulted at `0.8 × size` — a conventional figure, and one that keeps
+    /// [`MonospaceRunMetrics`] font-free and every existing implementation compiling. A real font
+    /// overrides it with its own ascent, which is the same number the writer and the renderer
+    /// already draw with, so all three agree by construction.
+    fn ascent_pt(&self, size_pt: f32) -> f32 {
+        0.8 * size_pt
+    }
 }
 
 /// A fixed-advance run-metrics stub: `width = em_ratio * size_pt * text.chars().count()`.
@@ -272,6 +287,44 @@ pub fn break_paragraph_indented(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<String> {
+    // The justified default: the caller will shrink an over-wide line back to its measure.
+    break_paragraph_shrinkable(
+        text,
+        first_width_pt,
+        rest_width_pt,
+        size_pt,
+        metrics,
+        hyphenator,
+        true,
+    )
+}
+
+/// [`break_paragraph_indented`], told whether the caller will actually **shrink** an over-wide line
+/// back to its measure (spec 0060).
+///
+/// This is the difference between justified and ragged setting, and until spec 0060 the breaker did
+/// not know about it. Knuth-Plass permits a line whose natural width exceeds its measure by up to
+/// the line's available shrink, on the understanding that the renderer tightens the spaces to pull
+/// it back. [`justify_paragraph_indented`] does exactly that — but only for the interior lines of a
+/// *justified* paragraph. A last line, and every line of a ragged one, gets `space_adjust_pt: 0.0`
+/// and is drawn at its natural width, so for those the shrink allowance is a promise nobody keeps
+/// and the line is simply drawn past its measure. Spec 0048 measured it: a 120 pt measure drawing a
+/// 126 pt line.
+///
+/// `shrinkable = false` therefore forbids `natural > l` outright. The breaker moves a word down
+/// instead — or, when no breaking can keep every line inside the measure because some single word
+/// is wider than it, falls back to greedy as it always has (spec 0018): laying out visibly beats
+/// not laying out.
+#[allow(clippy::too_many_arguments)]
+pub fn break_paragraph_shrinkable(
+    text: &str,
+    first_width_pt: f32,
+    rest_width_pt: f32,
+    size_pt: f32,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+    shrinkable: bool,
+) -> Vec<String> {
     // Words break at ordinary whitespace only. U+00A0 NO-BREAK SPACE binds its neighbours into a
     // single unbreakable box and is emitted as an ordinary space (spec 0048), which is how a key
     // like `Armour Class:` survives a narrow measure instead of breaking after `Armour` and losing
@@ -369,14 +422,30 @@ pub fn break_paragraph_indented(
         let natural = (wsum[e] - wsum[s]) + extra_w;
         let y = ysum[e] - ysum[s];
         let z = zsum[e] - zsum[s];
-        // A last line is permitted to be up to `l + shrink` wide, on the strength of shrink that
-        // `justify_paragraph_*` never applies to it — so it can be *drawn* past its measure. Real,
-        // measured by spec 0048, and deliberately not fixed there: forbidding it changes line
-        // breaking across the corpus (it would move spec 0051's equivalence digest) and makes
-        // stat-block sections tall enough to stop fitting a narrow column. Recorded in the
-        // roadmap's known issues; it wants its own increment.
-        let badness = if is_last && natural <= l {
-            0.0
+        // A line that will be *drawn at its natural width* has no shrink to spend, so `natural > l`
+        // simply puts it past its measure (spec 0060). That is the last line of any paragraph, and
+        // every line of a ragged one: `justify_paragraph_indented` gives both
+        // `space_adjust_pt: 0.0`.
+        //
+        // This is the one place the rule can live. Clamping at paint time would overlap glyphs;
+        // clamping in `justify_*` would disagree with the breaker about how many lines there are.
+        let drawn_at_natural = is_last || !shrinkable;
+        let badness = if drawn_at_natural {
+            if natural > l {
+                return None;
+            }
+            if is_last {
+                // A last line is free: it is not expected to fill the measure.
+                0.0
+            } else if y > 0.0 {
+                // A ragged interior line is scored like any other underfull line, so the breaker
+                // still prefers an even rag over a jagged one.
+                (100.0 * ((l - natural) / y).powi(3)).min(BADNESS_CEIL)
+            } else if (l - natural).abs() < f32::EPSILON {
+                0.0
+            } else {
+                BADNESS_CEIL
+            }
         } else if natural > l {
             if z <= 0.0 {
                 return None; // over-wide with no shrink: r < −1 unavoidable → infeasible
@@ -751,7 +820,22 @@ pub fn justify_paragraph_indented(
 ) -> Vec<Line> {
     let first_w = max_width_pt - indent.first_pt;
     let rest_w = max_width_pt - indent.rest_pt;
-    let lines = break_paragraph_indented(text, first_w, rest_w, size_pt, metrics, hyphenator);
+    // Tell the breaker whether these lines will actually be shrunk (spec 0060). A ragged paragraph
+    // draws every line at its natural width, so the shrink allowance Knuth-Plass grants an over-wide
+    // line is a promise this function never keeps — and the line is drawn past its measure.
+    //
+    // The greedy-fallback case is *not* covered here, and cannot be: it is detected below, after
+    // breaking, and in that case some single word is wider than the measure so no breaking keeps
+    // every line inside it. Laying out visibly beats not laying out (spec 0018).
+    let lines = break_paragraph_shrinkable(
+        text,
+        first_w,
+        rest_w,
+        size_pt,
+        metrics,
+        hyphenator,
+        align == Alignment::Justified,
+    );
 
     // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
     // would need to shrink past its glue, so justifying it would push spaces negative).
@@ -1247,11 +1331,38 @@ mod tests {
     fn left_alignment_is_all_ragged() {
         let lines = justify_paragraph("an ox in the mud", 69.0, SIZE, Alignment::Left, &MONO);
         assert!(lines.iter().all(|l| l.space_adjust_pt == 0.0));
-        // Text/breakpoints match break_paragraph exactly.
-        let plain = break_paragraph("an ox in the mud", 69.0, SIZE, &MONO);
+        // Every line is inside the measure, which under ragged setting means its *natural* width
+        // is — there is no shrink to spend (spec 0060).
+        for l in &lines {
+            assert!(
+                MONO.measure_run(&l.text, SIZE) <= 69.0,
+                "ragged line {:?} is drawn past the 69 pt measure",
+                l.text
+            );
+        }
+        // And it breaks where the *ragged* breaker breaks — which is deliberately **not** where the
+        // justified one does. This is spec 0060 in one line of text: `an ox in the` measures 72 pt
+        // against a 69 pt measure, and justified setting accepts it because it will shrink the two
+        // gaps by 1.5 pt each. Ragged setting shrinks nothing, so 72 pt is simply 3 pt too wide and
+        // `the` moves down. Before 0060 the two agreed here, and the ragged line was drawn over.
+        let ragged = break_paragraph_shrinkable(
+            "an ox in the mud",
+            69.0,
+            69.0,
+            SIZE,
+            &MONO,
+            &NoHyphenator,
+            false,
+        );
         assert_eq!(
             lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
-            plain
+            ragged
+        );
+        assert_eq!(ragged, vec!["an ox in", "the mud"]);
+        assert_eq!(
+            break_paragraph("an ox in the mud", 69.0, SIZE, &MONO),
+            vec!["an ox in the", "mud"],
+            "the justified breaker still takes the shrinkable line, which it will shrink to fit"
         );
     }
 

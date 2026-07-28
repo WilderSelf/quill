@@ -97,7 +97,7 @@ jobs:
           base64 -d > /tmp/doc/assets/map1.png <<'PNG'
           iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPgqvjwoYILAAolAuXl2MVzAAAAAElFTkSuQmCC
           PNG
-          cargo run -p quill-cli -- pack /tmp/doc/document.json --output /tmp/doc/book.tpub
+          cargo run -p quill-cli -- tpub /tmp/doc/document.json --output /tmp/doc/book.tpub
           cargo run -p quill-cli -- export /tmp/doc/book.tpub --output /tmp/from-tpub.pdf \
             --icc /tmp/cmyk.icc --pdfx x1a
           test -s /tmp/from-tpub.pdf

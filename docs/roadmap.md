@@ -18,7 +18,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
-| **M4** | Ecosystem — shareable component definitions and content packs | decomposed — specs 0054–0061 sequenced below |
+| **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 
 ## Decisions log
 
@@ -92,7 +92,7 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   three named features (templates, stat blocks, TOC) are the *content* of that claim, but the claim
   itself is the exit criterion, and it is what forces the last two increments: today the only way to
   produce a document is to author `document.json` by hand against `core-model`'s schema and pack it
-  with `quill pack` (crates/cli/src/main.rs:243-280). The shell can open and scroll it, edit the
+  with `quill tpub` (renamed from `quill pack` by spec 0055, which reserves `pack` for the `.qpack` content pack). The shell can open and scroll it, edit the
   text of an existing `Heading`/`Body` block (crates/app/src/lib.rs:212-247), and nothing else — no
   block creation, no save, and `document_mut()` (crates/app/src/lib.rs:260-262) is an escape hatch
   called only from tests. A stat block nobody can insert is not an on-ramp.
@@ -1789,32 +1789,26 @@ a narrow `rulebook` column, which sends a block down spec 0046's uncuttable path
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
 whose increment ships is deleted in that increment's PR, not left here as a fixed-but-still-listed
-defect — which is why the four entries M3 opened with are gone and the two below are the ones M3
-*found*.
+defect — which is why the four entries M3 opened with are gone, and why both entries M3 *found* are
+gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in their place.
 
-- **The screen render and the press export do not hyphenate the same way.** `quill render` lays out
-  with `NoHyphenator` while `export` uses the real en-US `HypherHyphenator`
-  (crates/export-pdf/src/lib.rs). So the two paths break lines differently, and a document can have
-  a different line count — and therefore a different page count — on screen than in the file that
-  goes to the printer. `CLAUDE.md` states the rule this breaks in as many words: *one shaper for
-  screen and press, so they cannot drift.* The shaper is shared; the hyphenator is not, because
-  `hyphenate::HypherHyphenator` is private to `export-pdf` and the CLI cannot reach it. The fix is to
-  promote it alongside the shaper — a small refactor with a large blast radius on rendered output,
-  so it is recorded rather than smuggled into an unrelated increment. Found while rendering spec
-  0044's verification page.
+- **A stat-block section taller than its column cannot be cut, so the panel overflows the page.**
+  Spec 0046 cuts a composite *between sections and nowhere else*, so a single section — a long
+  actions list — that is itself taller than a frame has no legal cut. The panel is placed whole and
+  runs off the bottom. Content is never lost, which is asserted; it is placed badly, which is also
+  asserted (`a_section_taller_than_its_column_is_placed_whole`).
 
-- **A paragraph's last line may be drawn past its measure.** `base_demerits` permits a last line up
-  to `measure + shrink`, on the strength of shrink that `justify_paragraph_*` never applies to it:
-  a last line gets `space_adjust_pt: 0.0` and is drawn at its natural width. Measured by spec 0048 —
-  a 120 pt measure with a 12 pt hanging indent draws a last line to 126 pt.
+  Not new, and not spec 0060's doing — but 0060 moved the threshold, so it is now reachable at a
+  quarter of the section count it used to take. Measured on both builds with the same fixture in a
+  `rulebook` column: 24 sections fitted and 26 overflowed before; 8 fits and 10 overflows now. The
+  cause is that forbidding an over-measure ragged line makes each run in a narrow panel wrap to two
+  lines instead of one.
 
-  The fix is one line (`is_last && natural > l` ⇒ infeasible) and it is *correct*, which is what
-  makes it worth its own increment rather than a drive-by. It moves line breaking across the corpus,
-  so spec 0051's equivalence digest has to be re-derived deliberately; and it makes stat-block
-  sections tall enough to stop fitting a narrow `rulebook` column, which sends a block down spec
-  0046's uncuttable path and off the bottom of the page. A 0046 test caught exactly that when it was
-  tried. Not a regression — this has been true since spec 0017 — but an indent makes it easy to hit,
-  which is how it was found.
+  The fix is the open question below — per-section paragraph splitting inside a composite. Spec
+  0044's `\vsplit` mechanism already exists; wiring it through the composite so a cut may fall
+  *inside* a section when no section boundary fits is the part that does not. Until then the
+  limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
+  it says in as many words that it inverts when the fix ships.
 
 ## Open questions
 
@@ -1874,9 +1868,35 @@ M3 closed on 2026-07-28. What it shipped, and what it left:
   the CLI says so out loud. Filling them from the printers' current specifications is the obvious
   next non-code task.
 
-M4 is decomposed above, into specs 0054–0061. Its two deferred M3 items — the baseline grid and the
-two known issues — are sequenced into it rather than left floating, because a milestone that ends
-with its own findings unfixed teaches the wrong thing.
+## Beyond M4
+
+M4 closed on 2026-07-28. What it shipped, and what it left:
+
+- **The generalization held exactly.** 0054's whole risk was subtle geometric drift, and the
+  byte-identical criterion caught nothing because there was nothing to catch: the two bundled
+  components, re-expressed as declarations, produce the same placed geometry over a ten-case corpus.
+  What the criterion *did* buy was the confidence to route both through one interpreter and delete
+  three hundred lines of hand-written measurement.
+- **The corpus assertion found more than the known issue did.** 0060 was scoped to last lines. The
+  test written for it found that every *ragged* line had the same defect, for the same reason — and
+  that is the case that matters, since stat blocks, table cells, headings and contents entries are
+  all ragged. A known issue described the symptom someone happened to hit; the assertion described
+  the rule.
+- **The equivalence corpus was measuring the wrong thing.** It was sized by laying a document out to
+  ~500 pages, so a deliberate line-breaking change moved the corpus and the breaking at once, with no
+  way to tell them apart. Pinned by block count now. This was not visible until a change came along
+  that was *meant* to move the digest.
+- **The baseline grid did not need the blast radius the plan budgeted for.** The roadmap expected
+  0058 to move every fixture in the repo and require 0051's re-derivation discipline. Making the
+  grid opt-in avoided all of it, and cost nothing a publisher wanted — a grid is a design choice, and
+  a document that does not ask for one has no reason to move.
+- **One number was deliberately not invented**: whether the bundled templates should opt in to a
+  baseline grid. That is a decision to make with a designer's eye, not as a side effect of building
+  the mechanism.
+
+M4's two deferred M3 items — the baseline grid and the two known issues — were sequenced into it
+rather than left floating, because a milestone that ends with its own findings unfixed teaches the
+wrong thing. All three shipped. The one known issue now open is one M4 found in their place.
 
 Two things M3 deliberately did *not* attempt, recorded so their absence is a decision:
 

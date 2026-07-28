@@ -10,6 +10,16 @@
 //!
 //! Scope is en-US only (a document-driven language seam is a named spec non-goal). Punctuation-
 //! bearing tokens (`"gloom."`) are hyphenated as-is; stripping trailing punctuation is deferred.
+//!
+//! ## Why this lives beside the shaper (spec 0059)
+//!
+//! It was private to `export-pdf`, so `quill render` could not reach it and laid out with
+//! [`quill_text_layout::NoHyphenator`] instead — the two paths broke lines differently and a
+//! document could have a different page count on screen than in the file that went to the printer.
+//! `CLAUDE.md` states the rule that breaks in as many words: *one shaper for screen and press, so
+//! they cannot drift.* A hyphenator is the same kind of thing — a decision about where text may
+//! break that both paths must answer identically — and this crate is where that kind of thing
+//! lives.
 
 use hypher::Lang;
 use quill_text_layout::Hyphenator;

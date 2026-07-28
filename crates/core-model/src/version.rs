@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use crate::{FORMAT_VERSION, TEMPLATE_VERSION};
+use crate::{FORMAT_VERSION, PACK_VERSION, TEMPLATE_VERSION};
 
 /// Everything that can go wrong loading a document or a `.tpub` container.
 ///
@@ -44,6 +44,45 @@ pub enum LoadError {
     /// A template file declares a `template_version` newer than this build supports. A refusal, on
     /// the same reasoning as [`LoadError::UnsupportedVersion`].
     UnsupportedTemplateVersion { found: u32, supported: u32 },
+    /// A component definition (spec 0054) is malformed, or declares a version this build does not
+    /// understand. Its own variant, and it names the definition, because a definition is the unit
+    /// a pack ships and a reader has to know which one to fix.
+    ComponentDef(quill_components_ttrpg::ComponentDefError),
+    /// A `.qpack` manifest (spec 0055) is not well-formed, or does not match the schema.
+    PackParse(String),
+    /// A pack declares a `pack_version` newer than this build supports. A refusal, on the same
+    /// reasoning as [`LoadError::UnsupportedVersion`].
+    UnsupportedPackVersion { found: u32, supported: u32 },
+    /// The container is a readable zip but not a `.qpack` (no `pack.json`).
+    NotAQpack(String),
+    /// A pack omits its `source` or `license`. Content arriving from a stranger with no provenance
+    /// is content nobody should install, so this is a refusal rather than a warning.
+    PackMissingProvenance { pack: String, field: String },
+    /// A pack carries a path that is absolute or escapes its root, in its manifest or as a zip
+    /// entry. A pack is the one artifact here that routinely comes from someone else.
+    PackUnsafePath { pack: String, path: String },
+    /// A document requires a pack that is not installed (spec 0056). Names what is installed too:
+    /// a reader who has just been refused needs to know what they *do* have.
+    PackNotInstalled {
+        pack: String,
+        version: String,
+        installed: Vec<String>,
+        root: String,
+    },
+    /// Two resolved packs both define the same component or template. Refused rather than
+    /// resolved last-one-wins, which would make the winner depend on iteration order.
+    PackConflict {
+        what: String,
+        item: String,
+        first: String,
+        second: String,
+    },
+    /// A different pack is already installed at this name and version.
+    PackAlreadyInstalled {
+        pack: String,
+        version: String,
+        path: String,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -66,6 +105,65 @@ impl fmt::Display for LoadError {
                 f,
                 "template file version {found} is newer than this build supports \
                  (up to {supported}); upgrade Quill to use it"
+            ),
+            LoadError::ComponentDef(e) => write!(f, "{e}"),
+            LoadError::PackParse(m) => write!(f, "malformed pack manifest: {m}"),
+            LoadError::UnsupportedPackVersion { found, supported } => write!(
+                f,
+                "pack format version {found} is newer than this build supports \
+                 (up to {supported}); upgrade Quill to install it"
+            ),
+            LoadError::NotAQpack(m) => write!(f, "not a .qpack container: {m}"),
+            LoadError::PackMissingProvenance { pack, field } => write!(
+                f,
+                "pack `{pack}` has no `{field}`; a pack must say where it came from and \
+                 under what licence before it can be installed"
+            ),
+            LoadError::PackUnsafePath { pack, path } => write!(
+                f,
+                "pack `{pack}` carries the path '{path}', which is absolute or escapes the \
+                 pack root"
+            ),
+            LoadError::PackNotInstalled {
+                pack,
+                version,
+                installed,
+                root,
+            } => {
+                let want = if version.trim().is_empty() {
+                    "any version".to_string()
+                } else {
+                    format!("version {version}")
+                };
+                let have = if installed.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    installed.join(", ")
+                };
+                write!(
+                    f,
+                    "this document requires pack `{pack}` ({want}), which is not installed in \
+                     '{root}' — installed there: {have}. Install it with `quill pack install`."
+                )
+            }
+            LoadError::PackConflict {
+                what,
+                item,
+                first,
+                second,
+            } => write!(
+                f,
+                "packs `{first}` and `{second}` both define the {what} `{item}`; \
+                 uninstall one or use a document-level definition"
+            ),
+            LoadError::PackAlreadyInstalled {
+                pack,
+                version,
+                path,
+            } => write!(
+                f,
+                "a different pack `{pack}` {version} is already installed at '{path}'; \
+                 pass --force to replace it"
             ),
         }
     }
@@ -193,6 +291,34 @@ pub fn migrate_template(value: &mut serde_json::Value) -> Result<(), LoadError> 
     }
 
     obj.insert("template_version".into(), TEMPLATE_VERSION.into());
+    Ok(())
+}
+
+/// Bring a `.qpack` manifest forward to [`PACK_VERSION`], or refuse it (spec 0055).
+///
+/// The same three-step shape as the two above — read the declared version, refuse a newer one,
+/// stamp the current one — because a third differently-shaped version gate would be a third thing
+/// to get wrong.
+pub fn migrate_pack(value: &mut serde_json::Value) -> Result<(), LoadError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| LoadError::PackParse("pack manifest root is not a JSON object".into()))?;
+
+    let found = match obj.get("pack_version") {
+        None => PACK_VERSION,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            LoadError::PackParse("`pack_version` is not a non-negative integer".into())
+        })? as u32,
+    };
+
+    if found > PACK_VERSION {
+        return Err(LoadError::UnsupportedPackVersion {
+            found,
+            supported: PACK_VERSION,
+        });
+    }
+
+    obj.insert("pack_version".into(), PACK_VERSION.into());
     Ok(())
 }
 

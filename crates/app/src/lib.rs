@@ -24,7 +24,12 @@ use quill_core_model::{page_geom, Block, BlockId, Document, LoadError, Template,
 use quill_fonts::Font;
 use quill_layout_engine::{LaidOutPage, LayoutSession, LayoutStats};
 use quill_render::{paint_page, PaintOp, PopulateReport, ProxyCache};
-use quill_text_layout::NoHyphenator;
+// The real en-US hyphenator, not `NoHyphenator` (spec 0059): the canvas is the screen path, and a
+// canvas that breaks lines differently from the exporter shows the author a book they will not get.
+// `LayoutSession` takes the hyphenator directly rather than going through
+// `quill_render::lay_out_for_screen`, because incremental relayout is the whole point of the
+// session — but it must be the *same* hyphenator, which is what the parity test in `cli` asserts.
+use quill_fonts::HypherHyphenator;
 
 /// Gap between pages in the scrolling viewport, in points.
 pub const PAGE_GAP_PT: f32 = 24.0;
@@ -113,7 +118,7 @@ impl AppState {
             .populate_from_assets(&state.doc.assets, &state.asset_root);
         let result = state
             .session
-            .relayout(&state.doc, &state.font, &NoHyphenator);
+            .relayout(&state.doc, &state.font, &HypherHyphenator);
         state.pages = result.pages;
         state
     }
@@ -248,6 +253,10 @@ impl AppState {
                     Block::Image { .. }
                     | Block::StatBlock { .. }
                     | Block::Table { .. }
+                    // A declared component (spec 0054) is the general case of the same thing: its
+                    // text lives in named fields, and which one a bare string would replace is not
+                    // a question this affordance can answer.
+                    | Block::Component { .. }
                     // A contents block's text is generated; there is nothing here to edit.
                     | Block::Toc { .. } => return EditOutcome::default(),
                 };
@@ -262,7 +271,9 @@ impl AppState {
 
     /// Re-flow after an external mutation of the document.
     pub fn relayout(&mut self) -> EditOutcome {
-        let result = self.session.relayout(&self.doc, &self.font, &NoHyphenator);
+        let result = self
+            .session
+            .relayout(&self.doc, &self.font, &HypherHyphenator);
         self.pages = result.pages;
         EditOutcome {
             stats: result.stats,

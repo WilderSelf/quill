@@ -62,7 +62,16 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0051 | [Knuth-Plass active-node pruning](0051-line-break-pruning.md) | M3 | implemented |
 | 0052 | [The screen export profile — clickable internal links](0052-screen-profile.md) | M3 | implemented |
 | 0053 | [User-authored templates: `quill new --from`](0053-user-authored-templates.md) | M3 | implemented |
+| 0054 | [Component definitions as data](0054-component-definitions.md) | M4 | implemented |
+| 0055 | [The `.qpack` container](0055-pack-container.md) | M4 | implemented |
+| 0056 | [Pack resolution](0056-pack-resolution.md) | M4 | implemented |
+| 0057 | [`quill pack extract`](0057-pack-extract.md) | M4 | implemented |
+| 0058 | [The baseline grid](0058-baseline-grid.md) | M4 | implemented |
+| 0059 | [Screen/press hyphenation parity](0059-hyphenation-parity.md) | M4 | implemented |
+| 0060 | [A line may not be drawn past its measure](0060-last-line-measure.md) | M4 | implemented |
+| 0061 | [The gallery and the pack authoring guide](0061-gallery-and-guide.md) | M4 | implemented |
 
-Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
+Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),
+and the content-pack authoring guide in [`../docs/pack-authoring.md`](../docs/pack-authoring.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind
 that order — lives in [`../docs/roadmap.md`](../docs/roadmap.md).

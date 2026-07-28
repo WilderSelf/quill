@@ -175,7 +175,7 @@ impl Tpub {
 /// Rejects absolute paths, drive prefixes and any `..` component. Note it rejects rather than
 /// sanitizes: silently rewriting `../../etc/foo` to `etc/foo` would extract a file the document
 /// never described, and a `.tpub` that tried to escape is not a document to be repaired.
-fn safe_relative_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn safe_relative_path(name: &str) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }

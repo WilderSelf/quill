@@ -18,3 +18,6 @@ authors.workspace = true
 ttf-parser = { workspace = true }
 rustybuzz = { workspace = true }
 quill-text-layout = { workspace = true }
+# en-US Knuth-Liang hyphenation (specs 0018, 0059). `no_std` pattern data with zero transitive
+# dependencies, so sharing it with the screen path costs that path nothing.
+hypher = { workspace = true }
