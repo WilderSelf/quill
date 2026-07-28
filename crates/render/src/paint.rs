@@ -192,12 +192,14 @@ mod tests {
     use super::*;
     use quill_core_model::{page_geom, Document};
     use quill_layout_engine::{lay_out, Stroke};
-    use quill_text_layout::NoHyphenator;
+    // The shared en-US hyphenator, not `NoHyphenator` (spec 0059). These fixtures used to assert a
+    // layout the exporter would never produce, because the screen path hyphenated differently.
+    use quill_fonts::HypherHyphenator;
 
     fn sample_page() -> (LaidOutPage, PageGeom, Font) {
         let doc = Document::sample();
         let font = Font::bundled();
-        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let pages = lay_out(&doc, &font, &HypherHyphenator);
         let geom = page_geom(&doc.page_setup, 0);
         (pages[0].clone(), geom, font)
     }
@@ -386,7 +388,7 @@ mod tests {
         ];
         doc.assign_missing_block_ids().unwrap();
         let font = Font::bundled();
-        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let pages = lay_out(&doc, &font, &HypherHyphenator);
         let ops = paint_page(
             &pages[0],
             &page_geom(&doc.page_setup, 0),
@@ -415,7 +417,7 @@ mod tests {
         doc.content.push(quill_core_model::Block::image("map1"));
         doc.assign_missing_block_ids().unwrap();
         let font = Font::bundled();
-        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let pages = lay_out(&doc, &font, &HypherHyphenator);
         let ops = paint_page(
             &pages[0],
             &page_geom(&doc.page_setup, 0),
@@ -441,7 +443,7 @@ mod tests {
         };
 
         let font = Font::bundled();
-        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let pages = lay_out(&doc, &font, &HypherHyphenator);
         let ops: Vec<PaintOp> = pages
             .iter()
             .flat_map(|p| paint_page(p, &page_geom(&doc.page_setup, p.index), &font, &cache))
@@ -461,7 +463,7 @@ mod tests {
         // Master art has to sit behind the text flowing over it, and paint order is what decides.
         let doc = Document::sample();
         let font = Font::bundled();
-        let mut page = lay_out(&doc, &font, &NoHyphenator)[0].clone();
+        let mut page = lay_out(&doc, &font, &HypherHyphenator)[0].clone();
         page.statics = vec![PlacedBlock::Text {
             source: quill_core_model::BlockId::UNASSIGNED,
             frame: quill_core_model::Rect {

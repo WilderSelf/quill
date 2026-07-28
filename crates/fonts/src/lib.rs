@@ -17,6 +17,10 @@
 //! `export-pdf` measures through this crate too, so there is exactly one shaper in the workspace
 //! and no way for the two paths to drift.
 
+mod hyphenate;
+
+pub use hyphenate::HypherHyphenator;
+
 use quill_text_layout::{CharMetrics, RunMetrics};
 use ttf_parser::{Face as TtfFace, GlyphId};
 

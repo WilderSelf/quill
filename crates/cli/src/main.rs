@@ -669,10 +669,12 @@ fn main() -> ExitCode {
                 }
             };
             let font = quill_fonts::Font::bundled();
-            // Screen layout goes through the same shaper the exporter uses (spec 0032), so what is
-            // drawn here is what the PDF would contain — that is the whole point of the shared crate.
-            let pages =
-                quill_layout_engine::lay_out(&loaded.doc, &font, &quill_text_layout::NoHyphenator);
+            // Screen layout goes through the same shaper *and the same hyphenator* the exporter
+            // uses (specs 0032, 0059), so what is drawn here is what the PDF would contain — that
+            // is the whole point of the shared crate. Until spec 0059 this passed `NoHyphenator`,
+            // and a document could have a different page count on screen than in the file that went
+            // to the printer.
+            let pages = quill_render::lay_out_for_screen(&loaded.doc, &font);
             let Some(page) = pages.get(args.page) else {
                 eprintln!(
                     "error: page {} out of range (document has {})",

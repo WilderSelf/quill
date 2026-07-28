@@ -66,6 +66,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0055 | [The `.qpack` container](0055-pack-container.md) | M4 | implemented |
 | 0056 | [Pack resolution](0056-pack-resolution.md) | M4 | implemented |
 | 0057 | [`quill pack extract`](0057-pack-extract.md) | M4 | implemented |
+| 0059 | [Screen/press hyphenation parity](0059-hyphenation-parity.md) | M4 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind

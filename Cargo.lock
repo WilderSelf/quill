@@ -2594,7 +2594,6 @@ name = "quill-export-pdf"
 version = "0.0.0"
 dependencies = [
  "flate2",
- "hypher",
  "jpeg-decoder",
  "lcms2",
  "pdf-writer",
@@ -2614,6 +2613,7 @@ dependencies = [
 name = "quill-fonts"
 version = "0.0.0"
 dependencies = [
+ "hypher",
  "quill-text-layout",
  "rustybuzz",
  "ttf-parser",

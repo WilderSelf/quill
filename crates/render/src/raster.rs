@@ -326,13 +326,15 @@ mod tests {
     use crate::paint::paint_page;
     use quill_core_model::{page_geom, Document};
     use quill_layout_engine::lay_out;
-    use quill_text_layout::NoHyphenator;
+    // The shared en-US hyphenator, not `NoHyphenator` (spec 0059). These fixtures used to assert a
+    // layout the exporter would never produce, because the screen path hyphenated differently.
+    use quill_fonts::HypherHyphenator;
 
     /// Rasterize the sample document's first page.
     fn render(scale: f32) -> (Raster, Font) {
         let doc = Document::sample();
         let font = Font::bundled();
-        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let pages = lay_out(&doc, &font, &HypherHyphenator);
         let geom = page_geom(&doc.page_setup, 0);
         let cache = ProxyCache::new();
         let ops = paint_page(&pages[0], &geom, &font, &cache);
@@ -456,7 +458,7 @@ mod tests {
         assert!(cache.insert_png("map1", &crate::tests_support::tiny_png(16, 16)));
 
         let font = Font::bundled();
-        let pages = lay_out(&doc, &font, &NoHyphenator);
+        let pages = lay_out(&doc, &font, &HypherHyphenator);
         let geom = page_geom(&doc.page_setup, 0);
         let ops = paint_page(&pages[0], &geom, &font, &cache);
         let raster = rasterize(&ops, &font, &cache, 1.0).expect("raster");

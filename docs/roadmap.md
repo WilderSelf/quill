@@ -1789,19 +1789,8 @@ a narrow `rulebook` column, which sends a block down spec 0046's uncuttable path
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
 whose increment ships is deleted in that increment's PR, not left here as a fixed-but-still-listed
-defect — which is why the four entries M3 opened with are gone and the two below are the ones M3
-*found*.
-
-- **The screen render and the press export do not hyphenate the same way.** `quill render` lays out
-  with `NoHyphenator` while `export` uses the real en-US `HypherHyphenator`
-  (crates/export-pdf/src/lib.rs). So the two paths break lines differently, and a document can have
-  a different line count — and therefore a different page count — on screen than in the file that
-  goes to the printer. `CLAUDE.md` states the rule this breaks in as many words: *one shaper for
-  screen and press, so they cannot drift.* The shaper is shared; the hyphenator is not, because
-  `hyphenate::HypherHyphenator` is private to `export-pdf` and the CLI cannot reach it. The fix is to
-  promote it alongside the shaper — a small refactor with a large blast radius on rendered output,
-  so it is recorded rather than smuggled into an unrelated increment. Found while rendering spec
-  0044's verification page.
+defect — which is why the four entries M3 opened with are gone, and why the hyphenation-parity entry
+M3 found is gone too: spec 0059 shipped it.
 
 - **A paragraph's last line may be drawn past its measure.** `base_demerits` permits a last line up
   to `measure + shrink`, on the strength of shrink that `justify_paragraph_*` never applies to it:
