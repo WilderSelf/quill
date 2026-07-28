@@ -315,7 +315,21 @@ pub fn write_pdf(
             p.finish();
         }
 
-        pdf.stream(*content_id, &content).finish();
+        // `/FlateDecode`, like the image XObjects and the font programs above (spec 0071). PDF 1.2,
+        // so it costs the PDF/X-1a:2001 conformance nothing — the header stays at 1.3 and the same
+        // filter is already on two other stream classes in this very file.
+        //
+        // It was the last stream that carries *bulk* and was not compressed — the XMP packet and
+        // the `/ToUnicode` CMap stay uncompressed on purpose, and are fixed small costs. That was
+        // affordable while the page held only operators and glyph bytes. Spec 0068 filled it with
+        // per-pair `TJ` adjustments:
+        // short repetitive integers drawn from a handful of values, which is close to a best case
+        // for deflate. The cost is that nothing can grep the finished file for operator text any
+        // more; `stream_read::content_streams` inflates, and so does the CI preflight job.
+        let compressed = deflate(&content);
+        let mut s = pdf.stream(*content_id, &compressed);
+        s.filter(Filter::FlateDecode);
+        s.finish();
     }
 
     // Link annotation objects (spec 0052). None under the press profile, by the PDF/X rule above.

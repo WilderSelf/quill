@@ -2646,6 +2646,7 @@ name = "quill-testdoc"
 version = "0.0.0"
 dependencies = [
  "quill-core-model",
+ "quill-export-pdf",
  "quill-layout-engine",
  "quill-render",
  "quill-text-layout",

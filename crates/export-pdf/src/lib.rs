@@ -1755,7 +1755,40 @@ mod tests {
     /// today. It is also the number that makes `FlateDecode` on the content stream (spec 0068's
     /// named separate increment) worth doing: the adjustments are highly repetitive integers and
     /// are exactly what a deflate window eats.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x8e3c_3d98_9471_cf23;
+    ///
+    /// Changed again by spec 0071, and it is **structural**, not a content-stream move — the
+    /// classification spec 0042's entry above is the template for. The stream the page draws did
+    /// not change; how it is *encoded* did. A length-and-offset diff proves nothing about a change
+    /// whose whole effect is on lengths and offsets, so the objects were compared for what they
+    /// *are*, on the same pair of files the ledger always uses: `Document::sample()` exported against the committed parity ICC
+    /// on a build of `main` and on this one. **10220 → 8454 bytes (−17.3%)**, and −3.8% against the
+    /// 8786 bytes the file was *before* spec 0068 — which is the claim the increment was for.
+    ///
+    /// What changed, exactly:
+    ///
+    /// - **Fourteen objects before, fourteen after, and exactly one of them differs.** Object 12,
+    ///   the page content stream. Every other object — catalog, page tree, page, Type0/CIDFont/
+    ///   descriptor, `FontFile2`, `/ToUnicode` CMap, ICC, XMP, outline root and item, info — is
+    ///   byte-identical.
+    /// - **That object differs only in its dictionary and in the encoding of its payload.** The
+    ///   dictionary goes from `<< /Length 2214 >>` to `<< /Length 426 /Filter /FlateDecode >>`, and
+    ///   the `/Length` set for the whole file from `[1017, 376, 2981, 1010, 2214]` to
+    ///   `[1017, 376, 2981, 1010, 426]`: XMP, ICC, font program and CMap all sit at the same
+    ///   lengths they did.
+    /// - **The payload inflates to the old bytes exactly.** All 2214 of them, compared byte for
+    ///   byte against the uncompressed stream `main` wrote. That is the strongest statement
+    ///   available here and it is why no glyph, no `TJ` amount and no operator needed inspecting
+    ///   one at a time: not one of them moved. Deflate took the stream to **19.2%** of its size.
+    ///
+    /// Nothing else in the file could move, because nothing upstream of the writer changed — the
+    /// same pages, the same shaped runs, the same subset. The compression ratio is what carries at
+    /// scale: the 500-page synthetic document goes **15,791,758 → 1,308,263 bytes**, i.e. to 9.5%
+    /// of the 13,763,105 it measured before spec 0068. Both numbers are now gated rather than
+    /// remembered — see `[export]` in `benches/budgets.toml`.
+    ///
+    /// PDF/X-1a:2001 is unaffected. `FlateDecode` is PDF 1.2, the header stays `%PDF-1.3`, and the
+    /// same filter was already on this file's image XObjects and font programs.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0xc1b5_3543_e96c_8692;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -1839,6 +1872,69 @@ mod tests {
              SAMPLE_EXPORT_DIGEST in this commit",
             a.len(),
             digest(&a)
+        );
+    }
+
+    /// The size the sample exported at **before spec 0068**, and the number spec 0071's acceptance
+    /// criterion is stated against: smaller than it was before the glyph run was drawn, not merely
+    /// smaller than 0068 left it. Measured in a worktree at `9811d6c`, the commit before 0068
+    /// landed, exported against this same committed parity ICC.
+    const SAMPLE_BYTES_BEFORE_0068: usize = 8786;
+
+    /// Spec 0071: the page content stream is `/FlateDecode`d, and reading it back means inflating.
+    ///
+    /// Both halves are asserted, because either alone is satisfiable by a defect. That the raw file
+    /// no longer shows a `BT` proves the compression happened; that `content_streams` still finds
+    /// the operators proves the reader kept up. A test that only checked the second would pass over
+    /// a writer that had quietly stopped compressing, and one that only checked the first would
+    /// pass over a reader that had gone blind — which is the failure mode this whole increment had
+    /// to be careful of, since a grep that stops matching reports success.
+    #[test]
+    fn the_page_content_stream_is_compressed_and_still_reads_back() {
+        let (opts, path) = opts_with_fixed_icc("compressed_content");
+        let mut buf = Vec::new();
+        export(&Document::sample(), &opts, &mut buf).expect("export");
+        let _ = std::fs::remove_file(&path);
+
+        // The raw stream payloads: not one of them carries a text operator any more.
+        let raw = crate::stream_read::streams(&buf);
+        assert!(!raw.is_empty(), "the file must have streams at all");
+        assert!(
+            !raw.iter()
+                .any(|s| s.windows(2).any(|w| w == b"BT") && s.windows(3).any(|w| w == b" Tj")),
+            "no stream may still show operator text in its stored bytes"
+        );
+
+        // Inflated, the page's operators are all there.
+        let decoded = crate::stream_read::content_streams(&buf);
+        assert_eq!(
+            decoded.len(),
+            1,
+            "the sample is one page, so one content stream"
+        );
+        let shown = crate::stream_read::shown_items(&decoded[0]);
+        assert!(
+            shown
+                .iter()
+                .any(|s| matches!(s, crate::stream_read::Shown::Glyphs(g) if !g.is_empty())),
+            "the inflated stream must show glyphs"
+        );
+
+        // And the `/Filter` is declared, not merely inferable — a stream a viewer cannot decode is
+        // a corrupt file, and Ghostscript's CI gate is what would catch the inverse mistake.
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("/Filter /FlateDecode"),
+            "the content stream must declare its filter"
+        );
+
+        // The claim the increment exists for, at the one-page scale: smaller than before spec 0068
+        // filled the stream with kern adjustments, not merely smaller than 0068 left it.
+        assert!(
+            buf.len() < SAMPLE_BYTES_BEFORE_0068,
+            "the sample must export smaller than its pre-0068 {SAMPLE_BYTES_BEFORE_0068} bytes, \
+             got {}",
+            buf.len()
         );
     }
 
@@ -3340,9 +3436,17 @@ mod tests {
         let mut bytes: Vec<u8> = Vec::new();
         export(&doc, &opts, &mut bytes).expect("export");
         let _ = std::fs::remove_file(icc);
-        let text = String::from_utf8_lossy(&bytes);
+        // Read through `content_streams`, which inflates: since spec 0071 the operators are
+        // `/FlateDecode`d and a search over the finished file's raw bytes finds nothing. This test
+        // is the one in-tree assertion that greps a *finished* PDF for operator text — every other
+        // one works on `render_page`'s output, which was never compressed — and it is why the spec
+        // treats "the check goes blind" as the real cost rather than a footnote.
+        let streams = crate::stream_read::content_streams(&bytes);
+        assert!(!streams.is_empty(), "the export must draw text at all");
         assert!(
-            text.contains("0 1 1 0 k"),
+            streams
+                .iter()
+                .any(|s| String::from_utf8_lossy(s).contains("0 1 1 0 k")),
             "the run's CMYK fill must appear in a content stream"
         );
     }

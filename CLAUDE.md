@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M5 complete; 0071 (compress content streams) sequenced and unbuilt.** M0 (headless PDF/X export) is
+**Status: M0–M5 complete, through spec 0071.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -134,9 +134,10 @@ rather than the characters (0068), a placed part reports the ink it draws rather
 given (0069), and the contents list is re-expressed through the tab mechanism (0070). They ran in a
 hard order: 0069 would have traded preflight false positives for false *negatives* until 0068 made
 measured and drawn the same number, and 0070 was not expressible until 0069 settled that `w_pt` is
-ink. **Spec 0071 (`FlateDecode` on content streams) is sequenced and unbuilt** — added by a
-measurement 0068 took rather than assumed, and not part of M5's completion. M6–M7 are named, not
-decomposed.
+ink. **Spec 0071 then compressed the content streams** — added by a measurement 0068 took rather
+than assumed, and the last stream in the file that was not `FlateDecode`'d: the 500-page synthetic
+export is now 1.31 MB against the 13.76 MB it was *before* 0068, and export size is budget-gated in
+`benches/budgets.toml` rather than unwatched. M6–M7 are named, not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
 `String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the

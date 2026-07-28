@@ -61,6 +61,11 @@ impl Budgets {
 
     /// Record a measurement against its ceiling, collecting rather than panicking so one bench run
     /// reports every violation instead of only the first.
+    ///
+    /// `#[allow(dead_code)]` for the same reason as [`Budgets::check_exact`] below: this module is
+    /// `mod budget;`-included by each bench target separately, and `export_size` (spec 0071) times
+    /// nothing — every one of its measurements is a deterministic byte count.
+    #[allow(dead_code)]
     pub fn check(&self, key: &str, measured: f64, failures: &mut Vec<String>) {
         let Some((_, ceiling)) = self.entries.iter().find(|(k, _)| k == key) else {
             println!("  ! no budget for '{key}' (measured {measured:.3}) — add one");
@@ -116,6 +121,10 @@ impl Budgets {
 /// source of noise on a shared runner (a neighbouring build, a scheduler preemption) only ever adds
 /// time. The minimum is the closest estimate of the true cost, and it is far more stable run to run
 /// than a mean that a single outlier can drag.
+///
+/// `#[allow(dead_code)]`: `export_size` measures byte counts, not durations, and so includes this
+/// module without using it.
+#[allow(dead_code)]
 pub fn min_of(n: usize, mut f: impl FnMut()) -> Duration {
     assert!(n > 0);
     let mut best = Duration::MAX;
