@@ -17,7 +17,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
-| **M3** | Pro polish + POD presets | decomposed — specs 0044–0053 sequenced below |
+| **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Plugins / ecosystem | not started |
 
 ## Decisions log
@@ -1538,10 +1538,21 @@ it inside 0049 would decide how a template composes in the increment that is not
 
 ## Known issues
 
-Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. Each entry
-now names the M3 increment that closes it; an entry whose increment ships is deleted in that
-increment's PR, not left here as a fixed-but-still-listed defect.
+Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
+whose increment ships is deleted in that increment's PR, not left here as a fixed-but-still-listed
+defect — which is why the four entries M3 opened with are gone and the two below are the ones M3
+*found*.
 
+- **The screen render and the press export do not hyphenate the same way.** `quill render` lays out
+  with `NoHyphenator` while `export` uses the real en-US `HypherHyphenator`
+  (crates/export-pdf/src/lib.rs). So the two paths break lines differently, and a document can have
+  a different line count — and therefore a different page count — on screen than in the file that
+  goes to the printer. `CLAUDE.md` states the rule this breaks in as many words: *one shaper for
+  screen and press, so they cannot drift.* The shaper is shared; the hyphenator is not, because
+  `hyphenate::HypherHyphenator` is private to `export-pdf` and the CLI cannot reach it. The fix is to
+  promote it alongside the shaper — a small refactor with a large blast radius on rendered output,
+  so it is recorded rather than smuggled into an unrelated increment. Found while rendering spec
+  0044's verification page.
 
 - **A paragraph's last line may be drawn past its measure.** `base_demerits` permits a last line up
   to `measure + shrink`, on the strength of shrink that `justify_paragraph_*` never applies to it:
@@ -1592,6 +1603,27 @@ than on a per-profile branch. `Screen` is deliberately not an RGB profile, and d
 compression, downsampling or reader spreads; see the non-goals in `specs/0052-screen-profile.md`.
 
 ## Beyond M3
+
+M3 closed on 2026-07-28. What it shipped, and what it left:
+
+- **The splitting mechanism was the milestone's spine.** Three increments had wanted it; it was built
+  once (0044) as a `\vsplit` over an already-measured vertical list, so the measurement cache gained
+  no height dimension, and tables (0045) and stat blocks (0046) then cost little. The rule that
+  bounds it — a fragment is non-empty and the absolute offset strictly increases — is what makes the
+  flow loop terminate, and it turned out that emptiness of the frame never was.
+- **Two perf results were larger than planned.** 0051's pruning was expected to close a superlinear
+  cliff; it also revealed the DP was cloning a growing path vector into every candidate, so the true
+  exponent was ~2.6. One 20,000-word paragraph went from 49.7 s to 4.2 ms, and full-document layout
+  from 0.31 to 0.073 ms/page.
+- **Two budgets stopped meaning what they said, and were repaired rather than raised.**
+  `incremental_pages_reflowed` was measuring looseness, not efficiency, once columns packed tight;
+  `incremental_blocks_measured` now carries the M1 claim. And a counter re-baselined to 260 with the
+  file's 2× *timing* tolerance had a failure threshold above every value it can physically take —
+  work counters are now checked exactly.
+- **Three numbers were deliberately not invented**: the vendor presets' figures, their trim
+  catalogues, and `generic`'s safety margin. Each is a named slot with its provenance recorded, and
+  the CLI says so out loud. Filling them from the printers' current specifications is the obvious
+  next non-code task.
 
 M4 (plugins / ecosystem) is not yet decomposed into increments. It is sketched in `CLAUDE.md` and
 will be sequenced here once M3 closes, following the same rule: a spec per feature, ordered by
