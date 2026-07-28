@@ -245,9 +245,11 @@ impl AppState {
                     // six independently editable sections, so replacing it from one string would
                     // silently discard five of them. Leave both alone rather than doing something
                     // the caller did not ask for; a stat-block editor is its own affordance.
-                    Block::Image { .. } | Block::StatBlock { .. } | Block::Table { .. } => {
-                        return EditOutcome::default()
-                    }
+                    Block::Image { .. }
+                    | Block::StatBlock { .. }
+                    | Block::Table { .. }
+                    // A contents block's text is generated; there is nothing here to edit.
+                    | Block::Toc { .. } => return EditOutcome::default(),
                 };
                 *block = replacement;
                 block.set_id(id);

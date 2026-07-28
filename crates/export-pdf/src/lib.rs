@@ -196,7 +196,8 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
             Block::Heading { color, .. }
             | Block::Body { color, .. }
             | Block::StatBlock { color, .. }
-            | Block::Table { color, .. } => Some(color),
+            | Block::Table { color, .. }
+            | Block::Toc { color, .. } => Some(color),
             Block::Image { .. } => None,
         };
         let Some(color) = color else { continue };
@@ -476,6 +477,15 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
                         set.extend(cell.chars());
                     }
                 }
+            }
+            Block::Toc { title, .. } => {
+                // Only the authored title. The entries are generated from heading text, which is
+                // already collected from the headings themselves — and the page numbers are
+                // digits, which the subset always carries because the folio needs them.
+                set.extend(title.chars());
+                set.extend('0'..='9');
+                set.insert('.');
+                set.insert('…');
             }
             Block::Image { .. } => {}
         }
@@ -1080,7 +1090,12 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    /// Changed by spec 0042, and this one is **structural rather than identifier-only** — the first
+    /// Changed by spec 0041: `StyleSheet::default()` gained `toc-title` and `toc-1`..`toc-6`, so
+    /// `doc.to_json()` changed and with it the document identifier. Verified identifier-only: both
+    /// files are 8786 bytes and differ in exactly 124, in the two XMP identifier clusters and the
+    /// trailer `/ID`. No content stream moved.
+    ///
+    /// Previously changed by spec 0042, and that one was **structural rather than identifier-only** — the first
     /// such move in M2, and expected: the catalog gained `/Outlines` and the document gained an
     /// outline root plus one item for the sample's single `h1`. 8559 -> 8786 bytes.
     ///
@@ -1112,7 +1127,7 @@ mod tests {
     /// Verified by inspecting the emitted text operators rather than by accepting the new number:
     /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
     /// only by being ragged-left.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0xaa41_b45e_01d6_c2dd;
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x25c8_f03e_dc43_661b;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
