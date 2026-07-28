@@ -108,3 +108,52 @@ content, so editing content reflows layout. See `CLAUDE.md` and the roadmap for 
 ("Spreads" appeared in earlier drafts of this document as the layout container. No such type was
 ever built: the layout layer is `master_pages` + `pages`, described above. Facing-page behavior
 lives in `page_setup.facing_pages` and in the inside/outside margins, not in a spread object.)
+
+## Appendix: the authoring syntax (spec 0043)
+
+A small line-oriented syntax that imports to a document. Deliberately a **subset**, not CommonMark:
+the constructs below are all of it, and everything else is an explicit non-goal. Round-tripping back
+out to this syntax is also a non-goal.
+
+- `#` … `######` followed by a space — a heading of that level. `#1` is a word, not a heading.
+- Blank-line-separated runs of text — a body paragraph; newlines inside one are soft.
+- `![alt](asset-id)` — an image block referencing a linked asset by id.
+- `:::statblock` … `:::` — one `key: value` per line, where `key` is `name`, `overview`, `detail`,
+  `action`, `reaction`, or `attr` (whose value is `name = value`).
+- `:::table` … `:::` — pipe-delimited rows; the first is the header, and a `|---|` separator row is
+  ignored as markdown furniture.
+- `:::toc` … `:::` — a generated contents list, taking `title:` and `max_level:`.
+
+Input the importer does not understand is **never silently dropped**. An unknown fence (`:::foo`) is
+an error, because the author clearly meant a structured object and both guessing and discarding lose
+real content. Everything else is kept as body text with a warning naming the line — a paragraph that
+came out as plain prose is visible and fixable; one that vanished is not.
+
+```quill-import
+# The Ruined Keep
+
+A dank corridor stretches
+into darkness.
+
+![a map](map1)
+
+:::statblock
+name: Goblin
+overview: Small humanoid, chaotic evil
+attr: Armour Class = 15
+action: Scimitar. +4 to hit.
+:::
+
+:::table
+| d20 | Encounter |
+|-----|-----------|
+| 1-4 | Nothing   |
+:::
+
+:::toc
+title: Contents
+max_level: 2
+:::
+```
+
+The example above is parsed by a test, so it cannot drift from what the importer accepts.
