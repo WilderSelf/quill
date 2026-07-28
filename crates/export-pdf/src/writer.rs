@@ -15,7 +15,7 @@ use std::io::Write;
 use std::path::Path;
 
 use pdf_writer::types::{
-    ActionType, AnnotationType, CidFontType, FontFlags, SystemInfo, TrappingStatus,
+    ActionType, AnnotationType, CidFontType, FontFlags, SystemInfo, TrappingStatus, UnicodeCmap,
 };
 use pdf_writer::writers::OutputIntent;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
@@ -117,10 +117,18 @@ pub fn write_pdf(
     // is legal (the xref gets a free entry) but it is a lie in the file, and the screen profile is
     // the profile that must not look like it half-claims PDF/X.
     let icc_id = write_output_intent_obj.then(|| alloc.bump());
-    // One Type0 chain per embedded face (spec 0064). A document that sets text in one face
-    // allocates exactly the four references it always did, in the same order.
-    let font_ids: Vec<[Ref; 4]> = (0..family.len())
-        .map(|_| [alloc.bump(), alloc.bump(), alloc.bump(), alloc.bump()])
+    // One Type0 chain per embedded face (spec 0064), each with its own `/ToUnicode` CMap
+    // (spec 0068): Type0, CIDFont, FontDescriptor, FontFile, CMap.
+    let font_ids: Vec<[Ref; 5]> = (0..family.len())
+        .map(|_| {
+            [
+                alloc.bump(),
+                alloc.bump(),
+                alloc.bump(),
+                alloc.bump(),
+                alloc.bump(),
+            ]
+        })
         .collect();
     for img in images_by_id.values_mut() {
         img.id = alloc.bump();
@@ -236,7 +244,7 @@ pub fn write_pdf(
     }
 
     for ((_, font), ids) in family.faces().zip(&font_ids) {
-        write_font(&mut pdf, font, ids[0], ids[1], ids[2], ids[3]);
+        write_font(&mut pdf, font, ids[0], ids[1], ids[2], ids[3], ids[4]);
     }
 
     // Image XObjects: grayscale as /DeviceGray, color as /DeviceCMYK (spec 0005).
@@ -407,6 +415,12 @@ fn write_output_intent(mut oi: OutputIntent<'_>, icc_id: Ref) {
 ///   a `Length1` (the sfnt byte length).
 /// - **CFF**: `CIDFontType0` (no `CIDToGIDMap` — it is meaningful only for `CIDFontType2`), bare
 ///   `CFF ` table in `FontFile3` tagged `/Subtype /CIDFontType0C`, no `Length1`.
+///
+/// The Type0 font also names a `/ToUnicode` CMap (spec 0068). With `Identity-H` and no CMap, a copy
+/// or a search over the file yields subset glyph ids rather than text — survivable while the
+/// encoding was one glyph per character, because the mapping was recoverable in principle, and
+/// *not* survivable once a ligature draws as one glyph: nothing downstream can learn that one glyph
+/// was three characters, because the cluster map that says so exists only at the moment of shaping.
 fn write_font(
     pdf: &mut Pdf,
     font: &fonts::EmbeddedFont,
@@ -414,6 +428,7 @@ fn write_font(
     cid_id: Ref,
     descriptor_id: Ref,
     fontfile_id: Ref,
+    to_unicode_id: Ref,
 ) {
     let base = font.base_font.as_bytes();
     let is_cff = font.outlines == fonts::OutlineKind::Cff;
@@ -422,6 +437,7 @@ fn write_font(
         t0.base_font(Name(base));
         t0.encoding_predefined(Name(b"Identity-H"));
         t0.descendant_font(cid_id);
+        t0.to_unicode(to_unicode_id);
         t0.finish();
     }
     {
@@ -479,7 +495,29 @@ fn write_font(
         }
         s.finish();
     }
+    {
+        // Left uncompressed, like the XMP packet and unlike the font program: it is the one object
+        // in the file a reader may have to open by hand to answer "what does this glyph say", and
+        // the workspace's tests read it out of the finished PDF rather than out of a fixture.
+        let mut cmap = UnicodeCmap::<u16>::new(Name(b"Adobe-Identity-UCS"), UCS_SYSTEM_INFO);
+        for (gid, text) in font.to_unicode() {
+            cmap.pair_with_multiple(gid, text.chars());
+        }
+        let bytes = cmap.finish();
+        let mut stream = pdf.cmap(to_unicode_id, bytes.as_slice());
+        stream.name(Name(b"Adobe-Identity-UCS"));
+        stream.system_info(UCS_SYSTEM_INFO);
+        stream.finish();
+    }
 }
+
+/// The `CIDSystemInfo` a `/ToUnicode` CMap declares: `Adobe-UCS-0`, which is what the destination
+/// strings are (UTF-16BE), not the `Adobe-Identity-0` the *encoding* uses.
+const UCS_SYSTEM_INFO: SystemInfo<'static> = SystemInfo {
+    registry: Str(b"Adobe"),
+    ordering: Str(b"UCS"),
+    supplement: 0,
+};
 
 /// Build one page's content stream: text (black) and image XObjects, y-flipped into PDF space.
 fn render_page(
@@ -564,7 +602,7 @@ fn render_page(
                     ) {
                         (Some(ink), Some(fmt), Some(shift)) => {
                             set_state(&mut content, family, &mut state, fmt, shift, ink);
-                            show_line(&mut content, family.font(state.slot), line, fmt.size_pt);
+                            show_line(&mut content, family, state.slot, line, fmt.size_pt);
                         }
                         _ => show_line_by_span(
                             &mut content,
@@ -793,19 +831,6 @@ fn set_stroke(content: &mut Content, color: &Color) {
     };
 }
 
-/// Show one laid-out line at the current text position, applying its justification adjustment
-/// (spec 0017, increment 2).
-///
-/// A ragged line (`space_adjust_pt == 0` — headings, last lines, single-word lines) is drawn as a
-/// single `Tj`, byte-for-byte as before. A justified line is drawn with a positioned `TJ`: each word
-/// (with its trailing space glyph, so the natural space advance is preserved) is shown in turn, and
-/// the extra `space_adjust_pt` is inserted between words as a `TJ` adjustment. `Tw` word spacing is
-/// unusable here — the font is a Type0/Identity-H composite (2-byte codes), and PDF word spacing
-/// applies only to single-byte code 32. The `TJ` `amount` is in thousandths of a text-space unit and
-/// is *subtracted* from the position, so a rightward (space-adding) shift of `space_adjust_pt` points
-/// at `font_size_pt` is `-1000 · space_adjust_pt / font_size_pt`. The size is the block's own
-/// (spec 0028), not a global constant: the adjustment is in thousandths of an *em*, so using the
-/// wrong size would misplace every word on a justified line set at anything but body size.
 /// The one ink this line is set in, or `None` if its spans disagree (spec 0063).
 ///
 /// Compared against `fallback` — the block's own colour — and not merely against the line's first
@@ -950,52 +975,95 @@ fn show_line_by_span(
         if piece.is_empty() {
             continue;
         }
-        let font = family.font(state.slot);
-        let adjust = if line.space_adjust_pt == 0.0 {
-            0.0
-        } else {
-            -1000.0 * line.space_adjust_pt / fmt.size_pt
-        };
-        if adjust == 0.0 {
-            content.show(Str(&font.encode_line(piece)));
-            continue;
-        }
-        let mut tj = content.show_positioned();
-        let mut items = tj.items();
-        let mut rest = piece;
-        while let Some(idx) = rest.find(' ') {
-            let (head, tail) = rest.split_at(idx + 1);
-            items.show(Str(&font.encode_line(head)));
-            items.adjust(adjust);
-            rest = tail;
-        }
-        if !rest.is_empty() {
-            items.show(Str(&font.encode_line(rest)));
-        }
+        // The span's own size, not the line's: the `TJ` unit is a thousandth of the *current* font
+        // size, so a span set at another size would otherwise spend the wrong amount of space. Each
+        // span is shaped on its own, exactly as it was measured — which is why a kern pair
+        // straddling a span boundary is neither counted twice nor drawn.
+        let per_space = justification_amount(line, fmt.size_pt);
+        show_segments(content, &shaped(family, state.slot, piece, per_space));
     }
 }
 
-fn show_line(content: &mut Content, font: &fonts::EmbeddedFont, line: &Line, font_size_pt: f32) {
+/// Draw one line's shaped glyph run (spec 0068).
+///
+/// `slot` is the face already in force — the text state was brought to it by [`set_state`], and
+/// shaping through any other face would draw a sequence the line was not measured at.
+fn show_line(
+    content: &mut Content,
+    family: &fonts::EmbeddedFamily,
+    slot: usize,
+    line: &Line,
+    font_size_pt: f32,
+) {
+    let per_space = justification_amount(line, font_size_pt);
+    show_segments(content, &shaped(family, slot, &line.text, per_space));
+}
+
+/// Shape one piece of text in the face already in force, and return the encoded glyph segments with
+/// the `TJ` amount that follows each.
+///
+/// A ragged line takes the plain path, where every adjustment is an integral number of thousandths
+/// of an em; a justified one additionally spends `per_space` after each inter-word space.
+fn shaped(
+    family: &fonts::EmbeddedFamily,
+    slot: usize,
+    text: &str,
+    per_space: f32,
+) -> Vec<(Vec<u8>, f32)> {
+    let font = family.font(slot);
+    let shaper = family.shaper(slot);
+    if per_space == 0.0 {
+        font.shape_piece(shaper, text)
+            .into_iter()
+            .map(|(bytes, adjust)| (bytes, adjust as f32))
+            .collect()
+    } else {
+        font.shape_piece_justified(shaper, text, per_space)
+    }
+}
+
+/// The `TJ` amount spent after each inter-word space to justify `line`, in thousandths of a text
+/// space unit at `font_size_pt` (spec 0017, increment 2).
+///
+/// `TJ` amounts are **subtracted** from the position, so a rightward (space-adding) shift of
+/// `space_adjust_pt` points is a *negative* number. `Tw` word spacing is unusable here — the font
+/// is a Type0/Identity-H composite (2-byte codes) and PDF word spacing applies only to single-byte
+/// code 32.
+fn justification_amount(line: &Line, font_size_pt: f32) -> f32 {
     if line.space_adjust_pt == 0.0 {
-        content.show(Str(&font.encode_line(&line.text)));
+        0.0
+    } else {
+        -1000.0 * line.space_adjust_pt / font_size_pt
+    }
+}
+
+/// Emit encoded glyph segments, as a plain `Tj` when nothing needs adjusting and a positioned `TJ`
+/// when something does.
+///
+/// The single-`Tj` case is not an optimisation: it is what keeps a kern-free, unjustified line
+/// byte-identical to what the writer emitted before it drew shaped runs, which is what makes the
+/// control case of spec 0068's width table meaningful rather than self-referential.
+fn show_segments(content: &mut Content, segments: &[(Vec<u8>, f32)]) {
+    // Empty text still shows an empty string, as the character encoder did — a text object that
+    // silently drew nothing would be a second thing to explain.
+    if segments.is_empty() {
+        content.show(Str(&[]));
         return;
     }
-    let amount = -1000.0 * line.space_adjust_pt / font_size_pt;
-    let words: Vec<&str> = line.text.split(' ').collect();
+    if let [(bytes, adjust)] = segments {
+        if *adjust == 0.0 {
+            content.show(Str(bytes));
+            return;
+        }
+    }
     let mut tj = content.show_positioned();
     let mut items = tj.items();
-    let last = words.len() - 1;
-    for (i, word) in words.iter().enumerate() {
-        // Keep the natural space glyph on every word but the last, then add the adjustment; this
-        // preserves the measured space advance and only inserts the extra justification space.
-        let piece = if i == last {
-            (*word).to_string()
-        } else {
-            format!("{word} ")
-        };
-        items.show(Str(&font.encode_line(&piece)));
-        if i != last {
-            items.adjust(amount);
+    for (bytes, adjust) in segments {
+        if !bytes.is_empty() {
+            items.show(Str(bytes));
+        }
+        if *adjust != 0.0 {
+            items.adjust(*adjust);
         }
     }
 }
@@ -1031,6 +1099,7 @@ fn doc_id_hex(doc: &Document) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream_read::{shown_items, Shown};
     use quill_core_model::PageSetup;
     use quill_layout_engine::Stroke;
     use quill_text_layout::{
@@ -1038,8 +1107,8 @@ mod tests {
     };
 
     /// The bundled regular face as a one-face family — what every one of these tests draws with.
-    fn test_family(chars: &BTreeSet<char>) -> fonts::EmbeddedFamily {
-        let font = fonts::build(chars).expect("build bundled font");
+    fn test_family(text: &fonts::FaceText) -> fonts::EmbeddedFamily {
+        let font = fonts::build(text).expect("build bundled font");
         fonts::EmbeddedFamily::new(
             vec![(quill_fonts::FaceKey::REGULAR, font)],
             quill_fonts::FontFamily::single(
@@ -1049,15 +1118,12 @@ mod tests {
     }
 
     /// Build a one-page layout holding a single text block with the given fill color, render it,
-    /// and return the (uncompressed) content-stream bytes as a lossy string. Unlike the finished
-    /// PDF, `render_page` output is not FlateDecode'd, so fill operators are directly greppable.
+    /// and return the content-stream bytes as a lossy string. Content streams are not FlateDecode'd
+    /// anywhere — not here and not in the finished file — so operators are directly greppable.
     fn render_text_color(color: Color) -> String {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
-        let mut chars = BTreeSet::new();
-        chars.insert('H');
-        chars.insert('i');
-        let font = test_family(&chars);
+        let font = test_family(&fonts::FaceText::from_text("Hi"));
         let page = LaidOutPage {
             index: 0,
             statics: Vec::new(),
@@ -1091,7 +1157,7 @@ mod tests {
     fn a_mixed_format_line_switches_face_tracking_and_rise() {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
-        let chars: BTreeSet<char> = "Hiabc".chars().collect();
+        let chars = fonts::FaceText::from_chars("Hiabc".chars());
         let family = fonts::EmbeddedFamily::new(
             vec![
                 (
@@ -1175,7 +1241,7 @@ mod tests {
     fn every_line_is_shown_in_the_face_it_was_set_in() {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
-        let chars: BTreeSet<char> = "abcdefgh ".chars().collect();
+        let chars = fonts::FaceText::from_chars("abcdefgh ".chars());
         let family = fonts::EmbeddedFamily::new(
             vec![
                 (
@@ -1235,7 +1301,10 @@ mod tests {
         let content = String::from_utf8_lossy(&render_page(&page, &g, &family, &BTreeMap::new()))
             .into_owned();
 
-        // Walk the stream tracking the font in force, and record which one each `Tj` was shown in.
+        // Walk the stream tracking the font in force, and record which one each show was made in.
+        // Both show operators count: spec 0068 made `TJ` the form a kerning line takes, so a walk
+        // that matched only `" Tj"` would stop seeing lines rather than start failing — it would go
+        // structurally blind, which is the failure mode this test exists to have caught.
         let mut current = String::new();
         let mut shown = Vec::new();
         for op in content.lines() {
@@ -1244,7 +1313,7 @@ mod tests {
                     current = name.to_string();
                 }
             }
-            if op.contains(" Tj") {
+            if op.ends_with(" Tj") || op.ends_with(" TJ") {
                 shown.push(current.clone());
             }
         }
@@ -1273,7 +1342,7 @@ mod tests {
     ) -> String {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
-        let font = test_family(&BTreeSet::new());
+        let font = test_family(&fonts::FaceText::default());
         let page = LaidOutPage {
             index: 0,
             statics: Vec::new(),
@@ -1373,10 +1442,18 @@ mod tests {
 
     /// Render a single justified line and return the (uncompressed, greppable) content bytes.
     fn render_justified_line(text: &str, space_adjust_pt: f32) -> Vec<u8> {
+        render_line_in(
+            &test_family(&fonts::FaceText::from_text(text)),
+            text,
+            space_adjust_pt,
+        )
+    }
+
+    /// The same, in a family the caller already built — so a test can ask the *same* subset both
+    /// what was drawn and how wide its glyphs are declared to be.
+    fn render_line_in(font: &fonts::EmbeddedFamily, text: &str, space_adjust_pt: f32) -> Vec<u8> {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
-        let chars: BTreeSet<char> = text.chars().collect();
-        let font = test_family(&chars);
         let page = LaidOutPage {
             index: 0,
             statics: Vec::new(),
@@ -1399,7 +1476,168 @@ mod tests {
                 color: Color::Gray { v: 0.0 },
             }],
         };
-        render_page(&page, &g, &font, &BTreeMap::new())
+        render_page(&page, &g, font, &BTreeMap::new())
+    }
+
+    /// The width the page will actually draw, in points: the `/W` entry of every glyph the stream
+    /// showed, less every `TJ` amount it wrote (they are *subtracted* from the position).
+    fn drawn_width_pt(content: &[u8], font: &fonts::EmbeddedFont, size_pt: f32) -> f32 {
+        let mut units = 0.0f32;
+        for item in shown_items(content) {
+            match item {
+                Shown::Glyphs(gids) => {
+                    for gid in gids {
+                        units += font.widths[gid as usize];
+                    }
+                }
+                Shown::Adjust(amount) => units -= amount,
+            }
+        }
+        units * size_pt / 1000.0
+    }
+
+    /// Spec 0068's headline acceptance criterion: **the width the PDF draws equals the width layout
+    /// measured, to 0.01 pt**, over the five cases the spec tabulates.
+    ///
+    /// Measured by summing the `/W` entries of the glyphs the content stream actually shows and the
+    /// `TJ` adjustments it actually writes, parsed back out of the emitted bytes. Deliberately not
+    /// re-derived from the shaper: that would assert the shaper against itself and would pass even
+    /// if the writer emitted nothing at all.
+    #[test]
+    fn the_drawn_width_equals_the_measured_width() {
+        use quill_text_layout::RunMetrics;
+        let cases: [(&str, &str); 5] = [
+            (
+                "ordinary prose",
+                "The quick brown fox jumps over the lazy dog and then runs off",
+            ),
+            ("kern-heavy", "AV Wa To Yo, Pa."),
+            ("office", "office"),
+            (
+                "ligature-rich",
+                "The officer shuffled a fistful of ruffled affidavits off the shelf",
+            ),
+            ("control", "mmmmm nnnnn ooooo"),
+        ];
+        for (name, text) in cases {
+            let family = test_family(&fonts::FaceText::from_text(text));
+            let bytes = render_line_in(&family, text, 0.0);
+            let drawn = drawn_width_pt(&bytes, family.font(0), FONT_SIZE_PT);
+            let measured = family.metrics().measure_run(text, FONT_SIZE_PT);
+            assert!(
+                (drawn - measured).abs() < 0.01,
+                "{name}: drawn {drawn} vs measured {measured} ({:+})",
+                drawn - measured
+            );
+            // Nothing drew as `.notdef`, or the widths above would agree about a box.
+            for item in shown_items(&bytes) {
+                if let Shown::Glyphs(gids) = item {
+                    assert!(gids.iter().all(|g| *g != 0), "{name}: .notdef drawn");
+                }
+            }
+        }
+
+        // The control case must come out at *exactly* zero adjustment, or the instrument is
+        // measuring its own machinery rather than the writer's.
+        let family = test_family(&fonts::FaceText::from_text("mmmmm nnnnn ooooo"));
+        let control = render_line_in(&family, "mmmmm nnnnn ooooo", 0.0);
+        assert_eq!(
+            shown_items(&control)
+                .into_iter()
+                .filter(|i| matches!(i, Shown::Adjust(_)))
+                .count(),
+            0
+        );
+    }
+
+    /// A justified line's width is its measured width plus the space the justifier bought — and the
+    /// kern corrections must survive alongside it, not be replaced by it.
+    #[test]
+    fn a_justified_line_draws_its_measure_plus_the_space_it_was_given() {
+        use quill_text_layout::RunMetrics;
+        let text = "AV Wa To Yo";
+        let family = test_family(&fonts::FaceText::from_text(text));
+        let bytes = render_line_in(&family, text, 3.0);
+        let drawn = drawn_width_pt(&bytes, family.font(0), FONT_SIZE_PT);
+        // Three inter-word spaces, each widened by 3 pt.
+        let measured = family.metrics().measure_run(text, FONT_SIZE_PT) + 3.0 * 3.0;
+        assert!(
+            (drawn - measured).abs() < 0.01,
+            "drawn {drawn} vs measured {measured}"
+        );
+    }
+
+    /// Spec 0068: a kern pair straddling a **span** boundary is neither lost nor doubled. There was
+    /// no test for that boundary before this spec, and the trap is the one already documented for
+    /// justification — each span is shaped and measured on its own, so the drawn width has to be
+    /// the sum of the spans' measured widths, not the width of the line shaped as a whole.
+    #[test]
+    fn a_kern_pair_across_a_span_boundary_is_neither_lost_nor_doubled() {
+        use quill_text_layout::RunMetrics;
+        let setup = PageSetup::default();
+        let g = geom::page_geom(&setup, 0);
+        // `AV` kerns hard. Split across two runs that are set in the *same* face, so the only thing
+        // that differs is where the span boundary falls.
+        let family = test_family(&fonts::FaceText::from_text("AV"));
+        let line = Line {
+            text: "AV".into(),
+            spans: vec![
+                quill_text_layout::Span {
+                    run: 0,
+                    len_bytes: 1,
+                },
+                quill_text_layout::Span {
+                    run: 1,
+                    len_bytes: 1,
+                },
+            ],
+            space_adjust_pt: 0.0,
+            indent_pt: 0.0,
+        };
+        let page = LaidOutPage {
+            index: 0,
+            statics: Vec::new(),
+            blocks: vec![PlacedBlock::Text {
+                // Two runs differing in colour, so the by-span path is the one taken.
+                run_colors: vec![Color::Gray { v: 0.0 }, Color::Gray { v: 0.5 }],
+                run_formats: vec![
+                    quill_text_layout::RunFormat::plain(FONT_SIZE_PT),
+                    quill_text_layout::RunFormat::plain(FONT_SIZE_PT),
+                ],
+                run_shifts: Vec::new(),
+                weight: 400,
+                italic: false,
+                source: quill_core_model::BlockId::UNASSIGNED,
+                frame: quill_core_model::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: setup.trim.w_pt,
+                    h_pt: LINE_HEIGHT_PT,
+                },
+                font_size_pt: FONT_SIZE_PT,
+                leading_pt: LINE_HEIGHT_PT,
+                lines: vec![line],
+                color: Color::Gray { v: 0.0 },
+            }],
+        };
+        let bytes = render_page(&page, &g, &family, &BTreeMap::new());
+        let drawn = drawn_width_pt(&bytes, family.font(0), FONT_SIZE_PT);
+        // What layout measured: each span on its own, which is how `measure_format` is called.
+        let per_span = family.metrics().measure_run("A", FONT_SIZE_PT)
+            + family.metrics().measure_run("V", FONT_SIZE_PT);
+        assert!(
+            (drawn - per_span).abs() < 0.01,
+            "drawn {drawn} vs the sum of the spans' measures {per_span}"
+        );
+        // And the kern was not smuggled in twice, nor once: the whole-line shaping is strictly
+        // narrower, so a drawn width equal to *that* would mean the writer shaped across the
+        // boundary and the line would end short of where layout put the next one.
+        let whole = family.metrics().measure_run("AV", FONT_SIZE_PT);
+        assert!(whole < per_span - 0.01, "sanity: AV should kern");
+        assert!(
+            (drawn - whole).abs() > 0.01,
+            "the kern was applied across a span boundary"
+        );
     }
 
     #[test]
@@ -1425,14 +1663,39 @@ mod tests {
         );
     }
 
+    /// Rewritten by spec 0068 rather than deleted. It used to assert that a ragged line contains no
+    /// `TJ` **at all**, which this spec invalidates by design — a ragged line whose glyphs kern now
+    /// carries that kern as a `TJ` adjustment, which is the whole point.
+    ///
+    /// What it was actually protecting survives and is what is asserted here: a line that needs no
+    /// correction is still one plain `Tj` and nothing more, so the overwhelmingly common case did
+    /// not grow a positioned array it has no use for. The second half is the new half — a line that
+    /// *does* kern must take the positioned form, or the correction has nowhere to go.
     #[test]
-    fn ragged_line_uses_a_single_show() {
-        // A line carrying no adjustment is drawn with `Tj`, not the positioned `TJ` (bytes unchanged
-        // from before increment 2 for headings / last lines / single-word lines).
-        let bytes = render_justified_line("ab cd", 0.0);
+    fn a_line_that_needs_no_correction_is_drawn_with_one_show() {
+        // Neither `kern` nor `liga` fires on these pairs in the bundled face.
+        let bytes = render_justified_line("mmmmm nnnnn ooooo", 0.0);
         let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("Tj"), "expected a Tj show, got:\n{s}");
-        assert!(!s.contains("TJ"), "ragged line must not use TJ, got:\n{s}");
+        assert!(s.contains(" Tj"), "expected a Tj show, got:\n{s}");
+        assert!(
+            !s.contains(" TJ"),
+            "a line needing no correction must not use TJ, got:\n{s}"
+        );
+        assert_eq!(
+            shown_items(&bytes)
+                .iter()
+                .filter(|i| matches!(i, Shown::Adjust(_)))
+                .count(),
+            0,
+            "the control case must emit exactly zero adjustments:\n{s}"
+        );
+
+        let kerned = render_justified_line("AV Wa To", 0.0);
+        let k = String::from_utf8_lossy(&kerned);
+        assert!(
+            k.contains(" TJ"),
+            "a ragged line that kerns must carry the kern as TJ, got:\n{k}"
+        );
     }
 
     #[test]

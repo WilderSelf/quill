@@ -250,7 +250,7 @@ pub struct Outline {
     pub advance: f32,
 }
 
-/// A shaped glyph: which glyph, and where it sits along the run.
+/// A shaped glyph: which glyph, where it sits along the run, and which characters it came from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PositionedGlyph {
     pub gid: u16,
@@ -258,6 +258,17 @@ pub struct PositionedGlyph {
     pub x_pt: f32,
     /// This glyph's advance, in points.
     pub advance_pt: f32,
+    /// Byte offset into the shaped text of the first character this glyph came from — HarfBuzz's
+    /// cluster value (spec 0068).
+    ///
+    /// It is the only record of *which characters became which glyph*, and it exists only at the
+    /// moment of shaping: once `office` has become `o ffi c e` there is nothing in the glyph ids to
+    /// say the second one was three letters. The PDF writer needs it twice — to build the
+    /// `/ToUnicode` map that keeps a press file searchable, and to know which glyph is the
+    /// inter-word space justification is spent at. Clusters are ascending for the LTR direction
+    /// this shaper forces, so the characters a glyph covers run from its own cluster to the next
+    /// glyph's.
+    pub cluster: u32,
 }
 
 impl Font {
@@ -376,6 +387,7 @@ impl Font {
                 gid: info.glyph_id as u16,
                 x_pt: x,
                 advance_pt: advance,
+                cluster: info.cluster,
             });
             x += advance;
         }
@@ -548,6 +560,31 @@ mod tests {
         for pair in glyphs.windows(2) {
             assert!(pair[1].x_pt > pair[0].x_pt);
         }
+    }
+
+    /// Spec 0068: the cluster of each shaped glyph is the byte offset of the first character it
+    /// came from, so the characters behind a glyph run from its cluster to the next glyph's. This
+    /// is what lets the PDF writer state that one glyph was three letters — the fact that stops
+    /// existing the moment shaping is over.
+    #[test]
+    fn clusters_name_the_characters_a_glyph_came_from() {
+        let font = Font::bundled();
+        let text = "office";
+        let glyphs = font.shape(text, 10.0);
+        assert_eq!(
+            glyphs.len(),
+            4,
+            "the `ffi` ligature should form: {glyphs:?}"
+        );
+        let mut spans = Vec::new();
+        for (i, g) in glyphs.iter().enumerate() {
+            let start = g.cluster as usize;
+            let end = glyphs
+                .get(i + 1)
+                .map_or(text.len(), |next| next.cluster as usize);
+            spans.push(&text[start..end]);
+        }
+        assert_eq!(spans, vec!["o", "ffi", "c", "e"]);
     }
 
     #[test]

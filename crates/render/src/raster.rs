@@ -183,12 +183,6 @@ fn stroke_rect(
     }
 }
 
-/// Draw one line of text by shaping it and filling each glyph's outline.
-///
-/// Re-shaping here rather than receiving glyphs from layout is a known wart, recorded in spec 0032:
-/// `text-layout::Line` carries text plus a justification adjustment, not positioned glyphs. It goes
-/// through the *same* shaper the PDF writer uses, so the two agree on advances; the word positions
-/// are derived the same way the writer derives its `TJ` offsets.
 /// One line's worth of drawing parameters, grouped so the call site reads as a unit.
 struct TextRun<'a> {
     x_pt: f32,
@@ -201,6 +195,18 @@ struct TextRun<'a> {
     tracking_pt: f32,
 }
 
+/// Draw one line of text by shaping it and filling each glyph's outline.
+///
+/// Re-shaping here rather than receiving glyphs from layout is a known wart, recorded in spec 0032:
+/// `text-layout::Line` carries text plus a justification adjustment, not positioned glyphs. It goes
+/// through the *same* shaper the PDF writer uses, and — since spec 0068 — on the *same* whole line
+/// rather than word by word, so the two agree glyph for glyph as well as on totals.
+///
+/// The word-at-a-time version this replaced shaped each word separately, which silently threw away
+/// any kern pair straddling a space while `measure_run`, which shapes the whole line, counted it —
+/// the same class of defect as the press one spec 0068 closes, in the opposite direction. Position
+/// is now accumulated glyph by glyph, and the justification is spent at the space glyph itself,
+/// which is exactly where the writer's `TJ` adjustment goes.
 fn draw_text(pixmap: &mut Pixmap, font: &Font, run: &TextRun<'_>, scale: f32) {
     let TextRun {
         x_pt,
@@ -215,38 +221,48 @@ fn draw_text(pixmap: &mut Pixmap, font: &Font, run: &TextRun<'_>, scale: f32) {
     paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], 255);
     paint.anti_alias = true;
 
-    // Justification inserts extra space between words, so words are drawn in sequence with the
-    // adjustment added at each gap — mirroring the writer's positioned-`TJ` construction.
-    let mut pen = x_pt;
-    let words: Vec<&str> = text.split(' ').collect();
-    let last = words.len().saturating_sub(1);
-    for (i, word) in words.iter().enumerate() {
-        let piece = if i == last {
-            (*word).to_string()
-        } else {
-            format!("{word} ")
-        };
-        // Tracking is spent per glyph, after each one, exactly as a PDF `Tc` spends it — so the
-        // nth glyph of a run starts n trackings further along than shaping alone would put it
-        // (spec 0064).
-        let shaped = font.shape(&piece, size_pt);
-        for (n, glyph) in shaped.iter().enumerate() {
-            if let Some(outline) = font.outline(glyph.gid) {
-                fill_glyph(
-                    pixmap,
-                    &outline.commands,
-                    (pen + glyph.x_pt + n as f32 * tracking_pt) * scale,
-                    baseline_pt * scale,
-                    size_pt * scale / font.units_per_em(),
-                    &paint,
-                );
-            }
+    for (gid, x) in glyph_run(font, text, size_pt, space_adjust_pt, tracking_pt).0 {
+        if let Some(outline) = font.outline(gid) {
+            fill_glyph(
+                pixmap,
+                &outline.commands,
+                (x_pt + x) * scale,
+                baseline_pt * scale,
+                size_pt * scale / font.units_per_em(),
+                &paint,
+            );
         }
-        pen += shaped.iter().map(|g| g.advance_pt).sum::<f32>() + shaped.len() as f32 * tracking_pt;
-        if i != last {
+    }
+}
+
+/// Where each glyph of `text` sits along the line, and where the pen ends up.
+///
+/// Split out of [`draw_text`] so the positions can be asserted without rasterizing: what matters is
+/// that the line ends where layout said it would, and a pixel count cannot say that.
+///
+/// Tracking is spent per glyph, after each one, exactly as a PDF `Tc` spends it (spec 0064); the
+/// justification allowance is spent after each inter-word space, exactly where the writer's `TJ`
+/// adjustment goes (spec 0068).
+fn glyph_run(
+    font: &Font,
+    text: &str,
+    size_pt: f32,
+    space_adjust_pt: f32,
+    tracking_pt: f32,
+) -> (Vec<(u16, f32)>, f32) {
+    let mut pen = 0.0f32;
+    let mut out = Vec::new();
+    for glyph in font.shape(text, size_pt) {
+        out.push((glyph.gid, pen));
+        pen += glyph.advance_pt + tracking_pt;
+        if text
+            .get(glyph.cluster as usize..)
+            .is_some_and(|rest| rest.starts_with(' '))
+        {
             pen += space_adjust_pt;
         }
     }
+    (out, pen)
 }
 
 /// Fill a glyph outline. Font units are y-up from the baseline; the raster is y-down.
@@ -364,6 +380,38 @@ mod tests {
     fn ink_fraction(r: &Raster) -> f32 {
         let dark = r.rgba.chunks(4).filter(|p| p[0] < 200).count();
         dark as f32 / (r.width * r.height) as f32
+    }
+
+    /// Spec 0068's named non-goal, shipped: the screen used to shape each word separately, so a
+    /// kern pair straddling a space was lost on screen while `measure_run` — which shapes the whole
+    /// line — counted it. The line then drew wider than it measured, the same class of defect as
+    /// the press one, in the opposite direction.
+    ///
+    /// Asserted on where the pen ends up, against the measurement layout broke the line with.
+    #[test]
+    fn a_line_draws_to_the_width_it_was_measured_at() {
+        use quill_text_layout::RunMetrics;
+        let font = quill_fonts::Font::bundled();
+        for text in [
+            "AV Wa To Yo",
+            "The officer shuffled a fistful of ruffled affidavits",
+        ] {
+            let (_, end) = glyph_run(&font, text, 10.0, 0.0, 0.0);
+            let measured = font.measure_run(text, 10.0);
+            assert!(
+                (end - measured).abs() < 0.001,
+                "{text:?}: drew to {end}, measured {measured}"
+            );
+        }
+        // A justified line draws its measure plus the space it was given, once per inter-word gap.
+        let text = "AV Wa To Yo";
+        let (_, end) = glyph_run(&font, text, 10.0, 2.0, 0.0);
+        assert!((end - (font.measure_run(text, 10.0) + 3.0 * 2.0)).abs() < 0.001);
+        // And tracking is still spent once per shaped glyph, not per character.
+        let ligature = "office";
+        let (glyphs, end) = glyph_run(&font, ligature, 10.0, 0.0, 1.0);
+        assert_eq!(glyphs.len(), 4, "the ffi ligature should form");
+        assert!((end - (font.measure_run(ligature, 10.0) + 4.0)).abs() < 0.001);
     }
 
     #[test]

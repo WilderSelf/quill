@@ -2260,7 +2260,8 @@ applies.
 
 ### 0068 shaped-glyph-output
 
-**The PDF draws the glyphs that were measured** · size: large · branch: `feat/shaped-glyph-output`
+**The PDF draws the glyphs that were measured** · size: large · branch: `feat/shaped-glyph-output` ·
+**shipped**
 
 The writer encodes the shaped glyph run rather than the characters, emits the GPOS advance deltas as
 `TJ` adjustments, subsets by glyph id rather than by character, and writes a `/ToUnicode` CMap so the
@@ -2298,6 +2299,20 @@ result is still text. Closes spec 0016's three-times-deferred non-goal.
   `ragged_line_uses_a_single_show` asserts a ragged line contains no `TJ` — exactly what this
   invalidates — and `every_line_is_shown_in_the_face_it_was_set_in` walks the stream matching
   `" Tj"`, so it goes structurally blind rather than failing.
+
+**As built.** All five cases come out at a 0.00 pt gap and the control case emits exactly zero
+adjustments; the table is in the spec. Two things the plan above did not anticipate:
+
+- **The subset union needs a third pass.** Shaping each run plus the per-character cmap lookup is
+  *not* sufficient, because the breaker's other split point is a hyphenation break: `of-` and `fice`
+  need the `fi` ligature, which appears neither in the shaping of `office` (that gives `ffi`) nor in
+  any single character. Verified empirically before it was built, and closed by also shaping each
+  distinct word's hyphenated halves through the same hyphenator layout breaks with.
+- **The size growth is a finding, not a footnote.** `Document::sample()` grows 8786 → 10220 bytes
+  (+16.3%), and the 500-page synthetic document 13,763,105 → 15,791,758 (+14.7%) — essentially all
+  of it kern adjustments in uncompressed content streams. Nothing guards export size today. This is
+  the number that makes `FlateDecode` on the content stream (the spec's named separate increment)
+  worth doing: the adjustments are repetitive integers.
 
 **Named non-goals, with the residual measured** — in the style of spec 0016, so the known issue can
 honestly be deleted. The screen renderer splits on `' '` unconditionally and shapes each word
@@ -2355,6 +2370,35 @@ with a dot leader. The pattern spec 0054 used to retire the hand-written compone
   named in the known issue, which no test covers today.
 - The ellipsis clipping stays in the contents list. It is not a tab rule.
 
+### 0071 compress-content-streams
+
+**Content streams are `FlateDecode`'d** · size: small · branch: `feat/compress-content-streams`
+
+Added to the closeout by a measurement 0068 took rather than assumed. Every other stream in the file
+is already compressed — images, font programs — and the content stream never was. That was
+affordable while it held nothing but operators and glyph bytes; 0068 filled it with kern adjustments,
+which are short repetitive integers and close to a best case for deflate.
+
+**Measured on landing 0068**, and the reason this increment exists: `Document::sample()` 8786 → 10220
+bytes (+16.3%), the bundled `reference` template 5977 → 7087 (+18.6%), and the 500-page synthetic
+document 13.76 MB → 15.79 MB (+14.7%). Nothing guards export size today, and a 500-page art-heavy
+book is the workload the product is *for*.
+
+**Acceptance criteria**
+
+- The 500-page synthetic export is **smaller than it was before 0068**, not merely smaller than it is
+  now. That is the claim worth making, and it is plausible precisely because the added bytes are
+  repetitive.
+- An export-size budget exists after this, since the increment establishes that nobody was watching.
+  It belongs in `benches/budgets.toml` beside the work counters, checked exactly rather than with the
+  2× timing tolerance — spec 0051's lesson about a counter whose failure threshold sat above every
+  reachable value.
+- **The cost is that a test can no longer grep the finished PDF for operator text.** Several do, and
+  so do the CI `grep -aq` checks in the `pdf-preflight` job. Each moves to decompressing first —
+  which most writer tests already do — and the CI checks need the same treatment or they go
+  structurally blind rather than failing, the trap 0068 already met twice.
+- PDF/X-1a is unaffected: `FlateDecode` is PDF 1.2 and already used for this file's other streams.
+
 ## Known issues
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
@@ -2379,45 +2423,6 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   *inside* a section when no section boundary fits is the part that does not. Until then the
   limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
   it says in as many words that it inverts when the fix ships.
-
-- **The PDF does not draw the glyphs that were measured.** Sequenced as spec 0068; the entry is
-  kept until it ships, with its diagnosis corrected. Since spec 0016 measurement goes through
-  `rustybuzz` with HarfBuzz's default feature set for horizontal LTR, which is **both `kern`/`GPOS`
-  and `liga`/`GSUB`**. The content stream is encoded character by character
-  (`EmbeddedFont::encode_line`, crates/export-pdf/src/fonts.rs:80-87), the subset is cut from a
-  `BTreeSet<char>`, and the viewer advances by the `/W` array, which holds raw `hmtx` advances. So
-  the drawn run is a different glyph sequence from the measured one, and it is always the wider.
-
-  **This entry previously recorded the kerning half only, and named a fix that cannot work.**
-  Measured on the bundled face at 10 pt, printing character count beside glyph count:
-
-  | case | chars | glyphs | measured | drawn | gap |
-  |---|---|---|---|---|---|
-  | ordinary prose | 59 | 59 | 285.22 | 286.38 | +1.16 pt |
-  | kern-heavy `AV Wa To Yo, Pa.` | 16 | 16 | 76.85 | 81.38 | +4.53 pt |
-  | `office` | 6 | **4** | 26.10 | 26.99 | +0.89 pt |
-  | ligature-rich prose | 62 | **52** | 260.93 | 265.83 | +4.90 pt |
-  | control — neither feature fires | 17 | 17 | 113.59 | 113.59 | 0.0000 |
-
-  The control row is what makes the rest attributable rather than noise. The fourth row is the
-  finding: an ordinary sentence loses ten glyphs to ligatures and draws 4.90 pt wider — a larger
-  error than the kern-heavy display string, and four times the figure this entry used to carry. The
-  repo already asserts the mechanism from the other side
-  (`tracking_is_spent_per_shaped_glyph_not_per_character`, crates/fonts/src/lib.rs:744-763, whose
-  comment says in as many words that `office` shapes its `ffi` to one glyph).
-
-  **The recorded fix — "emit the kerning as `TJ` adjustments" — is not implementable as stated**,
-  and that is why 0068 is scoped the way it is rather than as the patch this entry once implied. A
-  `TJ` array interleaves numbers between pieces of *one* encoded string, so it can only express a
-  correction that is positional. When the shaped sequence has 52 glyphs and the encoded sequence has
-  62, there is no per-piece correspondence to hang the adjustments on. Either measurement stops
-  applying `liga` — rejected: a publishing application that never sets a ligature is not one — or
-  the writer draws the shaped glyph run. The second is the fix, and the kern adjustments then fall
-  out of it, because shaping yields the GPOS deltas at the same moment it yields the glyph ids.
-
-  It is spec 0060's rule leaking: a last line proven to fit its measure can still be drawn past it.
-  It is also **a prerequisite for the placed-geometry decision below**, not merely adjacent to it —
-  see the decisions log.
 
 - **The generated contents list is not yet re-expressed through spec 0067's tab mechanism.**
   Sequenced as spec 0070, behind 0068 and 0069. 0067 ships the mechanism and 0041's hand-rolled
