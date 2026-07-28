@@ -3975,11 +3975,8 @@ mod tests {
 
         // One "Roll" per fragment and no more. A header that repeated twice, or that appeared on a
         // page it did not start, would be just as wrong as one that never repeated.
-        let fragments: Vec<Vec<(f32, f32, String)>> = pages
-            .iter()
-            .map(cells)
-            .filter(|c| !c.is_empty())
-            .collect();
+        let fragments: Vec<Vec<(f32, f32, String)>> =
+            pages.iter().map(cells).filter(|c| !c.is_empty()).collect();
         let headers: usize = fragments
             .iter()
             .map(|c| c.iter().filter(|(_, _, t)| t == "Roll").count())
