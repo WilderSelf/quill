@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use quill_color::within_ink_limit_pct;
-use quill_core_model::{Block, Color, Document};
+use quill_core_model::{page_geom, Asset, Block, Color, Document, PageGeom, PageSetup, Rect};
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 use thiserror::Error;
 
@@ -174,12 +174,19 @@ pub enum CheckId {
     /// Always a `Warning`: an unusual trim is a conversation with the printer, not a corrupt file,
     /// and a preflight that blocks a legitimate document teaches its user to reach for `--force`.
     TrimSize,
+    /// Content sits nearer the trim than the preset's safety margin allows (spec 0050).
+    ///
+    /// Distinct from [`CheckId::Bleed`], which is about the *page box* being large enough. This is
+    /// about where content was actually placed, so it needs a laid-out page and cannot be answered
+    /// from the model at all — which is why spec 0036's folio printed hard against the trim while
+    /// every numeric test passed.
+    SafeArea,
 }
 
 impl CheckId {
     /// Every check, in declaration order. Used to derive [`PreflightReport::applied`] from the
     /// skip list, so the two can never disagree about what preflight covers.
-    pub const ALL: [CheckId; 9] = [
+    pub const ALL: [CheckId; 11] = [
         CheckId::ColorSpace,
         CheckId::FontEmbedding,
         CheckId::Bleed,
@@ -189,6 +196,11 @@ impl CheckId {
         CheckId::OutputIntent,
         CheckId::Transparency,
         CheckId::IccProfileInvalid,
+        // `TrimSize` arrived with spec 0049 and was not added here, so `applied()` under-reported
+        // what preflight covers — a report that understates itself is the same class of defect as
+        // a gate that is not a required context.
+        CheckId::TrimSize,
+        CheckId::SafeArea,
     ];
 }
 
@@ -474,7 +486,7 @@ pub fn export(
     // writer is about to draw, rather than laying the document out a second time inside
     // `preflight`.
     if !opts.force {
-        let findings = preflight_pages(&pages, &opts.preset);
+        let findings = preflight_pages(&pages, &opts.preset, &doc.page_setup, &doc.assets);
         let errors = findings
             .iter()
             .filter(|f| f.severity == Severity::Error)
@@ -523,6 +535,72 @@ pub fn annotation_finding(
     })
 }
 
+/// The live area of a page, in the layout engine's top-left trim coordinates: the rectangle content
+/// must stay inside for the printer's stated safety margin (spec 0050).
+///
+/// Returned as `(left, top, right, bottom)` edges. A preset stating `safety_pt: 0.0` yields the trim
+/// itself, which makes the check inert rather than a special case.
+fn live_area(setup: &PageSetup, preset: &PodPreset) -> (f32, f32, f32, f32) {
+    let s = preset.safety_pt;
+    (s, s, setup.trim.w_pt - s, setup.trim.h_pt - s)
+}
+
+/// Which edge, if any, `frame` intrudes past on its way *inward* from the trim.
+///
+/// The direction is the whole point. A block extending **outward** past the trim is a deliberate
+/// full bleed and is exempt; one falling **inward** of the live edge is at risk from the guillotine.
+/// Flagging the first would train a user to ignore the check, and then the second goes unread too.
+fn intrudes(frame: &Rect, geom: &PageGeom, live: (f32, f32, f32, f32)) -> Option<&'static str> {
+    let (l, t, r, b) = live;
+    // Zero safety margin: the preset states none, so there is nothing to check.
+    if l <= 0.0 && t <= 0.0 {
+        return None;
+    }
+    let (x0, y0) = (frame.x_pt, frame.y_pt);
+    let (x1, y1) = (frame.x_pt + frame.w_pt, frame.y_pt + frame.h_pt);
+    // Outward of trim on an edge ⇒ bleeding there ⇒ that edge is not a safety question.
+    let bleeds_left = x0 < 0.0;
+    let bleeds_top = y0 < 0.0;
+    let bleeds_right = x1 > geom.trim_w;
+    let bleeds_bottom = y1 > geom.trim_h;
+    if !bleeds_left && x0 < l {
+        return Some("left");
+    }
+    if !bleeds_top && y0 < t {
+        return Some("top");
+    }
+    if !bleeds_right && x1 > r {
+        return Some("right");
+    }
+    if !bleeds_bottom && y1 > b {
+        return Some("bottom");
+    }
+    None
+}
+
+/// The effective resolution of `asset` at the size it was **placed**, and the minimum the preset
+/// wants, when the first is below the second.
+///
+/// `Asset.dpi` is what the author declared about the source file; this is pixels divided by the
+/// inches the image actually occupies. A 300 dpi image placed at 2x its natural size prints at 150
+/// and passes the model-level check — that gap is why this exists. Deriving the placed size from
+/// `dpi` would make the check circular, so it reads the laid-out rect and nothing else.
+fn under_dpi(asset: &Asset, frame: &Rect, preset: &PodPreset) -> Option<(f32, f32)> {
+    let required = if asset.line_art {
+        preset.min_dpi_line_art
+    } else {
+        preset.min_dpi_color
+    };
+    if frame.w_pt <= 0.0 || frame.h_pt <= 0.0 || asset.px_w == 0 || asset.px_h == 0 {
+        return None;
+    }
+    let dpi_x = asset.px_w as f32 / (frame.w_pt / 72.0);
+    let dpi_y = asset.px_h as f32 / (frame.h_pt / 72.0);
+    let effective = dpi_x.min(dpi_y);
+    // A hair of tolerance so an image placed at exactly its natural size cannot fail on rounding.
+    (effective < required - 0.5).then_some((effective, required))
+}
+
 /// Press checks that can only be made against laid-out geometry (spec 0037).
 ///
 /// [`preflight`] walks the document, which is the right place for everything a *block* declares.
@@ -537,9 +615,74 @@ pub fn annotation_finding(
 ///
 /// `preset` supplies the ink limit (spec 0049): decoration is checked against the same press the
 /// blocks are, because a panel and a paragraph reach the same printer.
-pub fn preflight_pages(pages: &[LaidOutPage], preset: &PodPreset) -> Vec<Finding> {
+pub fn preflight_pages(
+    pages: &[LaidOutPage],
+    preset: &PodPreset,
+    setup: &PageSetup,
+    assets: &[Asset],
+) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let by_id: std::collections::HashMap<&str, &Asset> =
+        assets.iter().map(|a| (a.id.as_str(), a)).collect();
+
     for page in pages {
+        // Two checks that need a *placed* page and a preset, and can be answered from nothing less
+        // (spec 0050). Both are reported once per page rather than once per block: a systematically
+        // misplaced master static would otherwise fill a 500-page report with the same sentence.
+        let mut safe_area_reported = false;
+        let mut dpi_reported: std::collections::BTreeSet<String> = Default::default();
+        let geom = page_geom(setup, page.index);
+        let live = live_area(setup, preset);
+
+        for block in page.statics.iter().chain(page.blocks.iter()) {
+            let frame = match block {
+                PlacedBlock::Text { frame, .. }
+                | PlacedBlock::Image { frame, .. }
+                | PlacedBlock::Rect { frame, .. } => *frame,
+                PlacedBlock::Link { .. } => continue,
+            };
+
+            // Effective dpi: pixels divided by the inches it was *placed* at, not the resolution
+            // the asset declares. A 300 dpi image scaled to twice its natural size prints at 150
+            // and passes the model-level check, which is why this one exists.
+            if let PlacedBlock::Image { asset_id, .. } = block {
+                if let Some(asset) = by_id.get(asset_id.as_str()) {
+                    if let Some((effective, required)) = under_dpi(asset, &frame, preset) {
+                        if dpi_reported.insert(asset_id.clone()) {
+                            findings.push(Finding {
+                                check: CheckId::ImageResolution,
+                                severity: Severity::Error,
+                                message: format!(
+                                    "page {}: image '{asset_id}' is placed at {effective:.0} dpi                                      but preset '{}' requires {required:.0}; place it smaller or                                      supply a higher-resolution source",
+                                    page.index, preset.name
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Safe area: content that falls *inward* of the live edge. Content extending outward
+            // past trim is a deliberate full bleed and is exempt — flagging it would train users to
+            // ignore the check, which costs more than the check is worth.
+            if !safe_area_reported {
+                if let Some(edge) = intrudes(&frame, &geom, live) {
+                    safe_area_reported = true;
+                    findings.push(Finding {
+                        check: CheckId::SafeArea,
+                        severity: Severity::Error,
+                        message: format!(
+                            "page {}: content sits inside the {} safety margin at the {edge} edge;                              preset '{}' wants {:.1}pt of clearance from the trim",
+                            page.index,
+                            preset.name,
+                            preset.name,
+                            preset.safety_pt
+                        ),
+                    });
+                }
+            }
+        }
+
         for block in page.statics.iter().chain(page.blocks.iter()) {
             let PlacedBlock::Rect { fill, stroke, .. } = block else {
                 continue;
@@ -1092,7 +1235,12 @@ mod tests {
             y: 0.7,
             k: 0.6,
         }; // 280%
-        let findings = preflight_pages(&[page_with_rect(Some(over), None)], &PodPreset::generic());
+        let findings = preflight_pages(
+            &[page_with_rect(Some(over), None)],
+            &PodPreset::generic(),
+            &PageSetup::default(),
+            &[],
+        );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check, CheckId::InkCoverage);
         assert_eq!(findings[0].severity, Severity::Error);
@@ -1107,7 +1255,12 @@ mod tests {
             g: 0.0,
             b: 0.0,
         };
-        let by_fill = preflight_pages(&[page_with_rect(Some(rgb), None)], &PodPreset::generic());
+        let by_fill = preflight_pages(
+            &[page_with_rect(Some(rgb), None)],
+            &PodPreset::generic(),
+            &PageSetup::default(),
+            &[],
+        );
         assert_eq!(by_fill.len(), 1);
         assert_eq!(by_fill[0].check, CheckId::ColorSpace);
 
@@ -1120,6 +1273,8 @@ mod tests {
                 }),
             )],
             &PodPreset::generic(),
+            &PageSetup::default(),
+            &[],
         );
         assert_eq!(by_stroke.len(), 1);
         assert_eq!(by_stroke[0].check, CheckId::ColorSpace);
@@ -1135,10 +1290,14 @@ mod tests {
             y: 0.0,
             k: 0.1,
         };
-        assert!(
-            preflight_pages(&[page_with_rect(Some(tint), None)], &PodPreset::generic()).is_empty()
-        );
-        assert!(preflight_pages(&[], &PodPreset::generic()).is_empty());
+        assert!(preflight_pages(
+            &[page_with_rect(Some(tint), None)],
+            &PodPreset::generic(),
+            &PageSetup::default(),
+            &[]
+        )
+        .is_empty());
+        assert!(preflight_pages(&[], &PodPreset::generic(), &PageSetup::default(), &[]).is_empty());
     }
 
     #[test]
@@ -1152,7 +1311,12 @@ mod tests {
             y: 0.7,
             k: 0.6,
         };
-        let findings = preflight_pages(&[page_with_rect(Some(over), None)], &PodPreset::generic());
+        let findings = preflight_pages(
+            &[page_with_rect(Some(over), None)],
+            &PodPreset::generic(),
+            &PageSetup::default(),
+            &[],
+        );
         assert_eq!(findings.len(), 1, "fixture must actually violate the limit");
 
         // A clean document still exports, so the wiring cannot have simply broken export.
@@ -2155,5 +2319,248 @@ mod tests {
             Some(PdfxVersion::X3_2002)
         );
         assert_eq!(ExportProfile::Screen.pdfx(PdfxVersion::X3_2002), None);
+    }
+
+    // ----- spec 0050: preflight over placed geometry -------------------------------------------
+
+    /// A preset that states a real safety margin, so the check has something to check. `generic`
+    /// states none — see `PodPreset::generic` for why quill does not invent one.
+    fn preset_with_safety(pt: f32) -> PodPreset {
+        PodPreset {
+            safety_pt: pt,
+            ..PodPreset::generic()
+        }
+    }
+
+    fn page_with(blocks: Vec<PlacedBlock>) -> LaidOutPage {
+        LaidOutPage {
+            index: 0,
+            blocks,
+            statics: Vec::new(),
+        }
+    }
+
+    fn text_at(x: f32, y: f32, w: f32, h: f32) -> PlacedBlock {
+        PlacedBlock::Text {
+            source: quill_core_model::BlockId(1),
+            frame: Rect {
+                x_pt: x,
+                y_pt: y,
+                w_pt: w,
+                h_pt: h,
+            },
+            lines: Vec::new(),
+            color: Color::Gray { v: 0.0 },
+            font_size_pt: 10.0,
+            leading_pt: 12.0,
+        }
+    }
+
+    fn image_at(id: &str, x: f32, y: f32, w: f32, h: f32) -> PlacedBlock {
+        PlacedBlock::Image {
+            source: quill_core_model::BlockId(1),
+            frame: Rect {
+                x_pt: x,
+                y_pt: y,
+                w_pt: w,
+                h_pt: h,
+            },
+            asset_id: id.to_string(),
+        }
+    }
+
+    fn asset_px(id: &str, px_w: u32, px_h: u32, line_art: bool) -> Asset {
+        Asset {
+            id: id.into(),
+            path: format!("{id}.png"),
+            px_w,
+            px_h,
+            dpi: 300.0,
+            has_alpha: false,
+            line_art,
+        }
+    }
+
+    #[test]
+    fn the_0036_fore_edge_folio_now_fails_preflight() {
+        // The increment's proof of worth. Spec 0036's bundled folio printed hard against the trim —
+        // where the guillotine goes — while every numeric test passed, and only a 2x render of a
+        // filled page showed it. This reproduces that placement and asserts preflight now catches
+        // it without anyone having to look.
+        let setup = PageSetup::default();
+        let folio = text_at(setup.trim.w_pt - 8.0, setup.trim.h_pt - 20.0, 8.0, 10.0);
+        let findings = preflight_pages(
+            &[page_with(vec![folio])],
+            &preset_with_safety(36.0),
+            &setup,
+            &[],
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check == CheckId::SafeArea && f.severity == Severity::Error),
+            "a folio at the trim edge must fail the safe-area check: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn content_inside_the_live_area_passes() {
+        let setup = PageSetup::default();
+        let inside = text_at(60.0, 60.0, 100.0, 20.0);
+        let findings = preflight_pages(
+            &[page_with(vec![inside])],
+            &preset_with_safety(36.0),
+            &setup,
+            &[],
+        );
+        assert!(
+            findings.iter().all(|f| f.check != CheckId::SafeArea),
+            "content well inside the live area must not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_bleed_image_is_exempt_from_the_safe_area() {
+        // The distinction the whole check depends on. A block extending *outward* past the trim is
+        // a deliberate full bleed; one falling *inward* of the live edge is at risk. Flagging the
+        // first would train a user to ignore the report, and then the second goes unread too.
+        let setup = PageSetup::default();
+        let bleeding = image_at(
+            "bg",
+            -9.0,
+            -9.0,
+            setup.trim.w_pt + 18.0,
+            setup.trim.h_pt + 18.0,
+        );
+        let findings = preflight_pages(
+            &[page_with(vec![bleeding])],
+            &preset_with_safety(36.0),
+            &setup,
+            &[asset_px("bg", 4000, 6000, false)],
+        );
+        assert!(
+            findings.iter().all(|f| f.check != CheckId::SafeArea),
+            "a full-bleed image must not be flagged as intruding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_safety_preset_makes_the_check_inert() {
+        let setup = PageSetup::default();
+        let at_the_edge = text_at(0.0, 0.0, 20.0, 10.0);
+        let findings = preflight_pages(
+            &[page_with(vec![at_the_edge])],
+            &PodPreset::generic(),
+            &setup,
+            &[],
+        );
+        assert!(
+            findings.iter().all(|f| f.check != CheckId::SafeArea),
+            "a preset stating no safety margin must not flag anything: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_scaled_up_fails_on_its_effective_resolution() {
+        // `Asset.dpi` is what the author declared about the source; this is pixels over the inches
+        // it was *placed* at. A 300 dpi image at 2x its natural size prints at 150 and sails
+        // through the model-level check, which is the gap this closes.
+        let setup = PageSetup::default();
+        // 600x600 px at 300 dpi is 2in square = 144pt. Placed at 288pt it is 4in ⇒ 150 dpi.
+        let scaled = image_at("art", 60.0, 60.0, 288.0, 288.0);
+        let findings = preflight_pages(
+            &[page_with(vec![scaled])],
+            &PodPreset::generic(),
+            &setup,
+            &[asset_px("art", 600, 600, false)],
+        );
+        let dpi: Vec<_> = findings
+            .iter()
+            .filter(|f| f.check == CheckId::ImageResolution)
+            .collect();
+        assert_eq!(
+            dpi.len(),
+            1,
+            "expected one resolution finding: {findings:?}"
+        );
+        assert_eq!(dpi[0].severity, Severity::Error);
+        // The message must name both numbers: one that does not say by how much you missed is one
+        // the user cannot act on.
+        assert!(
+            dpi[0].message.contains("150") && dpi[0].message.contains("300"),
+            "the message must state the effective dpi and the required one: {}",
+            dpi[0].message
+        );
+    }
+
+    #[test]
+    fn an_image_at_its_natural_size_passes_and_so_does_the_boundary() {
+        let setup = PageSetup::default();
+        // 600x600 px placed at 144pt = 2in ⇒ exactly 300 dpi, the boundary.
+        let natural = image_at("art", 60.0, 60.0, 144.0, 144.0);
+        let findings = preflight_pages(
+            &[page_with(vec![natural])],
+            &PodPreset::generic(),
+            &setup,
+            &[asset_px("art", 600, 600, false)],
+        );
+        assert!(
+            findings.iter().all(|f| f.check != CheckId::ImageResolution),
+            "exactly at the threshold must pass: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn line_art_is_held_to_the_higher_threshold() {
+        let setup = PageSetup::default();
+        // 600x600 px at 144pt is 300 dpi — fine for a photograph, half what line art needs.
+        let art = image_at("map", 60.0, 60.0, 144.0, 144.0);
+        let findings = preflight_pages(
+            &[page_with(vec![art])],
+            &PodPreset::generic(),
+            &setup,
+            &[asset_px("map", 600, 600, true)],
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.check == CheckId::ImageResolution && f.message.contains("600")),
+            "line art must be held to 600 dpi: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn findings_are_deduplicated_per_page() {
+        // A 500-page document with one systematically misplaced master static must report it once
+        // per page, not once per placed block, or the report stops being readable and stops being
+        // read.
+        let setup = PageSetup::default();
+        let intruding: Vec<PlacedBlock> = (0..20)
+            .map(|i| text_at(1.0, i as f32 * 10.0, 20.0, 8.0))
+            .collect();
+        let findings = preflight_pages(
+            &[page_with(intruding)],
+            &preset_with_safety(36.0),
+            &setup,
+            &[],
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.check == CheckId::SafeArea)
+                .count(),
+            1,
+            "one safe-area finding per page, however many blocks intrude"
+        );
+    }
+
+    #[test]
+    fn every_check_is_listed_in_all() {
+        // `applied()` is derived from `ALL` minus the skip list, so a variant missing from `ALL`
+        // makes the report understate what preflight covers. `TrimSize` was missing until spec
+        // 0050 noticed.
+        for id in [CheckId::TrimSize, CheckId::SafeArea] {
+            assert!(CheckId::ALL.contains(&id), "{id:?} must be in CheckId::ALL");
+        }
     }
 }
