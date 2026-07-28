@@ -269,6 +269,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
     styles.paragraph.insert(
         BODY_STYLE.to_string(),
         ParagraphStyle {
+            list: None,
             font_size_pt: body_pt,
             leading_pt,
             align: TextAlign::Justified,
@@ -281,6 +282,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
         styles.paragraph.insert(
             heading_style_name(level),
             ParagraphStyle {
+                list: None,
                 font_size_pt: size,
                 leading_pt: leading,
                 // Headings are ragged-left: justifying a one-line heading stretches it across the
@@ -295,6 +297,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
     styles.paragraph.insert(
         FOLIO_STYLE.to_string(),
         ParagraphStyle {
+            list: None,
             font_size_pt: (body_pt - 1.0).max(7.0),
             leading_pt,
             align: TextAlign::Left,

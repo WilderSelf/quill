@@ -98,6 +98,12 @@ struct MeasureKey {
     /// Frame width, as bits — `f32` is not `Hash`, and a paragraph broken to 200 pt is a different
     /// measurement from the same paragraph broken to 210 pt.
     width_bits: u32,
+    /// The block's list marker, hashed (spec 0066). Derived from the blocks *before* it in document
+    /// order, so it is context rather than content: inserting an item at the top of a list changes
+    /// every marker below it while changing none of their text. Without this in the key, a renumber
+    /// would serve stale ordinals from the cache — the exact failure spec 0041 records for anything
+    /// derived from position.
+    marker: u64,
     /// Style fingerprint: size, leading, alignment and the surrounding space all change the result.
     style: u64,
 }
@@ -475,6 +481,7 @@ impl Measurer for CachingMeasurer<'_> {
             block: block.id(),
             content: content_fingerprint(block),
             width_bits: width.to_bits(),
+            marker: marker_fingerprint(ctx.markers.get(&block.id())),
             style: style_fingerprint(self.styles, block),
         };
         if let Some(hit) = self.cache.get(&key) {
@@ -651,6 +658,16 @@ fn context_fingerprint(doc: &Document, headings: &[HeadingEntry]) -> u64 {
 }
 
 /// Fingerprint of the style a block resolves to.
+/// Hash of a block's list marker, or of its absence.
+fn marker_fingerprint(marker: Option<&String>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in marker.map_or(&b""[..], |m| m.as_bytes()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 fn style_fingerprint(styles: &StyleSheet, block: &Block) -> u64 {
     let s = styles.resolve(block);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

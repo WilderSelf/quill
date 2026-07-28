@@ -23,6 +23,8 @@
 //! - `:::panel` … `:::` — a panel: a titled record of named sections, one `key: value` per line.
 //!   `:::statblock` is the same fence under its pre-0062 name and still parses.
 //! - `:::table` … `:::` — a table, as pipe-delimited rows; the first row is the header.
+//! - `- item` / `* item` / `1. item` — a list item. The ordinal you write is ignored: markers are
+//!   derived from document order at layout time, so an inserted item renumbers what follows.
 //! - `:::toc` … `:::` — a generated table of contents.
 //!
 //! ## What happens to input it does not understand
@@ -35,7 +37,10 @@
 //! - **Anything else** is kept as body text with a **warning** naming the line. A paragraph that
 //!   came out as plain prose is visible and fixable; a paragraph that vanished is not.
 
-use crate::{Block, BlockId, Color, Document, Panel, Table, Template};
+use crate::{
+    Block, BlockId, Color, Document, Panel, Run, Table, Template, LIST_BULLET_STYLE,
+    LIST_NUMBER_STYLE,
+};
 
 /// Something the importer could not honor, with the line it was on.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,11 +167,18 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
                           `:::table` to lay it out as a table"
                     .into(),
             });
-        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            warnings.push(Diagnostic {
-                line: line_no,
-                message: "lists are not supported; kept as body text".into(),
+        } else if let Some(item) = list_item(trimmed) {
+            // A list item ends whatever paragraph was accumulating and becomes its own block, since
+            // a list is a run of consecutive marked paragraphs rather than a container (spec 0066).
+            flush!();
+            content.push(Block::Body {
+                id: BlockId::UNASSIGNED,
+                runs: vec![Run::plain(item.text)],
+                color: INK,
+                style: Some(item.style.to_string()),
             });
+            i += 1;
+            continue;
         } else if trimmed.starts_with("> ") {
             warnings.push(Diagnostic {
                 line: line_no,
@@ -232,6 +244,37 @@ fn fence_body(lines: &[&str], start: usize) -> (Vec<String>, usize) {
 fn key_value(line: &str) -> Option<(&str, &str)> {
     let (k, v) = line.split_once(':')?;
     Some((k.trim(), v.trim()))
+}
+
+/// A markdown list item: `- text`, `* text`, or `1. text` (spec 0066).
+///
+/// Ordinals in the source are *not* honoured — the marker a reader sees is derived from document
+/// order at layout time, for the reason spec 0041 records: anything counted while placing goes
+/// missing on a page an incremental pass reuses. An author who writes `1.` three times still gets
+/// `1. 2. 3.`, which is what every markdown implementation does and what they meant.
+struct ListItem<'a> {
+    text: &'a str,
+    style: &'static str,
+}
+
+fn list_item(line: &str) -> Option<ListItem<'_>> {
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return Some(ListItem {
+            text: rest.trim(),
+            style: LIST_BULLET_STYLE,
+        });
+    }
+    // `12. text` — digits, a dot, a space.
+    let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits > 0 {
+        if let Some(rest) = line[digits..].strip_prefix(". ") {
+            return Some(ListItem {
+                text: rest.trim(),
+                style: LIST_NUMBER_STYLE,
+            });
+        }
+    }
+    None
 }
 
 fn parse_panel(body: &[String], first_line: usize, warnings: &mut Vec<Diagnostic>) -> Block {
@@ -487,12 +530,13 @@ max_level: 3
 
     #[test]
     fn unsupported_inline_syntax_warns_with_a_line_number_and_keeps_the_text() {
-        // The worst failure this feature could have is a paragraph that silently vanishes.
-        let out = import_ok("intro\n\n- a list item\n\n> a quote\n\n| stray | row |\n");
-        assert_eq!(out.warnings.len(), 3, "{:?}", out.warnings);
+        // The worst failure this feature could have is a paragraph that silently vanishes. Lists
+        // used to be in this list and are now imported (spec 0066), so the remaining two are the
+        // constructs the importer still does not understand.
+        let out = import_ok("intro\n\n> a quote\n\n| stray | row |\n");
+        assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
         assert_eq!(out.warnings[0].line, 3);
         assert_eq!(out.warnings[1].line, 5);
-        assert_eq!(out.warnings[2].line, 7);
 
         let kept: Vec<String> = out
             .document
@@ -503,9 +547,33 @@ max_level: 3
                 _ => None,
             })
             .collect();
+        assert_eq!(kept, ["intro", "> a quote", "| stray | row |"]);
+    }
+
+    #[test]
+    fn markdown_lists_import_as_marked_paragraphs() {
+        let out = import_ok("intro\n\n- first\n- second\n\n1. one\n7. two\n");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let items: Vec<(Option<&str>, String)> = out
+            .document
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Block::Body { style, .. } => Some((style.as_deref(), b.plain_text()?)),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            kept,
-            ["intro", "- a list item", "> a quote", "| stray | row |"]
+            items,
+            vec![
+                (None, "intro".to_string()),
+                (Some(LIST_BULLET_STYLE), "first".to_string()),
+                (Some(LIST_BULLET_STYLE), "second".to_string()),
+                (Some(LIST_NUMBER_STYLE), "one".to_string()),
+                (Some(LIST_NUMBER_STYLE), "two".to_string()),
+            ],
+            "the marker character is consumed; `7.` is still the second item, because the ordinal \
+             a reader sees is derived at layout time and not copied from the source"
         );
     }
 

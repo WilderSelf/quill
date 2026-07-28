@@ -291,6 +291,9 @@ out to this syntax is also a non-goal.
   are permanent.
 - `:::table` … `:::` — pipe-delimited rows; the first is the header, and a `|---|` separator row is
   ignored as markdown furniture.
+- `- item` / `* item` / `1. item` — a list item. The ordinal written in the source is ignored:
+  markers are derived from document order when the document is laid out, so inserting an item
+  renumbers what follows.
 - `:::toc` … `:::` — a generated contents list, taking `title:` and `max_level:`.
 
 Input the importer does not understand is **never silently dropped**. An unknown fence (`:::foo`) is

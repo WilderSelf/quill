@@ -16,8 +16,9 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
     builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, Color,
-    ComponentLibrary, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle, Rect,
-    StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
+    ComponentLibrary, Document, ListMarker, Margins, MasterPage, MasterStatic, PageSetup,
+    ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT,
+    TOC_TITLE_STYLE,
 };
 use quill_text_layout::{justify_runs_indented, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -579,6 +580,9 @@ pub(crate) enum Measured {
         /// (spec 0063). One entry per run, already folded with the paragraph's colour, so no
         /// consumer has to know how an override resolves.
         run_colors: Vec<Color>,
+        /// This paragraph's list marker, if it is a list item (spec 0066). Drawn in the gutter at
+        /// the first line's baseline, so it never enters the text flow and cannot move a break.
+        marker: Option<String>,
         style: ParagraphStyle,
     },
     Image {
@@ -793,6 +797,7 @@ impl Measured {
                 lines,
                 color,
                 run_colors,
+                marker,
                 style,
             } => {
                 if at == 0 || at >= lines.len() {
@@ -802,6 +807,8 @@ impl Measured {
                 let head = Measured::Text {
                     lines: lines[..at].to_vec(),
                     color: *color,
+                    // The marker belongs to the item, and the head is where the item starts.
+                    marker: marker.clone(),
                     // Both halves keep the whole run table: a span's `run` indexes the paragraph's
                     // runs, and re-basing it per fragment would make a continuation's spans mean
                     // something different from its head's.
@@ -815,9 +822,13 @@ impl Measured {
                 let tail_h = tail_lines.len() as f32 * style.leading_pt + style.space_after_pt;
                 let tail = Measured::Text {
                     run_colors: run_colors.clone(),
+                    // A continuation is not a new item, so it is not marked again — the same rule
+                    // spec 0045 applies to a table's header, from the other direction.
+                    marker: None,
                     lines: tail_lines,
                     color: *color,
                     style: ParagraphStyle {
+                        list: None,
                         space_before_pt: 0.0,
                         ..*style
                     },
@@ -946,6 +957,60 @@ pub(crate) struct BlockContext<'a> {
     /// The component definitions this document can resolve (spec 0054): the bundled two, plus
     /// whatever it or its packs supply.
     pub components: &'a ComponentLibrary,
+    /// Each list item's marker, keyed by block (spec 0066).
+    ///
+    /// Derived in one pass over the document's blocks *before* anything is placed, never
+    /// accumulated while placing. Spec 0041 learned this the hard way: an incremental pass reuses
+    /// whole pages, so a counter advanced during placement goes missing on a reused page — and goes
+    /// missing exactly when the document was just edited, which is always.
+    pub markers: &'a BTreeMap<BlockId, String>,
+}
+
+/// Every list item's marker, derived from the blocks in document order (spec 0066).
+///
+/// A list is a run of consecutive paragraphs whose resolved style carries a [`ListSpec`], so this
+/// walks the content once and keeps a counter per nesting level. A level's counter restarts when a
+/// shallower item or a non-list paragraph interrupts it, which is what makes two lists separated by
+/// a paragraph two lists rather than one long one.
+pub(crate) fn list_markers(content: &[Block], styles: &StyleSheet) -> BTreeMap<BlockId, String> {
+    let mut out = BTreeMap::new();
+    // Counter per level; `None` at a level means "not currently inside a list at that depth".
+    let mut counters: Vec<Option<u32>> = Vec::new();
+    for block in content {
+        if !matches!(block, Block::Body { .. } | Block::Heading { .. }) {
+            counters.clear();
+            continue;
+        }
+        let Some(spec) = styles.resolve(block).list else {
+            counters.clear();
+            continue;
+        };
+        let level = spec.level as usize;
+        if counters.len() <= level {
+            counters.resize(level + 1, None);
+        }
+        // A shallower item closes every deeper level: `1, a, b, 2` restarts the inner list.
+        for deeper in counters.iter_mut().skip(level + 1) {
+            *deeper = None;
+        }
+        let n = match counters[level] {
+            Some(prev) => prev + 1,
+            None => spec.start,
+        };
+        counters[level] = Some(n);
+        let text = match spec.marker {
+            ListMarker::Bullet { glyph } => glyph.to_string(),
+            ListMarker::Number { format, suffix } => {
+                let mut t = format.format(n);
+                if let Some(c) = suffix {
+                    t.push(c);
+                }
+                t
+            }
+        };
+        out.insert(block.id(), text);
+    }
+    out
 }
 
 /// Each run's resolved ink: its own override, or the paragraph's (spec 0063).
@@ -971,6 +1036,7 @@ pub(crate) fn measure_block(
         styles,
         headings,
         components,
+        markers,
     } = *ctx;
     match block {
         Block::Heading { runs, color, .. } | Block::Body { runs, color, .. } => {
@@ -1009,6 +1075,7 @@ pub(crate) fn measure_block(
                     lines,
                     color: *color,
                     run_colors: run_inks(runs, *color),
+                    marker: markers.get(&block.id()).cloned(),
                     style,
                 },
                 height,
@@ -1535,11 +1602,13 @@ pub(crate) fn flow(
     // frame per block, and it used to resolve image ids with a linear scan of `assets` — quadratic
     // in an art-heavy document, which is precisely the workload this engine exists for (spec 0026).
     let assets: AssetIndex<'_> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    let markers = list_markers(content, styles);
     let ctx = BlockContext {
         assets: &assets,
         styles,
         headings,
         components,
+        markers: &markers,
     };
     let grid = template.baseline_grid().filter(BaselineGrid::is_usable);
 
@@ -1723,26 +1792,58 @@ fn place_measured(
             lines,
             color,
             run_colors,
+            marker,
             style,
-        } => vec![PlacedBlock::Text {
-            source,
-            run_colors,
-            // The frame starts *below* the style's space-above: that space belongs to this
-            // block's height (so pagination reserves it) but no text is drawn in it.
-            frame: Rect {
-                x_pt: frame.rect.x_pt,
-                y_pt: y + style.space_before_pt,
-                w_pt: frame.rect.w_pt,
-                h_pt: height - style.space_before_pt,
-            },
-            lines,
-            color,
-            // Carried through to the writer. Without this the exported PDF would set every
-            // paragraph at body size regardless of its style, because `PlacedBlock` was the
-            // only thing the writer sees and it did not record how the text was measured.
-            font_size_pt: style.font_size_pt,
-            leading_pt: style.leading_pt,
-        }],
+        } => {
+            let text_block = PlacedBlock::Text {
+                source,
+                run_colors,
+                // The frame starts *below* the style's space-above: that space belongs to this
+                // block's height (so pagination reserves it) but no text is drawn in it.
+                frame: Rect {
+                    x_pt: frame.rect.x_pt,
+                    y_pt: y + style.space_before_pt,
+                    w_pt: frame.rect.w_pt,
+                    h_pt: height - style.space_before_pt,
+                },
+                lines,
+                color,
+                // Carried through to the writer. Without this the exported PDF would set every
+                // paragraph at body size regardless of its style, because `PlacedBlock` was the
+                // only thing the writer sees and it did not record how the text was measured.
+                font_size_pt: style.font_size_pt,
+                leading_pt: style.leading_pt,
+            };
+            let Some(marker) = marker else {
+                return vec![text_block];
+            };
+            // The marker sits in the gutter the item's indent opens, on its first baseline —
+            // never in the text flow, so it cannot move a break, and every line of the item is
+            // inset past it so a wrap lines up under the text (spec 0048's `Indent` opens the
+            // gutter; this only fills it).
+            let PlacedBlock::Text {
+                frame: text_frame, ..
+            } = &text_block
+            else {
+                unreachable!("just built a text block")
+            };
+            let marker_block = PlacedBlock::Text {
+                source,
+                frame: Rect {
+                    x_pt: text_frame.x_pt,
+                    y_pt: text_frame.y_pt,
+                    w_pt: style.indent.first_pt.max(0.0),
+                    h_pt: style.leading_pt,
+                },
+                lines: vec![Line::single_run(marker, 0.0, 0.0)],
+                color,
+                // One run by construction: a marker is generated, not authored.
+                run_colors: Vec::new(),
+                font_size_pt: style.font_size_pt,
+                leading_pt: style.leading_pt,
+            };
+            vec![marker_block, text_block]
+        }
         Measured::Image { asset_id, width } => vec![PlacedBlock::Image {
             source,
             frame: Rect {
@@ -3530,6 +3631,7 @@ mod tests {
         styles.paragraph.insert(
             BODY_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: BODY_FONT_SIZE_PT,
                 leading_pt: BODY_LINE_HEIGHT_PT,
                 align: TextAlign::Left,
@@ -5337,6 +5439,7 @@ mod tests {
         styles.paragraph.insert(
             BODY_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: BODY_FONT_SIZE_PT,
                 leading_pt: BODY_LINE_HEIGHT_PT,
                 align: TextAlign::Justified,
@@ -5658,6 +5761,180 @@ mod tests {
             }
             other => panic!("expected a text static, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ordered_items_number_in_document_order_and_renumber_on_insert() {
+        use quill_core_model::LIST_NUMBER_STYLE;
+        let styles = StyleSheet::default();
+        let item = |t: &str| {
+            let mut b = Block::body(t, Color::Gray { v: 0.0 });
+            if let Block::Body { style, .. } = &mut b {
+                *style = Some(LIST_NUMBER_STYLE.to_string());
+            }
+            b
+        };
+        let mut content = vec![item("alpha"), item("beta"), item("gamma")];
+        for (i, b) in content.iter_mut().enumerate() {
+            b.set_id(BlockId(i as u64 + 1));
+        }
+        let markers = list_markers(&content, &styles);
+        let of = |id: u64| markers.get(&BlockId(id)).cloned().unwrap_or_default();
+        assert_eq!(
+            (of(1), of(2), of(3)),
+            ("1.".into(), "2.".into(), "3.".into())
+        );
+
+        // Insert at the top: every marker below it moves, and none of their text changed. This is
+        // why the ordinal is in the measure key and not derived from the block alone.
+        let mut inserted = content.clone();
+        inserted.insert(0, item("new first"));
+        inserted[0].set_id(BlockId(99));
+        let m2 = list_markers(&inserted, &styles);
+        assert_eq!(m2.get(&BlockId(99)).unwrap(), "1.");
+        assert_eq!(m2.get(&BlockId(1)).unwrap(), "2.");
+        assert_eq!(m2.get(&BlockId(3)).unwrap(), "4.");
+    }
+
+    #[test]
+    fn a_paragraph_between_two_lists_makes_them_two_lists() {
+        use quill_core_model::LIST_NUMBER_STYLE;
+        let styles = StyleSheet::default();
+        let item = |t: &str| {
+            let mut b = Block::body(t, Color::Gray { v: 0.0 });
+            if let Block::Body { style, .. } = &mut b {
+                *style = Some(LIST_NUMBER_STYLE.to_string());
+            }
+            b
+        };
+        let mut content = vec![
+            item("a"),
+            item("b"),
+            Block::body("an interruption", Color::Gray { v: 0.0 }),
+            item("c"),
+        ];
+        for (i, b) in content.iter_mut().enumerate() {
+            b.set_id(BlockId(i as u64 + 1));
+        }
+        let markers = list_markers(&content, &styles);
+        assert_eq!(markers.get(&BlockId(1)).unwrap(), "1.");
+        assert_eq!(markers.get(&BlockId(2)).unwrap(), "2.");
+        assert!(!markers.contains_key(&BlockId(3)), "not a list item");
+        assert_eq!(
+            markers.get(&BlockId(4)).unwrap(),
+            "1.",
+            "an interrupted list restarts"
+        );
+    }
+
+    #[test]
+    fn nested_levels_count_independently_and_a_shallower_item_closes_them() {
+        use quill_core_model::{ListMarker, ListSpec, NumberFormat};
+        let mut styles = StyleSheet::default();
+        for (name, level, format) in [
+            ("l0", 0u8, NumberFormat::Decimal),
+            ("l1", 1, NumberFormat::LowerAlpha),
+        ] {
+            styles.paragraph.insert(
+                name.to_string(),
+                ParagraphStyle {
+                    list: Some(ListSpec {
+                        marker: ListMarker::Number {
+                            format,
+                            suffix: Some('.'),
+                        },
+                        start: 1,
+                        level,
+                    }),
+                    ..ParagraphStyle::default()
+                },
+            );
+        }
+        let item = |t: &str, s: &str| {
+            let mut b = Block::body(t, Color::Gray { v: 0.0 });
+            if let Block::Body { style, .. } = &mut b {
+                *style = Some(s.to_string());
+            }
+            b
+        };
+        // 1. / a. / b. / 2. / a.  — the inner list restarts under the second outer item.
+        let mut content = vec![
+            item("one", "l0"),
+            item("inner a", "l1"),
+            item("inner b", "l1"),
+            item("two", "l0"),
+            item("inner again", "l1"),
+        ];
+        for (i, b) in content.iter_mut().enumerate() {
+            b.set_id(BlockId(i as u64 + 1));
+        }
+        let m = list_markers(&content, &styles);
+        let got: Vec<String> = (1..=5).map(|i| m[&BlockId(i)].clone()).collect();
+        assert_eq!(got, ["1.", "a.", "b.", "2.", "a."]);
+    }
+
+    #[test]
+    fn number_formats_are_right_at_their_boundaries() {
+        use quill_core_model::NumberFormat::*;
+        // Bijective base-26 rather than ordinary base-26: 27 is `aa`, not `ba`.
+        assert_eq!(LowerAlpha.format(1), "a");
+        assert_eq!(LowerAlpha.format(26), "z");
+        assert_eq!(LowerAlpha.format(27), "aa");
+        assert_eq!(UpperAlpha.format(28), "AB");
+        // The subtractive forms are the ones a naive table gets wrong.
+        assert_eq!(LowerRoman.format(4), "iv");
+        assert_eq!(LowerRoman.format(9), "ix");
+        assert_eq!(UpperRoman.format(1994), "MCMXCIV");
+        // Above the standard range, decimal rather than something a reader must decode.
+        assert_eq!(UpperRoman.format(4000), "4000");
+    }
+
+    #[test]
+    fn a_list_marker_is_drawn_in_the_gutter_and_not_repeated_on_a_continuation() {
+        use quill_core_model::LIST_NUMBER_STYLE;
+        // The marker sits at the frame's left edge; the text is inset by the hanging indent, so a
+        // wrapped line lines up under the text rather than under the marker.
+        let mut b = Block::body(
+            "a list item long enough to wrap onto a second line in a narrow frame indeed",
+            Color::Gray { v: 0.0 },
+        );
+        if let Block::Body { style, .. } = &mut b {
+            *style = Some(LIST_NUMBER_STYLE.to_string());
+        }
+        let mut content = vec![b];
+        content[0].set_id(BlockId(1));
+        let assets: Vec<quill_core_model::Asset> = Vec::new();
+        let pages = lay_out_in_frame(
+            &content,
+            &assets,
+            &StyleSheet::default(),
+            &Frame {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 160.0,
+                    h_pt: 400.0,
+                },
+            },
+            &MONO,
+            &NoHyphenator,
+        );
+        let texts: Vec<(&str, f32)> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, frame, .. } => {
+                    Some((lines[0].text.as_str(), frame.x_pt + lines[0].indent_pt))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts[0].0, "1.", "the marker is placed first");
+        assert_eq!(texts[0].1, 0.0, "and sits at the frame's left edge");
+        assert!(
+            texts[1].1 > texts[0].1,
+            "the item's text is inset past the marker: {texts:?}"
+        );
     }
 
     #[test]

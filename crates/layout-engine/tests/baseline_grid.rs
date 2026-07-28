@@ -38,6 +38,7 @@ fn gridded_styles() -> StyleSheet {
         style.leading_pt = (style.leading_pt / STEP).ceil() * STEP;
     }
     let on_grid = |size: f32, steps: f32, before: f32, after: f32, indent: Indent| ParagraphStyle {
+        list: None,
         font_size_pt: size,
         leading_pt: STEP * steps,
         align: TextAlign::Left,
@@ -435,6 +436,7 @@ fn a_style_whose_leading_is_not_a_grid_multiple_is_named() {
     styles.paragraph.insert(
         "quote".into(),
         ParagraphStyle {
+            list: None,
             leading_pt: 13.5,
             ..*styles.paragraph.get(BODY_STYLE).unwrap()
         },

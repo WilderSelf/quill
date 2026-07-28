@@ -1899,7 +1899,11 @@ interpreter both were. 0064 then makes the metric-bearing overrides real and giv
 0065 gives runs named, reusable treatments, which is what turns "bold this word" into "this is a
 `lead-in`", and is the character-level twin of spec 0028's paragraph styles.
 
-**0066 → 0067, the paragraph features that need runs to exist.** A list marker is a run in a
+**0066 → 0067, the paragraph features that need runs to exist.** They run *ahead* of 0064 and 0065 in
+practice: 0064 is blocked on font assets (above), and 0065 would ship a `CharacterStyle` most of whose
+fields stay inert until 0064 lands — the same mostly-declared-and-not-honoured shape that 0063 split
+itself to avoid. Lists and tabs need neither faces nor metrics, so they are what can be built now.
+ A list marker is a run in a
 different style at a tab position; a leader is a run repeated to fill a measure. Building either before 0063 would mean building it twice. They are last because they are the two most visible
 remaining holes in what a publisher can type, and because each is small once the run model is there.
 
@@ -2031,6 +2035,15 @@ than one entry.
 
 **Risks** — This is the increment that moves glyphs, and it moves them everywhere the fixtures look.
 The "no override ⇒ byte-identical" criterion is what separates a bug from the intended change.
+
+**Blocked, and named rather than worked around.** The bundled `SourceSerif4-Regular.ttf` is a *static*
+instance — its table list carries no `fvar`, so a bold or italic face cannot be instanced from it.
+0064 therefore needs new font programs in the repository (Source Serif 4's Bold, Italic and Bold
+Italic instances, same OFL as the regular one), which is a download and a licence note rather than a
+decision anyone should take silently on someone else's behalf. This is the same posture M3 took with
+the vendor preset figures: a named slot with its provenance recorded, not an invented value. **0064
+is sequenced but cannot start until those assets are approved and added**, which is why 0066 runs
+ahead of it below.
 
 ### 0065 character-styles
 
