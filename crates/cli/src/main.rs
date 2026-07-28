@@ -130,6 +130,31 @@ enum PackCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Turn a finished book into a reusable pack (spec 0057).
+    ///
+    /// Its templates, styles and component definitions travel; its content does not.
+    Extract {
+        /// Path to the document (`document.json` or `.tpub`) to extract the look from.
+        input: String,
+        /// Pack slug, e.g. `ashen-vault`.
+        #[arg(long)]
+        name: String,
+        /// Human-readable title. Defaults to the slug.
+        #[arg(long)]
+        title: Option<String>,
+        /// The pack's own content version, e.g. `1.0.0`.
+        #[arg(long)]
+        version: String,
+        /// Where this pack comes from. Required: a pack with no provenance cannot be installed.
+        #[arg(long)]
+        source: String,
+        /// The licence the content is offered under. Required, for the same reason.
+        #[arg(long)]
+        license: String,
+        /// Output `.qpack` path.
+        #[arg(short, long)]
+        output: String,
+    },
     /// List installed packs with their provenance.
     List {
         /// Pack root. Defaults to `$QUILL_PACKS`, then the platform data directory.
@@ -544,6 +569,69 @@ fn main() -> ExitCode {
                     );
                     println!("  source:  {}", opened.manifest.source);
                     println!("  licence: {}", opened.manifest.license);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(PackCommand::Extract {
+            input,
+            name,
+            title,
+            version,
+            source,
+            license,
+            output,
+        }) => {
+            let loaded = match load_doc(&Some(input)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let title = title.unwrap_or_else(|| name.clone());
+            let manifest = quill_core_model::PackManifest::extract_from(
+                &loaded.doc,
+                &name,
+                &title,
+                &version,
+                &source,
+                &license,
+            );
+            // Only the furniture art the manifest kept — the same rule the extraction applied, so
+            // the container cannot end up carrying an asset the manifest does not declare.
+            let mut payload: Vec<(String, Vec<u8>)> = Vec::new();
+            for asset in &manifest.assets {
+                let path = loaded.asset_root.join(&asset.path);
+                match std::fs::read(&path) {
+                    Ok(bytes) => payload.push((asset.path.clone(), bytes)),
+                    Err(e) => {
+                        eprintln!("error: asset '{}' ({}): {e}", asset.id, path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            let entries: Vec<(&str, &[u8])> = payload
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_slice()))
+                .collect();
+            match quill_core_model::Qpack::write(&manifest, Path::new(&output), &entries) {
+                Ok(()) => {
+                    println!(
+                        "wrote {output}: {} {} — {} template(s), {} component definition(s), \
+                         {} style(s), {} furniture asset(s)",
+                        manifest.name,
+                        manifest.version,
+                        manifest.templates.len(),
+                        manifest.components.len(),
+                        manifest.styles.paragraph.len(),
+                        manifest.assets.len()
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {

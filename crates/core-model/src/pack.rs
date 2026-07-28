@@ -146,6 +146,67 @@ impl PackManifest {
         Ok(())
     }
 
+    /// Turn a finished book into a reusable pack (spec 0057).
+    ///
+    /// **A pack is a look, not a book.** No blocks, no paragraph text, no stat block, no table, no
+    /// image placed in the flow — a pack that carried its author's prose would make every book
+    /// built from it a derivative of that prose.
+    ///
+    /// Three inclusion rules, each of which is a decision rather than a convenience:
+    ///
+    /// - Only [`Document::components`] travels, never the bundled definitions. Every quill already
+    ///   has those, and shipping a copy would pin a definition the pack's author never edited to
+    ///   whatever this build's version of it happened to be.
+    /// - Only assets referenced by a [`MasterStatic::Image`] travel. Furniture art is design; a
+    ///   rule ornament in a running head belongs to the look. Art placed in the *flow* is content
+    ///   and stays behind. "Extract the assets" would take the art, which is why the rule is
+    ///   stated this precisely.
+    /// - Provenance is a parameter, not a default. Spec 0055 would refuse an unprovenanced pack at
+    ///   write time anyway, and that is a worse place to learn it.
+    pub fn extract_from(
+        doc: &crate::Document,
+        name: impl Into<String>,
+        title: impl Into<String>,
+        version: impl Into<String>,
+        source: impl Into<String>,
+        license: impl Into<String>,
+    ) -> PackManifest {
+        let name = name.into();
+        let title = title.into();
+        let template = Template::from_document(
+            doc,
+            name.clone(),
+            title.clone(),
+            format!(
+                "Extracted from a document with {} block(s).",
+                doc.content.len()
+            ),
+        );
+
+        // Asset ids the master furniture references, and nothing else.
+        let mut furniture: std::collections::BTreeSet<&str> = Default::default();
+        for master in &doc.master_pages {
+            for stat in &master.statics {
+                if let crate::MasterStatic::Image { asset, .. } = stat {
+                    furniture.insert(asset.as_str());
+                }
+            }
+        }
+
+        let mut m = PackManifest::new(name, title, version, source, license);
+        m.description = template.description.clone();
+        m.styles = doc.styles.clone();
+        m.components = doc.components.clone();
+        m.templates = vec![template];
+        m.assets = doc
+            .assets
+            .iter()
+            .filter(|a| furniture.contains(a.id.as_str()))
+            .cloned()
+            .collect();
+        m
+    }
+
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }

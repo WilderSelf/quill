@@ -210,6 +210,34 @@ impl Document {
     }
 }
 
+impl Template {
+    /// The exact inverse of [`Document::from_template`]: everything a document has *except its
+    /// content*, lifted back out (spec 0057).
+    ///
+    /// The round-trip is asserted rather than assumed. Without it, `from_template` and
+    /// `from_document` are two functions that happen to share field names, and the day one grows a
+    /// field the other does not is the day an extracted pack quietly stops carrying part of the
+    /// look.
+    pub fn from_document(
+        doc: &Document,
+        name: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Template {
+        Template {
+            template_version: TEMPLATE_VERSION,
+            name: name.into(),
+            title: title.into(),
+            description: description.into(),
+            page_setup: doc.page_setup,
+            styles: doc.styles.clone(),
+            master_pages: doc.master_pages.clone(),
+            default_master: doc.default_master.clone(),
+            pages: doc.pages.clone(),
+        }
+    }
+}
+
 /// Ink. Grayscale rather than CMYK for furniture: a folio set in rich black would be a registration
 /// problem on press for no typographic gain.
 const INK: Color = Color::Gray { v: 0.0 };
