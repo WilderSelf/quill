@@ -39,6 +39,8 @@ fn house_style_book() -> Document {
     doc.styles.paragraph.insert(
         BODY_STYLE.into(),
         ParagraphStyle {
+            weight: Default::default(),
+            italic: false,
             list: None,
             font_size_pt: 10.5,
             leading_pt: 15.5,

@@ -9,8 +9,8 @@
 //!
 //! 1. The workspace's dependency rule is minimal-and-permissive, and this needs no library.
 //! 2. **A subset can be enumerated.** "Markdown-ish" invites unbounded creep toward CommonMark, and
-//!    an importer that half-supports emphasis, nested lists and reference links is worse than one
-//!    that supports six constructs completely and says so. The supported set is the list below;
+//!    an importer that half-supports nested lists and reference links is worse than one that
+//!    supports eight constructs completely and says so. The supported set is the list below;
 //!    everything else is an explicit non-goal.
 //!
 //! Round-tripping *out* to markdown is a non-goal.
@@ -26,6 +26,11 @@
 //! - `- item` / `* item` / `1. item` — a list item. The ordinal you write is ignored: markers are
 //!   derived from document order at layout time, so an inserted item renumbers what follows.
 //! - `:::toc` … `:::` — a generated table of contents.
+//! - `**bold**` / `__bold__` and `*italic*` / `_italic_` inside a heading or a paragraph — a run set
+//!   in the family's bold or italic face (spec 0064). They nest: `***both***` is bold italic, and
+//!   `**bold with *italic* inside**` is what it reads as. An **unmatched** delimiter is literal
+//!   text, which is the same rule the rest of this importer follows — an author who typed a
+//!   lone asterisk gets a lone asterisk, not an error and not a swallowed line.
 //!
 //! ## What happens to input it does not understand
 //!
@@ -38,8 +43,8 @@
 //!   came out as plain prose is visible and fixable; a paragraph that vanished is not.
 
 use crate::{
-    Block, BlockId, Color, Document, Panel, Run, Table, Template, LIST_BULLET_STYLE,
-    LIST_NUMBER_STYLE,
+    Block, BlockId, Color, Document, InlineStyle, Panel, Run, Table, Template, Weight,
+    LIST_BULLET_STYLE, LIST_NUMBER_STYLE,
 };
 
 /// Something the importer could not honor, with the line it was on.
@@ -94,7 +99,7 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
     macro_rules! flush {
         () => {
             if !paragraph.is_empty() {
-                content.push(Block::body(paragraph.join(" "), INK));
+                content.push(Block::body_runs(emphasis(&paragraph.join(" ")), INK));
                 paragraph.clear();
                 let _ = paragraph_line;
             }
@@ -147,7 +152,7 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
                     message: "empty heading; kept as an empty heading rather than dropped".into(),
                 });
             }
-            content.push(Block::heading(level, text, INK));
+            content.push(Block::heading_runs(level, emphasis(text), INK));
             i += 1;
             continue;
         }
@@ -204,6 +209,120 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
 }
 
 /// `#`-count for a heading line, or `None`.
+/// Split authored text into runs at `**bold**` and `*italic*` delimiters (spec 0064).
+///
+/// A hand-rolled scanner, for the reason the whole importer is hand-rolled: the supported set has
+/// to be enumerable. It knows exactly two delimiters, each in two spellings, and it nests them.
+///
+/// Three rules keep it from eating text that was never emphasis, and all three are the ones a
+/// reader already expects:
+///
+/// - **A delimiter only opens if it is closed later.** `**bold` with no close is a paragraph about
+///   asterisks, not an unterminated error and not a swallowed line — the same posture the rest of
+///   this importer takes toward input it cannot honour.
+/// - **An opener is followed by text and a closer is preceded by it.** That is what keeps
+///   `2 * 3 * 4` arithmetic instead of italicising ` 3 `.
+/// - **`_` does not work inside a word.** `snake_case_word` is an identifier. `*` still does, so
+///   `un*frozen*` remains available for the case that wants it.
+fn emphasis(text: &str) -> Vec<Run> {
+    let b = text.as_bytes();
+
+    // The delimiter run starting at `i`, as (byte, length).
+    let delim_at = |i: usize| -> Option<(u8, usize)> {
+        let c = *b.get(i)?;
+        if c != b'*' && c != b'_' {
+            return None;
+        }
+        Some((c, b[i..].iter().take_while(|x| **x == c).count()))
+    };
+    let alnum = |i: Option<usize>| i.is_some_and(|i| b[i].is_ascii_alphanumeric());
+    let space = |i: Option<usize>| i.is_none_or(|i| b[i].is_ascii_whitespace());
+    let after = |i: usize, run: usize| (i + run < b.len()).then_some(i + run);
+    let can_open = |i: usize, c: u8, run: usize| {
+        !(space(after(i, run)) || c == b'_' && alnum(i.checked_sub(1)))
+    };
+    let can_close = |i: usize, c: u8, run: usize| {
+        !(space(i.checked_sub(1)) || c == b'_' && alnum(after(i, run)))
+    };
+    // Whether a valid closer of `width` exists after `from`.
+    let closes = |from: usize, c: u8, width: usize| {
+        let mut i = from;
+        while i < b.len() {
+            match delim_at(i) {
+                Some((d, run)) if d == c && run >= width && can_close(i, c, run) => return true,
+                Some((_, run)) => i += run,
+                None => i += 1,
+            }
+        }
+        false
+    };
+
+    let mut runs: Vec<Run> = Vec::new();
+    let mut buf = String::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut i = 0usize;
+
+    // Flush what has accumulated under the *current* emphasis state.
+    macro_rules! flush {
+        () => {
+            if !buf.is_empty() {
+                let style = InlineStyle {
+                    weight: bold.then_some(Weight::BOLD),
+                    italic: italic.then_some(true),
+                    ..InlineStyle::EMPTY
+                };
+                runs.push(Run {
+                    text: std::mem::take(&mut buf),
+                    style,
+                });
+            }
+        };
+    }
+
+    while i < b.len() {
+        let Some((c, run)) = delim_at(i) else {
+            let ch = text[i..].chars().next().expect("byte index is a boundary");
+            buf.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+        // `***` is both at once; anything longer is treated as bold plus italic and then literal.
+        let width = run.min(2);
+        let double = width == 2;
+        let inside = if double { bold } else { italic };
+        if inside && can_close(i, c, run) {
+            flush!();
+            if double {
+                bold = false;
+            } else {
+                italic = false;
+            }
+            i += width;
+            continue;
+        }
+        if !inside && can_open(i, c, width) && closes(i + width, c, width) {
+            flush!();
+            if double {
+                bold = true;
+            } else {
+                italic = true;
+            }
+            i += width;
+            continue;
+        }
+        // Literal: one delimiter character, then round again — a `**` that could not open may still
+        // contain a `*` that can.
+        buf.push(c as char);
+        i += 1;
+    }
+    flush!();
+    if runs.is_empty() {
+        runs.push(Run::plain(text));
+    }
+    runs
+}
+
 fn heading_level(line: &str) -> Option<u8> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     // A `#` with no space after it is a word, not a heading — `#1` is how people write numbers.
@@ -692,5 +811,94 @@ max_level: 3
             .collect();
         let out = import_ok(&src);
         assert_eq!(out.document.content.len(), 5_000);
+    }
+
+    /// Spec 0064: `**bold**` and `*italic*`, the two constructs the importer refused for want of a
+    /// face to import them into.
+    #[test]
+    fn emphasis_becomes_runs() {
+        let doc = import("a **bold** word and an *italic* one", tpl())
+            .expect("imports")
+            .document;
+        let Block::Body { runs, .. } = &doc.content[0] else {
+            panic!("expected a body paragraph")
+        };
+        let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["a ", "bold", " word and an ", "italic", " one"]);
+        assert_eq!(runs[1].style.weight, Some(Weight::BOLD));
+        assert_eq!(runs[1].style.italic, None);
+        assert_eq!(runs[3].style.italic, Some(true));
+        assert_eq!(runs[3].style.weight, None);
+    }
+
+    #[test]
+    fn emphasis_nests() {
+        let doc = import("***both*** and **bold with *italic* inside**", tpl())
+            .expect("imports")
+            .document;
+        let Block::Body { runs, .. } = &doc.content[0] else {
+            panic!("expected a body paragraph")
+        };
+        let both = &runs[0];
+        assert_eq!(both.text, "both");
+        assert_eq!(both.style.weight, Some(Weight::BOLD));
+        assert_eq!(both.style.italic, Some(true));
+        let inner = runs
+            .iter()
+            .find(|r| r.text == "italic")
+            .expect("the nested run survives");
+        assert_eq!(inner.style.weight, Some(Weight::BOLD));
+        assert_eq!(inner.style.italic, Some(true));
+    }
+
+    #[test]
+    fn an_unmatched_delimiter_is_literal_text() {
+        // The rule the rest of this importer follows: keep what the author typed. `2 * 3 * 4` is
+        // arithmetic, and a paragraph that opens `**bold` and never closes it is a paragraph about
+        // asterisks — not an error, and not a swallowed line.
+        for source in [
+            "**bold and no close",
+            "a lone * asterisk",
+            "snake_case_word",
+            "2 * 3 * 4 is arithmetic",
+            "a file_name_with_underscores and another_one",
+        ] {
+            let doc = import(source, tpl()).expect("imports").document;
+            let Block::Body { runs, .. } = &doc.content[0] else {
+                panic!("expected a body paragraph")
+            };
+            let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+            assert_eq!(joined, source, "text was altered");
+            assert!(
+                runs.iter().all(|r| r.style.is_empty()),
+                "{source:?} should carry no emphasis"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heading_takes_emphasis_too() {
+        let doc = import("# a *slanted* title", tpl())
+            .expect("imports")
+            .document;
+        let Block::Heading { runs, .. } = &doc.content[0] else {
+            panic!("expected a heading")
+        };
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].style.italic, Some(true));
+    }
+
+    #[test]
+    fn text_with_no_emphasis_is_still_exactly_one_run() {
+        // The parser runs over every paragraph, so the shape of an unemphasised one must not move:
+        // a second run would change every span map in the workspace for no reason.
+        let doc = import("just some ordinary prose", tpl())
+            .expect("imports")
+            .document;
+        let Block::Body { runs, .. } = &doc.content[0] else {
+            panic!("expected a body paragraph")
+        };
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].style.is_empty());
     }
 }

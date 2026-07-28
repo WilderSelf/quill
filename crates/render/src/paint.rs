@@ -17,7 +17,7 @@
 //! writer's bottom-left flip is a PDF convention and does not appear here.
 
 use quill_core_model::{Color, PageGeom};
-use quill_fonts::Font;
+use quill_fonts::FontFamily;
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 
 use crate::ProxyCache;
@@ -45,6 +45,14 @@ pub enum PaintOp {
         /// Extra space inserted between words to justify the line (spec 0017).
         space_adjust_pt: f32,
         rgb: [u8; 3],
+        /// Which face of the family this run is set in (spec 0064). The rasterizer selects it from
+        /// the same family the layout measured with, so the screen draws the face the page does.
+        weight: u16,
+        italic: bool,
+        /// Extra advance per glyph, and a vertical offset from the baseline — the screen halves of
+        /// the PDF's `Tc` and `Ts`.
+        tracking_pt: f32,
+        baseline_shift_pt: f32,
     },
     /// A filled and/or stroked rectangle — a rule, a border, a tinted panel (spec 0037).
     ///
@@ -85,6 +93,18 @@ pub enum PaintOp {
 ///
 /// Colours are `f32` and so not `Eq`; compared by debug form, as the writer does, so the two
 /// painters cannot disagree about whether a line needs splitting.
+fn line_is_one_format(
+    line: &quill_text_layout::Line,
+    run_formats: &[quill_text_layout::RunFormat],
+) -> bool {
+    if run_formats.is_empty() {
+        return true;
+    }
+    let mut fmts = line.spans.iter().map(|sp| run_formats.get(sp.run));
+    let first = fmts.next().flatten();
+    fmts.all(|f| f == first)
+}
+
 fn line_is_one_ink(line: &quill_text_layout::Line, run_colors: &[quill_core_model::Color]) -> bool {
     let mut inks = line
         .spans
@@ -97,7 +117,7 @@ fn line_is_one_ink(line: &quill_text_layout::Line, run_colors: &[quill_core_mode
 pub fn paint_page(
     page: &LaidOutPage,
     geom: &PageGeom,
-    font: &Font,
+    family: &FontFamily,
     proxies: &ProxyCache,
 ) -> Vec<PaintOp> {
     let mut ops = vec![
@@ -122,21 +142,35 @@ pub fn paint_page(
                 lines,
                 color,
                 run_colors,
+                run_formats,
+                run_shifts,
+                weight,
+                italic,
                 font_size_pt,
                 leading_pt,
                 ..
             } => {
+                // The block's own face and size: what a span with no override resolves to
+                // (spec 0064).
+                let base = quill_text_layout::RunFormat {
+                    size_pt: *font_size_pt,
+                    weight: *weight,
+                    italic: *italic,
+                    tracking_pt: 0.0,
+                };
                 let rgb = quill_color::to_srgb(color);
                 // The baseline comes from the shared font crate, which is also where the PDF writer
                 // gets it (spec 0032). One source, so screen and page agree about where a line sits.
-                let ascent = font.ascent_pt(*font_size_pt);
+                let ascent = quill_text_layout::RunMetrics::ascent_pt(family, *font_size_pt);
                 for (i, line) in lines.iter().enumerate() {
                     let x0 = geom.off_x + frame.x_pt + line.indent_pt;
                     let baseline_pt = geom.off_y + frame.y_pt + ascent + i as f32 * leading_pt;
                     // One op per line unless the line's runs really are set in different inks
                     // (spec 0063). The single-ink path is the one every existing document takes,
                     // and it must stay exactly what it was.
-                    if run_colors.is_empty() || line_is_one_ink(line, run_colors) {
+                    if (run_colors.is_empty() || line_is_one_ink(line, run_colors))
+                        && line_is_one_format(line, run_formats)
+                    {
                         ops.push(PaintOp::Text {
                             // A line's own left inset (spec 0048), added here and in the PDF writer
                             // from the same field, so the two derivation sites cannot disagree about
@@ -144,9 +178,13 @@ pub fn paint_page(
                             x_pt: x0,
                             baseline_pt,
                             text: line.text.clone(),
-                            size_pt: *font_size_pt,
+                            size_pt: base.size_pt,
                             space_adjust_pt: line.space_adjust_pt,
                             rgb,
+                            weight: base.weight,
+                            italic: base.italic,
+                            tracking_pt: 0.0,
+                            baseline_shift_pt: 0.0,
                         });
                         continue;
                     }
@@ -154,22 +192,26 @@ pub fn paint_page(
                     // justification already spent on the spaces behind it. That is the same
                     // accumulation the writer's `TJ` array performs, from the same metrics, which
                     // is what keeps screen and press from disagreeing about where a run begins.
+                    // Where each span starts, from the shared helper the PDF writer's own
+                    // advance is measured against (spec 0064) — one derivation, so the screen and
+                    // the page cannot disagree about where a run begins.
+                    let offsets = quill_text_layout::span_offsets(line, run_formats, base, family);
                     let mut at = 0usize;
-                    for sp in &line.spans {
+                    for (i, sp) in line.spans.iter().enumerate() {
                         let end = (at + sp.len_bytes).min(line.text.len());
-                        let before = &line.text[..at];
                         let piece = &line.text[at..end];
-                        let spaces = before.matches(' ').count() as f32;
-                        let dx =
-                            quill_text_layout::RunMetrics::measure_run(font, before, *font_size_pt)
-                                + spaces * line.space_adjust_pt;
+                        let fmt = run_formats.get(sp.run).copied().unwrap_or(base);
                         ops.push(PaintOp::Text {
-                            x_pt: x0 + dx,
+                            x_pt: x0 + offsets.get(i).copied().unwrap_or(0.0),
                             baseline_pt,
                             text: piece.to_string(),
-                            size_pt: *font_size_pt,
+                            size_pt: fmt.size_pt,
                             space_adjust_pt: line.space_adjust_pt,
                             rgb: run_colors.get(sp.run).map_or(rgb, quill_color::to_srgb),
+                            weight: fmt.weight,
+                            italic: fmt.italic,
+                            tracking_pt: fmt.tracking_pt,
+                            baseline_shift_pt: run_shifts.get(sp.run).copied().unwrap_or(0.0),
                         });
                         at = end;
                     }
@@ -241,9 +283,9 @@ mod tests {
     // layout the exporter would never produce, because the screen path hyphenated differently.
     use quill_fonts::HypherHyphenator;
 
-    fn sample_page() -> (LaidOutPage, PageGeom, Font) {
+    fn sample_page() -> (LaidOutPage, PageGeom, FontFamily) {
         let doc = Document::sample();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let pages = lay_out(&doc, &font, &HypherHyphenator);
         let geom = page_geom(&doc.page_setup, 0);
         (pages[0].clone(), geom, font)
@@ -415,7 +457,8 @@ mod tests {
             PlacedBlock::Text { frame, .. } => frame.y_pt,
             _ => panic!("expected text first"),
         };
-        let expected = geom.off_y + frame_y + font.ascent_pt(first_text.1);
+        let expected =
+            geom.off_y + frame_y + quill_text_layout::RunMetrics::ascent_pt(&font, first_text.1);
         assert!(
             (first_text.0 - expected).abs() < 0.001,
             "baseline {} vs expected {expected}",
@@ -432,7 +475,7 @@ mod tests {
             quill_core_model::Block::body("body text", Color::Gray { v: 0.0 }),
         ];
         doc.assign_missing_block_ids().unwrap();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let pages = lay_out(&doc, &font, &HypherHyphenator);
         let ops = paint_page(
             &pages[0],
@@ -461,7 +504,7 @@ mod tests {
         let mut doc = Document::sample();
         doc.content.push(quill_core_model::Block::image("map1"));
         doc.assign_missing_block_ids().unwrap();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let pages = lay_out(&doc, &font, &HypherHyphenator);
         let ops = paint_page(
             &pages[0],
@@ -487,7 +530,7 @@ mod tests {
             (p.width, p.height)
         };
 
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let pages = lay_out(&doc, &font, &HypherHyphenator);
         let ops: Vec<PaintOp> = pages
             .iter()
@@ -507,9 +550,13 @@ mod tests {
     fn statics_paint_before_flowed_content() {
         // Master art has to sit behind the text flowing over it, and paint order is what decides.
         let doc = Document::sample();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let mut page = lay_out(&doc, &font, &HypherHyphenator)[0].clone();
         page.statics = vec![PlacedBlock::Text {
+            run_formats: Vec::new(),
+            run_shifts: Vec::new(),
+            weight: 400,
+            italic: false,
             run_colors: Vec::new(),
             source: quill_core_model::BlockId::UNASSIGNED,
             frame: quill_core_model::Rect {

@@ -45,17 +45,41 @@ fn digest_str(text: &str) -> u64 {
     h
 }
 
-/// The digest with spec 0063's two new `Debug` fields textually removed.
+/// The digest with every field added since spec 0060 textually removed.
 ///
 /// The digest is deliberately `Debug`-based so a new field cannot slip past it — which means a new
 /// field also moves it even when no geometry did. Stripping them recovers the pre-0063 rendering
 /// exactly, so the old constant still has to match: that is what separates "the struct grew" from
 /// "the layout moved", and it is the only reason the constants below could be re-derived.
-fn digest_pre_0063(pages: &[LaidOutPage]) -> u64 {
+///
+/// Spec 0063 added `spans` and `run_colors`; spec 0064 added `run_formats`, `run_shifts`, `weight`
+/// and `italic`. Every one of them is stripped here, and `EXPECTED` below has not moved since spec
+/// 0060 — which is the whole claim: neither increment moved a placed position, size or text.
+fn digest_geometry(pages: &[LaidOutPage]) -> u64 {
     let text = format!("{pages:?}");
     let text = regex_free_strip(&text, "spans: [", "]");
     let text = regex_free_strip(&text, "run_colors: [", "]");
+    let text = regex_free_strip(&text, "run_formats: [", "]");
+    let text = regex_free_strip(&text, "run_shifts: [", "]");
+    let text = strip_scalar(&text, "weight: ");
+    let text = strip_scalar(&text, "italic: ");
     digest_str(&text)
+}
+
+/// Remove every `name: value` scalar field, plus the `, ` that separated it from the next.
+fn strip_scalar(text: &str, name: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(name) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + name.len()..];
+        let j = after
+            .find(", ")
+            .expect("a scalar field is followed by another");
+        rest = &after[j + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Remove every `open .. close` region, plus the `, ` that separated it from the next field.
@@ -257,24 +281,29 @@ const EXPECTED: &[(&str, u64)] = &[
     ("mixed flow", 0xd75f_5e98_0a5b_34ad),
 ];
 
-/// The same corpus under the *complete* `Debug` rendering, including spec 0063's `spans` and
-/// `run_colors`.
+/// The same corpus under the *complete* `Debug` rendering, including every field specs 0063 and
+/// 0064 added.
 ///
 /// Two sets rather than one, because they answer two different questions. `EXPECTED` is the
-/// geometry, and its constants have not moved since spec 0060 — proving 0063 changed no placed
-/// position, size or text. This set is the structure, and it keeps the digest's original virtue:
-/// a field nobody thought to list still cannot slip past it.
+/// geometry, and its constants have not moved since spec 0060 — proving that neither 0063 nor 0064
+/// changed a placed position, size or text. This set is the structure, and it keeps the digest's
+/// original virtue: a field nobody thought to list still cannot slip past it.
+///
+/// It moved at spec 0064, and only because `PlacedBlock::Text` grew four fields — `run_formats`,
+/// `run_shifts`, `weight` and `italic`. The evidence that nothing else moved is the *other* set
+/// above: strip those four out of the `Debug` rendering and every pre-0064 constant still matches,
+/// which it does.
 const EXPECTED_FULL: &[(&str, u64)] = &[
-    ("statblock whole", 0xe9a9_a381_1b7c_34ef),
-    ("statblock narrow", 0xd7bf_4757_ae84_c047),
-    ("statblock absent sections", 0x1ec5_0338_61b5_8c77),
-    ("statblock split", 0xfe2d_77a6_b6d0_a629),
-    ("table whole", 0x0357_776a_51dd_b24e),
-    ("table wrapped", 0xf54e_298b_4314_9dee),
-    ("table split", 0xe0d8_c23c_47c8_a326),
-    ("table headerless", 0x1e98_6c0e_678a_da77),
-    ("table empty", 0x20a5_06c7_2af7_0c53),
-    ("mixed flow", 0x22c8_b796_2e79_347a),
+    ("statblock whole", 0x9cb9_a4b2_e870_cd4d),
+    ("statblock narrow", 0x3b07_7190_0f56_9e9b),
+    ("statblock absent sections", 0xdd23_d287_183e_c4d5),
+    ("statblock split", 0xdc90_c840_0083_5093),
+    ("table whole", 0xe741_e596_ad73_bdc2),
+    ("table wrapped", 0x86c5_52a6_ce3b_ea6c),
+    ("table split", 0xbfbd_0292_8a67_83e4),
+    ("table headerless", 0x1fa5_b50f_4021_33a9),
+    ("table empty", 0x1d8e_2e95_97a5_8f8f),
+    ("mixed flow", 0x9df1_3a4b_763f_f36e),
 ];
 
 #[test]
@@ -285,7 +314,7 @@ fn the_bundled_components_produce_byte_identical_geometry() {
     let mut drift: Vec<String> = Vec::new();
     for (name, content, w, h) in corpus() {
         let pages = lay(content, w, h);
-        let got = digest_pre_0063(&pages);
+        let got = digest_geometry(&pages);
         match expected.get(name) {
             Some(&want) if want == got => {}
             Some(&want) => drift.push(format!("  {name}: expected {want:#x}, got {got:#x}")),

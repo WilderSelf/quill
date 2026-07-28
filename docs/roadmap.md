@@ -19,7 +19,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
-| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | decomposed — specs 0062–0066 sequenced below |
+| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | in progress — 0062, 0063, 0064 and 0066 shipped; 0065 and 0067 remain |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
@@ -1996,7 +1996,7 @@ treatment must not move a break, and a word straddling a boundary is one word, h
 
 ### 0064 font-family
 
-**The font family, and the overrides that move a glyph** · size: large · branch: `feat/font-family`
+**The font family, and the overrides that move a glyph** · size: large · branch: `feat/font-family` · **shipped**
 
 What 0063 declared and did not honour, plus the two overrides a reader expects first. These are one
 increment because they are one problem: every one of them changes what a box measures.
@@ -2035,6 +2035,26 @@ than one entry.
 
 **Risks** — This is the increment that moves glyphs, and it moves them everywhere the fixtures look.
 The "no override ⇒ byte-identical" criterion is what separates a bug from the intended change.
+
+**What it produced**
+
+- **`Document::sample()`'s export byte-hash did not move at all.** No document that names no weight,
+  slant, size, tracking or shift changed by a byte — the criterion the increment stood on, and the
+  reason `RunMetrics::measure_format` is defaulted onto `measure_run` rather than replacing it.
+- **No component geometry moved either.** Spec 0054's parity digests are `Debug`-based and so moved
+  when `PlacedBlock::Text` grew four fields; stripping those four reproduces the pre-0064 rendering
+  and every one of the ten *geometry* constants — unmoved since spec 0060 — still matches.
+- The breaker splits a box only where the **format** changes, not where the run changes, so two runs
+  differing in colour are still measured as one string and 0063's parity survives.
+- Spec 0051's pruning was **not** narrowed: its argument is per item (`width − shrink ≥ 0` whatever
+  size measured the item), and per-run size changes the value, not the sign.
+- One defect found and fixed on the way: `justify_runs_indented` computed the width to fill with
+  `measure_run(text, paragraph_size)`, which judged a 14 pt run inside a 10 pt paragraph as narrow
+  and stretched the line past its measure — spec 0060's rule, broken from the other direction. The
+  width to fill is now `natural_width`, measured through the line's own formats.
+- `export-pdf` lost its duplicate copy of the regular face and now reads all four from `quill-fonts`,
+  and `EmbeddedFont` no longer retains the un-subset program: measurement goes through the family,
+  which is the single shaper spec 0032 exists to keep.
 
 **Was blocked on assets; unblocked 2026-07-28.** The bundled `SourceSerif4-Regular.ttf` is a *static*
 instance — its table list carries no `fvar`, so a bold or italic face cannot be instanced from it.
@@ -2170,6 +2190,28 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   *inside* a section when no section boundary fits is the part that does not. Until then the
   limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
   it says in as many words that it inverts when the fix ships.
+
+- **A master page's static text is never gathered into the subset, so a folio can render as
+  `.notdef` boxes.** `collect_doc_faces` (and `collect_doc_chars` before it) walks `doc.content` and
+  nothing else. Every character a master static draws — a running head, a folio's separator, a
+  chapter name — reaches the page only if some *content* block happens to use it too. Found by spec
+  0064 while re-shaping the collector per face; it predates that increment entirely and is the exact
+  silent-failure surface spec 0026 named. Digits usually survive by accident (a contents list
+  contributes `0`–`9`), which is why nobody has hit it. The fix is small — walk `doc.master_pages`
+  in the same collector — and its blast radius is that every document *with* a master gets a
+  different subset, and so a different export byte-hash. That is why it is its own increment rather
+  than a rider on 0064's.
+
+- **Line breaking measures kerned advances; the PDF draws unkerned ones.** Since spec 0016,
+  measurement goes through `rustybuzz`, which applies `kern`/`GPOS`. The content stream shows a
+  string of CIDs and the viewer advances by the `/W` array, which holds `hmtx` advances — no kern
+  pair is applied by any consumer. So a line is drawn slightly *wider* than it was broken to.
+  Measured on the bundled face at 10 pt: a 61-character line of ordinary prose draws 1.36 pt wider
+  than it measured (0.3% of a 432 pt measure); a kern-heavy `AV Wa To Yo, Pa.` draws 4.53 pt wider
+  over 16 characters. Small, but it is spec 0060's rule leaking: a last line proven to fit its
+  measure can still be drawn past it. The fix is to emit the kerning as `TJ` adjustments — the same
+  array justification already uses — which moves every export byte-hash in the workspace and so is
+  an increment with a re-derivation, not a patch.
 
 ## Open questions
 

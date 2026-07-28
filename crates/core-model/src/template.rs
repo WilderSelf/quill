@@ -18,12 +18,12 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Indent;
 use crate::{
     heading_style_name, version, Color, Document, LoadError, Margins, MasterPage, MasterStatic,
     PageOverride, PageSetup, ParagraphStyle, Pt, Rect, Size, StaticAlign, StyleSheet, TextAlign,
     BODY_STYLE, DEFAULT_BLEED_PT, FORMAT_VERSION, PAGE_TOKEN,
 };
+use crate::{Indent, Weight};
 
 /// The current template-file format version (spec 0053).
 ///
@@ -269,6 +269,8 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
     styles.paragraph.insert(
         BODY_STYLE.to_string(),
         ParagraphStyle {
+            weight: Weight::REGULAR,
+            italic: false,
             list: None,
             font_size_pt: body_pt,
             leading_pt,
@@ -282,6 +284,8 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
         styles.paragraph.insert(
             heading_style_name(level),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: size,
                 leading_pt: leading,
@@ -297,6 +301,8 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
     styles.paragraph.insert(
         FOLIO_STYLE.to_string(),
         ParagraphStyle {
+            weight: Weight::REGULAR,
+            italic: false,
             list: None,
             font_size_pt: (body_pt - 1.0).max(7.0),
             leading_pt,

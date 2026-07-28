@@ -730,7 +730,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let font = quill_fonts::Font::bundled();
+            let font = quill_fonts::FontFamily::bundled();
             // Screen layout goes through the same shaper *and the same hyphenator* the exporter
             // uses (specs 0032, 0059), so what is drawn here is what the PDF would contain — that
             // is the whole point of the shared crate. Until spec 0059 this passed `NoHyphenator`,

@@ -522,6 +522,11 @@ fn content_fingerprint(block: &Block) -> u64 {
             eat(&[*level]);
             for r in runs {
                 eat(r.text.as_bytes());
+                // Everything about a run that changes what it measures (spec 0064). Size, tracking,
+                // weight and slant each move an advance, so each belongs here rather than in the
+                // colour tail below — a key missing a dimension the measurement depends on returns
+                // a stale layout and the document is silently wrong.
+                eat(measured_style(r).as_bytes());
                 // A boundary byte, so ["ab"] and ["a","b"] cannot collide: same text, different
                 // runs, and one of them can be recoloured mid-word.
                 eat(&[0xff]);
@@ -532,6 +537,11 @@ fn content_fingerprint(block: &Block) -> u64 {
             eat(b"b");
             for r in runs {
                 eat(r.text.as_bytes());
+                // Everything about a run that changes what it measures (spec 0064). Size, tracking,
+                // weight and slant each move an advance, so each belongs here rather than in the
+                // colour tail below — a key missing a dimension the measurement depends on returns
+                // a stale layout and the document is silently wrong.
+                eat(measured_style(r).as_bytes());
                 // A boundary byte, so ["ab"] and ["a","b"] cannot collide: same text, different
                 // runs, and one of them can be recoloured mid-word.
                 eat(&[0xff]);
@@ -613,14 +623,30 @@ fn content_fingerprint(block: &Block) -> u64 {
         }
     }
     // Colour does not affect measurement, but it does affect the placed block, so a colour-only
-    // edit must still invalidate the cached *result*.
+    // edit must still invalidate the cached *result*. A baseline shift is the same shape of thing:
+    // it moves a glyph vertically without changing an advance, so it cannot move a break either
+    // (spec 0064).
     if let Block::Heading { color, runs, .. } | Block::Body { color, runs, .. } = block {
         eat(format!("{color:?}").as_bytes());
         for r in runs {
             eat(format!("{:?}", r.style.color).as_bytes());
+            eat(format!("{:?}", r.style.baseline_shift_pt).as_bytes());
         }
     }
     h
+}
+
+/// The part of a run's style that changes what it measures (spec 0064).
+///
+/// Spelled out field by field rather than `Debug`-ing the whole `InlineStyle`, because the two
+/// fields it leaves out — colour and baseline shift — must land in the *tail* instead. A run
+/// recoloured mid-word has to invalidate the placed result without invalidating the line breaking
+/// that the measurement cache holds.
+fn measured_style(run: &quill_core_model::Run) -> String {
+    format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        run.style.size_pt, run.style.tracking_pt, run.style.weight, run.style.italic
+    )
 }
 
 /// Fingerprint of everything other than block content that layout depends on.
@@ -905,6 +931,104 @@ mod tests {
         assert_eq!(again.stats.pages_reflowed, 0);
         assert_eq!(again.stats.blocks_measured, 0);
         assert!(again.changed_pages.is_empty());
+    }
+
+    /// Spec 0064: a run edit that moves a glyph must invalidate the *measurement*, not just the
+    /// placed result.
+    ///
+    /// The failure this guards against is the one `MeasureKey`'s own doc comment names: a key
+    /// missing a dimension the measurement depends on returns a stale layout, and the document is
+    /// silently wrong. Size, tracking, weight and slant each change an advance and so each belongs
+    /// in the content hash; colour and baseline shift move nothing horizontally and belong in the
+    /// tail beside it.
+    #[test]
+    fn an_edit_that_moves_a_glyph_re_measures_and_one_that_does_not_still_repaints() {
+        use quill_core_model::{InlineStyle, Run, Weight};
+
+        let moves_a_glyph = [
+            InlineStyle {
+                size_pt: Some(14.0),
+                ..InlineStyle::EMPTY
+            },
+            InlineStyle {
+                tracking_pt: Some(0.4),
+                ..InlineStyle::EMPTY
+            },
+            InlineStyle {
+                weight: Some(Weight::BOLD),
+                ..InlineStyle::EMPTY
+            },
+            InlineStyle {
+                italic: Some(true),
+                ..InlineStyle::EMPTY
+            },
+        ];
+        for style in moves_a_glyph {
+            let mut doc = doc_of(40);
+            let mut session = LayoutSession::new();
+            session.relayout(&doc, &MONO, &NoHyphenator);
+
+            let id = doc.content[3].id();
+            let mut edited = Block::body_runs(
+                vec![
+                    Run::plain("paragraph 3 with "),
+                    Run {
+                        text: "enough".into(),
+                        style,
+                    },
+                    Run::plain(" words in it to occupy a line or so of text"),
+                ],
+                INK,
+            );
+            edited.set_id(id);
+            doc.content[3] = edited;
+            doc.bump_revision();
+
+            let after = session.relayout(&doc, &MONO, &NoHyphenator);
+            assert!(
+                after.stats.blocks_measured > 0,
+                "{style:?} changed an advance and must re-measure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_baseline_shift_repaints_without_re_breaking_the_paragraph() {
+        // The other side of the same split: a shift moves a glyph *vertically*, so it cannot move a
+        // break — but it does reach the page, so the cached placed result must not be reused.
+        use quill_core_model::{InlineStyle, Run};
+
+        let mut doc = doc_of(40);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let plain_runs = vec![
+            Run::plain("paragraph 3 with "),
+            Run::plain("enough"),
+            Run::plain(" words in it to occupy a line or so of text"),
+        ];
+        let id = doc.content[3].id();
+        let mut same_text = Block::body_runs(plain_runs.clone(), INK);
+        same_text.set_id(id);
+        doc.content[3] = same_text;
+        doc.bump_revision();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let mut shifted_runs = plain_runs;
+        shifted_runs[1].style = InlineStyle {
+            baseline_shift_pt: Some(3.0),
+            ..InlineStyle::EMPTY
+        };
+        let mut shifted = Block::body_runs(shifted_runs, INK);
+        shifted.set_id(id);
+        doc.content[3] = shifted;
+        doc.bump_revision();
+
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            !after.changed_pages.is_empty(),
+            "a shifted run still changes what is drawn"
+        );
     }
 
     #[test]

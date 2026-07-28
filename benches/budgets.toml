@@ -71,6 +71,12 @@ incremental_blocks_measured = 2.0
 # so re-pinning would silently import a different machine's speed into the gate. The ratio below is
 # the entry that carries 0051's improvement, because a ratio is machine-independent.
 us_per_paragraph = 70.0
+# Spec 0064's mixed-face pass over the same corpus, as a multiple of the single-face pass above.
+# Measured 1.4-1.6x: three runs per paragraph means the item stream is built with a per-boundary
+# glue and hyphen measurement and two extra split boxes, and each of the three formats shapes in its
+# own face. Pinned at 2.5 — the gate is there to catch a *class* of regression (a per-box face
+# lookup that reparses a font, say), not to police a tenth of a multiple.
+mixed_face_ratio = 2.5
 # An 8x longer paragraph. **Was 35.8x — superlinear, the defect spec 0051 closed. Now 8.1-8.9x**
 # (same machine: 34.2x before the fix, 8.3x after), i.e. linear to within measurement noise, which
 # is what active-node pruning is supposed to buy. Pinned at 12.0 rather than at ~9 to leave room for
