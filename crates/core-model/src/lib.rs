@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Re-exported so consumers get the component types from the model they appear in, rather than
-/// having to add a dependency on `quill-components-ttrpg` to name a field of `Block` (spec 0038).
-pub use quill_components_ttrpg::{
+/// having to add a dependency on `quill-components` to name a field of `Block` (spec 0038).
+pub use quill_components::{
     normalized_widths, ComponentDef, ComponentDefError, ComponentFields, ComponentLibrary,
-    DefColor, DefStroke, FieldValue, PanelDef, RandomTable, RuleDef, SectionDef, SectionShape,
-    SplitDef, SplitGranularity, StatBlock, Table, TableEntry, ZebraDef, COMPONENT_DEF_VERSION,
+    DefColor, DefStroke, FieldValue, Panel, PanelDef, RangeEntry, RangeTable, RuleDef, SectionDef,
+    SectionShape, SplitDef, SplitGranularity, Table, ZebraDef, COMPONENT_DEF_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,8 @@ mod template;
 mod version;
 
 pub use components::{
-    builtin_components, statblock_definition, table_definition, STATBLOCK_COMPONENT,
-    STATBLOCK_PADDING_PT, TABLE_CELL_PADDING_PT, TABLE_COMPONENT,
+    builtin_components, statblock_definition, table_definition, PANEL_PADDING_PT,
+    STATBLOCK_COMPONENT, TABLE_CELL_PADDING_PT, TABLE_COMPONENT,
 };
 pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
 pub use geom::{page_geom, PageGeom};
@@ -351,19 +351,27 @@ pub enum Block {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<String>,
     },
-    /// A creature or NPC stat block — the TTRPG-native content object this product exists for
-    /// (spec 0038).
+    /// A titled, bordered record of named sections — a creature, a recipe, a specimen, a part
+    /// number (specs 0038, 0062).
     ///
-    /// Carries the portable [`StatBlock`] verbatim rather than flattening it into fields, so the
-    /// same value can be authored, exchanged and rolled on without a document in sight. The
-    /// document adds only what placing it on a page needs: identity and ink.
-    StatBlock {
+    /// Carries the portable [`Panel`] verbatim rather than flattening it into fields, so the same
+    /// value can be authored and exchanged without a document in sight. The document adds only what
+    /// placing it on a page needs: identity and ink.
+    ///
+    /// The wire form is deliberately still `"kind": "stat_block"` with a `"stat"` field: renaming
+    /// it would be a `FORMAT_VERSION` migration to a name with a known expiry date, since this
+    /// variant is a bundled specialization of [`Block::Component`] and retires when it does. Spec
+    /// 0062 records the reasoning; a test pins the wire form so it stays a decision rather than a
+    /// memory.
+    #[serde(rename = "stat_block")]
+    Panel {
         #[serde(default)]
         id: BlockId,
-        stat: StatBlock,
+        #[serde(rename = "stat")]
+        panel: Panel,
         /// The ink every line in the block is set in. One colour rather than one per section: a
-        /// stat block is a single typographic object, and per-line colour would multiply the
-        /// preflight surface for no authoring gain.
+        /// panel is a single typographic object, and per-line colour would multiply the preflight
+        /// surface for no authoring gain.
         color: Color,
     },
     /// A generated table of contents (spec 0041).
@@ -390,7 +398,7 @@ pub enum Block {
         color: Color,
     },
     /// An instance of a declared component (spec 0054) — the general case
-    /// [`Block::StatBlock`] and [`Block::Table`] are the two bundled specializations of.
+    /// [`Block::Panel`] and [`Block::Table`] are the two bundled specializations of.
     ///
     /// Additive: a manifest that carries none loads and lays out exactly as before, which is why
     /// `FORMAT_VERSION` stays 3.
@@ -406,7 +414,7 @@ pub enum Block {
         #[serde(default)]
         fields: ComponentFields,
         /// The ink every run in the component is set in. One colour rather than one per section,
-        /// on [`Block::StatBlock`]'s reasoning.
+        /// on [`Block::Panel`]'s reasoning.
         color: Color,
     },
     Image {
@@ -423,7 +431,7 @@ impl Block {
             Block::Heading { id, .. }
             | Block::Body { id, .. }
             | Block::Image { id, .. }
-            | Block::StatBlock { id, .. }
+            | Block::Panel { id, .. }
             | Block::Table { id, .. }
             | Block::Component { id, .. }
             | Block::Toc { id, .. } => *id,
@@ -435,7 +443,7 @@ impl Block {
             Block::Heading { id, .. }
             | Block::Body { id, .. }
             | Block::Image { id, .. }
-            | Block::StatBlock { id, .. }
+            | Block::Panel { id, .. }
             | Block::Table { id, .. }
             | Block::Component { id, .. }
             | Block::Toc { id, .. } => *id = new,
@@ -470,7 +478,7 @@ impl Block {
             // Neither has one paragraph to style: an image has none, and a stat block is a
             // composite whose parts resolve `statblock-*` individually.
             Block::Image { .. }
-            | Block::StatBlock { .. }
+            | Block::Panel { .. }
             | Block::Table { .. }
             | Block::Component { .. }
             | Block::Toc { .. } => {}
@@ -583,11 +591,11 @@ impl Default for ParagraphStyle {
 pub const BODY_STYLE: &str = "body";
 
 /// The stat block's name line (spec 0038).
-pub const STATBLOCK_TITLE_STYLE: &str = "statblock-title";
+pub const PANEL_TITLE_STYLE: &str = "statblock-title";
 /// A stat block's `Key  Value` attribute lines.
-pub const STATBLOCK_ATTR_STYLE: &str = "statblock-attr";
+pub const PANEL_ATTR_STYLE: &str = "statblock-attr";
 /// A stat block's prose sections — overview, details, actions, reactions.
-pub const STATBLOCK_BODY_STYLE: &str = "statblock-body";
+pub const PANEL_BODY_STYLE: &str = "statblock-body";
 
 /// A table's header row (spec 0039).
 pub const TABLE_HEADER_STYLE: &str = "table-header";
@@ -648,7 +656,7 @@ impl Default for StyleSheet {
         // point of a first-class component is that dropping one in produces something that already
         // looks like a stat block. Restyling the whole book is still one edit — these three names.
         paragraph.insert(
-            STATBLOCK_TITLE_STYLE.to_string(),
+            PANEL_TITLE_STYLE.to_string(),
             ParagraphStyle {
                 font_size_pt: 13.0,
                 leading_pt: 16.0,
@@ -659,7 +667,7 @@ impl Default for StyleSheet {
             },
         );
         paragraph.insert(
-            STATBLOCK_ATTR_STYLE.to_string(),
+            PANEL_ATTR_STYLE.to_string(),
             ParagraphStyle {
                 font_size_pt: 9.0,
                 leading_pt: 11.0,
@@ -670,7 +678,7 @@ impl Default for StyleSheet {
             },
         );
         paragraph.insert(
-            STATBLOCK_BODY_STYLE.to_string(),
+            PANEL_BODY_STYLE.to_string(),
             ParagraphStyle {
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
@@ -756,7 +764,7 @@ impl StyleSheet {
             // A composite has no single paragraph treatment; its parts resolve `statblock-*`
             // themselves. `resolve` must still be total, so both fall back to the default.
             Block::Image { .. }
-            | Block::StatBlock { .. }
+            | Block::Panel { .. }
             | Block::Table { .. }
             | Block::Component { .. }
             | Block::Toc { .. } => return ParagraphStyle::default(),
@@ -1311,6 +1319,43 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_wire_form_is_pinned_to_its_pre_0062_names() {
+        // Spec 0062 renamed the Rust surface and deliberately did NOT rename the on-disk one: the
+        // tag and the field retire with `Block::Panel` itself, which is a bundled specialization of
+        // `Block::Component`. A migration to a name that is already scheduled for removal is one
+        // nobody should write. Enforced rather than remembered.
+        let block = Block::Panel {
+            id: BlockId(1),
+            panel: Panel {
+                name: "Astrolabe".into(),
+                ..Panel::default()
+            },
+            color: Color::Gray { v: 0.0 },
+        };
+        let json = serde_json::to_string(&block).expect("serialize");
+        assert!(
+            json.contains(r#""kind":"stat_block""#),
+            "the wire tag must stay `stat_block`: {json}"
+        );
+        assert!(
+            json.contains(r#""stat":"#),
+            "the wire field must stay `stat`: {json}"
+        );
+
+        // And a block written before the rename still loads, which is what the pin is for. The
+        // literal is the pre-0062 wire form typed out, not a re-serialization of the value above:
+        // a round-trip through today's code would agree with itself whatever the names became.
+        let v3 = r#"{"kind":"stat_block","id":7,"stat":{"name":"Astrolabe"},"color":{"space":"gray","v":0.0}}"#;
+        let back: Block = serde_json::from_str(v3).expect("a pre-0062 block must load");
+        let Block::Panel { id, panel, .. } = &back else {
+            panic!("expected a panel, got {back:?}")
+        };
+        assert_eq!(*id, BlockId(7));
+        assert_eq!(panel.name, "Astrolabe");
+        assert_eq!(FORMAT_VERSION, 3, "renaming is not a format change");
+    }
+
+    #[test]
     fn default_bleed_is_one_eighth_inch() {
         assert_eq!(DEFAULT_BLEED_PT, 9.0);
         assert_eq!(PageSetup::default().bleed_pt, DEFAULT_BLEED_PT);
@@ -1676,9 +1721,9 @@ mod tests {
     #[test]
     fn a_stat_block_round_trips_through_the_manifest() {
         let mut doc = Document::sample();
-        doc.content.push(Block::StatBlock {
+        doc.content.push(Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: StatBlock {
+            panel: Panel {
                 name: "Goblin".into(),
                 overview: vec!["Small humanoid, chaotic".into()],
                 attributes: vec![("AC".into(), "15".into()), ("HP".into(), "7".into())],
@@ -1693,11 +1738,11 @@ mod tests {
         let back = Document::from_json(&doc.to_json().expect("save")).expect("load");
         assert_eq!(back, doc);
         // The component survives as a component, not as flattened text.
-        let Block::StatBlock { stat, .. } = &back.content[2] else {
+        let Block::Panel { panel, .. } = &back.content[2] else {
             panic!("expected a stat block")
         };
-        assert_eq!(stat.attributes.len(), 2);
-        assert_eq!(stat.name, "Goblin");
+        assert_eq!(panel.attributes.len(), 2);
+        assert_eq!(panel.name, "Goblin");
     }
 
     #[test]
@@ -1705,16 +1750,12 @@ mod tests {
         // A stat block resolves these three by name. If one were missing it would fall back to
         // `body` and the block would come out looking like a paragraph.
         let sheet = StyleSheet::default();
-        for name in [
-            STATBLOCK_TITLE_STYLE,
-            STATBLOCK_ATTR_STYLE,
-            STATBLOCK_BODY_STYLE,
-        ] {
+        for name in [PANEL_TITLE_STYLE, PANEL_ATTR_STYLE, PANEL_BODY_STYLE] {
             assert!(sheet.paragraph.contains_key(name), "missing `{name}`");
         }
         assert!(
-            sheet.paragraph[STATBLOCK_TITLE_STYLE].font_size_pt
-                > sheet.paragraph[STATBLOCK_BODY_STYLE].font_size_pt,
+            sheet.paragraph[PANEL_TITLE_STYLE].font_size_pt
+                > sheet.paragraph[PANEL_BODY_STYLE].font_size_pt,
             "the name must be set larger than the prose"
         );
     }

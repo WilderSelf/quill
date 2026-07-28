@@ -1,7 +1,8 @@
 //! Component *definitions* — a component as data rather than as a Rust type (spec 0054).
 //!
-//! [`StatBlock`](crate::StatBlock) and [`Table`](crate::Table) are two shapes a TTRPG publisher
-//! wants; there are hundreds. A `ComponentDef` declares what `layout-engine`'s two hand-written
+//! [`Panel`](crate::Panel) and [`Table`](crate::Table) are two shapes a publisher wants; there are
+//! hundreds, and they are not one genre's — a creature, a recipe, a specimen, a part number and a
+//! case study are the same object set differently. A `ComponentDef` declares what `layout-engine`'s two hand-written
 //! measurement functions used to hard-code — an ordered list of styled sections, a panel, and the
 //! rules a section list needs to be cut across a frame boundary — so a publisher can express a
 //! third shape without a Rust compiler, and so a content pack (spec 0055) has something to carry.

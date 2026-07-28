@@ -69,7 +69,7 @@ quill-layout-engine = { path = "crates/layout-engine" }
 quill-color = { path = "crates/color" }
 quill-render = { path = "crates/render" }
 quill-export-pdf = { path = "crates/export-pdf" }
-quill-components-ttrpg = { path = "crates/components-ttrpg" }
+quill-components = { path = "crates/components" }
 
 [profile.release]
 lto = "thin"

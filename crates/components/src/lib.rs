@@ -1,6 +1,12 @@
-//! TTRPG-native content components (stat blocks, random tables) as portable, first-class
-//! objects — addressing the Homebrewery/GM Binder fragmentation where the same content needs
-//! different markup per tool.
+//! Portable content components — panels, tables and range tables — as first-class objects that
+//! exist independently of any document, so the same record can be authored once and set by any
+//! tool that understands the format.
+//!
+//! Deliberately domain-neutral (spec 0062). A panel is a titled, bordered record of named
+//! sections: a creature, a recipe, a specimen, a part number. A range table partitions `1..=max`:
+//! a d100 roll, a severity scale, a postage band. The genre lives in the *content* — which is what
+//! spec 0054's declared components made expressible — and a mechanism only one genre can use is a
+//! defect here.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,10 +52,13 @@ pub fn normalized_widths(widths: &[f32], count: usize) -> Vec<f32> {
     usable.iter().map(|w| w / total).collect()
 }
 
-/// A creature/NPC stat block. Sections mirror the common compact layout
-/// (Overview / Attributes / Details / Actions / Reactions).
+/// A titled record of named sections, set as a bordered panel.
+///
+/// The section names are fixed. This type is the *bundled specialization* — spec 0054's
+/// [`ComponentDef`](crate::ComponentDef) is the general mechanism, and a publisher whose record has
+/// different sections declares one rather than reaching for this.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct StatBlock {
+pub struct Panel {
     pub name: String,
     #[serde(default)]
     pub overview: Vec<String>,
@@ -63,7 +72,7 @@ pub struct StatBlock {
     pub reactions: Vec<String>,
 }
 
-impl StatBlock {
+impl Panel {
     /// This stat block as component instance fields (spec 0054). See [`Table::to_fields`].
     pub fn to_fields(&self) -> ComponentFields {
         let mut fields = ComponentFields::new();
@@ -87,31 +96,40 @@ impl StatBlock {
     }
 }
 
-/// One row of a random table, covering an inclusive die-roll range `low..=high`.
+/// One row of a range table, covering the inclusive range `low..=high`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TableEntry {
+pub struct RangeEntry {
     pub low: u32,
     pub high: u32,
-    pub result: String,
+    pub value: String,
 }
 
-/// A random table rolled on `die` (e.g. `die = 100` for a d100 table).
+/// A table whose entries partition `1..=max` — a lookup by number rather than by key.
+///
+/// A d100 roll table is the case this was built for, but so is a severity scale, a postage band and
+/// a damage-deposit schedule; `max` is the upper bound of the partition and carries no claim about
+/// where the number came from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RandomTable {
-    pub die: u32,
-    pub entries: Vec<TableEntry>,
+pub struct RangeTable {
+    pub max: u32,
+    /// The heading column 0 is given when this is set as a [`Table`]. Empty falls back to
+    /// `1–{max}`; `d100` is what a roll table would put here, which is how the genre stays in the
+    /// content rather than in the type.
+    #[serde(default)]
+    pub label: String,
+    pub entries: Vec<RangeEntry>,
 }
 
-impl RandomTable {
-    /// The result for a given roll, if any entry covers it.
-    pub fn lookup(&self, roll: u32) -> Option<&str> {
+impl RangeTable {
+    /// The value for a given number, if any entry covers it.
+    pub fn lookup(&self, n: u32) -> Option<&str> {
         self.entries
             .iter()
-            .find(|e| roll >= e.low && roll <= e.high)
-            .map(|e| e.result.as_str())
+            .find(|e| n >= e.low && n <= e.high)
+            .map(|e| e.value.as_str())
     }
 
-    /// Whether the entries cover every value in `1..=die` exactly once (no gaps or overlaps).
+    /// Whether the entries cover every value in `1..=max` exactly once (no gaps or overlaps).
     pub fn is_complete(&self) -> bool {
         let mut sorted = self.entries.clone();
         sorted.sort_by_key(|e| e.low);
@@ -122,7 +140,7 @@ impl RandomTable {
             }
             expected = e.high + 1;
         }
-        expected == self.die + 1
+        expected == self.max + 1
     }
 }
 
@@ -130,19 +148,20 @@ impl RandomTable {
 mod tests {
     use super::*;
 
-    fn d6_table() -> RandomTable {
-        RandomTable {
-            die: 6,
+    fn six_way_table() -> RangeTable {
+        RangeTable {
+            max: 6,
+            label: String::new(),
             entries: vec![
-                TableEntry {
+                RangeEntry {
                     low: 1,
                     high: 3,
-                    result: "Goblins".into(),
+                    value: "Goblins".into(),
                 },
-                TableEntry {
+                RangeEntry {
                     low: 4,
                     high: 6,
-                    result: "Bandits".into(),
+                    value: "Bandits".into(),
                 },
             ],
         }
@@ -150,7 +169,7 @@ mod tests {
 
     #[test]
     fn lookup_finds_the_covering_entry() {
-        let t = d6_table();
+        let t = six_way_table();
         assert_eq!(t.lookup(2), Some("Goblins"));
         assert_eq!(t.lookup(5), Some("Bandits"));
         assert_eq!(t.lookup(7), None);
@@ -158,13 +177,14 @@ mod tests {
 
     #[test]
     fn completeness_detects_gaps() {
-        assert!(d6_table().is_complete());
-        let gappy = RandomTable {
-            die: 6,
-            entries: vec![TableEntry {
+        assert!(six_way_table().is_complete());
+        let gappy = RangeTable {
+            max: 6,
+            label: String::new(),
+            entries: vec![RangeEntry {
                 low: 1,
                 high: 3,
-                result: "x".into(),
+                value: "x".into(),
             }],
         };
         assert!(!gappy.is_complete());
@@ -173,9 +193,9 @@ mod tests {
 
 /// A table: column widths, an optional repeating header, and rows of cells.
 ///
-/// General rather than random-table-specific. A random table is the special case where column 0
-/// holds a die range — [`Table::from_random`] builds one — but a rulebook is full of ordinary
-/// tables (equipment, prices, encounter difficulty) and they all want the same layout.
+/// General rather than lookup-specific. A [`RangeTable`] is the special case where column 0 holds a
+/// numeric range — [`Table::from_range_table`] builds one — but a book is full of ordinary tables
+/// (parts, prices, comparisons) and they all want the same layout.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     /// Column widths as fractions of the available measure. Normalized on use, so `[1, 3]` and
@@ -240,22 +260,31 @@ impl Table {
         fields
     }
 
-    /// Render a [`RandomTable`] as a two-column table of die range and result.
-    pub fn from_random(table: &RandomTable) -> Table {
+    /// Set a [`RangeTable`] as a two-column table of range and value.
+    ///
+    /// Column 0's heading comes from the table's own `label`, falling back to `1–{max}`. It was
+    /// `d{die}` before spec 0062, which asserted the number was a die roll; a roll table now says
+    /// so itself by setting `label` to `d100`.
+    pub fn from_range_table(table: &RangeTable) -> Table {
+        let heading = if table.label.is_empty() {
+            format!("1–{}", table.max)
+        } else {
+            table.label.clone()
+        };
         Table {
             columns: vec![0.2, 0.8],
-            header: Some(vec![format!("d{}", table.die), "Result".into()]),
+            header: Some(vec![heading, "Result".into()]),
             rows: table
                 .entries
                 .iter()
-                .map(|e| vec![format_range(e.low, e.high), e.result.clone()])
+                .map(|e| vec![format_range(e.low, e.high), e.value.clone()])
                 .collect(),
             zebra: true,
         }
     }
 }
 
-/// A die range as a reader would write it: `7` for a single value, `11-25` for a span.
+/// A range as a reader would write it: `7` for a single value, `11-25` for a span.
 ///
 /// The singleton case is the one that ships and then embarrasses — `7-7` in a printed book.
 fn format_range(low: u32, high: u32) -> String {
@@ -271,31 +300,43 @@ mod table_tests {
     use super::*;
 
     #[test]
-    fn a_random_table_renders_as_range_and_result() {
-        let t = RandomTable {
-            die: 100,
+    fn a_range_table_renders_as_range_and_value() {
+        let t = RangeTable {
+            max: 100,
+            label: String::new(),
             entries: vec![
-                TableEntry {
+                RangeEntry {
                     low: 1,
                     high: 10,
-                    result: "Nothing".into(),
+                    value: "Nothing".into(),
                 },
-                TableEntry {
+                RangeEntry {
                     low: 11,
                     high: 11,
-                    result: "A single".into(),
+                    value: "A single".into(),
                 },
             ],
         };
-        let table = Table::from_random(&t);
+        let table = Table::from_range_table(&t);
         assert_eq!(
             table.header.as_deref(),
-            Some(&["d100".to_string(), "Result".to_string()][..])
+            Some(&["1\u{2013}100".to_string(), "Result".to_string()][..]),
+            "an unlabelled range table heads column 0 with its own bounds, not with a die"
         );
         assert_eq!(table.rows[0][0], "1-10");
         assert_eq!(
             table.rows[1][0], "11",
             "a one-value range must not read `11-11`"
+        );
+
+        // The genre is content, not mechanism: a roll table says so by labelling itself.
+        let rolled = RangeTable {
+            label: "d100".into(),
+            ..t
+        };
+        assert_eq!(
+            Table::from_range_table(&rolled).header.as_deref(),
+            Some(&["d100".to_string(), "Result".to_string()][..])
         );
     }
 

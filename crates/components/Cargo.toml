@@ -1,5 +1,5 @@
 [package]
-name = "quill-components-ttrpg"
+name = "quill-components"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

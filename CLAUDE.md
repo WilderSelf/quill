@@ -169,9 +169,9 @@ cargo test -p <crate>            # test one crate, e.g. -p export-pdf
 cargo test -p <crate> <name>     # run a single test by name substring
 cargo run -p quill-cli -- <args> # headless render/export (primary M0 entrypoint)
 cargo run -p quill-cli -- new --list          # built-in document templates (spec 0036)
-cargo run -p quill-cli -- new --template rulebook --output book.tpub
+cargo run -p quill-cli -- new --template reference --output book.tpub
 cargo run -p quill-cli -- new --from my-template.json --output book.tpub  # user-authored (0053)
-cargo run -p quill-cli -- import doc.md --output book.tpub --template rulebook
+cargo run -p quill-cli -- import doc.md --output book.tpub --template reference
 cargo run -p quill-cli -- tpub document.json --output book.tpub   # was `pack`, renamed by 0055
 cargo run -p quill-cli -- pack install examples/packs/pbta-moves.json   # content packs (0055-0057)
 cargo run -p quill-cli -- pack list

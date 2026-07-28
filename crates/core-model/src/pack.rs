@@ -153,7 +153,7 @@ impl PackManifest {
             def.validate().map_err(LoadError::ComponentDef)?;
             if &def.name != key {
                 return Err(LoadError::ComponentDef(
-                    quill_components_ttrpg::ComponentDefError::NameMismatch {
+                    quill_components::ComponentDefError::NameMismatch {
                         key: key.clone(),
                         def: def.name.clone(),
                     },

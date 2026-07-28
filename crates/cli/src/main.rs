@@ -12,11 +12,7 @@ use quill_export_pdf::{
 };
 
 #[derive(Parser)]
-#[command(
-    name = "quill",
-    version,
-    about = "Quill TTRPG desktop publishing (CLI)"
-)]
+#[command(name = "quill", version, about = "Quill desktop publishing (CLI)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -61,7 +57,7 @@ struct ImportArgs {
     #[arg(short, long)]
     output: String,
     /// Template slug supplying page setup, styles and masters. See `quill new --list`.
-    #[arg(long, default_value = "adventure")]
+    #[arg(long, default_value = "digest")]
     template: String,
 }
 

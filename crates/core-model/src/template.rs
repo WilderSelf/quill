@@ -99,12 +99,28 @@ impl Template {
     /// The built-in templates.
     pub fn bundled() -> &'static [Template] {
         static BUNDLED: OnceLock<Vec<Template>> = OnceLock::new();
-        BUNDLED.get_or_init(|| vec![adventure(), rulebook(), playtest()])
+        BUNDLED.get_or_init(|| vec![digest(), reference(), draft()])
     }
 
-    /// Look a bundled template up by slug.
+    /// A bundled template's slug before spec 0062 renamed it, and the slug it is now.
+    ///
+    /// The old names described a genre (`adventure`, `rulebook`, `playtest`); the new ones describe
+    /// the geometry, which is what a template actually is. Both resolve, permanently: a slug is a
+    /// published surface that scripts and documentation name, and breaking one to tidy a vocabulary
+    /// would cost an author real work for no gain.
+    const ALIASES: &'static [(&'static str, &'static str)] = &[
+        ("adventure", "digest"),
+        ("rulebook", "reference"),
+        ("playtest", "draft"),
+    ];
+
+    /// Look a bundled template up by slug, resolving a pre-0062 slug to the template it named.
     pub fn by_name(name: &str) -> Option<&'static Template> {
-        Template::bundled().iter().find(|t| t.name == name)
+        let resolved = Template::ALIASES
+            .iter()
+            .find(|(old, _)| *old == name)
+            .map_or(name, |(_, new)| *new);
+        Template::bundled().iter().find(|t| t.name == resolved)
     }
 
     /// The slugs of every bundled template, for error messages and `--list`.
@@ -333,8 +349,8 @@ const LETTER: Size = Size {
     h_pt: 792.0,
 };
 
-/// 6×9 single-column adventure module.
-fn adventure() -> Template {
+/// 6×9 single-column digest.
+fn digest() -> Template {
     // Inside margin exceeds the fore-edge because a bound book's text drifts toward the gutter
     // otherwise — the detail a beginner is least likely to know to add.
     let body_margins = Margins {
@@ -345,8 +361,8 @@ fn adventure() -> Template {
     };
     Template {
         template_version: TEMPLATE_VERSION,
-        name: "adventure".into(),
-        title: "Adventure module (6×9)".into(),
+        name: "digest".into(),
+        title: "Digest (6×9, single column)".into(),
         description: "Single-column 6×9 digest with a chapter opener and page numbers.".into(),
         page_setup: PageSetup {
             baseline_grid: None,
@@ -384,8 +400,8 @@ fn adventure() -> Template {
     }
 }
 
-/// 6×9 two-column rulebook.
-fn rulebook() -> Template {
+/// 6×9 two-column reference book.
+fn reference() -> Template {
     let body_margins = Margins {
         top_pt: 54.0,
         bottom_pt: 54.0,
@@ -395,8 +411,8 @@ fn rulebook() -> Template {
     // Text area 432 - 54 - 40 = 338 pt; two columns with a 14 pt gutter are 162 pt each.
     Template {
         template_version: TEMPLATE_VERSION,
-        name: "rulebook".into(),
-        title: "Rulebook (6×9, two columns)".into(),
+        name: "reference".into(),
+        title: "Reference (6×9, two columns)".into(),
         description: "Two-column 6×9 reference book with a chapter opener and page numbers.".into(),
         page_setup: PageSetup {
             baseline_grid: None,
@@ -435,19 +451,19 @@ fn rulebook() -> Template {
     }
 }
 
-/// US Letter single-column playtest document.
-fn playtest() -> Template {
+/// US Letter single-column draft.
+fn draft() -> Template {
     let body_margins = Margins::uniform(72.0);
     Template {
         template_version: TEMPLATE_VERSION,
-        name: "playtest".into(),
-        title: "Playtest document (US Letter)".into(),
-        description: "Single-column US Letter draft for hand-outs and playtest packets.".into(),
+        name: "draft".into(),
+        title: "Draft (US Letter, single-sided)".into(),
+        description: "Single-column US Letter draft for hand-outs and review copies.".into(),
         page_setup: PageSetup {
             baseline_grid: None,
             trim: LETTER,
             bleed_pt: DEFAULT_BLEED_PT,
-            // A playtest packet is read single-sided and printed at home, so there is no spine to
+            // A draft is read single-sided and printed at home, so there is no spine to
             // mirror margins about.
             facing_pages: false,
             margins: body_margins,
@@ -457,7 +473,7 @@ fn playtest() -> Template {
             14.5,
             &[(1, 20.0, 24.0), (2, 15.0, 19.0), (3, 12.5, 16.0)],
         ),
-        // No opener: a playtest draft is a working document, not a book.
+        // No opener: a draft is a working document, not a book.
         master_pages: vec![MasterPage {
             margins: Some(body_margins),
             // Text area ends at 792 - 72 = 720; the folio sits below it, inside the margin.
@@ -689,7 +705,7 @@ mod tests {
 
     #[test]
     fn a_template_with_an_opener_puts_it_on_page_zero_only() {
-        for name in ["adventure", "rulebook"] {
+        for name in ["digest", "reference"] {
             let t = Template::by_name(name).expect("bundled");
             let doc = Document::from_template(t);
             assert_eq!(
@@ -710,7 +726,7 @@ mod tests {
     #[test]
     fn an_openers_first_line_starts_lower_than_the_bodys() {
         // What "chapter opener" means, as a number rather than as a claim.
-        for name in ["adventure", "rulebook"] {
+        for name in ["digest", "reference"] {
             let t = Template::by_name(name).expect("bundled");
             let opener = t
                 .master_pages
@@ -731,7 +747,7 @@ mod tests {
 
     #[test]
     fn a_template_document_starts_empty_and_editable() {
-        let doc = Document::from_template(Template::by_name("rulebook").expect("bundled"));
+        let doc = Document::from_template(Template::by_name("reference").expect("bundled"));
         assert!(doc.content.is_empty());
         assert_eq!(doc.revision, 0);
         assert_eq!(doc.format_version, FORMAT_VERSION);
@@ -800,7 +816,7 @@ mod tests {
         // Expressed relative to TEMPLATE_VERSION, so it keeps testing "one newer than we
         // understand" across every future bump rather than silently stopping at a literal.
         let next = TEMPLATE_VERSION + 1;
-        let json = adventure().to_json().expect("serialize").replace(
+        let json = digest().to_json().expect("serialize").replace(
             &format!("\"template_version\": {TEMPLATE_VERSION}"),
             &format!("\"template_version\": {next}"),
         );
@@ -937,7 +953,7 @@ mod tests {
         // derived from the page height and its rect from the trim width, so re-trimming from
         // underneath would move the page without moving the furniture authored for it — furniture
         // does not participate in the flow, so nothing at layout time would catch the collision.
-        let t = Template::by_name("rulebook").expect("bundled");
+        let t = Template::by_name("reference").expect("bundled");
         let seeded = t.seeded_with(seed(LETTER.w_pt, LETTER.h_pt, DEFAULT_BLEED_PT));
         assert_eq!(
             seeded.page_setup.trim, DIGEST,
@@ -954,7 +970,7 @@ mod tests {
         // The other half: bleed is a press floor, not a design choice, and it lives entirely
         // outside the trim box — so honoring a stricter requirement costs the design nothing while
         // lowering it would cost something.
-        let t = Template::by_name("adventure").expect("bundled");
+        let t = Template::by_name("digest").expect("bundled");
         assert_eq!(t.page_setup.bleed_pt, DEFAULT_BLEED_PT);
 
         let stricter = t.seeded_with(seed(DIGEST.w_pt, DIGEST.h_pt, DEFAULT_BLEED_PT + 3.0));
@@ -973,7 +989,7 @@ mod tests {
         // trim is a conversation with the printer, not a corrupt file. But it must be *sayable*,
         // or the precedence above becomes the confusing-by-default behavior the spec exists to
         // prevent.
-        let t = Template::by_name("rulebook").expect("bundled");
+        let t = Template::by_name("reference").expect("bundled");
         assert!(t.disagrees_on_trim(seed(LETTER.w_pt, LETTER.h_pt, DEFAULT_BLEED_PT)));
         assert!(!t.disagrees_on_trim(seed(DIGEST.w_pt, DIGEST.h_pt, DEFAULT_BLEED_PT)));
         // Two trims that differ only below the epsilon are the same trim: 432x648 is 6x9 however
@@ -984,11 +1000,31 @@ mod tests {
     #[test]
     fn lookup_is_by_slug_and_unknown_names_are_none() {
         assert_eq!(
-            Template::by_name("rulebook").map(|t| t.name.as_str()),
-            Some("rulebook")
+            Template::by_name("reference").map(|t| t.name.as_str()),
+            Some("reference")
         );
-        assert!(Template::by_name("Rulebook").is_none(), "slugs are exact");
+        assert!(Template::by_name("Reference").is_none(), "slugs are exact");
         assert!(Template::by_name("nope").is_none());
         assert_eq!(Template::names().len(), Template::bundled().len());
+    }
+
+    #[test]
+    fn every_pre_0062_slug_still_resolves_to_the_template_it_named() {
+        // The slugs were renamed from a genre to a geometry. A slug is a published surface, so every
+        // old one resolves permanently rather than being deprecated with a date.
+        for (old, new) in Template::ALIASES {
+            let by_old = Template::by_name(old).unwrap_or_else(|| panic!("`{old}` must resolve"));
+            assert_eq!(
+                by_old.name, *new,
+                "`{old}` must resolve to `{new}`, not to something else"
+            );
+            assert_eq!(
+                Some(by_old),
+                Template::by_name(new),
+                "the same template either way"
+            );
+        }
+        // `names()` and `--list` show the current slugs only; an alias is a way in, not a listing.
+        assert_eq!(Template::names(), vec!["digest", "reference", "draft"]);
     }
 }

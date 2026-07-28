@@ -555,24 +555,24 @@ fn content_fingerprint(block: &Block) -> u64 {
                 eat(b"\x1e");
             }
         }
-        Block::StatBlock { stat, .. } => {
+        Block::Panel { panel, .. } => {
             // Every field, not a summary. A key that misses a dimension the measurement depends on
-            // returns a stale layout and the document is silently wrong (spec 0031) — and a stat
+            // returns a stale layout and the document is silently wrong (spec 0031) — and a panel
             // block has six independently editable sections, so five of them missing would be five
             // ways to edit a creature and see nothing change.
             eat(b"s");
-            eat(stat.name.as_bytes());
-            for (k, v) in &stat.attributes {
+            eat(panel.name.as_bytes());
+            for (k, v) in &panel.attributes {
                 eat(k.as_bytes());
                 eat(b"\x1f");
                 eat(v.as_bytes());
                 eat(b"\x1e");
             }
             for (tag, section) in [
-                (b"ov".as_slice(), &stat.overview),
-                (b"de", &stat.details),
-                (b"ac", &stat.actions),
-                (b"re", &stat.reactions),
+                (b"ov".as_slice(), &panel.overview),
+                (b"de", &panel.details),
+                (b"ac", &panel.actions),
+                (b"re", &panel.reactions),
             ] {
                 eat(tag);
                 for line in section {
@@ -1215,12 +1215,12 @@ mod tests {
         //
         // Every section is asserted individually, and the no-edit case is asserted too, so this
         // cannot pass against a fingerprint that simply invalidates on everything.
-        use quill_core_model::StatBlock;
+        use quill_core_model::Panel;
 
         /// A named edit to one section of a stat block.
-        type Mutation = (&'static str, fn(&mut StatBlock));
+        type Mutation = (&'static str, fn(&mut Panel));
 
-        let base = StatBlock {
+        let base = Panel {
             name: "Goblin".into(),
             overview: vec!["Small humanoid".into()],
             attributes: vec![("AC".into(), "15".into())],
@@ -1242,9 +1242,9 @@ mod tests {
         for (what, mutate) in mutations {
             let mut doc = doc_of(20);
             let id = doc.content[5].id();
-            doc.content[5] = Block::StatBlock {
+            doc.content[5] = Block::Panel {
                 id,
-                stat: base.clone(),
+                panel: base.clone(),
                 color: INK,
             };
 
@@ -1258,10 +1258,10 @@ mod tests {
                 "{what}: an unchanged document must not re-measure"
             );
 
-            let Block::StatBlock { stat, .. } = &mut doc.content[5] else {
+            let Block::Panel { panel, .. } = &mut doc.content[5] else {
                 unreachable!()
             };
-            mutate(stat);
+            mutate(panel);
             doc.bump_revision();
 
             let after = session.relayout(&doc, &MONO, &NoHyphenator);

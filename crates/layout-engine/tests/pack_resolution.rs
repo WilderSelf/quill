@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use quill_core_model::{
     install, resolve, statblock_definition, Block, BlockId, Color, Document, PackManifest,
-    PackRequirement, Qpack, StatBlock, STATBLOCK_COMPONENT,
+    PackRequirement, Panel, Qpack, STATBLOCK_COMPONENT,
 };
 use quill_layout_engine::{lay_out, LaidOutPage, PlacedBlock};
 use quill_text_layout::{MonospaceRunMetrics, NoHyphenator};
@@ -45,9 +45,9 @@ fn roomy_pack(padding_pt: f32) -> PackManifest {
 
 fn doc_with_statblock() -> Document {
     let mut doc = Document::sample();
-    doc.content = vec![Block::StatBlock {
+    doc.content = vec![Block::Panel {
         id: BlockId(1),
-        stat: StatBlock {
+        panel: Panel {
             name: "Cave Troll".into(),
             overview: vec!["Large giant, chaotic evil.".into()],
             attributes: vec![("Armour Class".into(), "15".into())],

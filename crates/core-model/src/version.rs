@@ -47,7 +47,7 @@ pub enum LoadError {
     /// A component definition (spec 0054) is malformed, or declares a version this build does not
     /// understand. Its own variant, and it names the definition, because a definition is the unit
     /// a pack ships and a reader has to know which one to fix.
-    ComponentDef(quill_components_ttrpg::ComponentDefError),
+    ComponentDef(quill_components::ComponentDefError),
     /// A `.qpack` manifest (spec 0055) is not well-formed, or does not match the schema.
     PackParse(String),
     /// A pack declares a `pack_version` newer than this build supports. A refusal, on the same

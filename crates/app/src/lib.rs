@@ -251,7 +251,7 @@ impl AppState {
                     // silently discard five of them. Leave both alone rather than doing something
                     // the caller did not ask for; a stat-block editor is its own affordance.
                     Block::Image { .. }
-                    | Block::StatBlock { .. }
+                    | Block::Panel { .. }
                     | Block::Table { .. }
                     // A declared component (spec 0054) is the general case of the same thing: its
                     // text lives in named fields, and which one a bare string would replace is not
@@ -514,8 +514,7 @@ mod tests {
     fn a_template_document_accepts_its_first_paragraph() {
         // A starter is only useful if it can be typed into. This is the first edit a beginner
         // makes, and it goes through the same session every other edit does.
-        let mut state =
-            AppState::new_from_template(Template::by_name("adventure").expect("bundled"));
+        let mut state = AppState::new_from_template(Template::by_name("digest").expect("bundled"));
         let doc = state.document_mut();
         doc.content.push(Block::body(
             "The road out of town is longer than it looks.",

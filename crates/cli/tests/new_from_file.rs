@@ -42,7 +42,7 @@ fn reopen(tpub: &Path, into: &Path) -> Document {
 }
 
 /// A template that is deliberately *not* one of the bundled three: a different trim, a different
-/// scale, a differently named master. A test that authored a copy of `rulebook` could pass while
+/// scale, a differently named master. A test that authored a copy of `reference` could pass while
 /// `--from` silently fell back to a bundled template.
 fn authored_template() -> Template {
     Template::from_json(
@@ -198,7 +198,7 @@ fn from_and_template_are_mutually_exclusive() {
     let out = run(&[
         "new",
         "--template",
-        "rulebook",
+        "reference",
         "--from",
         "anything.json",
         "--output",
@@ -257,7 +257,7 @@ fn list_and_template_are_unchanged_by_the_addition_of_from() {
         dir.join("nope.tpub").to_str().unwrap(),
     ]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("rulebook"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("reference"), "{}", stderr(&out));
 }
 
 #[test]
