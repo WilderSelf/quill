@@ -127,6 +127,40 @@ fn image_size(asset: &Asset, content_width: f32) -> (f32, f32) {
 }
 
 /// A block positioned on a page.
+///
+/// # `frame` is the ink (spec 0069)
+///
+/// **A placed part's `frame` is the bounding box of the ink that part actually draws**: `x_pt` is
+/// the left edge of its leftmost glyph, `x_pt + w_pt` the right edge of its rightmost, and `h_pt`
+/// follows the same rule vertically — the line boxes drawn, never the space reserved around them.
+/// It is *not* the slot the content was laid into. Every producer in this crate is checked against
+/// that one sentence, and the three exceptions it used to have are gone.
+///
+/// The slot is not lost by this: a frame's geometry and the stylesheet still say what measure a
+/// paragraph was broken to, and both are available without going through placed output. What is
+/// *not* recoverable downstream is the ink, because `PlacedBlock` carries no alignment field — a
+/// right-aligned segment in a wide slot is indistinguishable from a left-aligned one, and under
+/// slot semantics its reported box is nowhere near its glyphs. Both consumers of this geometry want
+/// ink: spec 0050's safe-area check asks whether ink lands in the margin, and `under_dpi` divides
+/// pixels by the width the image was *drawn* at.
+///
+/// **A multi-line paragraph is a bounding box, not an advance.** [`Line::indent_pt`] is added at
+/// draw time and differs per line under a hanging indent (spec 0048), so no single line's box is
+/// the paragraph's:
+///
+/// ```text
+/// x_pt = measure_left + min over lines of indent_pt
+/// w_pt = max over lines of (indent_pt + advance) - min over lines of indent_pt
+/// ```
+///
+/// [`quill_text_layout::ink_box`] is the one place that computes it, and both painters subtract
+/// [`quill_text_layout::indent_base`] so the change moves no glyph. A single line at zero indent —
+/// a tab segment, a master static, a list marker — is the degenerate case.
+///
+/// **[`PlacedBlock::Image`] is the one variant where the old rule and the new agree**, and it keeps
+/// drawn-extent semantics exactly: `under_dpi` divides a pixel count by `frame.w_pt`, so anything
+/// else would silently mis-report resolution. That is a press-safety regression rather than a
+/// cosmetic one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlacedBlock {
     Text {
@@ -958,11 +992,23 @@ pub(crate) struct PanelRect {
 }
 
 /// One styled run inside a [`Measured::Panel`], positioned relative to the panel's top-left.
+///
+/// A part carries **both** the measure it was broken to and the ink that came out of it, and the
+/// distinction is the point (spec 0069). `dx_pt`/`w_pt` are the slot — a table column, a panel's
+/// inner width — and stay on the *measurement*, where the producer knows them and where the
+/// containment invariants are asserted. `ink_dx_pt`/`ink_w_pt` are what reaches placed output,
+/// because [`PlacedBlock`]'s frame is the ink.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PanelPart {
+    /// Left edge of the **measure** this run was broken to, relative to the panel's top-left.
     pub dx_pt: f32,
     pub dy_pt: f32,
+    /// Width of that measure. Never placed; see `ink_w_pt`.
     pub w_pt: f32,
+    /// The run's ink box, relative to `dx_pt`. `(0.0, w_pt)` for a part whose ink fills its measure
+    /// by construction, which is what a tab segment's own extent is.
+    pub ink_dx_pt: f32,
+    pub ink_w_pt: f32,
     pub lines: Vec<Line>,
     pub color: Color,
     pub font_size_pt: f32,
@@ -1332,7 +1378,12 @@ fn measure_tabbed(
         .map(|seg| PanelPart {
             dx_pt: seg.x_pt,
             dy_pt: style.space_before_pt,
+            // `lay_tabs` already resolved the stop into the segment's own extent for all four
+            // alignments, so a segment's measure and its ink are the same rectangle — the
+            // degenerate case of spec 0069's rule, one line at zero indent.
             w_pt: seg.w_pt,
+            ink_dx_pt: 0.0,
+            ink_w_pt: seg.w_pt,
             // Each segment is drawn where the stops put it, so it carries no justification: a tab is
             // a hard position, and stretching the gap in front of one would move the stop.
             lines: vec![Line::single_run(seg.text, 0.0, 0.0)],
@@ -1376,10 +1427,15 @@ fn measure_toc(
             .copied()
             .unwrap_or_default();
         y += style.space_before_pt;
+        // The list's own heading is one line, set flush left: its ink is its measured advance, not
+        // the whole frame measure it was given (spec 0069).
+        let title_w = metrics.measure_run(title, style.font_size_pt);
         parts.push(PanelPart {
             dx_pt: 0.0,
             dy_pt: y,
             w_pt: width,
+            ink_dx_pt: 0.0,
+            ink_w_pt: title_w,
             lines: vec![Line::single_run(title.to_string(), 0.0, 0.0)],
             color,
             font_size_pt: style.font_size_pt,
@@ -1417,10 +1473,18 @@ fn measure_toc(
         }
         let title_w = metrics.measure_run(&text, style.font_size_pt);
 
+        // An entry's three parts still report their columns rather than their ink, and are the one
+        // stated exception to spec 0069's rule. Spec 0070 deletes this arithmetic outright in
+        // favour of one right tab stop with a dot leader, and moving these widths here would
+        // collide with the equivalence claim that increment is built on — every x and every dot
+        // count byte-identical to spec 0041's, with the three *widths* moving individually and
+        // justified there. The list's own title above is not an entry and moves now.
         parts.push(PanelPart {
             dx_pt: indent,
             dy_pt: y,
             w_pt: title_max,
+            ink_dx_pt: 0.0,
+            ink_w_pt: title_max,
             lines: vec![Line::single_run(text.clone(), 0.0, 0.0)],
             color,
             font_size_pt: style.font_size_pt,
@@ -1442,6 +1506,8 @@ fn measure_toc(
                     dx_pt: leader_x,
                     dy_pt: y,
                     w_pt: leader_end - leader_x,
+                    ink_dx_pt: 0.0,
+                    ink_w_pt: leader_end - leader_x,
                     lines: vec![Line::single_run(".".repeat(dots), 0.0, 0.0)],
                     color,
                     font_size_pt: style.font_size_pt,
@@ -1456,7 +1522,11 @@ fn measure_toc(
         parts.push(PanelPart {
             dx_pt: width - number_w,
             dy_pt: y,
+            // Already the measured advance rather than the reserved column: the page number was one
+            // of the three producers that reported ink before spec 0069 made it the rule.
             w_pt: number_w,
+            ink_dx_pt: 0.0,
+            ink_w_pt: number_w,
             lines: vec![Line::single_run(number, 0.0, 0.0)],
             color,
             font_size_pt: style.font_size_pt,
@@ -1890,6 +1960,7 @@ pub(crate) fn flow(
                                 &frame,
                                 y,
                                 block.id(),
+                                metrics,
                             ));
                             split_at += k;
                             cut_taken = true;
@@ -1954,8 +2025,14 @@ pub(crate) fn flow(
                 }
             }
 
-            page.blocks
-                .extend(place_measured(measured, height, &frame, y, block.id()));
+            page.blocks.extend(place_measured(
+                measured,
+                height,
+                &frame,
+                y,
+                block.id(),
+                metrics,
+            ));
             y += height;
             frame_empty = false;
             break;
@@ -1978,12 +2055,17 @@ pub(crate) fn flow(
 /// whole of it — placement does not care, and deliberately: every fragment carries the same
 /// `source`, which is what lets the heading index and the conservation invariant treat the pieces
 /// as one block.
+///
+/// `metrics` is here because [`PlacedBlock`]'s frame is the ink (spec 0069) and ink has to be
+/// measured. It is the same run-metrics the block was broken with — a second one could report a
+/// width the text was never set to.
 fn place_measured(
     measured: Measured,
     height: f32,
     frame: &Frame,
     y: f32,
     source: BlockId,
+    metrics: &impl RunMetrics,
 ) -> Vec<PlacedBlock> {
     match measured {
         Measured::Text {
@@ -1995,6 +2077,15 @@ fn place_measured(
             marker,
             style,
         } => {
+            // The paragraph's own format: what a span with no override of its own is set in, and
+            // the same `base` both painters measure against (spec 0064).
+            let base = RunFormat {
+                size_pt: style.font_size_pt,
+                weight: style.weight.0,
+                italic: style.italic,
+                tracking_pt: 0.0,
+            };
+            let (ink_dx, ink_w) = quill_text_layout::ink_box(&lines, &run_formats, base, metrics);
             let text_block = PlacedBlock::Text {
                 source,
                 run_colors,
@@ -2002,13 +2093,14 @@ fn place_measured(
                 run_shifts,
                 weight: style.weight.0,
                 italic: style.italic,
-                // The frame starts *below* the style's space-above: that space belongs to this
-                // block's height (so pagination reserves it) but no text is drawn in it.
+                // The frame starts *below* the style's space-above and ends at the last line's
+                // bottom: both spaces belong to this block's height (so pagination reserves them)
+                // but no text is drawn in either, and the frame is the ink (spec 0069).
                 frame: Rect {
-                    x_pt: frame.rect.x_pt,
+                    x_pt: frame.rect.x_pt + ink_dx,
                     y_pt: y + style.space_before_pt,
-                    w_pt: frame.rect.w_pt,
-                    h_pt: height - style.space_before_pt,
+                    w_pt: ink_w,
+                    h_pt: lines.len() as f32 * style.leading_pt,
                 },
                 lines,
                 color,
@@ -2031,12 +2123,26 @@ fn place_measured(
             else {
                 unreachable!("just built a text block")
             };
+            // The gutter is the slot; the marker's own glyphs are what it reports (spec 0069). A
+            // bullet in a 24 pt gutter is a few points of ink, and saying "24 pt" of it would put
+            // the item's box under the safe-area check for text that is not there. Its x is the
+            // frame's left edge rather than the item text's, which the item's indent has already
+            // moved right.
+            let marker_w = metrics.measure_format(
+                &marker,
+                RunFormat {
+                    size_pt: style.font_size_pt,
+                    weight: style.weight.0,
+                    italic: style.italic,
+                    tracking_pt: 0.0,
+                },
+            );
             let marker_block = PlacedBlock::Text {
                 source,
                 frame: Rect {
-                    x_pt: text_frame.x_pt,
+                    x_pt: frame.rect.x_pt,
                     y_pt: text_frame.y_pt,
-                    w_pt: style.indent.first_pt.max(0.0),
+                    w_pt: marker_w,
                     h_pt: style.leading_pt,
                 },
                 lines: vec![Line::single_run(marker, 0.0, 0.0)],
@@ -2101,10 +2207,13 @@ fn place_measured(
                 stroke: d.stroke,
             }));
             for p in parts {
+                // The part's ink, not the column or the panel's inner width it was broken to
+                // (spec 0069). The measure stays on the `PanelPart`, which is where the producer
+                // knows it and where the containment invariants are asserted.
                 let rect = Rect {
-                    x_pt: frame.rect.x_pt + p.dx_pt,
+                    x_pt: frame.rect.x_pt + p.dx_pt + p.ink_dx_pt,
                     y_pt: y + p.dy_pt,
-                    w_pt: p.w_pt,
+                    w_pt: p.ink_w_pt,
                     h_pt: p.lines.len() as f32 * p.leading_pt,
                 };
                 // The link candidate is emitted from the *same* rectangle as the run it belongs to
@@ -2632,9 +2741,14 @@ mod tests {
             })
             .collect();
         assert!(!right.is_empty(), "some blocks landed in the right column");
+        // The frame they landed in is proved by their x, which is the frame's; their width is their
+        // own ink (spec 0069), and `L0` is two characters wide in either column. What must still
+        // hold is that the ink stays inside the column it was broken to.
         assert!(
-            right.iter().all(|f| f.w_pt == 216.0),
-            "right-column blocks wrap to the right frame's width"
+            right
+                .iter()
+                .all(|f| f.x_pt + f.w_pt <= 216.0 + 216.0 + 0.01),
+            "right-column ink stays inside the right frame: {right:?}"
         );
     }
 
@@ -3230,15 +3344,26 @@ mod tests {
             &NoHyphenator,
         );
         assert!(pages.len() >= 3, "expected at least 3 pages");
-        let widths: Vec<f32> = pages
-            .iter()
-            .take(3)
-            .map(|p| match &p.blocks[0] {
-                PlacedBlock::Text { frame, .. } => frame.w_pt,
-                _ => panic!("expected text"),
-            })
+        // The measures come from the template, which is the thing that varies them; what placed
+        // content proves is that it was laid into *that* page's frame — its ink starts at the
+        // frame's left edge and ends inside its right (spec 0069). Reading the measure back off a
+        // placed width would only work while every line happened to fill its column.
+        let measures: Vec<f32> = (0..3)
+            .map(|i| NarrowingTemplate.frames(i)[0].rect.w_pt)
             .collect();
-        assert_eq!(widths, vec![400.0, 350.0, 300.0]);
+        assert_eq!(measures, vec![400.0, 350.0, 300.0]);
+        for (i, page) in pages.iter().take(3).enumerate() {
+            let PlacedBlock::Text { frame, .. } = &page.blocks[0] else {
+                panic!("expected text");
+            };
+            let rect = NarrowingTemplate.frames(i)[0].rect;
+            assert_eq!(frame.x_pt, rect.x_pt, "page {i} starts at its frame");
+            assert!(
+                frame.x_pt + frame.w_pt <= rect.x_pt + rect.w_pt + 0.01,
+                "page {i} ink {frame:?} left its {}pt measure",
+                rect.w_pt
+            );
+        }
     }
 
     #[test]
@@ -3313,11 +3438,17 @@ mod tests {
         // Parity: the pre-0030 behavior must survive a document that declares nothing.
         let doc = doc_with_blocks(vec![Block::body("x", Color::Gray { v: 0.0 })]);
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        // The *frame* is the full page — asked of the template, which is where a measure is known.
+        // A placed block's width is its ink (spec 0069), and a one-character paragraph has 6 pt of
+        // it however wide the page is, so reading the measure back off placed output would be
+        // asking the wrong object.
+        let frames = DocumentTemplate::new(&doc).frames(0);
+        assert_eq!(frames[0].rect.w_pt, doc.page_setup.trim.w_pt);
         match &pages[0].blocks[0] {
             PlacedBlock::Text { frame, .. } => {
                 assert_eq!(frame.x_pt, 0.0);
                 assert_eq!(frame.y_pt, 0.0);
-                assert_eq!(frame.w_pt, doc.page_setup.trim.w_pt);
+                assert_eq!(frame.w_pt, MONO.measure_run("x", BODY_FONT_SIZE_PT));
             }
             _ => panic!("expected text"),
         }
@@ -3329,11 +3460,16 @@ mod tests {
         let mut doc = doc_with_blocks(vec![Block::body("x", Color::Gray { v: 0.0 })]);
         doc.page_setup.margins = Margins::uniform(36.0);
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        // The margin is a property of the *frame*, so it is asserted on the frame; the placed block
+        // then only has to start at the frame's left edge, which is what "inset" means for ink
+        // (spec 0069).
+        let frames = DocumentTemplate::new(&doc).frames(0);
+        assert_eq!(frames[0].rect.x_pt, 36.0);
+        assert_eq!(frames[0].rect.w_pt, 432.0 - 72.0);
         match &pages[0].blocks[0] {
             PlacedBlock::Text { frame, .. } => {
                 assert_eq!(frame.x_pt, 36.0);
                 assert_eq!(frame.y_pt, 36.0);
-                assert_eq!(frame.w_pt, 432.0 - 72.0);
             }
             _ => panic!("expected text"),
         }
@@ -3444,10 +3580,11 @@ mod tests {
         let mut doc = doc_with_blocks(vec![Block::body("x", Color::Gray { v: 0.0 })]);
         doc.default_master = Some("was-renamed".into());
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
-        match &pages[0].blocks[0] {
-            PlacedBlock::Text { frame, .. } => assert_eq!(frame.w_pt, 432.0),
-            _ => panic!("expected text"),
-        }
+        // The claim is about the *frame* the fallback produced, so it is asked of the template. A
+        // placed block reports its ink (spec 0069), and one character is 6 pt wide on a 432 pt page
+        // as on any other.
+        assert_eq!(DocumentTemplate::new(&doc).frames(0)[0].rect.w_pt, 432.0);
+        assert!(matches!(&pages[0].blocks[0], PlacedBlock::Text { .. }));
     }
 
     #[test]
@@ -3462,10 +3599,12 @@ mod tests {
         };
         let doc = doc_with_master(master, vec![Block::body("x", Color::Gray { v: 0.0 })]);
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
-        match &pages[0].blocks[0] {
-            PlacedBlock::Text { frame, .. } => assert_eq!(frame.w_pt, 432.0),
-            _ => panic!("expected text"),
-        }
+        // One column across the whole page, asked of the template — see the note in
+        // `an_unknown_default_master_degrades_to_the_page_setup`.
+        let frames = DocumentTemplate::new(&doc).frames(0);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].rect.w_pt, 432.0);
+        assert!(matches!(&pages[0].blocks[0], PlacedBlock::Text { .. }));
     }
 
     #[test]
@@ -3883,6 +4022,184 @@ mod tests {
         );
     }
 
+    // ----- spec 0069: a placed frame is the ink the part draws -----------------------------------
+
+    /// A single frame of an explicit measure at the page origin. `split_columns` fixes its width at
+    /// 120 pt, and these tests are about the relationship between a measure and the ink inside it,
+    /// so the measure has to be theirs to state.
+    fn one_column(w_pt: f32, h_pt: f32) -> Thread {
+        Thread {
+            frames: vec![Frame {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt,
+                    h_pt,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn a_multi_line_paragraph_reports_an_ink_bounding_box_not_an_advance() {
+        // The case a naive reading of the rule gets wrong, and the reason the rule has to be
+        // written down. `indent_pt` is added at *draw* time and differs per line under a hanging
+        // indent (spec 0048), so no single line's box is the paragraph's: the frame is
+        // `min(indent)` wide of the measure's left edge, and reaches `max(indent + advance)`.
+        // A tab segment — one line, zero indent — is the degenerate case this generalizes.
+        let indent_pt = 12.0;
+        let mut styles = StyleSheet::default();
+        styles.paragraph.insert(
+            BODY_STYLE.to_string(),
+            ParagraphStyle {
+                align: TextAlign::Left,
+                indent: quill_core_model::Indent::hanging(indent_pt),
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+                ..Default::default()
+            },
+        );
+        let mut content = vec![Block::body(n_line_paragraph(6), Color::Gray { v: 0.0 })];
+        content[0].set_id(BlockId(1));
+        // 120 pt, which is what `n_line_paragraph` is calibrated against.
+        let measure = 120.0;
+        let thread = one_column(measure, 400.0);
+        let pages = lay_out_in_thread(&content, &[], &styles, &thread, &MONO, &NoHyphenator);
+
+        let PlacedBlock::Text { frame, lines, .. } = &pages[0].blocks[0] else {
+            panic!("expected text");
+        };
+        assert!(lines.len() >= 3, "need several lines");
+        // The first line hangs flush and the rest are indented, so the paragraph's ink starts at
+        // the measure's left edge — at line 0's origin, not at any later line's.
+        assert_eq!(lines[0].indent_pt, 0.0);
+        assert!(lines[1..].iter().all(|l| l.indent_pt == indent_pt));
+        assert_eq!(frame.x_pt, 0.0, "x is min(indent), which line 0 supplies");
+
+        // And the width is the widest *reach*, which under a hanging indent may well be a line
+        // whose own advance is not the longest.
+        let advance = |l: &Line| MONO.measure_run(&l.text, BODY_FONT_SIZE_PT);
+        let want: f32 = lines
+            .iter()
+            .map(|l| l.indent_pt + advance(l))
+            .fold(0.0, f32::max);
+        assert!(
+            (frame.w_pt - want).abs() < 0.01,
+            "w {} vs {want}",
+            frame.w_pt
+        );
+        assert!(frame.w_pt <= measure + 0.01, "and never past the measure");
+
+        // The box really is a bound over the lines rather than any one of them: at least one line
+        // is strictly narrower than the block reports, or this fixture proves nothing.
+        assert!(
+            lines.iter().any(|l| l.indent_pt + advance(l) < want - 0.01),
+            "the fixture must have a short line, or the bounding box is untested"
+        );
+    }
+
+    #[test]
+    fn a_right_aligned_part_reports_a_box_over_its_ink_not_its_slot() {
+        // `PlacedBlock` carries no alignment field, so a right-aligned segment in a wide slot is
+        // indistinguishable from a left-aligned one downstream. Under slot semantics its reported
+        // box is nowhere near its glyphs — which is the first of the five reasons the decision log
+        // gives. Asserted through the tab mechanism (spec 0067), where all four alignments are
+        // resolved into an x.
+        let measure = 400.0;
+        let stop_pt = 300.0;
+        let mut styles = StyleSheet::default();
+        styles.paragraph.insert(
+            BODY_STYLE.to_string(),
+            ParagraphStyle {
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+                ..Default::default()
+            },
+        );
+        styles.tabs.insert(
+            BODY_STYLE.to_string(),
+            vec![quill_core_model::TabStop {
+                position_pt: stop_pt,
+                align: quill_core_model::TabAlign::Right,
+                leader: None,
+            }],
+        );
+        let mut content = vec![Block::body("Key\tValue", Color::Gray { v: 0.0 })];
+        content[0].set_id(BlockId(1));
+        let thread = one_column(measure, 400.0);
+        let pages = lay_out_in_thread(&content, &[], &styles, &thread, &MONO, &NoHyphenator);
+
+        let boxes: Vec<(f32, f32, String)> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, lines, .. } => {
+                    Some((frame.x_pt, frame.w_pt, lines[0].text.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes.len(), 2, "a key and a right-aligned value: {boxes:?}");
+        let (x, w, ref text) = boxes[1];
+        let advance = MONO.measure_run(text, BODY_FONT_SIZE_PT);
+        // Its right edge is the stop and its left edge is one advance back — the ink, not the slot
+        // from the previous segment to the stop, and not the whole measure.
+        assert!((x + w - stop_pt).abs() < 0.01, "right edge {}", x + w);
+        assert!((w - advance).abs() < 0.01, "width {w} vs advance {advance}");
+        assert!(x > boxes[0].0 + boxes[0].1, "and it sits past the key");
+    }
+
+    #[test]
+    fn a_list_marker_reports_its_glyphs_not_the_gutter_they_sit_in() {
+        // The gutter the indent opens is the slot; a bullet is a few points of ink inside it
+        // (spec 0069). Reporting the gutter would put a marker's box under the safe-area check for
+        // text that is not there.
+        let gutter_pt = 24.0;
+        let mut styles = StyleSheet::default();
+        styles.paragraph.insert(
+            BODY_STYLE.to_string(),
+            ParagraphStyle {
+                align: TextAlign::Left,
+                list: Some(quill_core_model::ListSpec {
+                    marker: ListMarker::Bullet { glyph: '\u{2022}' },
+                    start: 1,
+                    level: 0,
+                }),
+                indent: quill_core_model::Indent {
+                    first_pt: gutter_pt,
+                    rest_pt: gutter_pt,
+                },
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+                ..Default::default()
+            },
+        );
+        let mut content = vec![Block::body("An item", Color::Gray { v: 0.0 })];
+        content[0].set_id(BlockId(1));
+        let thread = one_column(400.0, 400.0);
+        let pages = lay_out_in_thread(&content, &[], &styles, &thread, &MONO, &NoHyphenator);
+
+        let PlacedBlock::Text {
+            frame: marker,
+            lines: marker_lines,
+            ..
+        } = &pages[0].blocks[0]
+        else {
+            panic!("expected the marker first");
+        };
+        assert_eq!(marker.x_pt, 0.0, "the marker sits at the frame's left edge");
+        let advance = MONO.measure_run(&marker_lines[0].text, BODY_FONT_SIZE_PT);
+        assert!((marker.w_pt - advance).abs() < 0.01, "w {}", marker.w_pt);
+        assert!(marker.w_pt < gutter_pt, "and is narrower than its gutter");
+
+        // The item's own text starts past the gutter, which is where it is drawn.
+        let PlacedBlock::Text { frame: item, .. } = &pages[0].blocks[1] else {
+            panic!("expected the item text");
+        };
+        assert_eq!(item.x_pt, gutter_pt);
+    }
+
     #[test]
     fn a_stat_blocks_attribute_value_hangs_under_itself() {
         // The built-in treatment, which is where the defect lived: a wrapped attribute lines up
@@ -3957,6 +4274,42 @@ mod tests {
         }
     }
 
+    /// Measure one block against `width` exactly as the flow does, so a test can assert against the
+    /// **measure a producer broke to** rather than trying to recover it from placed output.
+    ///
+    /// Spec 0069 is why this exists. A placed frame is the ink a part draws, so a containment
+    /// assertion read off placed geometry weakens to "the text that happened to be there fits" —
+    /// which cannot catch a cell broken to too wide a measure, the defect those assertions were
+    /// written for. The measure is known here, at the producer, and is asserted here.
+    fn measure_at(block: &Block, width: f32) -> Measured {
+        let assets: AssetIndex<'_> = AssetIndex::new();
+        let styles = StyleSheet::default();
+        let components = quill_core_model::builtin_components();
+        let markers = BTreeMap::new();
+        let ctx = BlockContext {
+            assets: &assets,
+            styles: &styles,
+            headings: &[],
+            components: &components,
+            markers: &markers,
+        };
+        measure_block(block, width, &ctx, &MONO, &NoHyphenator)
+            .expect("the fixtures all measure")
+            .0
+    }
+
+    /// Every `(measure_left, measure_width, ink_left, ink_width)` a panel measurement produced,
+    /// relative to the panel's own origin.
+    fn panel_parts(measured: &Measured) -> Vec<(f32, f32, f32, f32)> {
+        let Measured::Panel { parts, .. } = measured else {
+            panic!("expected a panel measurement");
+        };
+        parts
+            .iter()
+            .map(|p| (p.dx_pt, p.w_pt, p.dx_pt + p.ink_dx_pt, p.ink_w_pt))
+            .collect()
+    }
+
     fn stat_doc() -> Document {
         let mut doc = doc_with_blocks(vec![Block::Panel {
             id: BlockId::UNASSIGNED,
@@ -4001,6 +4354,25 @@ mod tests {
             panic!("expected a panel");
         };
 
+        // The inset is a property of the **measure**, so it is asserted on the measurement, where
+        // the producer knows it: every section is broken to the panel's inner width, at the
+        // padding. Placed output can no longer answer this — a run's frame is its ink (spec 0069),
+        // and a two-word section's ink is nowhere near the inner width even when the measure is
+        // right.
+        let measured = measure_at(&doc.content[0], panel.w_pt);
+        for (mx, mw, ix, iw) in panel_parts(&measured) {
+            assert!((mx - PANEL_PADDING_PT).abs() < 0.01, "measure left {mx}");
+            assert!(
+                (mw - (panel.w_pt - PANEL_PADDING_PT * 2.0)).abs() < 0.01,
+                "measure width {mw}"
+            );
+            // And the ink each section drew stays inside the measure it was given.
+            assert!(
+                ix >= mx - 0.01 && ix + iw <= mx + mw + 0.01,
+                "ink {ix}+{iw}"
+            );
+        }
+
         let runs: Vec<&PlacedBlock> = pages[0]
             .blocks
             .iter()
@@ -4011,7 +4383,7 @@ mod tests {
                 panic!("expected text")
             };
             assert!((frame.x_pt - (panel.x_pt + PANEL_PADDING_PT)).abs() < 0.01);
-            assert!((frame.w_pt - (panel.w_pt - PANEL_PADDING_PT * 2.0)).abs() < 0.01);
+            assert!(frame.x_pt + frame.w_pt <= panel.x_pt + panel.w_pt - PANEL_PADDING_PT + 0.01);
             assert!(frame.y_pt >= panel.y_pt + PANEL_PADDING_PT - 0.01);
         }
         let last = match runs.last().unwrap() {
@@ -4545,13 +4917,21 @@ mod tests {
         let PlacedBlock::Rect { frame: panel, .. } = pages[0].blocks[0] else {
             panic!("expected a panel");
         };
-        for b in &pages[0].blocks {
-            let PlacedBlock::Text { frame, .. } = b else {
-                continue;
-            };
+        // Asserted on the measure, not on the ink. Under spec 0069 a placed frame is what a run
+        // drew, and a ragged run always draws short of its measure by up to a word — so "the ink
+        // fits" would pass against the very defect this test names, a section broken to the frame's
+        // full width and then drawn inset by the padding. The measure is what has to fit.
+        let measured = measure_at(&doc.content[0], panel.w_pt);
+        for (mx, mw, ix, iw) in panel_parts(&measured) {
             assert!(
-                frame.x_pt + frame.w_pt <= panel.x_pt + panel.w_pt - PANEL_PADDING_PT + 0.01,
-                "a run overran the panel's right padding"
+                mx + mw <= panel.w_pt - PANEL_PADDING_PT + 0.01,
+                "a run was broken to a measure that overruns the panel's right padding: \
+                 {mx} + {mw} > {}",
+                panel.w_pt - PANEL_PADDING_PT
+            );
+            assert!(
+                ix + iw <= mx + mw + 0.01,
+                "a run drew past the measure it was broken to: {ix} + {iw} > {mx} + {mw}"
             );
         }
     }
@@ -4595,15 +4975,35 @@ mod tests {
     #[test]
     fn table_columns_land_at_exact_fractions_of_the_measure() {
         // 432 pt frame, widths 0.25/0.75 ⇒ columns at x = 0 and x = 108, each inset by the 3 pt
-        // cell padding: text starts at 3 and 111, measuring 108 - 6 = 102 and 324 - 6 = 318.
+        // cell padding: text is broken at 3 and 111, to measures of 108 - 6 = 102 and 324 - 6 = 318.
+        //
+        // Asserted on the **measurement**, which is where a column width is known. A placed cell
+        // reports the ink it drew (spec 0069): `Roll` is 21.6 pt wide whether its column is 102 pt
+        // or 108 pt, so a column width read back off placed output stopped being a column width.
         let doc = table_doc(simple_table());
+        let measured = measure_at(&doc.content[0], 432.0);
+        let parts = panel_parts(&measured);
+        assert_eq!(parts.len(), 6, "header plus two rows, two columns each");
+        for (i, (mx, mw, ix, iw)) in parts.iter().copied().enumerate() {
+            let (want_x, want_w) = if i % 2 == 0 {
+                (3.0, 102.0)
+            } else {
+                (111.0, 318.0)
+            };
+            assert!((mx - want_x).abs() < 0.01, "cell {i} column x: {mx}");
+            assert!((mw - want_w).abs() < 0.01, "cell {i} column width: {mw}");
+            assert!(
+                ix >= mx - 0.01 && ix + iw <= mx + mw + 0.01,
+                "cell {i} ink {ix}+{iw} left its column"
+            );
+        }
+
+        // And the cells really do land there once placed, at the columns' left edges.
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
         let c = cells(&pages[0]);
-        assert_eq!(c.len(), 6, "header plus two rows, two columns each");
+        assert_eq!(c.len(), 6);
         assert!((c[0].0 - 3.0).abs() < 0.01, "column 0 x: {:?}", c[0]);
-        assert!((c[0].1 - 102.0).abs() < 0.01, "column 0 width: {:?}", c[0]);
         assert!((c[1].0 - 111.0).abs() < 0.01, "column 1 x: {:?}", c[1]);
-        assert!((c[1].1 - 318.0).abs() < 0.01, "column 1 width: {:?}", c[1]);
     }
 
     #[test]
@@ -5718,12 +6118,11 @@ mod tests {
             "fragment height {}",
             boxes[0].1
         );
-        // The fragment's box is its lines and nothing else — 9 x 12 pt — because it does not end
-        // the paragraph and so is charged no space below. The remainder starts flush at the next
-        // column's top, carries no space above, and its box is 3 x 12 + the 5 pt below: the two
-        // halves each carry exactly one of the paragraph's two vertical spaces, which is the whole
-        // point. (The placed box including the space below is the engine's existing convention,
-        // matching an unsplit paragraph.)
+        // Each box is its lines and nothing else — 9 x 12 pt and 3 x 12 pt — because a placed frame
+        // is the ink drawn and neither vertical space draws anything (spec 0069). The space
+        // arithmetic this test is about is still visible in the *positions*: the fragment starts
+        // 9 pt below the intro because it is charged the space above, and the remainder starts
+        // flush at the next column's top because it is not.
         assert!(
             (boxes[1].0 - 0.0).abs() < 0.01,
             "remainder y {}",
@@ -5731,7 +6130,7 @@ mod tests {
         );
         assert_eq!(boxes[1].2, 3);
         assert!(
-            (boxes[1].1 - 41.0).abs() < 0.01,
+            (boxes[1].1 - 36.0).abs() < 0.01,
             "remainder height {}",
             boxes[1].1
         );
@@ -6178,8 +6577,18 @@ mod tests {
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
         let template = DocumentTemplate::new(&doc);
         match &pages[0].blocks[0] {
-            PlacedBlock::Text { frame, .. } => {
-                assert_eq!((frame.x_pt, frame.y_pt, frame.w_pt), (54.0, 54.0, 338.0));
+            PlacedBlock::Text { frame, lines, .. } => {
+                // The paragraph starts at the migrated frame's top-left, exactly where the v2 build
+                // put it. Its *width* is the ink it draws (spec 0069) rather than the 338 pt
+                // measure it was broken to — that measure is asserted from the template below, and
+                // one short paragraph does not fill it.
+                assert_eq!((frame.x_pt, frame.y_pt), (54.0, 54.0));
+                assert_eq!(lines.len(), 1, "the fixture is one short paragraph");
+                assert_eq!(
+                    frame.w_pt,
+                    MONO.measure_run(&lines[0].text, BODY_FONT_SIZE_PT)
+                );
+                assert!(frame.w_pt <= 338.0);
             }
             other => panic!("expected text, got {other:?}"),
         }

@@ -86,6 +86,49 @@ fn strip_scalar(text: &str, name: &str) -> String {
     out
 }
 
+/// The digest with every **frame extent** — `x_pt`, `w_pt`, `h_pt` — textually removed.
+///
+/// This is how spec 0069's move was re-derived rather than pasted. That increment redefined a
+/// placed frame as the ink a part draws instead of the slot it was laid into, so exactly three
+/// numbers per placed rectangle were expected to move and nothing else: no text, no line break, no
+/// `y_pt`, no colour, no run table, no block count. Strip those three and the digest becomes a
+/// statement about everything the increment must *not* have touched — and the constants below were
+/// computed on the pre-0069 engine and still match on the post-0069 one, for all ten fixtures.
+///
+/// It is the same discipline `digest_geometry` applies to a struct that grew a field, pointed at a
+/// value that changed instead: prove what did not move, then read the new number off the change you
+/// can account for.
+fn digest_extent_free(pages: &[LaidOutPage]) -> u64 {
+    let text = format!("{pages:?}");
+    let text = strip_extent(&text, "x_pt: ");
+    let text = strip_extent(&text, "w_pt: ");
+    let text = strip_extent(&text, "h_pt: ");
+    digest_str(&text)
+}
+
+/// Remove every `name: value` scalar, whether it is followed by another field (`, `) or closes its
+/// struct (` }`). [`strip_scalar`] handles only the first, which is all its callers needed.
+fn strip_extent(text: &str, name: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(name) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + name.len()..];
+        let sep = after.find(", ");
+        let close = after.find(" }");
+        rest = match (sep, close) {
+            (Some(s), Some(c)) if s < c => &after[s + 2..],
+            // Keep the ` }`: the struct still has to close, or two differently-shaped renderings
+            // could collapse to the same string.
+            (_, Some(c)) => &after[c..],
+            (Some(s), None) => &after[s + 2..],
+            (None, None) => panic!("a scalar field is followed by a separator or a close"),
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Remove every `open .. close` region, plus the `, ` that separated it from the next field.
 fn regex_free_strip(text: &str, open: &str, close: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -257,32 +300,65 @@ fn corpus() -> Vec<(&'static str, Vec<Block>, f32, f32)> {
 
 /// Re-derived from the pre-change engine. See the module docs before changing any of these.
 ///
-/// **Moved once, deliberately, by spec 0060.** Forbidding a ragged line to be drawn past its
-/// measure is a typographic correction, and a stat block is set ragged, so six of these ten
-/// fixtures move. The four table cases that do not move are informative rather than incidental:
-/// their cells are short enough never to have been over-measure, which is what a targeted change
-/// should look like.
+/// **Moved once by spec 0060**, and once by **spec 0069**. Both moves are deliberate; neither was
+/// pasted in from a failing run.
 ///
-/// | fixture | before 0060 | after 0060 |
-/// |---|---|---|
-/// | statblock whole | `0xbe2e46dbbdfb9c85` | `0x47192e873263f5e9` |
-/// | statblock narrow | `0x0797d2697c5a55d8` | `0xa7e4e0404a9e2d50` |
-/// | statblock absent sections | `0x815ec8aa643567fd` | `0x2326d60454e58af1` |
-/// | statblock split | `0x63ef8f8cf1431973` | `0x61d81882312fbcbf` |
-/// | table wrapped | `0x3d748c61c283efa3` | `0x2f8d138d61822df3` |
-/// | mixed flow | `0xd699cc419ccbd22e` | `0xd75f5e980a5b34ad` |
-/// | table whole / split / headerless / empty | unchanged | unchanged |
+/// 0060 forbade a ragged line to be drawn past its measure. A stat block is set ragged, so six of
+/// these ten fixtures moved and the four table cases did not — their cells are short enough never
+/// to have been over-measure, which is what a targeted change should look like.
+///
+/// 0069 redefined a placed frame as the **ink a part draws** rather than the slot it was laid into,
+/// so every fixture moves: a table cell now reports its text's advance instead of its column, a
+/// panel section its ink instead of the panel's inner width, and a paragraph's box no longer
+/// includes the space below it that draws nothing. The re-derivation is `EXPECTED_EXTENT_FREE`
+/// below — strip the three numbers 0069 was allowed to move and *nothing* moved, on all ten
+/// fixtures, which is what makes these ten new values readable rather than merely observed.
+///
+/// | fixture | before 0060 | after 0060 | after 0069 |
+/// |---|---|---|---|
+/// | statblock whole | `0xbe2e46dbbdfb9c85` | `0x47192e873263f5e9` | `0x07a8a769b9253a17` |
+/// | statblock narrow | `0x0797d2697c5a55d8` | `0xa7e4e0404a9e2d50` | `0x2eab4a8fd91fbb4f` |
+/// | statblock absent sections | `0x815ec8aa643567fd` | `0x2326d60454e58af1` | `0xc3462392b3a5cd7d` |
+/// | statblock split | `0x63ef8f8cf1431973` | `0x61d81882312fbcbf` | `0x740024b00b9e96f1` |
+/// | table whole | `0x3fc2380da6ad2084` | unchanged | `0x7a49f1494c54de99` |
+/// | table wrapped | `0x3d748c61c283efa3` | `0x2f8d138d61822df3` | `0x5c5910b35894e97f` |
+/// | table split | `0x5b2f4672bd73b52f` | unchanged | `0xba87c2e5e18dcf44` |
+/// | table headerless | `0xcc4ed1098b178624` | unchanged | `0x9b3937e64f1d3364` |
+/// | table empty | `0x3acc4ba6c3671efe` | unchanged | `0xb238c77d431154aa` |
+/// | mixed flow | `0xd699cc419ccbd22e` | `0xd75f5e980a5b34ad` | `0xbc914d0bce8deff0` |
 const EXPECTED: &[(&str, u64)] = &[
-    ("statblock whole", 0x4719_2e87_3263_f5e9),
-    ("statblock narrow", 0xa7e4_e040_4a9e_2d50),
-    ("statblock absent sections", 0x2326_d604_54e5_8af1),
-    ("statblock split", 0x61d8_1882_312f_bcbf),
-    ("table whole", 0x3fc2_380d_a6ad_2084),
-    ("table wrapped", 0x2f8d_138d_6182_2df3),
-    ("table split", 0x5b2f_4672_bd73_b52f),
-    ("table headerless", 0xcc4e_d109_8b17_8624),
-    ("table empty", 0x3acc_4ba6_c367_1efe),
-    ("mixed flow", 0xd75f_5e98_0a5b_34ad),
+    ("statblock whole", 0x07a8_a769_b925_3a17),
+    ("statblock narrow", 0x2eab_4a8f_d91f_bb4f),
+    ("statblock absent sections", 0xc346_2392_b3a5_cd7d),
+    ("statblock split", 0x7400_24b0_0b9e_96f1),
+    ("table whole", 0x7a49_f149_4c54_de99),
+    ("table wrapped", 0x5c59_10b3_5894_e97f),
+    ("table split", 0xba87_c2e5_e18d_cf44),
+    ("table headerless", 0x9b39_37e6_4f1d_3364),
+    ("table empty", 0xb238_c77d_4311_54aa),
+    ("mixed flow", 0xbc91_4d0b_ce8d_eff0),
+];
+
+/// The corpus with `x_pt`, `w_pt` and `h_pt` stripped out of every placed rectangle — **the
+/// derivation behind spec 0069's move**, and the reason `EXPECTED`'s ten new values above are a
+/// claim rather than an observation.
+///
+/// Each of these was computed on the **pre-0069** engine, with this exact file compiled against it,
+/// and every one of the ten still matches on the post-0069 engine. So the increment changed the
+/// extent of placed rectangles and demonstrably nothing else: not a character of text, not a line
+/// break, not a `y_pt`, not a colour, not a run table, not the number or order of placed blocks.
+/// A move that could not be bounded like this would not be safe to accept.
+const EXPECTED_EXTENT_FREE: &[(&str, u64)] = &[
+    ("statblock whole", 0x0611_6a98_795e_664d),
+    ("statblock narrow", 0x7fd2_bd10_05ee_cba4),
+    ("statblock absent sections", 0x54d4_d562_e2b2_0688),
+    ("statblock split", 0x6b03_3cbb_708d_239d),
+    ("table whole", 0x917e_a515_ba57_9c48),
+    ("table wrapped", 0xa14c_28e9_2a36_ba19),
+    ("table split", 0xf08b_4221_f46c_cb05),
+    ("table headerless", 0xd432_6a09_1af7_2ff4),
+    ("table empty", 0x28ad_d060_96e0_aaef),
+    ("mixed flow", 0xd268_bb29_acfd_bbec),
 ];
 
 /// The same corpus under the *complete* `Debug` rendering, including every field specs 0063 and
@@ -297,17 +373,20 @@ const EXPECTED: &[(&str, u64)] = &[
 /// `run_shifts`, `weight` and `italic`. The evidence that nothing else moved is the *other* set
 /// above: strip those four out of the `Debug` rendering and every pre-0064 constant still matches,
 /// which it does.
+///
+/// It moved again at spec 0069, for the same reason `EXPECTED` did and by the same amount: the two
+/// sets differ only in which fields are stripped, and 0069 moved a value both of them include.
 const EXPECTED_FULL: &[(&str, u64)] = &[
-    ("statblock whole", 0x9cb9_a4b2_e870_cd4d),
-    ("statblock narrow", 0x3b07_7190_0f56_9e9b),
-    ("statblock absent sections", 0xdd23_d287_183e_c4d5),
-    ("statblock split", 0xdc90_c840_0083_5093),
-    ("table whole", 0xe741_e596_ad73_bdc2),
-    ("table wrapped", 0x86c5_52a6_ce3b_ea6c),
-    ("table split", 0xbfbd_0292_8a67_83e4),
-    ("table headerless", 0x1fa5_b50f_4021_33a9),
-    ("table empty", 0x1d8e_2e95_97a5_8f8f),
-    ("mixed flow", 0x9df1_3a4b_763f_f36e),
+    ("statblock whole", 0x28ed_1945_d5d4_7add),
+    ("statblock narrow", 0x66c6_f45c_4305_7690),
+    ("statblock absent sections", 0x46f5_8387_6fe0_dae3),
+    ("statblock split", 0x4ba0_bd82_012d_4d7b),
+    ("table whole", 0xc223_d1b3_01fa_f89d),
+    ("table wrapped", 0x9670_a2f5_f1cd_1484),
+    ("table split", 0xfa55_1696_f9e5_7f67),
+    ("table headerless", 0x0371_eed5_b3c9_f471),
+    ("table empty", 0xb2ad_a7ed_148a_0223),
+    ("mixed flow", 0xaf64_d985_4c75_4bf7),
 ];
 
 #[test]
@@ -315,9 +394,25 @@ fn the_bundled_components_produce_byte_identical_geometry() {
     let expected: std::collections::BTreeMap<&str, u64> = EXPECTED.iter().copied().collect();
     let full_expected: std::collections::BTreeMap<&str, u64> =
         EXPECTED_FULL.iter().copied().collect();
+    let extent_free_expected: std::collections::BTreeMap<&str, u64> =
+        EXPECTED_EXTENT_FREE.iter().copied().collect();
     let mut drift: Vec<String> = Vec::new();
     for (name, content, w, h) in corpus() {
         let pages = lay(content, w, h);
+        // Checked first and reported first, because it is the informative one: if this moves, the
+        // change is not the extent change it claims to be, and the other two digests cannot tell
+        // you that.
+        let extent_free = digest_extent_free(&pages);
+        match extent_free_expected.get(name) {
+            Some(&want) if want == extent_free => {}
+            Some(&want) => drift.push(format!(
+                "  {name} (extent-free): expected {want:#x}, got {extent_free:#x} — something \
+                 other than a frame's x/w/h moved"
+            )),
+            None => drift.push(format!(
+                "  {name} (extent-free): no expectation recorded, got {extent_free:#x}"
+            )),
+        }
         let got = digest_geometry(&pages);
         match expected.get(name) {
             Some(&want) if want == got => {}

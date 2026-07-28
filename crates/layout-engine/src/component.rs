@@ -175,10 +175,18 @@ pub(crate) fn measure_component(
                         let (cx, cw) = columns[c];
                         let lines = break_run(cell, cw, style, metrics, hyphenator);
                         row_h = row_h.max(lines.len() as f32 * style.leading_pt);
+                        // The column is the measure; what the cell reports is the ink inside it
+                        // (spec 0069). A one-word cell in a wide column puts no ink near the
+                        // column's right edge, and saying that it does is a false positive on
+                        // every check that reads placed geometry.
+                        let (ink_dx, ink_w) =
+                            quill_text_layout::ink_box(&lines, &[], plain(style), metrics);
                         parts.push(PanelPart {
                             dx_pt: cx,
                             dy_pt: y + cell_padding_pt,
                             w_pt: cw,
+                            ink_dx_pt: ink_dx,
+                            ink_w_pt: ink_w,
                             lines,
                             color,
                             font_size_pt: style.font_size_pt,
@@ -227,10 +235,18 @@ pub(crate) fn measure_component(
                     }
                     let lines = break_run(text, inner_w, style, metrics, hyphenator);
                     let n = lines.len();
+                    // The panel's inner width is the measure; the section reports its ink
+                    // (spec 0069). Under `statblock-attr`'s hanging indent the first line and the
+                    // wrapped ones start at different x, so this is a bounding box over the lines
+                    // rather than any one line's advance.
+                    let (ink_dx, ink_w) =
+                        quill_text_layout::ink_box(&lines, &[], plain(style), metrics);
                     parts.push(PanelPart {
                         dx_pt: padding,
                         dy_pt: y,
                         w_pt: inner_w,
+                        ink_dx_pt: ink_dx,
+                        ink_w_pt: ink_w,
                         lines,
                         color,
                         font_size_pt: style.font_size_pt,
@@ -303,6 +319,17 @@ pub(crate) fn measure_component(
         },
         y + padding,
     )
+}
+
+/// The format a component's runs are measured *and* drawn in: the paragraph's size, regular and
+/// upright.
+///
+/// A single function rather than the literal in two places, because an ink box measured in one
+/// format and drawn in another is a reported width the glyphs never had. Weight and slant on a
+/// declared component's styles are spec 0064's follow-on and are not read here yet — `place_measured`
+/// draws these runs at 400/upright to match.
+fn plain(style: ParagraphStyle) -> quill_text_layout::RunFormat {
+    quill_text_layout::RunFormat::plain(style.font_size_pt)
 }
 
 /// Break one run through the same Knuth-Plass path body text goes through, honouring the style's

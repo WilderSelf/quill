@@ -2965,6 +2965,57 @@ mod tests {
     }
 
     #[test]
+    fn a_short_line_in_a_wide_column_is_not_reported_at_the_fore_edge() {
+        // Spec 0069's proof of worth, and the reason it is sequenced where it is. The frame runs to
+        // 12 pt of the fore-edge — inside a 36 pt safety margin — but the paragraph in it is two
+        // characters long and puts no ink anywhere near the trim. Under the old slot semantics the
+        // block reported the whole column and this was an error; under ink it is what it looks
+        // like, which is nothing.
+        //
+        // False positives are the expensive failure mode here (spec 0050 says so in as many
+        // words): a report full of columns that merely *could* have reached the guillotine teaches
+        // a user to skim it, and then the real finding goes unread too.
+        let mut doc = Document::sample();
+        doc.content = vec![Block::body("Hi", Color::Gray { v: 0.0 })];
+        doc.assets = Vec::new();
+        doc.master_pages = Vec::new();
+        doc.default_master = None;
+        doc.page_setup.margins = quill_core_model::Margins {
+            top_pt: 60.0,
+            bottom_pt: 60.0,
+            inside_pt: 60.0,
+            // Narrower than the safety margin: this is what the column reaches into.
+            outside_pt: 12.0,
+        };
+        doc.assign_missing_block_ids().expect("ids");
+
+        let pages = lay_out_like_export(&doc, &ExportOptions::default());
+        let preset = preset_with_safety(36.0);
+        let findings = preflight_pages(&pages, &preset, &doc.page_setup, &[]);
+        assert!(
+            findings.iter().all(|f| f.check != CheckId::SafeArea),
+            "two characters at the spine margin are not a fore-edge risk: {findings:?}"
+        );
+
+        // The test is only worth something if the same page *would* be reported under the slot the
+        // paragraph was laid into, so that slot is asserted to fail — the column really does reach
+        // past the live edge, and it is the placed geometry, not the check, that changed.
+        let column = doc.page_setup.trim.w_pt - 60.0 - 12.0;
+        let PlacedBlock::Text { frame, .. } = &pages[0].blocks[0] else {
+            panic!("expected the paragraph");
+        };
+        assert!(frame.w_pt < column, "the block reports ink, not its column");
+        let as_slot = page_with(vec![text_at(60.0, 60.0, column, frame.h_pt)]);
+        let slot_findings = preflight_pages(&[as_slot], &preset, &doc.page_setup, &[]);
+        assert!(
+            slot_findings
+                .iter()
+                .any(|f| f.check == CheckId::SafeArea && f.severity == Severity::Error),
+            "the slot must intrude, or this test asserts nothing: {slot_findings:?}"
+        );
+    }
+
+    #[test]
     fn content_inside_the_live_area_passes() {
         let setup = PageSetup::default();
         let inside = text_at(60.0, 60.0, 100.0, 20.0);

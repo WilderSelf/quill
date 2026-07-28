@@ -148,7 +148,11 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   4. **False positives are the expensive failure mode**, which spec 0050 says in as many words. A
      short ragged line in a wide column puts no ink near the trim, and reporting it teaches a user
      to skim the report — and so to skim the real finding.
-  5. It makes spec 0052's `/Link` hot areas correct as a side effect, per the known issue above.
+  5. It is what lets spec 0052's `/Link` hot areas be fixed at all — though **0070**, not 0069, is
+     where that lands. The only part carrying `link_page` is the contents entry title, and that part
+     is `measure_toc`'s, which 0070 replaces wholesale; changing it in 0069 would collide with the
+     increment that deletes it. Written down because the first draft of this entry claimed 0069
+     fixed the link "as a side effect", and it does not.
 
   **`h_pt` moves with it, to the same rule.** A box that is ink horizontally and slot vertically is
   worse than either, because no reader of the rectangle can know which question it answers.
@@ -2325,7 +2329,24 @@ the moment this lands, and is part of the increment either way.
 
 ### 0069 placed-geometry-is-ink
 
-**A placed part reports the ink it draws** · size: medium · branch: `feat/placed-geometry-is-ink`
+**A placed part reports the ink it draws** · size: medium · branch: `feat/placed-geometry-is-ink` ·
+**shipped**
+
+**As built.** Two things worth carrying beyond the spec. First, the move was bounded by a *third*
+digest rather than argued: `digest_extent_free` strips `x_pt`/`w_pt`/`h_pt` out of every placed
+rectangle, was computed on the **pre-0069 engine**, and still matches after — so the increment
+provably changed extents and nothing else (no text, no line break, no `y_pt`, no colour, no block
+order). It is checked *first*, because if it moves the change is not what it claims and neither other
+digest can tell you that. Second, `SAMPLE_EXPORT_DIGEST` did **not** move, which is the load-bearing
+check that this never reached the content stream: the frame gained `min(indent)` and each line gives
+it back at draw time, so no glyph moved.
+
+The re-expressed containment tests were verified against a reintroduced defect, and the measurement
+found something the argument had only asserted: for the specific panel fixture, an ink-only check
+would *also* have caught the sabotage, because that one long action line happened to fill its measure
+exactly. The other four sections reported 46.8 / 124.2 / 32.4 / 27.0 pt of ink against a 426 pt
+measure — so a panel of only short sections would have passed with the measure wrong. That is the
+weakening the re-expression prevents, and it is now a number rather than a claim.
 
 Applies the decision from the log to every producer: body and heading paragraphs, table cells,
 component text sections, list markers, and the contents list. The three that are already ink
