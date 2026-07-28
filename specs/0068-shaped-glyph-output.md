@@ -1,6 +1,6 @@
 # 0068 — The PDF draws the glyphs that were measured
 
-**Milestone:** M5 (closeout) · **Status:** in progress
+**Milestone:** M5 (closeout) · **Status:** implemented
 
 ## Why
 
@@ -157,3 +157,34 @@ Spec 0016's style: the known issue may only be deleted if what remains is writte
 - **Compressing content streams.** `FlateDecode` on the content stream would absorb the size growth,
   and would break every test that greps the finished PDF for operator text plus the CI `grep -aq`
   checks. Separate increment, named here because this is the increment that makes it worth doing.
+
+## Measured on landing
+
+The five cases, re-measured against the bytes the writer emits — the `/W` entry of every glyph the
+content stream shows, less every `TJ` amount it writes:
+
+| case | chars | glyphs | measured | drawn | gap |
+|---|---|---|---|---|---|
+| ordinary prose | 61 | 60 | 296.73 | 296.73 | 0.00 |
+| kern-heavy `AV Wa To Yo, Pa.` | 16 | 16 | 76.85 | 76.85 | 0.00 |
+| `office` | 6 | **4** | 26.10 | 26.10 | 0.00 |
+| ligature-rich prose | 66 | **56** | 280.85 | 280.85 | 0.00 |
+| control — neither feature fires | 17 | 17 | 113.59 | 113.59 | 0.00 |
+
+The control case emits **exactly zero** adjustments and is still a single `Tj`, which is what makes
+the other four attributable to the writer rather than to the instrument.
+
+**Size, measured rather than discovered.** Content streams are not `FlateDecode`'d, so every added
+byte lands in the file. `Document::sample()` goes **8786 → 10220 bytes (+16.3%)**: +197 in the
+content stream (33 new integer `TJ` adjustments) and the rest a `/ToUnicode` CMap object. The
+500-page synthetic document goes **13,763,105 → 15,791,758 bytes (+14.7%)**, essentially all of it
+kern adjustments — the CMap is a fixed per-face cost and vanishes at that scale. Nothing guards
+export size today; this is the finding, and it is what makes the content-stream compression named
+above worth doing, since the adjustments are repetitive integers.
+
+**The subset union has a third pass the *What* section did not name.** Shaping each run plus the
+plain cmap lookup for each character is not sufficient: the line breaker's other split point is a
+hyphenation break, and `of-` / `fice` need the `fi` ligature, which appears neither in the shaping
+of `office` (that gives `ffi`) nor in any single character. Verified empirically before it was
+built. So each distinct word is also split at the offsets the shared hyphenator reports — the same
+one the layout pass breaks with — and both halves are shaped.

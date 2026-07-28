@@ -13,7 +13,7 @@
 //! [`ExportProfile::Press`] — the default, PDF/X, no annotations — or [`ExportProfile::Screen`],
 //! which carries clickable contents links and claims no conformance. See [`ExportProfile`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -56,6 +56,9 @@ mod geom;
 mod icc;
 mod images;
 mod preset;
+/// Content-stream reading, for tests only.
+#[cfg(test)]
+mod stream_read;
 mod writer;
 mod xmp;
 
@@ -805,13 +808,11 @@ pub fn preflight_pages(
 ///
 /// A document that names no weight or slant produces exactly one bucket, holding the whole
 /// document's characters — which is what keeps its export byte-identical.
-fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
-    let mut out: BTreeMap<FaceKey, BTreeSet<char>> = BTreeMap::new();
+fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
+    let mut out: BTreeMap<FaceKey, fonts::FaceText> = BTreeMap::new();
     // Everything not attributable to one face, plus the two characters the breaker can synthesize
     // for any of them: an inter-word space it normalized, and a hyphen it inserted at a break.
-    let mut everywhere: BTreeSet<char> = BTreeSet::new();
-    everywhere.insert(' ');
-    everywhere.insert('-');
+    let mut everywhere = fonts::FaceText::from_chars([' ', '-']);
     let mut draws_unattributed_text = false;
 
     for block in &doc.content {
@@ -828,14 +829,14 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
                         r.style.weight.map_or(base.weight, |w| w.0),
                         r.style.italic.unwrap_or(base.italic),
                     );
-                    out.entry(face).or_default().extend(r.text.chars());
+                    out.entry(face).or_default().add_run(&r.text);
                 }
             }
             Block::Panel { .. }
             | Block::Table { .. }
             | Block::Toc { .. }
             | Block::Component { .. } => {
-                everywhere.extend(other_block_chars(block));
+                everywhere.merge(&other_block_text(block));
                 draws_unattributed_text = true;
             }
             Block::Image { .. } => {}
@@ -857,7 +858,7 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
     for master in &doc.master_pages {
         for stat in &master.statics {
             if let quill_core_model::MasterStatic::Text { text, .. } = stat {
-                everywhere.extend(text.chars());
+                everywhere.add_run(text);
                 draws_unattributed_text = true;
             }
         }
@@ -870,30 +871,35 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
         .flat_map(|m| &m.statics)
         .any(|s| matches!(s, quill_core_model::MasterStatic::Text { text, .. } if text.contains("{page}")))
     {
-        everywhere.extend('0'..='9');
+        everywhere.add_chars('0'..='9');
     }
 
     if draws_unattributed_text {
         out.entry(FaceKey::REGULAR).or_default();
     }
     if out.is_empty() {
-        out.insert(FaceKey::REGULAR, BTreeSet::new());
+        out.insert(FaceKey::REGULAR, fonts::FaceText::default());
     }
     for bucket in out.values_mut() {
-        bucket.extend(everywhere.iter().copied());
+        bucket.merge(&everywhere);
     }
     out
 }
 
-/// Every character a block that does not select a face draws — see [`collect_doc_faces`].
-fn other_block_chars(block: &Block) -> BTreeSet<char> {
-    let mut set = BTreeSet::new();
+/// Every piece of text a block that does not select a face draws — see [`collect_doc_faces`].
+///
+/// Collected as *runs* rather than as loose characters (spec 0068): a panel's section, a table's
+/// cell and a component's field are all drawn through the same shaped-glyph writer as a paragraph
+/// is, so their ligatures need to be in the subset for exactly the same reason. Attribution is
+/// unchanged — this all still goes into every used bucket, because nothing here selects a face.
+fn other_block_text(block: &Block) -> fonts::FaceText {
+    let mut set = fonts::FaceText::default();
     match block {
         Block::Panel { panel, .. } => {
-            set.extend(panel.name.chars());
+            set.add_run(&panel.name);
             for (k, v) in &panel.attributes {
-                set.extend(k.chars());
-                set.extend(v.chars());
+                set.add_run(k);
+                set.add_run(v);
             }
             for section in [
                 &panel.overview,
@@ -902,45 +908,44 @@ fn other_block_chars(block: &Block) -> BTreeSet<char> {
                 &panel.reactions,
             ] {
                 for line in section {
-                    set.extend(line.chars());
+                    set.add_run(line);
                 }
             }
         }
         Block::Table { table, .. } => {
             for cell in table.header.iter().flatten() {
-                set.extend(cell.chars());
+                set.add_run(cell);
             }
             for row in &table.rows {
                 for cell in row {
-                    set.extend(cell.chars());
+                    set.add_run(cell);
                 }
             }
         }
         Block::Toc { title, .. } => {
-            set.extend(title.chars());
-            set.extend('0'..='9');
-            set.insert('.');
-            set.insert('\u{2026}');
+            set.add_run(title);
+            set.add_chars('0'..='9');
+            set.add_chars(['.', '\u{2026}']);
         }
         Block::Component { fields, .. } => {
             for value in fields.values() {
                 match value {
-                    FieldValue::Text(t) => set.extend(t.chars()),
+                    FieldValue::Text(t) => set.add_run(t),
                     FieldValue::Lines(lines) => {
                         for l in lines {
-                            set.extend(l.chars());
+                            set.add_run(l);
                         }
                     }
                     FieldValue::Pairs(pairs) => {
                         for (k, v) in pairs {
-                            set.extend(k.chars());
-                            set.extend(v.chars());
+                            set.add_run(k);
+                            set.add_run(v);
                         }
                     }
                     FieldValue::Rows(rows) => {
                         for row in rows {
                             for cell in row {
-                                set.extend(cell.chars());
+                                set.add_run(cell);
                             }
                         }
                     }
@@ -961,7 +966,7 @@ fn other_block_chars(block: &Block) -> BTreeSet<char> {
 /// would embed a program the file never draws from.
 fn build_family(
     opts: &ExportOptions,
-    wanted: &BTreeMap<FaceKey, BTreeSet<char>>,
+    wanted: &BTreeMap<FaceKey, fonts::FaceText>,
 ) -> Result<fonts::EmbeddedFamily, ExportError> {
     let bundled = opts.font_path.is_none();
     let family = match &opts.font_path {
@@ -975,27 +980,30 @@ fn build_family(
         None => quill_fonts::FontFamily::bundled(),
     };
 
-    let mut per_face: BTreeMap<usize, BTreeSet<char>> = BTreeMap::new();
-    for (want, chars) in wanted {
+    let mut per_face: BTreeMap<usize, fonts::FaceText> = BTreeMap::new();
+    for (want, text) in wanted {
         let sel = family.select(*want);
-        per_face.entry(sel.index).or_default().extend(chars);
+        per_face.entry(sel.index).or_default().merge(text);
     }
     if per_face.is_empty() {
-        per_face.insert(family.select(FaceKey::REGULAR).index, BTreeSet::new());
+        per_face.insert(
+            family.select(FaceKey::REGULAR).index,
+            fonts::FaceText::default(),
+        );
     }
 
     let keys: Vec<FaceKey> = family.faces().map(|(k, _)| k).collect();
     let mut faces = Vec::with_capacity(per_face.len());
-    for (index, chars) in per_face {
+    for (index, text) in per_face {
         let key = keys[index];
         let font = if bundled && key == FaceKey::REGULAR {
             // The regular bundled face goes through the same call it always did, so a document that
             // uses one face embeds byte for byte what it embedded before the family existed.
-            fonts::build(&chars)?
+            fonts::build(&text)?
         } else {
             // Other faces derive their own PostScript name, which is what keeps two embedded
             // programs from claiming one.
-            let mut font = fonts::build_from_bytes(family.font(index).program(), None, &chars)?;
+            let mut font = fonts::build_from_bytes(family.font(index).program(), None, &text)?;
             if bundled {
                 font.flags |= pdf_writer::types::FontFlags::SERIF;
             }
@@ -1010,12 +1018,34 @@ fn build_family(
 mod tests {
     use super::*;
     use quill_core_model::Asset;
+    use std::collections::BTreeSet;
 
     fn opts_with_icc() -> ExportOptions {
         ExportOptions {
             output_intent_icc: "profiles/cmyk.icc".into(),
             ..Default::default()
         }
+    }
+
+    /// Shape `text` through a bundled subset cut for `chars`, and return how many real (non-
+    /// `.notdef`) glyphs it draws — the question every "is this character in the subset" test is
+    /// really asking, now that the writer draws glyphs rather than characters.
+    fn drawn_gids(chars: &BTreeSet<char>, text: &str) -> usize {
+        let font = fonts::build(&fonts::FaceText::from_chars(chars.iter().copied()))
+            .expect("build bundled font");
+        let shaper = quill_fonts::Font::from_bytes(quill_fonts::BUNDLED_TTF).expect("parse");
+        let gids: Vec<u16> = font
+            .shape_piece(&shaper, text)
+            .into_iter()
+            .flat_map(|(bytes, _)| {
+                bytes
+                    .chunks(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(gids.iter().all(|g| *g != 0), "{text:?} drew .notdef");
+        gids.len()
     }
 
     /// Regression (spec 0015 review): `break_by_width` normalizes inter-word whitespace to a literal
@@ -1033,11 +1063,7 @@ mod tests {
         let chars = doc_chars(&doc);
         assert!(chars.contains(&' '), "space must always be collected");
 
-        let font = fonts::build(&chars).expect("build bundled font");
-        let encoded = font.encode_line(" ");
-        assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
-        let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
-        assert_ne!(gid, 0, "' ' must map to a real glyph, not .notdef");
+        assert_eq!(drawn_gids(&chars, " "), 1, "one glyph, not .notdef");
     }
 
     /// Spec 0018 incr. 2: hyphenation can add a trailing `-` to a broken line even when the source
@@ -1054,11 +1080,7 @@ mod tests {
         let chars = doc_chars(&doc);
         assert!(chars.contains(&'-'), "hyphen must always be collected");
 
-        let font = fonts::build(&chars).expect("build bundled font");
-        let encoded = font.encode_line("-");
-        assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
-        let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
-        assert_ne!(gid, 0, "'-' must map to a real glyph, not .notdef");
+        assert_eq!(drawn_gids(&chars, "-"), 1, "one glyph, not .notdef");
     }
 
     #[test]
@@ -1584,7 +1606,10 @@ mod tests {
     /// Every character the document needs, across every face — what a single-face document's
     /// subset carries, and the union a multi-face one is checked against.
     fn doc_chars(doc: &Document) -> BTreeSet<char> {
-        collect_doc_faces(doc).into_values().flatten().collect()
+        collect_doc_faces(doc)
+            .into_values()
+            .flat_map(|t| t.chars())
+            .collect()
     }
 
     fn opts_with_real_icc(tag: &str) -> (ExportOptions, std::path::PathBuf) {
@@ -1635,9 +1660,10 @@ mod tests {
     /// such move in M2, and expected: the catalog gained `/Outlines` and the document gained an
     /// outline root plus one item for the sample's single `h1`. 8559 -> 8786 bytes.
     ///
-    /// Verified that nothing else moved: every `/Length` in the file is unchanged
-    /// (`[1017, 376, 2981, 2017]` before and after), so no content stream, font or metadata stream
-    /// was touched; the object count rose by exactly the two new outline objects.
+    /// Verified that nothing else moved: every `/Length` in the file was unchanged
+    /// (`[1017, 376, 2981, 2017]` before and after — the set spec 0068 later moved), so no content
+    /// stream, font or metadata stream was touched; the object count rose by exactly the two new
+    /// outline objects.
     ///
     /// Previously changed by spec 0039: `StyleSheet::default()` gained the two built-in `table-*` styles, so
     /// `doc.to_json()` changed and with it the document identifier. Verified the same way as spec
@@ -1688,7 +1714,48 @@ mod tests {
     /// **8786 bytes both sides**, 128 differing bytes, every one inside the XMP
     /// `DocumentID`/`InstanceID` or the trailer `/ID`. The sample contains no list, so nothing it
     /// draws could have changed.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x29b3_771f_6bfb_a2bd;
+    ///
+    /// Changed again by spec 0068, and this one is a **content-stream** move — the third of the
+    /// three classifications above, and the first since spec 0028. Exported against the committed
+    /// parity ICC before and after and diffed against a build of `main` in a worktree: **8786 →
+    /// 10220 bytes**, and the new operators were inspected rather than the number accepted.
+    ///
+    /// What changed, exactly:
+    ///
+    /// - **Every glyph the page draws is unchanged.** Concatenating the operands of every show in
+    ///   the content stream gives the *same 392 bytes* — 196 Identity-H glyph ids — on both sides,
+    ///   and the `FontFile2` stream is the same length (`/Length1` chain unchanged, deflated
+    ///   2981 bytes), so the subset itself did not move either. The sample sets no `ffi`/`fi`/`fl`
+    ///   sequence, so shaping it produces exactly the glyph sequence the character encoder did.
+    ///   That is what makes this move attributable: the *positions* changed, not the glyphs.
+    /// - **33 new `TJ` numbers**, in place of nothing: 29 adjustments before, 62 after. Every new
+    ///   one is a positive integer (`2`, `5`, `10`, `15`, `18`, `20`, `25`) — a positive `TJ` amount
+    ///   is subtracted from the position, which moves the pen *left*, which is a tightening kern.
+    ///   The two justification amounts that were already there (`12.571499`, `-77.46664`) are
+    ///   unchanged in value and in count, so nothing about justification moved.
+    /// - **Four shows instead of two-and-two.** Two lines that were a plain `Tj` now carry
+    ///   corrections and so take the positioned form; the file has 0 `Tj` and 4 `TJ` where it had
+    ///   2 and 2. A line whose glyphs do not kern is still a single `Tj` — the control case of the
+    ///   spec's width table asserts exactly that, and it is why this is not an unconditional
+    ///   rewrite of every show in the workspace.
+    /// - **One new object**: the `/ToUnicode` CMap (`/Length 1010`, uncompressed, 27 `bfchar`
+    ///   entries for the 28-glyph subset), plus the `/ToUnicode` key on the Type0 dictionary. The
+    ///   `/Length` set moves from `[1017, 376, 2981, 2017]` to `[1017, 376, 2981, 1010, 2214]`: XMP,
+    ///   ICC and font stream all untouched, the CMap inserted, and the content stream growing by
+    ///   197 bytes — the 33 numbers and their separators.
+    ///
+    /// Content streams are not `FlateDecode`'d, so all 1434 added bytes land in the file: +197 in
+    /// the content stream, the rest the CMap object and its xref entry. That is **+16.3%** on a
+    /// one-page document.
+    ///
+    /// The CMap is a fixed cost per embedded face and falls away as a document grows, but the `TJ`
+    /// numbers do not: the 500-page synthetic document goes **13,763,105 → 15,791,758 bytes,
+    /// +14.7%**, essentially all of it kern adjustments in uncompressed content streams. That is
+    /// this spec's size finding, recorded rather than discovered — no budget guards export size
+    /// today. It is also the number that makes `FlateDecode` on the content stream (spec 0068's
+    /// named separate increment) worth doing: the adjustments are highly repetitive integers and
+    /// are exactly what a deflate window eats.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x8e3c_3d98_9471_cf23;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2150,7 +2217,10 @@ mod tests {
             }],
         }];
 
-        let carried: BTreeSet<char> = collect_doc_faces(&doc).into_values().flatten().collect();
+        let carried: BTreeSet<char> = collect_doc_faces(&doc)
+            .into_values()
+            .flat_map(|t| t.chars())
+            .collect();
         for ch in head.chars().filter(|c| *c != '{' && *c != '}') {
             assert!(
                 carried.contains(&ch),
@@ -2197,9 +2267,9 @@ mod tests {
         export(&doc, &opts, &mut buf).expect("export");
         let _ = std::fs::remove_file(&icc);
 
-        // Every glyph the content stream shows, and how many of them are `.notdef` (gid 0). The
-        // streams are uncompressed only in `render_page`, so this walks the placed pages instead
-        // and asks the same question of the same encoder the writer uses.
+        // Every glyph the content stream shows, and how many of them are `.notdef` (gid 0). Asked
+        // of the placed pages through the same shaped encoder the writer draws with, so a face that
+        // could not draw a glyph shows up here as it would in the file.
         let pages = lay_out_for_press(&doc, &opts).expect("layout");
         let faces = collect_doc_faces(&doc);
         let family = build_family(&opts, &faces).expect("family");
@@ -2229,8 +2299,11 @@ mod tests {
                     for sp in &line.spans {
                         let end = (at + sp.len_bytes).min(line.text.len());
                         let fmt = run_formats.get(sp.run).copied().unwrap_or(base);
-                        let font = family.font(family.slot(fonts::face_of(fmt)));
-                        for gid in font.encode_line(&line.text[at..end]).chunks(2) {
+                        let slot = family.slot(fonts::face_of(fmt));
+                        let segments = family
+                            .font(slot)
+                            .shape_piece(family.shaper(slot), &line.text[at..end]);
+                        for gid in segments.iter().flat_map(|(bytes, _)| bytes.chunks(2)) {
                             glyphs += 1;
                             if gid == [0, 0] {
                                 notdef += 1;
@@ -2243,6 +2316,46 @@ mod tests {
         }
         assert!(glyphs > 200, "sanity: only {glyphs} glyphs drawn");
         assert_eq!(notdef, 0, "{notdef} of {glyphs} glyphs drew as .notdef");
+    }
+
+    /// Spec 0068: a `/ToUnicode` CMap maps every emitted glyph back to its characters, with the
+    /// ligature mapping to the three it came from — asserted by extracting the text from the
+    /// exported PDF and comparing it to the source, which nothing in the workspace could do before
+    /// this spec, because nothing wrote a CMap.
+    ///
+    /// This is not a nicety. With `Identity-H` and no CMap a copy or a search yields subset glyph
+    /// ids; that was survivable while one glyph meant one character, because the mapping was
+    /// recoverable in principle. Drawing ligatures makes it unrecoverable from outside the file.
+    #[test]
+    fn the_exported_pdf_still_reads_as_text() {
+        let sentence = "The officer shuffled a fistful of ruffled affidavits";
+        let mut doc = Document::sample();
+        doc.content = vec![Block::body(sentence, Color::Gray { v: 0.0 })];
+
+        let (opts, icc) = opts_with_real_icc("tounicode");
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("export");
+        let _ = std::fs::remove_file(&icc);
+
+        let text = crate::stream_read::extract_text(&buf);
+        assert!(
+            !text.contains('\u{fffd}'),
+            "every drawn glyph must map back to characters, got: {text:?}"
+        );
+        // The sentence fits one line, so it comes back whole. Compared to the source, not to a
+        // re-derivation of it.
+        assert_eq!(text, sentence, "extracted text should be the source text");
+
+        // And the ligature specifically: one glyph standing for three characters.
+        let map = crate::stream_read::to_unicode_map(&buf);
+        assert!(
+            map.values().any(|v| v == "ffi"),
+            "the ffi ligature must map back to its three characters: {map:?}"
+        );
+        assert!(
+            map.values().any(|v| v.chars().count() > 1),
+            "a multi-character mapping is the whole reason the CMap ships"
+        );
     }
 
     /// Spec 0004: a user-supplied `font_path` is embedded instead of the bundled default, with a
