@@ -136,11 +136,19 @@ line. `docs/format-spec.md` records this, and a test asserts a document written 
 - `export`'s `--pdfx` becomes optional and defaults to the preset's conformance level.
 - `quill presets` lists every bundled preset with its numbers, `source` and `retrieved` — provenance
   a user cannot read is provenance that does not do its job.
-- `new --preset` sets the bleed from the preset, and sets the trim **only when the template's own
-  trim is not one the preset lists** (printing a warning when it does). The roadmap's wording was
-  "seeds from the preset's first trim"; applying that unconditionally would retrim the US-Letter
-  `playtest` template to 6×9 and leave its folio off the page — silently breaking master furniture
-  is exactly what this repo forbids.
+- `new --preset` takes the **bleed** from the preset and leaves the **trim** to the template,
+  reporting a disagreement rather than acting on it. The roadmap's wording was "seeds from the
+  preset's first trim"; applying that would retrim the US-Letter `playtest` template to 6×9 and
+  leave its folio off the page — silently breaking master furniture is exactly what this repo
+  forbids.
+
+  This spec originally retrimmed in the narrower case where the preset does not list the template's
+  trim, and warned. Spec 0053 argued the stronger position and it is the one that shipped: a
+  template's furniture derives its geometry *from* the trim (the bundled folios take their y from
+  the page height and their width from the trim), so moving the trim moves the page without moving
+  the geometry authored for it, and nothing at layout time catches it because furniture does not
+  participate in the flow. Bleed is the opposite — a press floor living entirely outside the trim
+  box — so taking the preset's, or the larger of the two, costs the design nothing.
 
 ## Acceptance criteria
 
