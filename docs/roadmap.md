@@ -2036,14 +2036,23 @@ than one entry.
 **Risks** — This is the increment that moves glyphs, and it moves them everywhere the fixtures look.
 The "no override ⇒ byte-identical" criterion is what separates a bug from the intended change.
 
-**Blocked, and named rather than worked around.** The bundled `SourceSerif4-Regular.ttf` is a *static*
+**Was blocked on assets; unblocked 2026-07-28.** The bundled `SourceSerif4-Regular.ttf` is a *static*
 instance — its table list carries no `fvar`, so a bold or italic face cannot be instanced from it.
-0064 therefore needs new font programs in the repository (Source Serif 4's Bold, Italic and Bold
-Italic instances, same OFL as the regular one), which is a download and a licence note rather than a
-decision anyone should take silently on someone else's behalf. This is the same posture M3 took with
-the vendor preset figures: a named slot with its provenance recorded, not an invented value. **0064
-is sequenced but cannot start until those assets are approved and added**, which is why 0066 runs
-ahead of it below.
+0064 therefore needed new font programs in the repository (Source Serif 4's Bold, Italic and Bold
+Italic instances, same OFL as the regular one), which was a download and a licence note rather than a
+decision anyone should take silently on someone else's behalf. This was the same posture M3 took with
+the vendor preset figures: a named slot with its provenance recorded, not an invented value. **0066
+therefore ran ahead of 0064**, which is why it is numbered later and shipped earlier.
+
+The three faces are now in `crates/fonts/assets/`, approved by the repository owner. Their
+provenance turned out to be recoverable rather than assumed: the committed regular is Google Fonts'
+Source Serif 4 variable, instanced at `opsz=14, wght=400` with overlaps removed and subset to 231
+codepoints — a recipe recovered by matching its advance widths against every optical size, and now
+recorded, executable and self-checking in `tools/fonts/build-faces.py`. The new faces are built by
+the same recipe from the same upstream, so the family is consistent by construction rather than by
+assertion. The regular itself is **not** regenerated — a newer `skia-pathops` re-points 44 of its
+glyphs and moves a bounding box by one unit per em, and moving the anchor every export byte-hash in
+the workspace is measured against would spend the very thing 0064's parity criterion needs.
 
 ### 0065 character-styles
 

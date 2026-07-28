@@ -3,3 +3,9 @@
 # committed with LF and every golden test fails there and only there — which is exactly how spec
 # 0049 first went red on CI.
 crates/cli/tests/golden/** -text
+
+# Font programs are embedded with `include_bytes!` and subset byte-exactly into the PDF. Git's
+# binary detection already gets this right, but the cost of it being wrong once — a face silently
+# corrupted on one platform's checkout — is far higher than the cost of saying so.
+*.ttf -text
+*.otf -text

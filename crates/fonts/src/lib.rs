@@ -27,6 +27,29 @@ use ttf_parser::{Face as TtfFace, GlyphId};
 /// The bundled font program. SIL OFL-1.1 — see `assets/SourceSerif4-LICENSE.txt`.
 pub const BUNDLED_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-Regular.ttf");
 
+/// The bundled bold face.
+///
+/// A separate program, and necessarily so: every bundled face is a *static instance* of Source
+/// Serif 4 with no `fvar` table, so a weight cannot be instanced from another weight at run time.
+/// Bold is a font, not a flag. All four are built by `tools/fonts/build-faces.py`, which records
+/// where they came from and how to rebuild them.
+pub const BUNDLED_BOLD_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-Bold.ttf");
+
+/// The bundled italic face — see [`BUNDLED_BOLD_TTF`] for why it is its own program.
+pub const BUNDLED_ITALIC_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-Italic.ttf");
+
+/// The bundled bold-italic face — see [`BUNDLED_BOLD_TTF`] for why it is its own program.
+pub const BUNDLED_BOLD_ITALIC_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-BoldItalic.ttf");
+
+/// Every face this build ships, in no particular order. The family that selects between them by
+/// weight and style is spec 0064's; this is the inventory the assets themselves guarantee.
+pub const BUNDLED_FACES: [&[u8]; 4] = [
+    BUNDLED_TTF,
+    BUNDLED_BOLD_TTF,
+    BUNDLED_ITALIC_TTF,
+    BUNDLED_BOLD_ITALIC_TTF,
+];
+
 /// A parsed font, ready to measure and draw with.
 ///
 /// Owns its program bytes so the borrow checker does not force every caller to keep the source
@@ -358,5 +381,109 @@ mod tests {
     #[test]
     fn garbage_is_rejected_rather_than_panicking() {
         assert!(Font::from_bytes(vec![0u8; 32]).is_none());
+    }
+
+    /// Every codepoint a face maps to a glyph.
+    fn coverage(program: &[u8]) -> std::collections::BTreeSet<u32> {
+        let face = TtfFace::parse(program, 0).expect("a bundled face must parse");
+        let mut out = std::collections::BTreeSet::new();
+        for table in face.tables().cmap.iter().flat_map(|c| c.subtables) {
+            table.codepoints(|cp| {
+                if table.glyph_index(cp).is_some() {
+                    out.insert(cp);
+                }
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn all_four_bundled_faces_parse() {
+        for program in BUNDLED_FACES {
+            let font = Font::from_bytes(program).expect("every bundled face must parse");
+            assert!(font.units_per_em() > 0.0);
+            assert!(font.ascent_pt(10.0) > 0.0);
+            assert!(font.descent_pt(10.0) < 0.0);
+        }
+    }
+
+    #[test]
+    fn the_faces_cover_exactly_the_same_characters() {
+        // A family whose bold refuses a character its regular accepts would drop a glyph the
+        // moment a word was emphasised — a silent hole rather than a visible one.
+        let regular = coverage(BUNDLED_TTF);
+        assert!(regular.len() > 200, "sanity: {} codepoints", regular.len());
+        for program in BUNDLED_FACES {
+            assert_eq!(
+                coverage(program),
+                regular,
+                "a bundled face covers a different character set than the regular"
+            );
+        }
+    }
+
+    #[test]
+    fn the_faces_share_one_set_of_vertical_metrics() {
+        // Leading is a property of the paragraph, not of the run that happens to be in it. If bold
+        // ascended further than regular, bolding a word would move the line — and would move it
+        // differently on screen and on the page, since both read these numbers.
+        let regular = Font::bundled();
+        for program in BUNDLED_FACES {
+            let font = Font::from_bytes(program).unwrap();
+            assert_eq!(font.units_per_em(), regular.units_per_em());
+            assert_eq!(font.ascent_pt(12.0), regular.ascent_pt(12.0));
+            assert_eq!(font.descent_pt(12.0), regular.descent_pt(12.0));
+        }
+    }
+
+    #[test]
+    fn the_faces_are_actually_different_programs() {
+        // The failure this guards against is a build that copied the regular four times: the
+        // identities would match, and every "bold" would silently render regular.
+        let ids: Vec<u64> = BUNDLED_FACES
+            .iter()
+            .map(|p| Font::from_bytes(*p).unwrap().identity())
+            .collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "two bundled faces are the same program");
+            }
+        }
+
+        // And they are different in the direction their names claim.
+        let text = "Handgloves";
+        let regular = Font::bundled().measure_run(text, 12.0);
+        let bold = Font::from_bytes(BUNDLED_BOLD_TTF)
+            .unwrap()
+            .measure_run(text, 12.0);
+        let italic = Font::from_bytes(BUNDLED_ITALIC_TTF)
+            .unwrap()
+            .measure_run(text, 12.0);
+        assert!(
+            bold > regular,
+            "bold {bold} should set wider than {regular}"
+        );
+        assert!(
+            (italic - regular).abs() > 0.01,
+            "italic {italic} should not measure as regular {regular}"
+        );
+    }
+
+    #[test]
+    fn the_italic_faces_are_slanted_and_the_bold_faces_are_bold() {
+        // Read from the faces' own metadata rather than from the file name, so a mislabelled asset
+        // is caught here rather than by a reader wondering why nothing looks bold.
+        let cases = [
+            (BUNDLED_TTF, 400, false),
+            (BUNDLED_BOLD_TTF, 700, false),
+            (BUNDLED_ITALIC_TTF, 400, true),
+            (BUNDLED_BOLD_ITALIC_TTF, 700, true),
+        ];
+        for (program, weight, italic) in cases {
+            let face = TtfFace::parse(program, 0).unwrap();
+            assert_eq!(face.weight().to_number(), weight);
+            assert_eq!(face.is_italic(), italic);
+            assert_eq!(face.is_bold(), weight == 700);
+        }
     }
 }

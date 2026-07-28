@@ -104,9 +104,18 @@ without any additional terms or conditions.
 
 ### Bundled fonts
 
-`crates/export-pdf/assets/SourceSerif4-Regular.ttf` is **Source Serif 4** (a static `glyf`
-instance), licensed under the
-[SIL Open Font License, Version 1.1](crates/export-pdf/assets/SourceSerif4-LICENSE.txt)
-(© 2014 The Source Serif 4 Project Authors). It ships as a data asset used as the default
-embeddable body font for PDF/X export; the OFL is compatible with the project's MIT/Apache-2.0
+quill bundles four faces of **Source Serif 4** — `Regular`, `Bold`, `Italic` and `BoldItalic`, in
+`crates/fonts/assets/` (`export-pdf` keeps its own copy of the regular). All four are licensed
+under the [SIL Open Font License, Version 1.1](crates/fonts/assets/SourceSerif4-LICENSE.txt)
+(© 2014 The Source Serif 4 Project Authors); that licence file is Google Fonts' `OFL.txt` for the
+family, byte for byte. They ship as data assets — the default embeddable body font for PDF/X
+export and for screen rendering — and the OFL is compatible with the project's MIT/Apache-2.0
 code license.
+
+Each face is a **static `glyf` instance** with no `fvar` table: pinned to one optical size
+(`opsz=14`) and one weight (`wght=400` or `700`), then subset to the 231 codepoints the family
+covers here. That is why bold and italic are three more font programs rather than three more
+numbers — a weight cannot be instanced from a static face at run time.
+[`tools/fonts/build-faces.py`](tools/fonts/build-faces.py) records where they came from and
+rebuilds them; its `--check` mode re-derives the regular from upstream and verifies the recipe
+still reproduces the committed one.
