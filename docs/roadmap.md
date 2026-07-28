@@ -16,9 +16,17 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
+| **M2** | Beginner on-ramp — templates, panels, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
-| **M4** | Ecosystem — shareable component definitions and content packs | decomposed — specs 0054–0061 sequenced below |
+| **M4** | The general typographic core — inline runs, character styles, lists, tabs, the baseline grid | decomposed — specs 0054–0061 sequenced below |
+| **M5** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
+| **M6** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
+| **M7** | Ecosystem — shareable component definitions and content packs | named, not decomposed (the decomposition deferred from M4 on 2026-07-28) |
+
+**Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
+application second.** Game books are the flagship use case; every mechanism must be one a cookbook,
+a field guide or a manual could use on the same terms. The argument, and the audit that re-scoped M4
+around it, are under "M4 increments" below.
 
 ## Decisions log
 
@@ -1538,201 +1546,232 @@ it inside 0049 would decide how a template composes in the increment that is not
 
 ## M4 increments
 
-M3 finished the tool. M4 is about a publisher not starting from scratch — and, more precisely, about
-**one person's work being usable by another**. A house style, a stat-block layout for a particular
-game system, a set of masters that matches a line of books: all of these exist today only as
-whatever the author happened to build, unshareable.
+M3 finished the *press* half of the product. M4 finishes the *typographic* half — and it is a
+different milestone than the one decomposed here on 2026-07-28, because of a positioning decision
+taken the same day and recorded below rather than left implied by the increments.
 
 ### The decision this milestone turns on
 
-`CLAUDE.md` says "plugins / ecosystem", and "plugin" usually means *executable extension* — a
-dynamic library, a scripting API, a WASM module. **M4 deliberately does not build that.** It builds a
-**declarative content pack**: a versioned bundle of templates, styles, component definitions and
-assets, with no code in it.
+**Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
+application second.** Game books stay the flagship use case: the audience the product is designed
+for, the corpus its fixtures come from, and the reason its POD presets exist. But every *mechanism*
+must be a general one that a game book happens to use, never a mechanism only a game book can use.
+A stat block is a panelled multi-section record; a random table is a range-lookup table; a rulebook
+template is a two-column reference-book template. Each of those is a thing a cookbook, a field
+guide, a hardware manual or a thesis wants on exactly the same terms.
 
-The reason is this repo's own first rule. *Prefer a visible failure over silent press-corruption.*
-An executable plugin that can emit geometry can emit geometry that is wrong — off the trim, over the
-ink limit, in the wrong colour space — and a plugin author debugging on screen has no way to know.
-Every mechanism M3 built to make press errors visible (0050's placed-geometry preflight, 0049's
-preset thresholds, 0052's provable annotation-freedom) assumes quill produced the geometry. Handing
-that to third-party code would either bypass those checks or force every one of them to run against
-an adversary, which is a different product.
+The reason is not modesty about the niche. It is that the niche-shaped mechanism is *also* the
+worse mechanism for the niche. `StatBlock` is a Rust struct with six named fields
+(crates/components-ttrpg/src/lib.rs), so a game system whose creatures are set differently — which is the
+normal case, not the exception — cannot be expressed at all. Generalising it is what makes it
+usable by the audience it was built for. The same argument holds everywhere the audit below found
+coupling.
 
-A declarative pack cannot do any of that. It supplies *inputs* — a trim, a style, a component's
-shape — and quill lays them out through the same engine, so preflight governs a community template
-exactly as it governs a bundled one. The audience wants to share a look, not to ship a program.
+### What the audit found
 
-This is the one M4 decision most worth overruling deliberately rather than by accident, so it is
-stated here rather than implied by the increments. If executable extensions are wanted later, the
-pack format is the right substrate to hang them on, and the sandboxing question can be answered once
-rather than assumed away.
+Two read-only audits ran against the M3 tree on 2026-07-28: one inventorying TTRPG coupling, one
+measuring quill against the capability set of a general DTP application (InDesign, Affinity
+Publisher, Scribus). Their results set this milestone's contents, so the load-bearing findings are
+recorded here rather than left in a session transcript.
 
-Same rule as M1–M3: each increment compiles, its tests pass, it is a coherent PR, and every one
-carries the `Document::sample()` export byte-hash bullet.
+**Coupling is shallower than the vocabulary suggests.** Type-level coupling is confined to one
+crate (`components`), one enum variant (`Block::StatBlock`), one measurement function
+(`measure_stat_block`), and one import fence (`:::statblock`). Everything else is bundled sample
+content, template slugs, or prose. Only two surfaces are gated by `FORMAT_VERSION` 3 — the
+`"kind": "stat_block"` serde tag and the three `statblock-*` style-sheet keys — so a rename is
+cheap everywhere else and needs a migration in exactly two places.
+
+**One capability gap disqualifies the general claim on its own: quill cannot bold a word.**
+`Block::Body` and `Block::Heading` each carry a single `String` and a single `Color`
+(crates/core-model/src/lib.rs). There is no styled run, no span, no inline formatting of any kind
+anywhere in the workspace, and the markdown importer refuses emphasis on purpose
+(crates/core-model/src/import.rs) because there is nothing to import it *into*. Nearly every other
+absent typographic feature is downstream of that one: character styles, drop caps, small caps,
+OpenType feature control, tracking, baseline shift and inline notes are all properties of a *run*,
+and the model has no runs. This is why M4 is re-scoped: an ecosystem for sharing a look is
+premature while the look cannot include an italic.
+
+**The rest of the gaps sort cleanly into three later milestones** — long-document apparatus
+(sections and folios, footnotes, cross-references, an index, a multi-document book), graphics and
+colour breadth (spot colours, image-format breadth, vector primitives, anchored objects and
+runaround), and the ecosystem work this milestone was previously going to be. Those are sequenced
+under "Beyond M4" below rather than decomposed now, because a decomposition written four milestones
+ahead is a decomposition that will be wrong.
+
+**What the audit did *not* find is worth recording too.** The press pipeline, incremental layout,
+threading, multi-column, master pages, generated contents, fragmentation and preflight are all real,
+tested and byte-hash-guarded. The engine is not the weak half; the content model is.
+
+### What this milestone is not
+
+M4 does not build the direct-manipulation authoring surface — move, resize, rotate, group, guides,
+snap, undo/redo. The `app` crate opens a document, scrolls it and edits the text of a block, and a
+WYSIWYG object editor is a milestone in its own right rather than an increment inside one. It is
+named in "Beyond M4" so its absence is a decision. The content model has to carry inline formatting
+before an editor can offer it, which is the same ordering argument as everything else here.
 
 | # | Spec | Increment | Size |
 |---|---|---|---|
-| 1 | 0054 | [Component definitions as data — a stat block stops being a Rust type](#0054-component-definitions) | large |
-| 2 | 0055 | [The `.qpack` container — a versioned, signed-by-provenance content pack](#0055-pack-container) | medium |
-| 3 | 0056 | [Pack resolution — install, list, and a document that names what it needs](#0056-pack-resolution) | medium |
-| 4 | 0057 | [Authoring a pack from a document — `quill pack extract`](#0057-pack-extract) | medium |
-| 5 | 0058 | [The baseline grid](#0058-baseline-grid) | large |
-| 6 | 0059 | [Screen/press hyphenation parity — one hyphenator, as there is one shaper](#0059-hyphenation-parity) | small |
-| 7 | 0060 | [The over-long last line](#0060-last-line-measure) | medium |
-| 8 | 0061 | [A starter gallery and the pack authoring guide](#0061-gallery-and-guide) | small |
+| 1 | 0054 | [The neutral core — a mechanism is general or it is a bug](#0054-neutral-core) | medium |
+| 2 | 0055 | [Inline runs — the paragraph stops being a `String`](#0055-inline-runs) | large |
+| 3 | 0056 | [Character styles — a named run treatment, as there is a named paragraph treatment](#0056-character-styles) | medium |
+| 4 | 0057 | [One hyphenator, as there is one shaper](#0057-hyphenation-parity) | small |
+| 5 | 0058 | [The over-long last line](#0058-last-line-measure) | medium |
+| 6 | 0059 | [Lists — bullets, numbering, and the counter that survives repagination](#0059-lists) | medium |
+| 7 | 0060 | [Tab stops and leaders](#0060-tabs-and-leaders) | medium |
+| 8 | 0061 | [The baseline grid](#0061-baseline-grid) | large |
 
 ## M4 sequencing rationale
 
-**Chain 1 — a component must be data before a pack can carry one.** 0054 is the milestone's real
-work and its riskiest increment. `quill-components-ttrpg` defines `StatBlock` and `Table` as Rust
-types with hand-written measurement in `layout-engine`; a pack that could only ship *those two*
-shapes would be a theming system, not an ecosystem, and a game system whose stat block looks
-different is the normal case rather than the exception. 0054 turns a component into a declared
-sequence of named, styled sections with a declared panel — which is, not coincidentally, exactly
-what `measure_stat_block` already builds at runtime. The two existing components become the first
-two *definitions*, and their current behaviour is the acceptance criterion: byte-identical output,
-or the generalization is wrong.
+**0054 first, because renaming after the fact is a bigger diff than renaming before it.** Every
+increment below adds call sites to the surfaces 0054 renames; doing it last would mean renaming them
+twice. It is also the increment that carries no risk — it must not move a single byte of output —
+which makes it the right one to establish the milestone's regression discipline on.
 
-0055 then packages definitions with templates and styles; 0056 makes a document able to say which
-pack it needs and resolve it; 0057 closes the loop by extracting a pack *from* a document, which is
-how a publisher who has already built a book gets a reusable pack without hand-writing JSON. 0057 is
-last in the chain because it can only extract what 0054–0056 can express.
+**Chain 1 — 0055 → 0056, the run model and what names it.** 0055 is the milestone's spine and its
+only format break (`FORMAT_VERSION` 4). It changes the type every other crate reads: shaping,
+measurement, justification, the PDF writer, the screen renderer and the importer all consume block
+text today as one string. The rule that makes it tractable is that a paragraph of one run must lay
+out *byte-identically* to the same paragraph as a string — the generalisation is proven by the
+absence of a diff, exactly as spec 0044's splitting mechanism was. 0056 then gives runs named,
+reusable treatments, which is what turns "bold this word" into "this is a `lead-in`", and is the
+character-level twin of spec 0028's paragraph styles.
 
-**Chain 2 — the two defects M3 found, plus the one it deferred.** 0059 and 0060 are the roadmap's
-current known issues and they are small and independent; they are sequenced into M4 rather than left
-in the list because a milestone that ends with its own findings unfixed teaches the wrong thing.
-0059 is genuinely small — promote the hyphenator beside the shaper. 0060 is the one-line breaker fix
-whose blast radius spec 0048 measured, so it carries the cost of re-deriving 0051's equivalence
-digest and re-checking 0046's narrow-column behaviour; that work is the increment.
+**Chain 2 — 0057 and 0058, the two defects M3 found.** Small, independent, and sequenced here rather
+than left in the known-issues list because a milestone that ends with its own findings unfixed
+teaches the wrong thing. They sit after the run model rather than before it because 0058 re-derives
+spec 0051's equivalence digest, and re-deriving it once against the final breaker is cheaper than
+twice.
 
-0058 (baseline grid) is placed after them and after 0054 because `CLAUDE.md` has named it a
-`layout-engine` responsibility since the beginning and nothing implements it, and because it
-interacts with everything that changed in M3 — leading, fragmentation, indents, and now declared
-component sections. It is the last large increment for that reason.
+**Chain 3 — 0059 → 0060 → 0061, the paragraph features that need runs to exist.** A list marker is a
+run in a different style at a tab position; a leader is a run repeated to fill a measure. Building
+either before 0055 would mean building it twice. 0061 (the baseline grid) is last and large for the
+reason M3 already recorded: it interacts with leading, fragmentation, indents, and now runs of
+mixed size, so it is cheapest after all of them.
 
-**0061 is documentation and is last**, because a guide to a format that is still moving is a guide
-that will be wrong.
-
-**Cross-cutting: a pack is content from a stranger.** Every increment in chain 1 carries the same
-posture, inherited from spec 0025's load contract: a malformed or newer-versioned pack fails with a
-typed error naming the file, never a panic and never a silent default. And a pack may not make
-output less press-correct — 0050's preflight runs over a packed component's geometry exactly as it
-runs over a bundled one, which is asserted rather than assumed.
+**Cross-cutting: every increment carries the export byte-hash bullet**, as M1–M3 did. Three of them
+(0055, 0058, 0061) legitimately move it, and each states *what* moved and proves it was only that —
+the discipline spec 0038 established and spec 0042 extended to structural change.
 
 ## M4 increment detail
 
-### 0054 component-definitions
+### 0054 neutral-core
 
-**A component becomes a declaration: named sections, a panel, and the styles they resolve** ·
-size: large · branch: `feat/component-definitions`
+**A mechanism is general or it is a bug** · size: medium · branch: `feat/neutral-core`
 
-`StatBlock` and `Table` are Rust structs in `quill-components-ttrpg`, measured by hand-written code
-in `layout-engine` (`measure_stat_block`, `measure_table`). A publisher whose game system sets its
-creatures differently — a PbtA move, a Blades clock, an OSR monster line — cannot express it at all.
+Turn the audit's coupling inventory into names that match what the code actually does. This is a
+rename and a re-documentation, not a redesign: the generalisation of the *mechanisms* (a stat block
+becoming a declared component) is ecosystem work sequenced under "Beyond M4", and it is a much
+larger increment. This one makes the vocabulary honest and costs nothing at runtime.
 
-A `ComponentDef` declares what those functions currently hard-code: an ordered list of sections,
-each with a style name, a source field and whether it opens a new section; a panel with a fill,
-a stroke and a padding; and the rules a section list needs (a repeated prefix for tables, spec 0045;
-a section boundary for cuts, spec 0046). A `Block::Component { def: String, fields: … }` carries the
-authored content.
-
-The two built-in components are re-expressed as definitions and their Rust types retire behind them.
-
-**Acceptance criteria**
-
-- Regression: `Document::sample()`'s export byte-hash unchanged.
-- **The bundled stat block and table, re-expressed as definitions, produce byte-identical placed
-  geometry to today** — asserted against the current `PlacedBlock` output for a corpus of fixtures,
-  not against a re-derived expectation. If the generalization cannot reproduce them exactly it is
-  the wrong generalization, and that is the whole test.
-- A user-defined component with three sections lays out, splits at its section boundaries (0046) and
-  preflights (0050) exactly as a built-in one does.
-- A definition naming a style that does not exist still lays out — the authoring-posture fallback.
-- A definition that is malformed, or names a component version quill does not understand, fails with
-  a typed error naming the definition, not a panic.
-- `quill import`'s `:::statblock` and `:::table` fences keep working unchanged; the importer resolves
-  them through the definitions.
-- A rendered page of a *user-defined* component is attached to the PR.
-- `benches/budgets.toml`: measurement cost per component unchanged — a definition is interpreted
-  once per measurement, not per line.
-
-**Risks** — This is a re-implementation of two shipped features behind a general mechanism, and the
-failure mode is subtle geometric drift rather than a broken build. The byte-identical criterion is
-the only thing standing in front of it, and it must be asserted over fixtures that exercise wrapped
-cells, zebra bands, section rules and the split paths, not over a single simple case.
-
-### 0055 pack-container
-
-**`.qpack`: a versioned bundle of templates, styles, component definitions and assets** · size:
-medium · branch: `feat/pack-container`
-
-Follows spec 0025's `.tpub` precedent exactly — a zip, a manifest, a version, a typed load contract —
-because a pack is the same kind of object and a second, different container would be a second thing
-to get wrong. Its manifest carries a name, a version, a `source` and a licence, because content
-arriving from a stranger with no provenance is content nobody should install.
+- Crate `quill-components-ttrpg` → `quill-components`; its crate doc describes portable content
+  components, not TTRPG ones.
+- `StatBlock` → `Panel` (a titled, bordered, multi-section record); `RandomTable` → `RangeTable`,
+  its `die` field → `max`, `TableEntry` → `RangeEntry`. `RangeTable::lookup` and `is_complete` keep
+  their logic exactly.
+- `measure_stat_block` → `measure_panel`; `STATBLOCK_*` layout constants → `PANEL_*`.
+- Bundled template slugs: `rulebook` → `reference`, `adventure` → `digest`, `playtest` → `draft`,
+  each keeping its old slug as a resolving alias so no script or document breaks.
+- The CLI's about-line, `Document::sample()`, the `testdoc` word bank and the worked examples in
+  `docs/format-spec.md` stop being genre-specific.
+- `README.md` and `CLAUDE.md` state the positioning above.
 
 **Acceptance criteria**
 
-- A pack round-trips: written, read back, equal, and every bundled template exports as a pack that
-  reloads identically (spec 0053's precedent — a format that round-trips the struct but builds a
-  different document proves nothing).
-- Malformed, newer-versioned, and missing-manifest packs each fail with a distinct typed error.
-- A pack may not carry an absolute path or a `..` traversal in an asset path; asserted, because a
-  container from a stranger is the one place that matters.
-- Licence and source are required, non-empty, and surfaced by `quill pack info`.
+- Regression: `Document::sample()`'s export byte-hash unchanged. This increment renames things; if
+  the hash moves, something other than a name changed. (`Document::sample()`'s *text* changes, so
+  the sample used for the hash assertion is pinned to the current content — the point of the check
+  is that renaming moved nothing, and it can only prove that against a fixed input.)
+- `FORMAT_VERSION` stays 3. The `"kind": "stat_block"` serde tag and the `statblock-*` style keys
+  are **not** renamed: they are on-disk contract, they disappear entirely when components become
+  declarations, and a migration to a name with a known expiry date is a migration nobody should
+  write. A test asserts the on-disk tag is still `stat_block` so the decision is enforced, not
+  remembered.
+- The `:::statblock` import fence keeps working. `:::panel` is accepted as its preferred spelling
+  and both are asserted; the old spelling is documented as retained, not deprecated-with-a-date,
+  because there is no version to remove it in yet.
+- Every old template slug resolves to its renamed template, asserted per slug.
+- No file under `crates/` outside test fixtures contains the string `ttrpg`, asserted by a test that
+  greps the tree — the anti-drift precedent specs 0030, 0043 and 0053 use for documentation.
 
-### 0056 pack-resolution
+**Risks** — A rename across ten crates is where a subtle behaviour change hides. The byte-hash and
+the unchanged serde tags are what stand in front of that.
 
-**A document names the packs it needs; `quill pack install` and `list` resolve them** · size:
-medium · branch: `feat/pack-resolution`
+### 0055 inline-runs
 
-**Acceptance criteria**
+**The paragraph stops being a `String`** · size: large · branch: `feat/inline-runs`
 
-- A `.tpub` naming a pack that is not installed fails to lay out with a typed error naming the pack
-  and its version — not a silent fallback to a default style, which would produce a book that looks
-  subtly wrong rather than one that refuses to open.
-- Version resolution is stated and asserted: exact match, or a documented compatibility rule.
-- Two packs defining the same component name is an error naming both, not last-one-wins.
-- `quill pack list` shows name, version, source and licence for each installed pack.
+`Block::Body` and `Block::Heading` carry `text: String` and one `Color`. They gain instead an
+ordered `Vec<Run>`, where a `Run` is a string plus an optional set of *inline overrides*: weight,
+style (italic), size, colour, tracking, and baseline shift. A run with no overrides is exactly the
+paragraph style resolved for the block, which is what makes the no-diff criterion below reachable.
 
-### 0057 pack-extract
+The break is real and gets a version: `FORMAT_VERSION` 4, with a v3 → v4 load migration that turns
+`{"text": "…", "color": …}` into a single run. A v3 document loaded, migrated, laid out and exported
+must produce **byte-identical** output to the same document under the v3 code — that is the whole
+proof that the run model is a generalisation and not a rewrite.
 
-**`quill pack extract` — turn a finished book into a reusable pack** · size: medium · branch:
-`feat/pack-extract`
-
-**Acceptance criteria**
-
-- Extracting from a document produces a pack whose templates, styles and definitions reproduce that
-  document's look when applied to a different one — asserted by laying out a second document under
-  the extracted pack and comparing to the first's placed styling.
-- Content is not extracted. A pack is a *look*, not a book, and the test asserts no block text
-  survives extraction.
-- Round-trips with 0055 and installs with 0056.
-
-### 0058 baseline-grid
-
-**A baseline grid** · size: large · branch: `feat/baseline-grid`
-
-Named as a `layout-engine` responsibility in `CLAUDE.md` since the beginning; deferred explicitly by
-specs 0019, 0020 and 0028. Facing pages whose baselines do not align is the defect that separates a
-book from a document, and it is the last of the big typographic gaps.
+Shaping is where the cost lands. `quill-fonts` shapes a string against one face; a mixed-weight
+paragraph is several shaping calls whose results must be concatenated with correct advances, and
+Knuth-Plass must break across a run boundary as if it were not there. The measurement cache
+(spec 0031) keys on block content, so its fingerprint grows a run dimension.
 
 **Acceptance criteria**
 
-- Every text baseline on a gridded page falls on a grid line, asserted to 0.01 pt across a
-  multi-page, two-column document.
-- Grid snapping composes with fragmentation (0044): a continuation's first baseline is on the grid.
-- It composes with indents (0048) and with declared components (0054) — a component's sections snap
-  as body text does.
-- Snapping is per frame and local, per `CLAUDE.md`; a global recompute is a named non-goal, and the
-  incremental budget is what proves it.
-- A rendered spread showing two facing pages with aligned baselines is attached.
+- Regression: `Document::sample()`'s export byte-hash *moves only by its identifiers* — the sample
+  is unchanged content in a new format version, so the document `/ID` and XMP identifiers move and
+  nothing else. Proven by the spec 0038 procedure: export against the committed parity ICC before
+  and after, `cmp -l`, and confirm every differing offset falls inside the XMP `DocumentID`/
+  `InstanceID` or the trailer `/ID`, with length unchanged.
+- **A single-run paragraph lays out byte-identically to the same paragraph as a string** — asserted
+  over the full fixture corpus at the `PlacedBlock` level, not just the exported bytes.
+- A v3 `.tpub` loads, migrates and exports byte-identically to what the v3 code produced from it.
+  A v4 file loaded by v3 code fails with the typed newer-version error spec 0025 defines.
+- A paragraph mixing regular and bold shapes correctly across the boundary: the advance at the join
+  is the sum of the two runs' advances, kerning is not applied across faces (they are different
+  fonts; a cross-face kern pair does not exist), and a rendered line is attached to the PR.
+- Line breaking is unchanged by run structure: the same paragraph split into three runs at
+  arbitrary points breaks at the same places, to 0.01 pt, as the one-run form.
+- Hyphenation crosses a run boundary correctly — a word split across two runs is one word to the
+  hyphenator, or the spec states and tests the opposite rule.
+- A run whose overrides name a font variant the family does not have falls back to the nearest
+  available and says so once per export on stderr, rather than silently setting it regular. Visible
+  failure over silent wrongness, per `CLAUDE.md`.
+- Preflight (0050) and ink coverage still run over every run's colour, not just the block's —
+  asserted with a paragraph whose fourth run is over the ink limit.
+- `quill import` gains `**bold**` and `*italic*`, which the importer previously refused for want of
+  a target; its "six constructs completely" posture is updated in the same PR.
+- `benches/budgets.toml`: shaping cost for a single-run paragraph unchanged; a documented,
+  proportionate budget for the mixed-run case. `incremental_blocks_measured` unchanged.
 
-**Risks** — Grid snapping changes every baseline in the document, so it changes the export hash and
-every geometric fixture in the repo. It needs the same deliberate re-derivation discipline spec 0051
-established for its equivalence digest.
+**Risks** — This is the largest change to `core-model` since the format existed and it touches every
+downstream crate. The byte-identity criteria are the only thing that will catch a subtle drift in
+advances or breaking, and they must be asserted over the corpus that exercises justification,
+hyphenation, fragmentation and the panel path — not a simple case.
 
-### 0059 hyphenation-parity
+### 0056 character-styles
+
+**A named run treatment, as there is a named paragraph treatment** · size: medium · branch:
+`feat/character-styles`
+
+Spec 0028's argument, one level down: changing "every lead-in in the book" has to be one edit. The
+stylesheet gains `character: BTreeMap<String, CharacterStyle>`; a run names a style, an override, or
+both, with the override winning field by field.
+
+**Acceptance criteria**
+
+- A run naming a character style resolves it; a run naming one that does not exist still lays out
+  with the paragraph's treatment — the authoring-posture fallback specs 0028 and 0054 both take.
+- Precedence is asserted exhaustively: paragraph style < character style < inline override, field by
+  field, with a test per field.
+- Editing a character style reflows only the blocks that use it — the spec 0031 dependency claim,
+  asserted with a work counter, not a timing.
+- A document that names no character style exports byte-identically to before this increment.
+- Built-in character styles ship as the stylesheet's defaults (`emphasis`, `strong`, `code`,
+  `lead-in`) and are the ones the importer resolves to, so an imported document is styled rather
+  than overridden.
+
+### 0057 hyphenation-parity
 
 **One hyphenator, as there is one shaper** · size: small · branch: `feat/hyphenation-parity`
 
@@ -1749,9 +1788,13 @@ Promote it beside the shaper.
   corpus of documents — asserted directly, which is the whole increment.
 - The export byte-hash is unchanged (export already used the real hyphenator); the *render* output
   changes, and the render fixtures are re-derived deliberately.
+- The hyphenator is selected by the document's language, not hard-coded, even though en-US is the
+  only dictionary bundled — the seam that makes a second language an increment rather than a
+  refactor. A document naming a language with no dictionary falls back to no hyphenation and says
+  so, rather than hyphenating it as English.
 - The known-issue entry is deleted in this PR.
 
-### 0060 last-line-measure
+### 0058 last-line-measure
 
 **A last line may not be drawn past its measure** · size: medium · branch: `feat/last-line-measure`
 
@@ -1761,8 +1804,8 @@ is drawn at natural width — 126 pt in a 120 pt frame, in the case that found i
 
 The fix is one line. **The increment is the blast radius**, which 0048 measured before deciding not
 to absorb it: it moves line breaking across the corpus, so spec 0051's equivalence digest must be
-re-derived from the pre-change breaker; and it makes stat-block sections tall enough to stop fitting
-a narrow `rulebook` column, which sends a block down spec 0046's uncuttable path and off the page.
+re-derived from the pre-change breaker; and it makes panel sections tall enough to stop fitting a
+narrow `reference` column, which sends a block down spec 0046's uncuttable path and off the page.
 
 **Acceptance criteria**
 
@@ -1773,17 +1816,82 @@ a narrow `rulebook` column, which sends a block down spec 0046's uncuttable path
   and said so.
 - The known-issue entry is deleted in this PR.
 
-### 0061 gallery-and-guide
+### 0059 lists
 
-**A starter gallery and the pack authoring guide** · size: small · branch: `feat/gallery-and-guide`
+**Bullets, numbering, and the counter that survives repagination** · size: medium · branch:
+`feat/lists`
+
+The importer refuses lists today (`crates/core-model/src/import.rs`) because the model has none. A
+list is a paragraph property, not a block type: a `list: Option<ListSpec>` on the paragraph style
+carrying a marker (a bullet glyph, or a number format and a start), an indent pair reusing spec
+0048's `Indent`, and a level.
+
+The hard part is the counter. Numbering must be derived from the document order of the blocks, never
+accumulated during pagination — spec 0041's lesson, and for the same reason: an incremental pass
+reuses whole pages, so anything counted while placing goes missing exactly when the document was
+just edited.
 
 **Acceptance criteria**
 
-- `docs/` gains a pack authoring guide whose every example is parsed by a test — the anti-drift
-  precedent specs 0030, 0043 and 0053 all use.
-- At least two packs ship as worked examples, each installing and laying out under 0056.
-- The guide states the executable-extension decision above and why, so the next person to want one
-  finds the reasoning rather than re-deriving it.
+- An ordered list numbers 1..n in document order; inserting an item at the top renumbers everything
+  below it, asserted after an *incremental* re-layout, not a cold one.
+- A list that breaks across a frame continues its numbering on the next frame (spec 0044's
+  fragmentation), and the continuation's first marker is right.
+- Nested levels number independently and indent cumulatively; number formats cover decimal, lower
+  and upper alpha, and lower and upper roman, each asserted at a boundary value (i/iv/ix, y/z/aa).
+- The marker is drawn at the hanging indent's origin, so wrapped text lines up under the text and
+  not under the marker — which is what 0048's `Indent::hanging` already does.
+- `quill import` maps `-` and `1.` markdown lists to it, replacing the "kept as body text" fallback.
+- A document with no list exports byte-identically to before this increment.
+
+### 0060 tabs-and-leaders
+
+**Tab stops and leaders** · size: medium · branch: `feat/tabs-and-leaders`
+
+A paragraph style gains an ordered list of tab stops, each with a position, an alignment (left,
+centre, right, decimal) and an optional leader string. A `\t` in a run advances to the next stop.
+This is what sets a contents entry's page number against the right margin with dots between, a
+price list, a bibliography or a character sheet — and quill currently draws its generated contents
+(spec 0041) without one.
+
+**Acceptance criteria**
+
+- Each alignment is asserted to 0.01 pt: left/centre/right against the stop, decimal against the
+  decimal separator's position, with a locale-independent rule for what the separator is.
+- A leader fills the gap with a whole number of repetitions, clipped to the gap, and never overlaps
+  the text on either side.
+- Text that overruns its stop goes to the next stop rather than overlapping — the standard rule,
+  asserted.
+- Justification and tabs compose: a justified line containing a tab does not stretch the tabbed gap,
+  because a tab is a hard position and not a space.
+- The generated contents list (0041) is re-expressed on a right tab with a dot leader, and the
+  change to its rendered output is shown in the PR.
+- A document with no tab stop exports byte-identically to before this increment.
+
+### 0061 baseline-grid
+
+**A baseline grid** · size: large · branch: `feat/baseline-grid`
+
+Named as a `layout-engine` responsibility in `CLAUDE.md` since the beginning; deferred explicitly by
+specs 0019, 0020 and 0028. Facing pages whose baselines do not align is the defect that separates a
+book from a document, and it is the last of the big typographic gaps.
+
+**Acceptance criteria**
+
+- Every text baseline on a gridded page falls on a grid line, asserted to 0.01 pt across a
+  multi-page, two-column document.
+- Grid snapping composes with fragmentation (0044): a continuation's first baseline is on the grid.
+- It composes with indents (0048), with mixed-size runs (0055) — a line's grid position is set by
+  its own leading, not by its tallest run — with lists (0059) and with panels.
+- A paragraph may opt out (`snap: false`), because a panel's internal lines and a display heading
+  routinely should not snap; the opt-out is per paragraph style and asserted.
+- Snapping is per frame and local, per `CLAUDE.md`; a global recompute is a named non-goal, and the
+  incremental budget is what proves it.
+- A rendered spread showing two facing pages with aligned baselines is attached.
+
+**Risks** — Grid snapping changes every baseline in the document, so it changes the export hash and
+every geometric fixture in the repo. It needs the same deliberate re-derivation discipline spec 0051
+established for its equivalence digest.
 
 ## Known issues
 
@@ -1851,7 +1959,7 @@ candidates — because the writer gates every annotation on spec 0042's `annotat
 than on a per-profile branch. `Screen` is deliberately not an RGB profile, and does not grow
 compression, downsampling or reader spreads; see the non-goals in `specs/0052-screen-profile.md`.
 
-## Beyond M3
+## Beyond M4
 
 M3 closed on 2026-07-28. What it shipped, and what it left:
 
@@ -1874,16 +1982,109 @@ M3 closed on 2026-07-28. What it shipped, and what it left:
   the CLI says so out loud. Filling them from the printers' current specifications is the obvious
   next non-code task.
 
-M4 is decomposed above, into specs 0054–0061. Its two deferred M3 items — the baseline grid and the
-two known issues — are sequenced into it rather than left floating, because a milestone that ends
-with its own findings unfixed teaches the wrong thing.
+**M4 was re-scoped on 2026-07-28**, from the ecosystem milestone decomposed that morning to the
+general typographic core decomposed above. The argument is in "The decision this milestone turns on":
+quill is a general-purpose desktop publishing application first, and an ecosystem for sharing a look
+is premature while the look cannot include an italic. The ecosystem decomposition is not discarded —
+it moves to M7 below, with its increments intact and its central decision unchanged.
 
-Two things M3 deliberately did *not* attempt, recorded so their absence is a decision:
+The three milestones after M4 are named here with their contents, and deliberately **not**
+decomposed into specs. A decomposition written three milestones ahead is one that will be wrong;
+what belongs here is the ordering argument and the list of things not to forget.
 
-- **A baseline grid.** `CLAUDE.md` names it as a `layout-engine` responsibility and nothing
-  implements it; specs 0019, 0020 and 0028 each deferred it explicitly. It interacts with leading,
-  with fragmentation (0044) and with indents (0048), so it is cheaper after all three than beside
-  any of them — which is why it is spec 0058 rather than an M3 increment.
+### M5 — the long document
+
+The apparatus a book needs beyond its typography. Every item is a fixpoint over laid-out pages, and
+spec 0041's rule governs all of them: derive from the final page vector, never accumulate during
+pagination.
+
+- **Sections with independent page numbering and folio formats.** Roman front matter, arabic body,
+  restart at a part opener. `PageOverride`'s own doc comment names the gap: the model has no notion
+  of a section. This also answers the open question below about whether master assignment by index
+  survives contact with a real book — a section is the anchor that index-based assignment lacks.
+- **Running headers derived from content.** `MasterStatic::Text` resolves `{page}` and nothing else,
+  so a chapter title in a running head must be typed onto every master. A `{section}` /
+  `{heading:1}` variable, resolved from spec 0040's heading index, is the same machinery.
+- **Footnotes and endnotes.** A second flow with an anchor in the first, and the only feature in
+  this list that changes the flow loop rather than reading its output: a footnote reduces the frame
+  its reference lands in, which can push the reference to the next frame, which is a fixpoint.
+- **Cross-references.** "See page 42" that survives repagination. The same dependency shape as the
+  contents list, and cheap once sections exist.
+- **An index.** Marked terms, collated, page-ranged and alphabetised. The one long-document feature
+  with no existing analogue in the codebase.
+- **A book: multiple documents, shared styles, continuous pagination.** The unit a 500-page game
+  book or a textbook is actually authored in. It is last in M5 because it is a composition over
+  everything before it.
+
+### M6 — graphics and colour
+
+The breadth that separates "lays out text correctly" from "produces the artefact". Ordered by how
+often its absence stops a real book.
+
+- **Image-format breadth.** PNG and JPEG are the only decoders (`Cargo.toml`); TIFF and PSD are what
+  art actually arrives as, and SVG is what a logo arrives as. Each is a decode path into the
+  existing CMYK pipeline, and each must respect spec 0012's posture: a colour space that cannot be
+  disambiguated is skipped loudly, never guessed.
+- **Frame fitting and transforms.** One fixed rule today (scale to content width, preserve aspect).
+  Fill, fit, centre, and crop; rotate and scale a placed object.
+- **Anchored objects and text runaround.** The pull-quote and the figure that text flows around.
+  This changes the flow model rather than adding to it, which is why it is not in M4.
+- **Spot colours and named swatches.** A named colour resolved at export to a separation, with ink
+  coverage accounting for it. PDF/X-1a admits spot colours; quill's `Color` enum does not.
+- **Vector primitives.** Lines, polygons and beziers, with the rules spec 0037's decoration
+  primitive already established for rectangles.
+- **Gradients, transparency and blend modes** — and the PDF/X-4 export path they imply, since
+  PDF/X-1a requires flattening. Last in M6 because it is the item that changes what conformance
+  quill can claim, and that decision deserves its own spec.
+
+### M7 — the ecosystem
+
+The milestone decomposed on 2026-07-28 and deferred here intact. Its central decision stands and is
+worth re-reading before it is built: **a pack is declarative — templates, styles, component
+definitions and assets, with no code in it.** An executable extension that emits geometry can emit
+geometry that is wrong — off the trim, over the ink limit, in the wrong colour space — and every
+mechanism M3 built to make press errors visible (0050's placed-geometry preflight, 0049's preset
+thresholds, 0052's provable annotation-freedom) assumes quill produced the geometry. A declarative
+pack supplies *inputs* and quill lays them out through the same engine, so preflight governs a
+community template exactly as it governs a bundled one. If executable extensions are wanted later,
+the pack format is the right substrate to hang them on, and the sandboxing question can be answered
+once rather than assumed away.
+
+- **Component definitions as data.** A `ComponentDef` declares an ordered list of sections, each
+  with a style name and a source field; a panel with a fill, a stroke and a padding; and the rules a
+  section list needs (a repeated prefix for tables, a section boundary for cuts). `Block::Panel` and
+  `Block::Table` retire behind it, and *their current placed geometry is the acceptance criterion* —
+  byte-identical, or the generalisation is wrong. This is also where the `stat_block` serde tag and
+  the `statblock-*` style keys spec 0054 deliberately left alone finally go, in one migration with a
+  reason rather than two with none.
+- **The `.qpack` container**, following spec 0025's `.tpub` precedent exactly — a zip, a manifest, a
+  version, a typed load contract — with a required name, version, source and licence, because
+  content arriving from a stranger with no provenance is content nobody should install. No absolute
+  paths, no `..` traversal.
+- **Pack resolution.** A document names the packs it needs; a missing one fails to lay out with a
+  typed error naming the pack and its version, never a silent fallback to a default style, which
+  would produce a book that looks subtly wrong rather than one that refuses to open. Two packs
+  defining the same component name is an error naming both.
+- **`quill pack extract`** — turn a finished book into a reusable pack, which is how a publisher who
+  has already built a book gets one without hand-writing JSON. A pack is a *look*, not a book: no
+  block text survives extraction, and that is a test.
+- **A starter gallery and the pack authoring guide**, last, because a guide to a format that is
+  still moving is a guide that will be wrong.
+
+### Named and not scheduled
+
+Real gaps, deliberately unscheduled, so their absence is a decision rather than an oversight:
+
+- **The direct-manipulation authoring surface** — move, resize, rotate, group, guides, snap, layers,
+  and the undo/redo that becomes architecturally invasive the moment they exist. The `app` crate
+  today opens a document, scrolls it and edits the text of a block. This is a milestone in its own
+  right and probably the largest one left; it is unscheduled because the content model has to carry
+  inline formatting, sections and anchored objects before an editor can offer them, and that is
+  M4–M6.
+- **Tagged PDF / PDF-UA**, increasingly a procurement requirement, with no groundwork in the writer.
+- **EPUB or HTML export, IDML interchange, imposition, separations preview, soft-proofing, data
+  merge, conditional text, spell-check, bidi/RTL and CJK.** Each is real; none is on the critical
+  path to a general DTP application that produces a correct press file, which is what M4–M6 are for.
 - **The M0 manual item.** A real POD upload validated with a B2A-equipped CMYK profile is not
   automatable and is not an increment; 0049's presets narrow what that upload has to prove, but do
   not replace it.

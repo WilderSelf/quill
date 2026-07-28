@@ -4,9 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app for
-semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
-must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
+An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing application** — long,
+art-heavy books up to ~500 pages that must export **press-ready PDF/X** for print-on-demand
+(Lulu, IngramSpark, DriveThruRPG).
+
+**Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
+application second.** Illustrated game books are the flagship use case — the audience it is
+designed for, the corpus its fixtures come from, and the reason its POD presets exist — but every
+*mechanism* must be a general one that a game book happens to use, never one only a game book can
+use. A stat block is a panelled multi-section record; a random table is a range-lookup table; a
+rulebook template is a two-column reference template. **A genre-shaped mechanism is a defect here,
+not a feature** — and it is the worse mechanism for the genre too, since a hard-coded `StatBlock`
+cannot express a game system whose creatures are set differently, which is the normal case. Apply
+this test to every new type, field, style name and template slug. The argument and the audit behind
+it are in `docs/roadmap.md` under "M4 increments".
 
 **Status: M1 complete — editing core + text-layout.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
@@ -28,16 +39,24 @@ master-static alignment → hanging indent → POD presets → geometry prefligh
 the screen export profile → user-authored templates. A block now splits across frames, furniture
 sits where a bound book puts it, preflight checks the printer's numbers against placed geometry, and
 a second export profile carries clickable links while the press file stays provably annotation-free.
-`FORMAT_VERSION` is 3. **M4 is decomposed into eight increments, specs 0054–0061**: component
-definitions as data → the `.qpack` container → pack resolution → pack extraction → the baseline grid
-→ screen/press hyphenation parity → the over-long last line → the gallery and authoring guide.
+`FORMAT_VERSION` is 3. **M4 was re-scoped on 2026-07-28** from the ecosystem milestone to **the
+general typographic core**, and is decomposed into eight increments, specs 0054–0061: the neutral
+core → inline runs (`FORMAT_VERSION` 4) → character styles → screen/press hyphenation parity → the
+over-long last line → lists → tab stops and leaders → the baseline grid.
 
-**M4 deliberately does not build executable plugins**, and that is the decision most worth revisiting
-deliberately rather than by accident. A pack is *declarative* — templates, styles, component
-definitions and assets, no code — because an executable extension that emits geometry can emit
-geometry that is wrong, and every mechanism M3 built to make press errors visible assumes quill
-produced the geometry. The argument is in `docs/roadmap.md`; the sequencing and acceptance criteria
-are there too.
+**Why it was re-scoped: quill cannot bold a word.** `Block::Body` and `Block::Heading` each carry
+one `String` and one `Color`, so there is no styled run anywhere in the workspace — which is why the
+importer refuses emphasis on purpose. Character styles, drop caps, small caps, OpenType feature
+control and tracking are all properties of a *run*, so all of them are downstream of that one gap.
+An ecosystem for sharing a look is premature while the look cannot include an italic. The ecosystem
+decomposition is not discarded: it moves to **M7** intact, with its central decision unchanged —
+**a pack is declarative** (templates, styles, component definitions and assets, no code), because an
+executable extension that emits geometry can emit geometry that is wrong, and every mechanism M3
+built to make press errors visible assumes quill produced the geometry. **M5** (the long document:
+sections and folios, running heads, footnotes, cross-references, an index, a book) and **M6**
+(graphics and colour: image-format breadth, fitting and transforms, anchored objects and runaround,
+spot colours, vector primitives) sit between. All four are in `docs/roadmap.md`, M4 with acceptance
+criteria and M5–M7 named but deliberately not decomposed.
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
 making architectural decisions. This file holds architecture, constraints and conventions; the
@@ -105,10 +124,18 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 ## Milestone order (build the risky/differentiating part first)
 
-**M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
-**M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and content packs). **M0–M3 done**; M0's sole open
-item is the manual POD upload. **M4** is decomposed and not started.
+**M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD
+upload) → **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, panels,
+TOC) → **M3** pro polish + POD presets → **M4** the general typographic core (inline runs,
+character styles, lists, tabs, baseline grid) → **M5** the long document (sections and folios,
+footnotes, cross-references, an index, a book) → **M6** graphics and colour → **M7** ecosystem
+(shareable component definitions and content packs). **M0–M3 done**; M0's sole open item is the
+manual POD upload. **M4** is decomposed; M5–M7 are named, not decomposed.
+
+**Not scheduled, and deliberately so:** the direct-manipulation authoring surface (move, resize,
+rotate, group, guides, snap, layers, undo/redo). The `app` crate opens a document, scrolls it and
+edits the text of a block; a WYSIWYG object editor is a milestone in its own right and needs the
+content model to carry inline formatting, sections and anchored objects first — which is M4–M6.
 
 ## Planning: spec-driven development
 
