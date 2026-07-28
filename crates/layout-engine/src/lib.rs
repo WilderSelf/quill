@@ -5615,6 +5615,63 @@ mod tests {
     }
 
     #[test]
+    fn a_user_template_naming_a_missing_style_still_lays_the_page_out() {
+        // Spec 0053. A user-authored template is far likelier than a bundled one to name a style
+        // its own stylesheet does not carry — a renamed `folio`, a `sidebar` copied from another
+        // book. The repo's authoring posture is that losing the *styling* beats losing the page, so
+        // this asserts the fallback end to end through the real engine rather than through
+        // `StyleSheet::resolve` alone: both a flowed block and a master static name styles that do
+        // not exist, and both still come out on the page with their text intact.
+        let template = quill_core_model::Template::from_json(
+            r#"{
+                "template_version": 1,
+                "name": "house", "title": "House", "description": "names styles it does not have",
+                "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                               "facing_pages": true,
+                               "margins": {"top_pt": 54.0, "bottom_pt": 54.0,
+                                           "inside_pt": 54.0, "outside_pt": 40.0}},
+                "styles": {"paragraph": {"body": {"font_size_pt": 10.0, "leading_pt": 12.0}}},
+                "master_pages": [
+                  {"name": "body", "columns": 1,
+                   "statics": [{"kind": "text",
+                                "rect": {"x_pt": 54.0, "y_pt": 606.0, "w_pt": 338.0, "h_pt": 12.0},
+                                "text": "{page}", "color": {"space": "gray", "v": 0.0},
+                                "style": "no-such-folio-style"}]}],
+                "default_master": "body"
+            }"#,
+        )
+        .expect("the template must load");
+        assert!(
+            !template
+                .styles
+                .paragraph
+                .contains_key("no-such-folio-style"),
+            "the fixture must actually be missing the style it names"
+        );
+
+        let mut doc = Document::from_template(&template);
+        doc.content.push(Block::Body {
+            id: quill_core_model::BlockId::UNASSIGNED,
+            text: "A dank corridor stretches into darkness.".into(),
+            color: Color::Gray { v: 0.0 },
+            style: Some("no-such-body-style".into()),
+        });
+        doc.assign_missing_block_ids().expect("ids");
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(!pages.is_empty(), "a missing style must not lose the page");
+        assert_eq!(
+            first_text_lines(&pages)[0].text,
+            "A dank corridor stretches into darkness."
+        );
+        // The furniture survives too, set in the default treatment rather than dropped.
+        match &pages[0].statics[0] {
+            PlacedBlock::Text { lines, .. } => assert_eq!(lines[0].text, "1"),
+            other => panic!("expected the folio, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_placed_static_reports_the_line_it_holds_not_the_band_it_was_aligned_in() {
         // The frame is narrowed to the measured line, so a preflight over placed geometry
         // (spec 0050) sees where the ink is rather than the whole 338 pt band.

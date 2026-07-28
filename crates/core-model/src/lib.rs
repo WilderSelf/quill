@@ -20,7 +20,9 @@ mod version;
 pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
 pub use geom::{page_geom, PageGeom};
 pub use import::{import, Diagnostic, ImportError, Imported};
-pub use template::{Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER};
+pub use template::{
+    PageGeometrySeed, Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER, TEMPLATE_VERSION,
+};
 pub use version::LoadError;
 
 /// Typographic points (1/72 inch) — the internal unit throughout Quill.

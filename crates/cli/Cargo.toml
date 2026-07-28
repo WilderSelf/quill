@@ -10,6 +10,12 @@ authors.workspace = true
 name = "quill"
 path = "src/main.rs"
 
+[dev-dependencies]
+# `quill new --from` is asserted by running the binary and opening the container it produced
+# (spec 0053). `quill-cli` has no lib target, so an integration test can only reach the model
+# through a dev-dependency.
+quill-core-model = { workspace = true }
+
 [dependencies]
 clap = { workspace = true }
 quill-core-model = { workspace = true }

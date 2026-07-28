@@ -4,18 +4,42 @@
 //! master pages and the per-page assignments that make page 1 a chapter opener. Starting from one
 //! is the difference between "a blank page with zero margins" and "a book".
 //!
-//! Templates are Rust data rather than files on disk: no template directory, no search path, no
-//! decision about what happens when a template goes missing at open time, and no new dependency.
-//! User-authored templates need all three of those problems solved and are an M3 follow-up.
+//! The *bundled* templates are Rust data rather than files on disk: no template directory, no
+//! search path, no decision about what happens when a template goes missing at open time, and no
+//! new dependency. Spec 0053 then made the type loadable *from* a file — `quill new --from
+//! house-style.json` — without adding any of that: `--from` takes a path the shell resolved, so
+//! there is still nothing to search and nothing to go missing behind the user's back.
+//!
+//! A template file is a **published format** the moment it ships, so it carries its own
+//! [`TEMPLATE_VERSION`] and its own migration chain (`version::migrate_template`), separate from
+//! the document's [`FORMAT_VERSION`]. See spec 0053 for when each is owed a bump.
 
 use std::sync::OnceLock;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Indent;
 use crate::{
-    heading_style_name, Color, Document, Margins, MasterPage, MasterStatic, PageOverride,
-    PageSetup, ParagraphStyle, Rect, Size, StaticAlign, StyleSheet, TextAlign, BODY_STYLE,
-    DEFAULT_BLEED_PT, FORMAT_VERSION, PAGE_TOKEN,
+    heading_style_name, version, Color, Document, LoadError, Margins, MasterPage, MasterStatic,
+    PageOverride, PageSetup, ParagraphStyle, Pt, Rect, Size, StaticAlign, StyleSheet, TextAlign,
+    BODY_STYLE, DEFAULT_BLEED_PT, FORMAT_VERSION, PAGE_TOKEN,
 };
+
+/// The current template-file format version (spec 0053).
+///
+/// A **separate integer** from [`FORMAT_VERSION`] because the two version different artifacts: a
+/// template file is not a document, and coupling them would force every template ever written to be
+/// re-versioned whenever the document model changed in a way templates never see — a new `Block`
+/// variant, say, which a template cannot contain.
+///
+/// It is owed a bump on *either* of two triggers, and the second is the one that is easy to miss:
+///
+/// 1. the template envelope changes — a field added to or removed from [`Template`] itself; or
+/// 2. a [`FORMAT_VERSION`] bump changes the serialized shape of [`PageSetup`], [`StyleSheet`],
+///    [`MasterPage`] or [`PageOverride`], the four document types a template file embeds. Spec
+///    0047's v2 → v3 reached `MasterStatic`, which lives inside a `MasterPage`, and would have owed
+///    a template migration had template files existed then.
+pub const TEMPLATE_VERSION: u32 = 1;
 
 /// The style name bundled templates give their folios.
 pub const FOLIO_STYLE: &str = "folio";
@@ -27,8 +51,17 @@ pub const BODY_MASTER: &str = "body";
 pub const OPENER_MASTER: &str = "chapter-opener";
 
 /// A starting point for a new document: everything a [`Document`] has except its content.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serializable since spec 0053, which is what makes `quill new --from house-style.json` possible.
+/// The serialized form is the published template-file format documented in `docs/format-spec.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Template {
+    /// The template-file format version this template was written as. See [`TEMPLATE_VERSION`].
+    ///
+    /// Not `serde(default)`: `version::migrate_template` inserts it before deserialization, exactly
+    /// as the document loader does for `format_version`, so an absent field is *decided* by the
+    /// version gate rather than defaulted past it.
+    pub template_version: u32,
     /// Slug used by `quill new --template <name>`.
     pub name: String,
     /// Human-readable label.
@@ -36,11 +69,31 @@ pub struct Template {
     /// One line, shown by `quill new --list`.
     pub description: String,
     pub page_setup: PageSetup,
+    #[serde(default)]
     pub styles: StyleSheet,
+    #[serde(default)]
     pub master_pages: Vec<MasterPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_master: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOverride>,
 }
+
+/// Page geometry offered to a template from outside it — a POD preset (spec 0049) is the intended
+/// source, and `quill new --preset` the intended caller.
+///
+/// Carries only the two numbers a preset and a template can both claim. Everything else a preset
+/// states (ink limits, dpi floors, the PDF/X level) is an export-time concern that never touches a
+/// template.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageGeometrySeed {
+    pub trim: Size,
+    pub bleed_pt: Pt,
+}
+
+/// Trims closer than this are the same trim. Sizes are `f32` points; a printer's 6×9 is 432×648
+/// however it was arrived at, and an exact float compare would call two of them different.
+const TRIM_EPSILON_PT: Pt = 0.01;
 
 impl Template {
     /// The built-in templates.
@@ -60,6 +113,61 @@ impl Template {
             .iter()
             .map(|t| t.name.as_str())
             .collect()
+    }
+
+    /// Serialize to the template-file format (spec 0053).
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Parse a template file, migrating it forward if it is older than [`TEMPLATE_VERSION`] and
+    /// refusing it if it is newer.
+    ///
+    /// Mirrors [`Document::from_json`] deliberately, including that it never leaks
+    /// `serde_json::Error`: the file being JSON is an implementation detail of the format, and a
+    /// caller matching on a `serde` error type would make the encoding impossible to change later
+    /// (spec 0025's reasoning, applied to the second published format).
+    pub fn from_json(s: &str) -> Result<Template, LoadError> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| LoadError::TemplateParse(e.to_string()))?;
+        version::migrate_template(&mut value)?;
+        serde_json::from_value(value).map_err(|e| LoadError::TemplateParse(e.to_string()))
+    }
+
+    /// Compose an outside page geometry with this template's own (spec 0053).
+    ///
+    /// The precedence, in two halves, each with its own reason:
+    ///
+    /// - **Trim: the template wins.** A template's masters, margins and furniture are authored
+    ///   *against* a specific trim — the bundled ones compute a folio's `y_pt` from the page height
+    ///   and its rect width from the trim width. Re-trimming from underneath moves every one of
+    ///   those numbers without moving the geometry authored for them, so the folio lands on the last
+    ///   line or past the trim, and nothing at layout time catches it because furniture does not
+    ///   participate in the flow. That is the silent press failure `CLAUDE.md` forbids.
+    /// - **Bleed: the larger wins.** Bleed is a floor, not a design choice — the distance art must
+    ///   extend past the trim so the guillotine cannot cut white. A seed asking for more is stating
+    ///   a press requirement and costs the design nothing, because bleed lives entirely outside the
+    ///   trim box; a seed asking for less would cost something, so it is not honored either.
+    ///
+    /// A disagreement about the trim is *reported*, not swallowed — see [`Template::disagrees_on_trim`].
+    pub fn seeded_with(&self, seed: PageGeometrySeed) -> Template {
+        Template {
+            page_setup: PageSetup {
+                bleed_pt: self.page_setup.bleed_pt.max(seed.bleed_pt),
+                ..self.page_setup
+            },
+            ..self.clone()
+        }
+    }
+
+    /// Whether a seed's trim differs from this template's, so a caller can say so.
+    ///
+    /// A warning rather than a refusal, matching spec 0049's own severity choice for a trim outside
+    /// a preset's list: an unusual trim is a conversation with the printer, not a corrupt file.
+    pub fn disagrees_on_trim(&self, seed: PageGeometrySeed) -> bool {
+        let t = self.page_setup.trim;
+        (t.w_pt - seed.trim.w_pt).abs() > TRIM_EPSILON_PT
+            || (t.h_pt - seed.trim.h_pt).abs() > TRIM_EPSILON_PT
     }
 }
 
@@ -205,6 +313,7 @@ fn adventure() -> Template {
         outside_pt: 45.0,
     };
     Template {
+        template_version: TEMPLATE_VERSION,
         name: "adventure".into(),
         title: "Adventure module (6×9)".into(),
         description: "Single-column 6×9 digest with a chapter opener and page numbers.".into(),
@@ -253,6 +362,7 @@ fn rulebook() -> Template {
     };
     // Text area 432 - 54 - 40 = 338 pt; two columns with a 14 pt gutter are 162 pt each.
     Template {
+        template_version: TEMPLATE_VERSION,
         name: "rulebook".into(),
         title: "Rulebook (6×9, two columns)".into(),
         description: "Two-column 6×9 reference book with a chapter opener and page numbers.".into(),
@@ -296,6 +406,7 @@ fn rulebook() -> Template {
 fn playtest() -> Template {
     let body_margins = Margins::uniform(72.0);
     Template {
+        template_version: TEMPLATE_VERSION,
         name: "playtest".into(),
         title: "Playtest document (US Letter)".into(),
         description: "Single-column US Letter draft for hand-outs and playtest packets.".into(),
@@ -607,6 +718,233 @@ mod tests {
         // "fixing" the default and moving the golden path with it.
         assert_eq!(PageSetup::default().margins, Margins::default());
         assert_eq!(Margins::default().top_pt, 0.0);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Spec 0053 — user-authored templates.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_bundled_template_round_trips_through_a_template_file() {
+        // The test that proves the template file format is real rather than write-only. Written as
+        // a loop over `bundled()` for spec 0036's reason: a fourth template must be caught by the
+        // assertions that already exist rather than needing a new one.
+        for t in Template::bundled() {
+            let json = t.to_json().expect("serialize");
+            let back = Template::from_json(&json).expect("load");
+            assert_eq!(&back, t, "template `{}` must survive a file", t.name);
+            // And every field the document actually consumes came back — asserted separately from
+            // the whole-struct compare, because `assert_eq!` on a struct that gained a field by
+            // mistake would still pass while the field was wrong in both halves.
+            assert_eq!(back.page_setup, t.page_setup);
+            assert_eq!(back.styles, t.styles);
+            assert_eq!(back.master_pages, t.master_pages);
+            assert_eq!(back.default_master, t.default_master);
+            assert_eq!(back.pages, t.pages);
+            assert_eq!(back.template_version, TEMPLATE_VERSION);
+        }
+    }
+
+    #[test]
+    fn a_template_loaded_from_a_file_builds_the_same_document_as_the_bundled_one() {
+        // The round-trip above is about the `Template`; this is about the thing a user gets. A
+        // format that round-tripped the struct but produced a different document would pass the
+        // first test and fail the only claim that matters.
+        for t in Template::bundled() {
+            let loaded = Template::from_json(&t.to_json().expect("serialize")).expect("load");
+            assert_eq!(
+                Document::from_template(&loaded),
+                Document::from_template(t),
+                "template `{}` must build the same document from a file",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_file_newer_than_this_build_is_refused_not_silently_downgraded() {
+        // Expressed relative to TEMPLATE_VERSION, so it keeps testing "one newer than we
+        // understand" across every future bump rather than silently stopping at a literal.
+        let next = TEMPLATE_VERSION + 1;
+        let json = adventure().to_json().expect("serialize").replace(
+            &format!("\"template_version\": {TEMPLATE_VERSION}"),
+            &format!("\"template_version\": {next}"),
+        );
+        match Template::from_json(&json) {
+            Err(LoadError::UnsupportedTemplateVersion { found, supported }) => {
+                assert_eq!(found, next);
+                assert_eq!(supported, TEMPLATE_VERSION);
+                // The message has to be actionable, i.e. name both versions.
+                let msg = LoadError::UnsupportedTemplateVersion {
+                    found,
+                    supported: TEMPLATE_VERSION,
+                }
+                .to_string();
+                assert!(msg.contains("template file"), "got: {msg}");
+            }
+            other => panic!("expected UnsupportedTemplateVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_far_future_template_version_is_refused_too() {
+        let json = r#"{"template_version": 99, "name": "x", "title": "x", "description": "x",
+                       "page_setup": {"trim": {"w_pt": 1.0, "h_pt": 1.0}, "bleed_pt": 9.0,
+                                      "facing_pages": true}}"#;
+        assert!(matches!(
+            Template::from_json(json),
+            Err(LoadError::UnsupportedTemplateVersion { found: 99, .. })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_template_file_is_a_typed_parse_error_not_a_panic() {
+        // Bound to `LoadError` explicitly, on spec 0025's posture: this is the assertion that the
+        // public signature does not leak `serde_json::Error`.
+        let err: LoadError = Template::from_json("{ this is not json").unwrap_err();
+        assert!(matches!(err, LoadError::TemplateParse(_)), "got {err:?}");
+        // And it names the *template*, not the document manifest — the two are different files and
+        // an error that sends the reader to the wrong one is worse than no error text at all.
+        assert!(err.to_string().contains("template file"), "{err}");
+    }
+
+    #[test]
+    fn a_template_file_that_is_valid_json_but_the_wrong_shape_is_also_a_parse_error() {
+        // The half a syntax test misses: well-formed JSON that does not match the schema. Loading
+        // this as a defaulted template would hand the user a document silently missing its trim.
+        let err =
+            Template::from_json(r#"{"name": "x", "title": "x", "description": "x"}"#).unwrap_err();
+        assert!(matches!(err, LoadError::TemplateParse(_)), "got {err:?}");
+
+        let err = Template::from_json("[1, 2, 3]").unwrap_err();
+        assert!(matches!(err, LoadError::TemplateParse(_)), "got {err:?}");
+
+        let err = Template::from_json(
+            r#"{"template_version": "one", "name": "x", "title": "x", "description": "x",
+                "page_setup": {"trim": {"w_pt": 1.0, "h_pt": 1.0}, "bleed_pt": 9.0,
+                               "facing_pages": true}}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LoadError::TemplateParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_absent_template_version_is_treated_as_current() {
+        // Tolerated so a hand-written file can be short, exactly as the document loader tolerates a
+        // missing `format_version`.
+        let json = r#"{"name": "hand", "title": "Hand-written", "description": "short",
+                       "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                                      "facing_pages": true}}"#;
+        let t = Template::from_json(json).expect("a short template file must load");
+        assert_eq!(t.template_version, TEMPLATE_VERSION);
+        // Everything optional defaults, and the default stylesheet is a real one — so a minimal
+        // template can never be missing a style the resolver expects.
+        assert!(t.styles.paragraph.contains_key(BODY_STYLE));
+        assert!(t.master_pages.is_empty());
+        assert!(t.default_master.is_none());
+        assert!(t.pages.is_empty());
+    }
+
+    #[test]
+    fn the_documented_template_example_parses() {
+        // The anti-drift guard this repo already uses for the manifest and the authoring syntax:
+        // the example in `docs/format-spec.md` is *the* one someone copies, so it is parsed here
+        // rather than trusted. Extracted from the doc itself, never duplicated.
+        const DOC: &str = include_str!("../../../docs/format-spec.md");
+        let example = DOC
+            .split("```json")
+            .skip(1)
+            .filter_map(|rest| rest.split("```").next())
+            .find(|block| block.contains("\"template_version\""))
+            .expect("docs/format-spec.md must carry a ```json template-file example");
+
+        let t = Template::from_json(example).expect("the documented template must load");
+        assert_eq!(t.template_version, TEMPLATE_VERSION);
+        // And it must demonstrate what it claims to: a real two-column book with a mirrored folio
+        // and a chapter opener on page 0, not a stub that parses.
+        assert_eq!(t.name, "house-style");
+        assert_eq!(t.page_setup.trim, DIGEST);
+        assert_eq!(t.default_master.as_deref(), Some(BODY_MASTER));
+        assert_eq!(t.pages[0].master.as_deref(), Some(OPENER_MASTER));
+        let body = t
+            .master_pages
+            .iter()
+            .find(|m| m.name == BODY_MASTER)
+            .expect("a body master");
+        assert_eq!(body.columns, 2);
+        let MasterStatic::Text { align, mirror, .. } = &body.statics[0] else {
+            panic!("the folio must be text")
+        };
+        assert_eq!(*align, StaticAlign::Outside);
+        assert!(*mirror);
+        // The example is a document someone can actually start from.
+        let doc = Document::from_template(&t);
+        assert_eq!(
+            doc.master_for(0).map(|m| m.name.as_str()),
+            Some(OPENER_MASTER)
+        );
+        assert_eq!(
+            doc.master_for(1).map(|m| m.name.as_str()),
+            Some(BODY_MASTER)
+        );
+    }
+
+    /// A stand-in for what spec 0049's `PodPreset` will hand `quill new --preset`.
+    fn seed(w_pt: f32, h_pt: f32, bleed_pt: f32) -> PageGeometrySeed {
+        PageGeometrySeed {
+            trim: Size { w_pt, h_pt },
+            bleed_pt,
+        }
+    }
+
+    #[test]
+    fn a_geometry_seed_never_retrims_a_template() {
+        // The precedence spec 0053 fixes, and the half with teeth: a template's folio `y_pt` is
+        // derived from the page height and its rect from the trim width, so re-trimming from
+        // underneath would move the page without moving the furniture authored for it — furniture
+        // does not participate in the flow, so nothing at layout time would catch the collision.
+        let t = Template::by_name("rulebook").expect("bundled");
+        let seeded = t.seeded_with(seed(LETTER.w_pt, LETTER.h_pt, DEFAULT_BLEED_PT));
+        assert_eq!(
+            seeded.page_setup.trim, DIGEST,
+            "the template's trim must win"
+        );
+        // And everything else the template carries is untouched by a seed.
+        assert_eq!(seeded.master_pages, t.master_pages);
+        assert_eq!(seeded.styles, t.styles);
+        assert_eq!(seeded.pages, t.pages);
+    }
+
+    #[test]
+    fn a_geometry_seed_raises_a_templates_bleed_but_never_lowers_it() {
+        // The other half: bleed is a press floor, not a design choice, and it lives entirely
+        // outside the trim box — so honoring a stricter requirement costs the design nothing while
+        // lowering it would cost something.
+        let t = Template::by_name("adventure").expect("bundled");
+        assert_eq!(t.page_setup.bleed_pt, DEFAULT_BLEED_PT);
+
+        let stricter = t.seeded_with(seed(DIGEST.w_pt, DIGEST.h_pt, DEFAULT_BLEED_PT + 3.0));
+        assert_eq!(stricter.page_setup.bleed_pt, DEFAULT_BLEED_PT + 3.0);
+
+        let looser = t.seeded_with(seed(DIGEST.w_pt, DIGEST.h_pt, 0.0));
+        assert_eq!(
+            looser.page_setup.bleed_pt, DEFAULT_BLEED_PT,
+            "a seed must not lower a template's bleed"
+        );
+    }
+
+    #[test]
+    fn a_trim_disagreement_is_reportable_rather_than_silent() {
+        // A warning rather than a refusal, matching spec 0049's own severity choice: an unusual
+        // trim is a conversation with the printer, not a corrupt file. But it must be *sayable*,
+        // or the precedence above becomes the confusing-by-default behavior the spec exists to
+        // prevent.
+        let t = Template::by_name("rulebook").expect("bundled");
+        assert!(t.disagrees_on_trim(seed(LETTER.w_pt, LETTER.h_pt, DEFAULT_BLEED_PT)));
+        assert!(!t.disagrees_on_trim(seed(DIGEST.w_pt, DIGEST.h_pt, DEFAULT_BLEED_PT)));
+        // Two trims that differ only below the epsilon are the same trim: 432x648 is 6x9 however
+        // it was arrived at, and an exact float compare would report a disagreement that is not one.
+        assert!(!t.disagrees_on_trim(seed(DIGEST.w_pt + 0.005, DIGEST.h_pt, DEFAULT_BLEED_PT)));
     }
 
     #[test]

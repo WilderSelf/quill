@@ -53,6 +53,20 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   68–250 s, so it is never the critical path, and the repo is public so Actions minutes are free.
   If the bench step ever flakes on runner noise, split it into its own advisory job rather than
   dropping the whole context — the other four checks in that job are deterministic.
+- **A template file is versioned separately from a document, and a preset never re-trims a
+  template.** Two decisions from spec 0053, both of which would otherwise be re-argued. (1)
+  `TEMPLATE_VERSION` is its own integer, not `FORMAT_VERSION`: a template is not a document, and
+  coupling them would re-version every template ever written whenever the document model changed in
+  a way templates never see. The cost is a rule to remember, so it is written in two places — a
+  template bump is owed either when the template envelope changes *or* when a `FORMAT_VERSION` bump
+  changes the serialized shape of `PageSetup`, `StyleSheet`, `MasterPage` or `PageOverride`, the
+  four types a template file embeds. Spec 0047's 2 → 3 was exactly the second kind. (2) When a POD
+  preset (0049) and a template both state a trim, the **template wins**, because a template's
+  furniture is authored *against* its trim — a folio's `y_pt` comes from the page height — and
+  re-trimming moves the page without moving the geometry authored for it, silently, since furniture
+  does not participate in the flow. Bleed goes the other way: the **larger** wins, because bleed is
+  a press floor living entirely outside the trim box, so honoring a stricter one costs the design
+  nothing. A disagreeing trim is reported, not refused, matching 0049's own severity choice.
 - **Master statics are pre-placed geometry that resolves a style name — not semantic blocks.** This
   answers an M1 open question, by implementation: `MasterStatic::Text { rect, text, color, style }`
   (crates/core-model/src/lib.rs:426-434) positions absolutely against the trim box and resolves
@@ -1313,7 +1327,10 @@ numerically identical to today's constants so that adding presets changes no exi
   serialized into `.tpub` (a document is not bound to one printer), and a test asserts a preset name
   round-trips through the CLI rather than through the document.
 - `quill new --preset <name>` seeds `PageSetup` from the preset's first trim and bleed, so the
-  on-ramp starts printable for the chosen vendor.
+  on-ramp starts printable for the chosen vendor. **Composed with `--from` this goes through the
+  seam spec 0053 already built** — `Template::seeded_with` for the numbers,
+  `Template::disagrees_on_trim` for the warning to print. The precedence is settled (see the
+  decisions log); 0049 supplies the preset and the flag, not a second answer.
 
 **Test strategy** — The golden-report test first (this is a refactor and must prove it), then the
 strict-vs-generic pair, then the provenance assertion. Table-driven over the bundled presets.
@@ -1509,6 +1526,15 @@ express — aligned statics (0047), indents (0048), preset-seeded geometry (0049
 **Risks** — Small increment, one real hazard: a template file is a *published format* the moment it
 ships, so it needs the same version discipline as `.tpub` rather than being an ad-hoc JSON dump.
 The spec must state its version field and its migration posture up front.
+
+**Shipped** (spec 0053, `TEMPLATE_VERSION` 1) — out of the sequenced order, ahead of 0048–0050 and
+0052, because it depends on none of them. One criterion is therefore only half-wired and it is
+recorded rather than implied: **0049 has not landed, so there is no `--preset` flag to compose
+with.** What shipped is the seam and the rule — `PageGeometrySeed`, `Template::seeded_with`,
+`Template::disagrees_on_trim`, with the precedence asserted at the library level in both directions
+and stated in the spec, the format spec and the decisions log. 0049 inherits one job: call them.
+The seam is here rather than in 0049 because the precedence is a *template* question, and answering
+it inside 0049 would decide how a template composes in the increment that is not about templates.
 
 ## Known issues
 

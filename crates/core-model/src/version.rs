@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use crate::FORMAT_VERSION;
+use crate::{FORMAT_VERSION, TEMPLATE_VERSION};
 
 /// Everything that can go wrong loading a document or a `.tpub` container.
 ///
@@ -34,6 +34,16 @@ pub enum LoadError {
     /// Two blocks claim the same [`BlockId`](crate::BlockId). Refused rather than repaired: see
     /// [`Document::assign_missing_block_ids`](crate::Document::assign_missing_block_ids).
     DuplicateBlockId(u64),
+    /// A user-authored template file (spec 0053) is not well-formed, or does not match the schema
+    /// this build understands.
+    ///
+    /// Distinct from [`LoadError::Parse`] rather than reused, because an error has to name the
+    /// thing that is wrong: a malformed *template* reported as a malformed document manifest sends
+    /// the reader to the wrong file.
+    TemplateParse(String),
+    /// A template file declares a `template_version` newer than this build supports. A refusal, on
+    /// the same reasoning as [`LoadError::UnsupportedVersion`].
+    UnsupportedTemplateVersion { found: u32, supported: u32 },
 }
 
 impl fmt::Display for LoadError {
@@ -50,6 +60,12 @@ impl fmt::Display for LoadError {
             LoadError::DuplicateBlockId(id) => write!(
                 f,
                 "two content blocks share id {id}; block ids must be unique within a document"
+            ),
+            LoadError::TemplateParse(m) => write!(f, "malformed template file: {m}"),
+            LoadError::UnsupportedTemplateVersion { found, supported } => write!(
+                f,
+                "template file version {found} is newer than this build supports \
+                 (up to {supported}); upgrade Quill to use it"
             ),
         }
     }
@@ -142,6 +158,42 @@ fn migrate_2_to_3(obj: &mut serde_json::Map<String, serde_json::Value>) {
             s.entry("mirror").or_insert_with(|| false.into());
         }
     }
+}
+
+/// Bring a **template file** (spec 0053) forward to [`TEMPLATE_VERSION`], or refuse it.
+///
+/// Deliberately written beside [`migrate`], arm for arm, so the second version chain in this
+/// workspace cannot be built to a different shape than the first. Same rules: the gate runs on the
+/// untyped value before deserialization, an absent version is treated as current, an older one
+/// migrates forward one step at a time, and a newer one is refused rather than half-loaded.
+///
+/// The chain is empty because nothing is older than v1. The shape is here so the first real bump is
+/// an added arm rather than a redesign — and spec 0053 states *when* that bump is owed: whenever the
+/// template envelope changes, **or** whenever a [`FORMAT_VERSION`] bump changes the serialized shape
+/// of `PageSetup`, `StyleSheet`, `MasterPage` or `PageOverride`, all four of which a template file
+/// embeds. Spec 0047's v2 → v3 was exactly such a bump; had template files existed then, they would
+/// have owed a migration too.
+pub fn migrate_template(value: &mut serde_json::Value) -> Result<(), LoadError> {
+    let obj = value.as_object_mut().ok_or_else(|| {
+        LoadError::TemplateParse("template file root is not a JSON object".into())
+    })?;
+
+    let found = match obj.get("template_version") {
+        None => TEMPLATE_VERSION,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            LoadError::TemplateParse("`template_version` is not a non-negative integer".into())
+        })? as u32,
+    };
+
+    if found > TEMPLATE_VERSION {
+        return Err(LoadError::UnsupportedTemplateVersion {
+            found,
+            supported: TEMPLATE_VERSION,
+        });
+    }
+
+    obj.insert("template_version".into(), TEMPLATE_VERSION.into());
+    Ok(())
 }
 
 #[cfg(test)]

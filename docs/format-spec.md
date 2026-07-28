@@ -136,6 +136,98 @@ wrongly, even when the new fields are optional. A pre-0030 build would drop a do
 heads and column geometry; a pre-0047 build would put every verso's folio in the gutter. Refusing to
 open beats either, because a half-understood document can be saved back over the original.
 
+> **Bumping `FORMAT_VERSION`? Check whether `TEMPLATE_VERSION` is owed one too.** A template file
+> (below) embeds `page_setup`, `styles`, `master_pages` and `pages`. A document bump that changes
+> the serialized shape of any of those four changes every template file as well, and the template
+> format has its own version and its own migration chain. Spec 0047's 2 → 3 was exactly such a bump.
+
+## Template files (spec 0053)
+
+A **template file** is everything a document has except its content: trim, margins, a type scale,
+master pages and the per-page assignments. `quill new --from house-style.json -o book.tpub` starts a
+document from one. It is a separate published format from `.tpub` — a plain JSON file, not a
+container, because a template links no assets.
+
+```json
+{
+  "template_version": 1,
+  "name": "house-style",
+  "title": "House style (6×9, two columns)",
+  "description": "The house two-column 6×9, with a chapter opener and page numbers.",
+  "page_setup": { "trim": { "w_pt": 432.0, "h_pt": 648.0 }, "bleed_pt": 9.0, "facing_pages": true,
+                  "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 } },
+  "styles": { "paragraph": {
+    "body": { "font_size_pt": 9.5, "leading_pt": 12.5, "align": "justified" },
+    "h1": { "font_size_pt": 22.0, "leading_pt": 26.0, "align": "left", "space_before_pt": 19.5 },
+    "folio": { "font_size_pt": 8.5, "leading_pt": 12.5, "align": "left" } } },
+  "master_pages": [
+    { "name": "chapter-opener", "columns": 2, "gutter_pt": 14.0,
+      "margins": { "top_pt": 216.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 },
+      "statics": [] },
+    { "name": "body", "columns": 2, "gutter_pt": 14.0,
+      "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 },
+      "statics": [
+        { "kind": "text", "rect": { "x_pt": 54.0, "y_pt": 606.0, "w_pt": 338.0, "h_pt": 12.0 },
+          "text": "{page}", "color": { "space": "gray", "v": 0.0 },
+          "style": "folio", "align": "outside", "mirror": true }
+      ] }
+  ],
+  "default_master": "body",
+  "pages": [ { "master": "chapter-opener" } ]
+}
+```
+
+The example above is parsed by a test, so it cannot drift from what the loader accepts.
+
+`name` is the slug the success line reports; `title` and `description` are what `quill new --list`
+shows for the bundled three. `styles`, `master_pages`, `default_master` and `pages` all default, so
+the shortest useful template is a `page_setup` and a name — but `styles` is built on the default
+sheet whenever it is omitted, so a template can never be missing a style the resolver expects. A
+style name nothing resolves falls back to `body` and then to the default treatment: losing a
+paragraph's *styling* beats losing the paragraph, which is the same posture a dangling master name
+gets.
+
+### Versioning a template file
+
+`template_version` is an integer, and a **separate one** from the document's `format_version`: a
+template file is not a document, and coupling them would re-version every template ever written
+whenever the document model changed in a way templates never see. The rules are otherwise identical
+to the document's — the gate runs on the untyped JSON before deserialization, and a file newer than
+this build is refused (`LoadError::UnsupportedTemplateVersion`) rather than half-loaded.
+
+| `template_version` | Behavior |
+|---|---|
+| absent | treated as current |
+| older | migrated forward, one step per version |
+| current | loaded as-is |
+| newer | refused |
+
+`TEMPLATE_VERSION` is **1** and the migration chain is empty, because nothing is older than v1. It
+is owed a bump on either of two triggers:
+
+1. the template envelope changes — a field added to or removed from the template itself; or
+2. a `format_version` bump changes the serialized shape of `page_setup`, `styles`, `master_pages` or
+   `pages`, the four document structures a template file embeds.
+
+Trigger 2 is the one that is easy to miss, which is why it is also flagged beside the document
+migration table above.
+
+### Composing a template with a POD preset
+
+A POD preset (spec 0049) carries the printer's geometry; a template carries a design. Both can state
+a trim, so the precedence is fixed rather than left to the invocation:
+
+- **Trim: the template wins.** A template's furniture is authored against a specific trim — a folio's
+  `y_pt` is derived from the page height and its rect from the trim width. Re-trimming from
+  underneath moves the page without moving the geometry authored for it, and nothing at layout time
+  catches it, because furniture does not participate in the flow. A preset whose trim differs is
+  *reported*; an unusual trim is a conversation with the printer, not a corrupt file.
+- **Bleed: the larger of the two wins.** Bleed is a floor, not a design choice, and it lives entirely
+  outside the trim box — so honoring a stricter press requirement costs the design nothing, and
+  lowering it would cost something.
+
+With no template at all, a preset seeds both outright.
+
 ## Reading a container
 
 `Tpub::read_manifest` reads `document.json` alone; `Tpub::open_into` also extracts the payload to a
