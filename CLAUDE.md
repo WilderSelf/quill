@@ -19,8 +19,10 @@ multi-column threads (0020), linked-image proxy pixels (0021–0023), incrementa
 invalidation (0024), the `.tpub` container and versioned load contract (0025), block identity
 (0026), the perf harness (0027), paragraph styles (0028), master pages (0029–0030,
 `FORMAT_VERSION` 2), incremental dependency-tracked layout (0031), the shared fonts crate (0032),
-screen render (0033) and the app shell (0034) have all shipped. **The M1 arc is complete.** M2 —
-the beginner on-ramp (templates, stat blocks, TOC) — is next and not yet decomposed; see
+screen render (0033) and the app shell (0034) have all shipped. **The M1 arc is complete.** **M2 —
+the beginner on-ramp — is now decomposed into specs 0035–0043** (per-page masters → document
+templates → decoration primitive → stat blocks → tables → heading index → generated TOC → PDF
+outline → markdown import); the sequencing and per-increment acceptance criteria are in
 `docs/roadmap.md`.
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
@@ -91,8 +93,8 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 **M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
 **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. Currently at **M1** (M0 code-complete;
-sole open M0 item is the manual POD upload).
+TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. Currently at **M2** (M1 complete;
+M0 code-complete, its sole open item is the manual POD upload).
 
 ## Planning: spec-driven development
 
