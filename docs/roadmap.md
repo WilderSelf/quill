@@ -16,7 +16,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **decomposed** — specs 0035–0044, sequenced below; none shipped |
+| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035 shipped |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
 

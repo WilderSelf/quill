@@ -228,6 +228,36 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_authored_layout_including_per_page_masters() {
+        // `round_trips_a_document_and_its_assets` uses `Document::sample()`, whose masters and page
+        // list are both empty — so it proves nothing about authored layout surviving the container.
+        // Spec 0035's round-trip criterion is this test.
+        let dir = temp_dir("masters");
+        let tpub = dir.join("book.tpub");
+
+        let mut doc = Document::sample();
+        doc.master_pages = vec![
+            crate::MasterPage::plain("opener"),
+            crate::MasterPage::plain("body"),
+        ];
+        doc.default_master = Some("body".into());
+        doc.pages = vec![
+            crate::PageOverride {
+                master: Some("opener".into()),
+            },
+            crate::PageOverride { master: None },
+        ];
+
+        Tpub::write(&doc, &tpub, &[("assets/map1.png", b"x")]).expect("write");
+        let opened = Tpub::open_into(&tpub, &dir.join("extracted")).expect("open");
+        assert_eq!(opened.document.pages, doc.pages);
+        assert_eq!(opened.document.master_pages, doc.master_pages);
+        assert_eq!(opened.document, doc);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn asset_root_resolves_the_documents_relative_paths() {
         // The whole point of the container: `Asset::path` is meaningful relative to `asset_root`.
         let dir = temp_dir("assetroot");

@@ -477,6 +477,22 @@ impl MasterPage {
     }
 }
 
+/// Per-page overrides of what the document otherwise decides (spec 0035).
+///
+/// Indexed positionally: `pages[i]` governs page `i`. Assignment by index means inserting content
+/// that pushes the book by a page slides every subsequent assignment — accepted semantics for now;
+/// anchoring a master to the chapter it opens needs a notion of "section" the model does not have,
+/// and is recorded as an open question in `docs/roadmap.md`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageOverride {
+    /// The master this page uses, overriding [`Document::default_master`].
+    ///
+    /// `None` declines to override — which is deliberately *not* the same as "no master": an
+    /// explicit entry that sets nothing still falls through to the document's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master: Option<String>,
+}
+
 /// The whole document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -506,13 +522,19 @@ pub struct Document {
     /// Named master pages (spec 0030).
     #[serde(default)]
     pub master_pages: Vec<MasterPage>,
-    /// The master applied to every page. `None` — or a name not in `master_pages` — means the
-    /// document's own page setup governs, which is the pre-0030 behavior.
-    ///
-    /// Per-page master assignment is a follow-up; one default master is what makes a consistent
-    /// 500-page book, and is the case worth having first.
+    /// The master applied to every page that does not override it. `None` — or a name not in
+    /// `master_pages` — means the document's own page setup governs, which is the pre-0030
+    /// behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_master: Option<String>,
+    /// Per-page overrides (spec 0035). An absent or empty list is exactly the pre-0035 behavior —
+    /// every page on `default_master` — which is why this is additive and `FORMAT_VERSION` stays 2.
+    ///
+    /// The list need not cover the document: pages past its end fall back to `default_master`, and
+    /// entries past the end of the document are ignored rather than being an error, because the
+    /// content that justified them may simply have been deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<PageOverride>,
 }
 
 impl Document {
@@ -558,6 +580,7 @@ impl Document {
             styles: StyleSheet::default(),
             master_pages: Vec::new(),
             default_master: None,
+            pages: Vec::new(),
         };
         // The sample is a *loaded* document as far as everything downstream is concerned, so it
         // carries real ids like one — otherwise every consumer would have to special-case it.
@@ -610,6 +633,27 @@ impl Document {
         }
         self.next_block_id = next;
         Ok(())
+    }
+
+    /// The master page governing `page_index` (spec 0035).
+    ///
+    /// Resolution is: the page's own override, else [`Document::default_master`], else none — and
+    /// a name that matches no master falls through to the next step rather than failing. That
+    /// fallback is deliberate and matches [`StyleSheet::resolve`]: a renamed master should cost the
+    /// page its furniture, not cost the author the page. A missing running head is obvious the
+    /// moment the page is looked at; a document that refuses to lay out is not recoverable by the
+    /// person who typed the name.
+    pub fn master_for(&self, page_index: usize) -> Option<&MasterPage> {
+        let named = self
+            .pages
+            .get(page_index)
+            .and_then(|p| p.master.as_deref())
+            .and_then(|name| self.master_pages.iter().find(|m| m.name == name));
+        named.or_else(|| {
+            self.default_master
+                .as_deref()
+                .and_then(|name| self.master_pages.iter().find(|m| m.name == name))
+        })
     }
 
     /// Look up a block by identity.
@@ -927,5 +971,104 @@ mod tests {
         assert_eq!(doc.format_version, FORMAT_VERSION);
         assert_eq!(doc.revision, 0);
         assert_eq!(doc.content.len(), 3);
+    }
+
+    // --- Per-page master assignment (spec 0035) -----------------------------------------------
+
+    fn doc_with_two_masters() -> Document {
+        let mut doc = Document::sample();
+        doc.master_pages = vec![MasterPage::plain("opener"), MasterPage::plain("body")];
+        doc.default_master = Some("body".into());
+        doc
+    }
+
+    #[test]
+    fn a_manifest_without_a_page_list_still_loads() {
+        // The whole reason FORMAT_VERSION stays 2: `pages` is serde(default), so a manifest written
+        // before spec 0035 loads unchanged and lays out exactly as it did.
+        //
+        // Asserted on both a v1 fixture (which reaches the current types through `migrate`) and a
+        // literal v2 one (which does not), because the two take different paths into the struct and
+        // only the second is the case spec 0035 actually claims.
+        let migrated = Document::from_json(UNIDENTIFIED).expect("v1 load");
+        assert!(migrated.pages.is_empty());
+        assert!(migrated.master_for(0).is_none());
+
+        let v2 = format!(
+            r#"{{"format_version":{FORMAT_VERSION},
+                "page_setup":{{"trim":{{"w_pt":432.0,"h_pt":648.0}},"bleed_pt":9.0,
+                               "facing_pages":true}},
+                "content":[],
+                "master_pages":[{{"name":"body"}}],
+                "default_master":"body"}}"#
+        );
+        let doc = Document::from_json(&v2).expect("a v2 manifest with no `pages` key must load");
+        assert!(doc.pages.is_empty());
+        assert_eq!(doc.master_for(0).map(|m| m.name.as_str()), Some("body"));
+    }
+
+    #[test]
+    fn a_page_override_wins_over_the_default_master() {
+        let mut doc = doc_with_two_masters();
+        doc.pages = vec![PageOverride {
+            master: Some("opener".into()),
+        }];
+        assert_eq!(doc.master_for(0).map(|m| m.name.as_str()), Some("opener"));
+        assert_eq!(doc.master_for(1).map(|m| m.name.as_str()), Some("body"));
+    }
+
+    #[test]
+    fn master_resolution_falls_through_every_step() {
+        // An unknown name at either level degrades to the next rather than failing — the same
+        // posture as `StyleSheet::resolve`. Losing the furniture beats losing the page.
+        let mut doc = doc_with_two_masters();
+        doc.pages = vec![PageOverride {
+            master: Some("was-renamed".into()),
+        }];
+        assert_eq!(
+            doc.master_for(0).map(|m| m.name.as_str()),
+            Some("body"),
+            "unknown page master ⇒ the document default"
+        );
+
+        doc.default_master = Some("also-renamed".into());
+        assert!(
+            doc.master_for(0).is_none(),
+            "unknown default too ⇒ the document's own page setup"
+        );
+    }
+
+    #[test]
+    fn an_override_naming_no_master_is_not_the_same_as_no_master() {
+        let mut doc = doc_with_two_masters();
+        doc.pages = vec![PageOverride { master: None }];
+        assert_eq!(
+            doc.master_for(0).map(|m| m.name.as_str()),
+            Some("body"),
+            "an entry that declines to override still gets the default"
+        );
+    }
+
+    #[test]
+    fn a_page_list_shorter_or_longer_than_the_document_is_fine() {
+        let mut doc = doc_with_two_masters();
+        doc.pages = vec![PageOverride {
+            master: Some("opener".into()),
+        }];
+        // Past the end of the list: fall back.
+        assert_eq!(doc.master_for(99).map(|m| m.name.as_str()), Some("body"));
+        // Past the end of the document: never consulted, and not an error to hold.
+        doc.pages.extend((0..50).map(|_| PageOverride {
+            master: Some("opener".into()),
+        }));
+        assert_eq!(doc.master_for(0).map(|m| m.name.as_str()), Some("opener"));
+    }
+
+    #[test]
+    fn an_empty_page_list_is_omitted_from_the_manifest() {
+        // `skip_serializing_if` keeps the text manifest readable and git-diffable — the property
+        // BlockId's plain-number encoding exists to protect.
+        let json = Document::sample().to_json().expect("save");
+        assert!(!json.contains("\"pages\""));
     }
 }
