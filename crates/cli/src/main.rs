@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use quill_core_model::{import, Document, Template, Tpub};
 use quill_export_pdf::{
-    export, preflight, synth_cmyk_profile, ExportOptions, ExportProfile, PdfxVersion,
+    export, preflight, synth_cmyk_profile, ExportOptions, ExportProfile, PdfxVersion, PodPreset,
     PreflightReport, Severity,
 };
 
@@ -43,6 +43,8 @@ enum Command {
     New(NewArgs),
     /// Import the authoring syntax into a `.tpub` (spec 0043).
     Import(ImportArgs),
+    /// List the bundled POD presets with their numbers and provenance (spec 0049).
+    Presets,
 }
 
 #[derive(Args)]
@@ -68,6 +70,10 @@ struct NewArgs {
     /// List the built-in templates and exit.
     #[arg(long)]
     list: bool,
+    /// POD preset seeding the page setup's bleed (and trim, if the template's is not one the
+    /// preset lists). See `quill presets`.
+    #[arg(long)]
+    preset: Option<String>,
 }
 
 #[derive(Args)]
@@ -131,6 +137,10 @@ impl From<ProfileArg> for ExportProfile {
 struct DocArgs {
     /// Path to a `.tpub` `document.json` (optional; falls back to the built-in sample).
     input: Option<String>,
+    /// POD preset supplying the preflight thresholds. Defaults to `generic`, which is exactly the
+    /// values quill has always checked. See `quill presets`.
+    #[arg(long)]
+    preset: Option<String>,
 }
 
 #[derive(Args)]
@@ -140,9 +150,15 @@ struct ExportArgs {
     /// Output PDF path.
     #[arg(short, long)]
     output: String,
-    /// PDF/X conformance level. Ignored by `--profile screen`, which claims no conformance.
-    #[arg(long, value_enum, default_value_t = PdfxArg::X1a)]
-    pdfx: PdfxArg,
+    /// PDF/X conformance level. Defaults to the level the selected preset states (X-1a for every
+    /// bundled preset), rather than to a constant that could disagree with it. Ignored by
+    /// `--profile screen`, which claims no conformance.
+    #[arg(long, value_enum)]
+    pdfx: Option<PdfxArg>,
+    /// POD preset supplying the preflight thresholds and the default conformance level. See
+    /// `quill presets`.
+    #[arg(long)]
+    preset: Option<String>,
     /// Export profile: `press` (PDF/X, the default) or `screen` (clickable links, not press-ready).
     #[arg(long, value_enum, default_value_t = ProfileArg::Press)]
     profile: ProfileArg,
@@ -205,6 +221,32 @@ fn load_doc(input: &Option<String>) -> Result<Loaded, String> {
     })
 }
 
+/// Resolve `--preset`, or the conservative default when the flag is absent (spec 0049).
+///
+/// An unknown name is an error listing the available ones — never a silent fall back to a default,
+/// which would preflight against a printer the user did not choose. Selecting an *unconfirmed*
+/// preset prints a note to stderr carrying its provenance: a preset whose numbers were not read
+/// from the vendor must not be able to look authoritative just because it has the vendor's name on
+/// it.
+fn resolve_preset(name: &Option<String>) -> Result<PodPreset, String> {
+    let Some(name) = name else {
+        return Ok(PodPreset::generic());
+    };
+    let Some(preset) = PodPreset::by_name(name) else {
+        return Err(format!(
+            "unknown preset '{name}'; available: {}",
+            PodPreset::names().join(", ")
+        ));
+    };
+    if !preset.confirmed {
+        eprintln!(
+            "note: preset '{}' is UNCONFIRMED — {}",
+            preset.name, preset.source
+        );
+    }
+    Ok(preset)
+}
+
 fn print_report(report: &PreflightReport) {
     if report.findings.is_empty() {
         println!("preflight: no findings.");
@@ -255,12 +297,20 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let preset = match resolve_preset(&args.preset) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             // No ICC supplied here, so the OutputIntent check will report — that is expected
             // for a bare preflight and signals what an export would still need.
             let report = preflight(
                 &loaded.doc,
                 &ExportOptions {
                     asset_root: loaded.asset_root,
+                    preset,
                     ..Default::default()
                 },
             );
@@ -275,6 +325,13 @@ fn main() -> ExitCode {
         Command::Export(args) => {
             let loaded = match load_doc(&args.input) {
                 Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let preset = match resolve_preset(&args.preset) {
+                Ok(p) => p,
                 Err(e) => {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
@@ -301,12 +358,15 @@ fn main() -> ExitCode {
                 );
             }
             let opts = ExportOptions {
-                version: args.pdfx.into(),
+                // An explicit `--pdfx` wins; otherwise the preset states the conformance level, so
+                // the flag and the preset cannot silently disagree.
+                version: args.pdfx.map_or(preset.pdfx, Into::into),
                 profile: args.profile.into(),
                 output_intent_icc: args.icc.unwrap_or_default(),
                 font_path: args.font,
                 force: args.force,
                 asset_root: loaded.asset_root,
+                preset,
             };
             print_report(&preflight(&doc, &opts));
 
@@ -439,6 +499,44 @@ fn main() -> ExitCode {
         Command::New(args) => new_document(args),
 
         Command::Import(args) => import_document(args),
+
+        Command::Presets => {
+            // Provenance a user cannot read is provenance that is not doing its job, so `source`
+            // and `retrieved` are printed, not just the numbers.
+            for p in PodPreset::bundled() {
+                println!("{} — {}", p.name, p.title);
+                println!(
+                    "  bleed {}pt · safety {}pt · ink {}% · {}/{} dpi · {}",
+                    p.bleed_pt,
+                    p.safety_pt,
+                    p.max_ink_pct,
+                    p.min_dpi_color,
+                    p.min_dpi_line_art,
+                    p.pdfx.identifier()
+                );
+                let trims = if p.trim_sizes.is_empty() {
+                    "no trim catalogue stated".to_string()
+                } else {
+                    p.trim_sizes
+                        .iter()
+                        .map(|s| format!("{}x{}pt", s.w_pt, s.h_pt))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!("  trims: {trims}");
+                println!(
+                    "  {} · retrieved {}",
+                    if p.confirmed {
+                        "CONFIRMED"
+                    } else {
+                        "UNCONFIRMED"
+                    },
+                    p.retrieved
+                );
+                println!("  source: {}", p.source);
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
@@ -519,7 +617,40 @@ fn new_document(args: NewArgs) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let doc = Document::from_template(template);
+    let mut doc = Document::from_template(template);
+
+    // Seed the page setup from the preset (spec 0049), so the on-ramp starts printable for the
+    // chosen vendor. The bleed is always taken. The *trim* is taken only when the template's own
+    // trim is not one the preset lists: applying "the preset's first trim" unconditionally would
+    // retrim the US-Letter `playtest` template to 6×9 and leave its folio static off the page —
+    // master furniture silently breaking is exactly what this repo forbids. When the trim does have
+    // to move, say so, because the furniture then genuinely needs a look.
+    if let Some(name) = args.preset.as_deref() {
+        let preset = match resolve_preset(&Some(name.to_string())) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        doc.page_setup.bleed_pt = preset.bleed_pt;
+        if !preset.lists_trim(doc.page_setup.trim) {
+            if let Some(trim) = preset.trim_sizes.first() {
+                eprintln!(
+                    "warning: template '{}' trims to {}x{}pt, which preset '{}' does not list; \
+                     retrimming to {}x{}pt — check the master furniture",
+                    name,
+                    doc.page_setup.trim.w_pt,
+                    doc.page_setup.trim.h_pt,
+                    preset.name,
+                    trim.w_pt,
+                    trim.h_pt
+                );
+                doc.page_setup.trim = *trim;
+            }
+        }
+    }
+
     // A template links no assets, so the container carries the manifest alone.
     match Tpub::write(&doc, Path::new(output), &[]) {
         Ok(()) => {

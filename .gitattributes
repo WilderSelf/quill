@@ -1,0 +1,5 @@
+# Golden output fixtures are compared byte for byte against a program's stdout, so git must not
+# rewrite their line endings on checkout. Without this, a Windows runner reads CRLF out of a file
+# committed with LF and every golden test fails there and only there — which is exactly how spec
+# 0049 first went red on CI.
+crates/cli/tests/golden/** -text

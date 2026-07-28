@@ -155,6 +155,25 @@ All three fields default when absent, so manifests written before they existed s
 version bump. Two blocks sharing an id is an error — a duplicate identity would let a cache return
 the wrong block's layout.
 
+## What the format deliberately does *not* carry: the POD preset
+
+A **POD preset** (spec 0049 — the bleed, safety margin, ink limit, minimum resolutions, trim
+catalogue and PDF/X level one printer states) is an **export-time** concern and is deliberately not
+serialized into `.tpub`. A document is not bound to one printer: the same manuscript is routinely
+quoted to two, and a preset baked into the manifest would make "which vendor is this book for?" a
+property of the file rather than of the export the author is doing right now.
+
+So a preset travels on the command line (`quill preflight --preset …`, `quill export --preset …`),
+never in the document. What *is* persisted is the **effect** a preset had at authoring time:
+`quill new --preset …` seeds `page_setup.bleed_pt` (and the trim, when the template's own trim is
+not one the preset lists) — ordinary page-setup fields that any later export re-checks against
+whatever preset it is given. A test asserts a manifest written this way contains no preset.
+
+The presets themselves are code, not data files, and each carries the `source` it was taken from
+and the date it was `retrieved`. **Bundled vendor presets are a convenience to be confirmed against
+the vendor's current specification, not a warranty**; `quill presets` prints that provenance, and a
+preset whose numbers were not read from the vendor is marked unconfirmed and says so when selected.
+
 ## Two linked representations
 
 The model carries both a **semantic content** tree (the easy authoring layer) and a **layout**
