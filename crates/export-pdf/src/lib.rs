@@ -846,6 +846,33 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
     // the layout engine, whatever their paragraph style says, so the regular face has to be embedded
     // whenever any of them is drawn — otherwise a document whose only body style is bold embeds one
     // program and draws its tables from it.
+    // A master page's static text — a running head, a folio, a footer — is drawn on every page that
+    // uses the master, and until now no collector had ever looked at it. Its characters reached the
+    // subset only when some *content* block happened to use them too, so a folio's separator or a
+    // running head's chapter name could render as `.notdef` boxes with no error anywhere. Digits
+    // usually survived by accident, because a contents list contributes `0`–`9`.
+    //
+    // Statics are placed in the paragraph face (`PageTemplate::statics`), so they go in every
+    // bucket, like everything else that does not select a face.
+    for master in &doc.master_pages {
+        for stat in &master.statics {
+            if let quill_core_model::MasterStatic::Text { text, .. } = stat {
+                everywhere.extend(text.chars());
+                draws_unattributed_text = true;
+            }
+        }
+    }
+    // `{page}` is replaced with a page number at layout time, so the digits have to be carried
+    // whether or not any of them appears in the token itself.
+    if doc
+        .master_pages
+        .iter()
+        .flat_map(|m| &m.statics)
+        .any(|s| matches!(s, quill_core_model::MasterStatic::Text { text, .. } if text.contains("{page}")))
+    {
+        everywhere.extend('0'..='9');
+    }
+
     if draws_unattributed_text {
         out.entry(FaceKey::REGULAR).or_default();
     }
@@ -2085,6 +2112,55 @@ mod tests {
             1,
             "one face was supplied, so one program is embedded"
         );
+    }
+
+    /// A master page's static text has to be in the subset, or a folio renders as `.notdef` boxes.
+    ///
+    /// Found while re-shaping the character collector per face for spec 0064, and predating it
+    /// entirely: `collect_doc_chars` walked `doc.content` and nothing else, so a running head's
+    /// characters reached the press file only if some content block happened to use them too. It is
+    /// the silent-failure surface spec 0026 named, and the one nobody had hit because digits usually
+    /// arrive by accident from a contents list.
+    #[test]
+    fn a_master_pages_static_text_reaches_the_subset() {
+        use quill_core_model::{MasterPage, MasterStatic, Rect as MRect};
+
+        let mut doc = Document::sample();
+        // Characters no content block in the sample uses, so the only way they can reach the subset
+        // is through the master itself.
+        let head = "Ǯ Ǳ Ǆ — page {page}";
+        let base = doc.master_pages.first().cloned();
+        doc.master_pages = vec![MasterPage {
+            name: "chapter".into(),
+            columns: base.as_ref().map_or(1, |m| m.columns),
+            gutter_pt: base.as_ref().map_or(0.0, |m| m.gutter_pt),
+            margins: base.map(|m| m.margins).unwrap_or_default(),
+            statics: vec![MasterStatic::Text {
+                rect: MRect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 200.0,
+                    h_pt: 12.0,
+                },
+                text: head.into(),
+                color: Color::Gray { v: 0.0 },
+                style: None,
+                align: Default::default(),
+                mirror: false,
+            }],
+        }];
+
+        let carried: BTreeSet<char> = collect_doc_faces(&doc).into_values().flatten().collect();
+        for ch in head.chars().filter(|c| *c != '{' && *c != '}') {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is drawn on every page and must be subset"
+            );
+        }
+        // `{page}` becomes a number at layout time, so the digits come too.
+        for d in '0'..='9' {
+            assert!(carried.contains(&d), "a folio needs its digits");
+        }
     }
 
     /// Spec 0064, and the defect an adversarial review of it found: a bold run long enough to fill

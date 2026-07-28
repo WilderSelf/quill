@@ -2208,17 +2208,6 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
   it says in as many words that it inverts when the fix ships.
 
-- **A master page's static text is never gathered into the subset, so a folio can render as
-  `.notdef` boxes.** `collect_doc_faces` (and `collect_doc_chars` before it) walks `doc.content` and
-  nothing else. Every character a master static draws — a running head, a folio's separator, a
-  chapter name — reaches the page only if some *content* block happens to use it too. Found by spec
-  0064 while re-shaping the collector per face; it predates that increment entirely and is the exact
-  silent-failure surface spec 0026 named. Digits usually survive by accident (a contents list
-  contributes `0`–`9`), which is why nobody has hit it. The fix is small — walk `doc.master_pages`
-  in the same collector — and its blast radius is that every document *with* a master gets a
-  different subset, and so a different export byte-hash. That is why it is its own increment rather
-  than a rider on 0064's.
-
 - **Line breaking measures kerned advances; the PDF draws unkerned ones.** Since spec 0016,
   measurement goes through `rustybuzz`, which applies `kern`/`GPOS`. The content stream shows a
   string of CIDs and the viewer advances by the `/W` array, which holds `hmtx` advances — no kern
