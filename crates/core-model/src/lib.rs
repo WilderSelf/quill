@@ -398,6 +398,46 @@ pub struct ParagraphStyle {
     pub space_before_pt: Pt,
     #[serde(default)]
     pub space_after_pt: Pt,
+    /// Left insets: a first-line indent, a hanging indent, or neither (spec 0048).
+    ///
+    /// Additive and defaulted to zero, so every document that predates it lays out exactly as it
+    /// did — `FORMAT_VERSION` does not move.
+    #[serde(default, skip_serializing_if = "Indent::is_zero")]
+    pub indent: Indent,
+}
+
+/// A paragraph's left insets, in points (spec 0048).
+///
+/// Mirrors `quill_text_layout::Indent`; kept as its own serialized type because `core-model` does
+/// not depend on `text-layout` and the file format must not be defined by a layout crate.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Indent {
+    /// Inset applied to the paragraph's first line — the opener a book sets by default.
+    #[serde(default)]
+    pub first_pt: Pt,
+    /// Inset applied to every line after the first — what makes a wrapped `Armour Class: 15
+    /// (leather, shield)` line up under its value rather than under its key.
+    #[serde(default)]
+    pub rest_pt: Pt,
+}
+
+impl Indent {
+    pub const ZERO: Indent = Indent {
+        first_pt: 0.0,
+        rest_pt: 0.0,
+    };
+
+    /// A hanging indent of `pt`: first line flush, every line after it inset.
+    pub const fn hanging(pt: Pt) -> Indent {
+        Indent {
+            first_pt: 0.0,
+            rest_pt: pt,
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.first_pt == 0.0 && self.rest_pt == 0.0
+    }
 }
 
 impl Default for ParagraphStyle {
@@ -410,6 +450,7 @@ impl Default for ParagraphStyle {
             align: TextAlign::Justified,
             space_before_pt: 0.0,
             space_after_pt: 0.0,
+            indent: Indent::ZERO,
         }
     }
 }
@@ -475,6 +516,7 @@ impl Default for StyleSheet {
                     align: TextAlign::Left,
                     space_before_pt: leading * 0.75,
                     space_after_pt: leading * 0.25,
+                    indent: Indent::ZERO,
                 },
             );
         }
@@ -489,6 +531,7 @@ impl Default for StyleSheet {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 3.0,
+                indent: Indent::ZERO,
             },
         );
         paragraph.insert(
@@ -499,6 +542,7 @@ impl Default for StyleSheet {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 0.0,
+                indent: Indent::hanging(10.0),
             },
         );
         paragraph.insert(
@@ -511,6 +555,7 @@ impl Default for StyleSheet {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 3.0,
+                indent: Indent::ZERO,
             },
         );
         // Table treatment (spec 0039), on the same principle as the stat block's: a table dropped
@@ -523,6 +568,7 @@ impl Default for StyleSheet {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 0.0,
+                indent: Indent::ZERO,
             },
         );
         paragraph.insert(
@@ -535,6 +581,7 @@ impl Default for StyleSheet {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 0.0,
+                indent: Indent::ZERO,
             },
         );
         // Contents treatment (spec 0041). Deeper levels are set smaller and indented, which is what
@@ -547,6 +594,7 @@ impl Default for StyleSheet {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 11.0,
+                indent: Indent::ZERO,
             },
         );
         for level in 1u8..=6 {
@@ -560,6 +608,7 @@ impl Default for StyleSheet {
                     // Level 1 entries get air above them; deeper ones sit tight under their parent.
                     space_before_pt: if level == 1 { 5.0 } else { 0.0 },
                     space_after_pt: 0.0,
+                    indent: Indent::ZERO,
                 },
             );
         }
@@ -1199,6 +1248,7 @@ mod tests {
                 align: TextAlign::Left,
                 space_before_pt: 0.0,
                 space_after_pt: 0.0,
+                indent: Indent::ZERO,
             },
         );
         let block = Block::body("aside", Color::Gray { v: 0.0 }).with_style("sidebar");
@@ -1233,6 +1283,7 @@ mod tests {
                 align: TextAlign::Left,
                 space_before_pt: 6.0,
                 space_after_pt: 3.0,
+                indent: Indent::ZERO,
             },
         );
         let back = Document::from_json(&doc.to_json().expect("save")).expect("load");

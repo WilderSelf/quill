@@ -18,7 +18,10 @@ use quill_core_model::{
     PAGE_TOKEN, STATBLOCK_ATTR_STYLE, STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE,
     TABLE_CELL_STYLE, TABLE_HEADER_STYLE, TOC_TITLE_STYLE,
 };
-use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
+use quill_text_layout::{
+    justify_paragraph_hyphenated, justify_paragraph_indented, Alignment, Hyphenator, Line,
+    RunMetrics,
+};
 
 /// A positioned rectangular region that content flows into. The layout engine fills a frame
 /// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
@@ -422,6 +425,7 @@ impl PageTemplate for DocumentTemplate<'_> {
                             lines: vec![Line {
                                 text: resolved,
                                 space_adjust_pt: 0.0,
+                                indent_pt: 0.0,
                             }],
                             color: *color,
                             font_size_pt: ps.font_size_pt,
@@ -874,9 +878,13 @@ pub(crate) fn measure_block(
                 TextAlign::Justified => Alignment::Justified,
                 TextAlign::Left => Alignment::Left,
             };
-            let lines = justify_paragraph_hyphenated(
+            let lines = justify_paragraph_indented(
                 text,
                 width,
+                quill_text_layout::Indent {
+                    first_pt: style.indent.first_pt,
+                    rest_pt: style.indent.rest_pt,
+                },
                 style.font_size_pt,
                 align,
                 metrics,
@@ -987,7 +995,12 @@ fn measure_stat_block(
         // inter-word whitespace to a single U+0020, so the intended visual gap collapsed to an
         // ordinary word space and "Armour Class 15 (leather, shield)" read as one sentence. With no
         // bold weight available, punctuation is what distinguishes the key.
-        runs.push((format!("{k}: {v}"), STATBLOCK_ATTR_STYLE, i == 0));
+        // The key's own words are joined by U+00A0, so `Armour Class:` is one unbreakable box
+        // (spec 0048). Before this, a ~150 pt column broke after `Armour` and the key/value pairing
+        // was lost — found by rendering spec 0038's panel, not by any assertion. The style's
+        // hanging indent then lines a wrapped value up under the value rather than under the key.
+        let key = k.split_whitespace().collect::<Vec<_>>().join("\u{a0}");
+        runs.push((format!("{key}:\u{a0}{v}"), STATBLOCK_ATTR_STYLE, i == 0));
     }
     for section in [&stat.details, &stat.actions, &stat.reactions] {
         push_group(&mut runs, section.clone());
@@ -1004,9 +1017,15 @@ fn measure_stat_block(
             .get(style_name)
             .copied()
             .unwrap_or_default();
-        let lines = justify_paragraph_hyphenated(
+        // Honours the style's indent (spec 0048), which is what lets `statblock-attr` hang its
+        // wrapped value under the value rather than under the key.
+        let lines = justify_paragraph_indented(
             &text,
             inner_w,
+            quill_text_layout::Indent {
+                first_pt: style.indent.first_pt,
+                rest_pt: style.indent.rest_pt,
+            },
             style.font_size_pt,
             Alignment::Left,
             metrics,
@@ -1281,6 +1300,7 @@ fn measure_toc(
             lines: vec![Line {
                 text: title.to_string(),
                 space_adjust_pt: 0.0,
+                indent_pt: 0.0,
             }],
             color,
             font_size_pt: style.font_size_pt,
@@ -1323,6 +1343,7 @@ fn measure_toc(
             lines: vec![Line {
                 text: text.clone(),
                 space_adjust_pt: 0.0,
+                indent_pt: 0.0,
             }],
             color,
             font_size_pt: style.font_size_pt,
@@ -1343,6 +1364,7 @@ fn measure_toc(
                     lines: vec![Line {
                         text: ".".repeat(dots),
                         space_adjust_pt: 0.0,
+                        indent_pt: 0.0,
                     }],
                     color,
                     font_size_pt: style.font_size_pt,
@@ -1360,6 +1382,7 @@ fn measure_toc(
             lines: vec![Line {
                 text: number,
                 space_adjust_pt: 0.0,
+                indent_pt: 0.0,
             }],
             color,
             font_size_pt: style.font_size_pt,
@@ -2899,6 +2922,7 @@ mod tests {
                 lines: vec![Line {
                     text: format!("{}", page_index + 1),
                     space_adjust_pt: 0.0,
+                    indent_pt: 0.0,
                 }],
                 color: Color::Gray { v: 0.0 },
                 font_size_pt: 9.0,
@@ -3567,6 +3591,107 @@ mod tests {
             .fold(None, |acc: Option<f32>, y| {
                 Some(acc.map_or(y, |a: f32| a.max(y)))
             })
+    }
+
+    // ----- spec 0048: indents reach placed geometry ---------------------------------------------
+
+    #[test]
+    fn a_hanging_indent_reaches_the_placed_lines() {
+        // The style's indent must survive measurement into `PlacedBlock`, because that is all the
+        // two painters ever see. Asserted on placed geometry rather than on the breaker's output,
+        // which is where a correctly-computed indent would otherwise be dropped.
+        let mut styles = StyleSheet::default();
+        styles.paragraph.insert(
+            BODY_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: BODY_FONT_SIZE_PT,
+                leading_pt: BODY_LINE_HEIGHT_PT,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+                indent: quill_core_model::Indent::hanging(12.0),
+            },
+        );
+        let mut content = vec![Block::body(n_line_paragraph(6), Color::Gray { v: 0.0 })];
+        content[0].set_id(BlockId(1));
+        let thread = split_columns(1, 400.0);
+        let pages = lay_out_in_thread(&content, &[], &styles, &thread, &MONO, &NoHyphenator);
+
+        let lines = pages[0]
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PlacedBlock::Text { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .expect("the paragraph must be placed");
+        assert!(lines.len() >= 3, "need several lines, got {}", lines.len());
+        assert_eq!(lines[0].indent_pt, 0.0, "the first line hangs flush");
+        assert!(
+            lines[1..].iter().all(|l| l.indent_pt == 12.0),
+            "every line after the first carries the hanging indent"
+        );
+    }
+
+    #[test]
+    fn a_stat_blocks_attribute_value_hangs_under_itself() {
+        // The built-in treatment, which is where the defect lived: a wrapped attribute lines up
+        // under its value rather than under its key. `statblock-attr` carries the hanging indent in
+        // `StyleSheet::default()`, so dropping a stat block in gets it with no authoring.
+        let stat = quill_core_model::StatBlock {
+            name: "Barrow Wight".into(),
+            overview: vec![],
+            attributes: vec![(
+                "Armour Class".into(),
+                "15 (leather armour, shield, and a helm)".into(),
+            )],
+            details: vec![],
+            actions: vec![],
+            reactions: vec![],
+        };
+        let mut content = vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat,
+            color: Color::Gray { v: 0.0 },
+        }];
+        content[0].set_id(BlockId(1));
+        let thread = split_columns(1, 400.0);
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
+
+        let attr = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, .. } if lines[0].text.starts_with("Armour") => {
+                    Some(lines)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("the attribute run must be placed");
+        assert!(
+            attr.len() >= 2,
+            "the fixture must wrap, got {} line(s)",
+            attr.len()
+        );
+        assert_eq!(attr[0].indent_pt, 0.0);
+        assert!(
+            attr[1..].iter().all(|l| l.indent_pt > 0.0),
+            "wrapped attribute lines must hang"
+        );
+        // And the key is one unbreakable unit, so it can never be the whole of a line.
+        assert!(
+            attr.iter().all(|l| l.text.trim() != "Armour"),
+            "the key must not be split: {:?}",
+            attr.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     // --- Stat blocks (spec 0038) ----------------------------------------------------------------
@@ -5141,6 +5266,7 @@ mod tests {
                 align: TextAlign::Justified,
                 space_before_pt: 9.0,
                 space_after_pt: 5.0,
+                indent: Default::default(),
             },
         );
         let mut content = vec![

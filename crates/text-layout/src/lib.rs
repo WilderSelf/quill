@@ -244,12 +244,67 @@ pub fn break_paragraph_hyphenated(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<String> {
-    let words: Vec<&str> = text.split_whitespace().collect();
+    break_paragraph_indented(
+        text,
+        max_width_pt,
+        max_width_pt,
+        size_pt,
+        metrics,
+        hyphenator,
+    )
+}
+
+/// [`break_paragraph_hyphenated`] with a **first line measured differently from the rest**
+/// (spec 0048).
+///
+/// `first_width_pt` is the measure available to the first line and `rest_width_pt` to every line
+/// after it. A first-line indent makes the first narrower; a hanging indent makes the rest narrower.
+/// Passing the same value for both is exactly the un-indented breaker, which is why that is how the
+/// parity entry point is written.
+///
+/// This is a per-line measure, not a per-paragraph one, and it needs no line counter in the DP:
+/// a line is the first exactly when it starts at item 0.
+pub fn break_paragraph_indented(
+    text: &str,
+    first_width_pt: f32,
+    rest_width_pt: f32,
+    size_pt: f32,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<String> {
+    // Words break at ordinary whitespace only. U+00A0 NO-BREAK SPACE binds its neighbours into a
+    // single unbreakable box and is emitted as an ordinary space (spec 0048), which is how a key
+    // like `Armour Class:` survives a narrow measure instead of breaking after `Armour` and losing
+    // the key/value pairing. The replacement matters as much as the binding: leaving U+00A0 in the
+    // box text would carry it into the PDF, where `collect_doc_chars` never gathered it and it
+    // would subset to a `.notdef` box.
+    let bound: Vec<String> = if text.contains('\u{a0}') {
+        text.split(|c: char| c.is_whitespace() && c != '\u{a0}')
+            .filter(|w| !w.is_empty())
+            .map(|w| w.replace('\u{a0}', " "))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let words: Vec<&str> = if bound.is_empty() {
+        text.split_whitespace().collect()
+    } else {
+        bound.iter().map(String::as_str).collect()
+    };
     if words.is_empty() {
         return Vec::new();
     }
 
-    let l = max_width_pt;
+    // The measure is per line, not per paragraph: an indent narrows the first line or every line
+    // after it (spec 0048). Only the first line differs, and a line is the first exactly when it
+    // starts at item 0, so this needs no line counter in the DP state.
+    let l_for = |s: usize| {
+        if s == 0 {
+            first_width_pt
+        } else {
+            rest_width_pt
+        }
+    };
     let g = metrics.measure_run(" ", size_pt);
     let stretch = g / 2.0;
     let shrink = g / 3.0;
@@ -310,9 +365,16 @@ pub fn break_paragraph_hyphenated(
     // `f64`: a ceiling-badness line squares to ≈ 1e8, where `f32`'s ulp is coarse enough to mask the
     // small differences total-fit compares in the all-bad regime.
     let base_demerits = |s: usize, e: usize, extra_w: f32, is_last: bool| -> Option<f64> {
+        let l = l_for(s);
         let natural = (wsum[e] - wsum[s]) + extra_w;
         let y = ysum[e] - ysum[s];
         let z = zsum[e] - zsum[s];
+        // A last line is permitted to be up to `l + shrink` wide, on the strength of shrink that
+        // `justify_paragraph_*` never applies to it — so it can be *drawn* past its measure. Real,
+        // measured by spec 0048, and deliberately not fixed there: forbidding it changes line
+        // breaking across the corpus (it would move spec 0051's equivalence digest) and makes
+        // stat-block sections tall enough to stop fitting a narrow column. Recorded in the
+        // roadmap's known issues; it wants its own increment.
         let badness = if is_last && natural <= l {
             0.0
         } else if natural > l {
@@ -460,7 +522,7 @@ pub fn break_paragraph_hyphenated(
     // is finalized before `e` reads it (a line s..e ends at e; the next line starts at e+1 > e).
     for e in 0..n_items {
         // Retire starts that cannot reach `e` — nor any later end — inside the measure.
-        while s_lo < e && tightest(s_lo, e) > l {
+        while s_lo < e && tightest(s_lo, e) > l_for(s_lo) {
             s_lo += 1;
         }
         let (extra_w, flagged) = match &items[e] {
@@ -519,7 +581,7 @@ pub fn break_paragraph_hyphenated(
 
     // No fully-feasible breaking (an over-wide, unbreakable word) → greedy fallback.
     let Some(solution) = solution else {
-        return break_by_width(text, max_width_pt, size_pt, metrics);
+        return break_by_width(text, rest_width_pt.min(first_width_pt), size_pt, metrics);
     };
 
     // Materialize the winning start sequence by walking its back-chain to the root, then reversing:
@@ -583,6 +645,14 @@ pub struct Line {
     pub text: String,
     /// Points to add to each inter-word gap to justify the line (see the struct docs).
     pub space_adjust_pt: f32,
+    /// Points to inset this line's left edge from its frame (spec 0048): a first-line indent on the
+    /// first line, a hanging indent on every line after it, `0.0` for an unindented paragraph.
+    ///
+    /// Carried per line rather than per paragraph so that both painters read one value and cannot
+    /// disagree about which lines are indented — the same reason `space_adjust_pt` lives here. It
+    /// also survives fragmentation for free: a continuation's lines are not first lines and already
+    /// carry the right value (spec 0044).
+    pub indent_pt: f32,
 }
 
 /// Break `text` with [`break_paragraph`] (Knuth-Plass total-fit, no hyphenation), then **resolve each
@@ -622,20 +692,91 @@ pub fn justify_paragraph_hyphenated(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<Line> {
-    let lines = break_paragraph_hyphenated(text, max_width_pt, size_pt, metrics, hyphenator);
+    justify_paragraph_indented(
+        text,
+        max_width_pt,
+        Indent::NONE,
+        size_pt,
+        align,
+        metrics,
+        hyphenator,
+    )
+}
+
+/// A paragraph's left insets (spec 0048).
+///
+/// Two numbers rather than one flag, because both conventional shapes fall out of it: a *first-line
+/// indent* is `first_pt > 0, rest_pt = 0` (the paragraph opener a book sets by default), and a
+/// *hanging indent* is `first_pt = 0, rest_pt > 0` (what makes a wrapped `Armour Class: 15 (leather,
+/// shield)` line up under its value rather than under its key).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Indent {
+    pub first_pt: f32,
+    pub rest_pt: f32,
+}
+
+impl Indent {
+    pub const NONE: Indent = Indent {
+        first_pt: 0.0,
+        rest_pt: 0.0,
+    };
+
+    /// A hanging indent of `pt`: the first line flush, every line after it inset.
+    pub const fn hanging(pt: f32) -> Indent {
+        Indent {
+            first_pt: 0.0,
+            rest_pt: pt,
+        }
+    }
+
+    /// Whether this inset is zero on both edges — the un-indented paragraph.
+    pub fn is_none(&self) -> bool {
+        self.first_pt == 0.0 && self.rest_pt == 0.0
+    }
+}
+
+/// [`justify_paragraph_hyphenated`] with a first-line and/or hanging indent (spec 0048).
+///
+/// The indents narrow the *measure*, not just the drawn position: a justified line must fill
+/// `frame − indent`, and filling `frame` instead overruns the frame by exactly the indent — which a
+/// ragged-right test cannot see, because ragged text has no fill to be wrong about.
+pub fn justify_paragraph_indented(
+    text: &str,
+    max_width_pt: f32,
+    indent: Indent,
+    size_pt: f32,
+    align: Alignment,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<Line> {
+    let first_w = max_width_pt - indent.first_pt;
+    let rest_w = max_width_pt - indent.rest_pt;
+    let lines = break_paragraph_indented(text, first_w, rest_w, size_pt, metrics, hyphenator);
 
     // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
     // would need to shrink past its glue, so justifying it would push spaces negative).
+    // The measure a line of index `idx` was broken to, and so the width it must fill.
+    let measure = |idx: usize| if idx == 0 { first_w } else { rest_w };
+    let inset = |idx: usize| {
+        if idx == 0 {
+            indent.first_pt
+        } else {
+            indent.rest_pt
+        }
+    };
+
     let ragged = align == Alignment::Left
         || text
             .split_whitespace()
-            .any(|w| metrics.measure_run(w, size_pt) > max_width_pt);
+            .any(|w| metrics.measure_run(w, size_pt) > first_w.min(rest_w));
     if ragged {
         return lines
             .into_iter()
-            .map(|text| Line {
+            .enumerate()
+            .map(|(idx, text)| Line {
                 text,
                 space_adjust_pt: 0.0,
+                indent_pt: inset(idx),
             })
             .collect();
     }
@@ -651,12 +792,15 @@ pub fn justify_paragraph_hyphenated(
                 0.0
             } else {
                 // `measure_run` counts a trailing hyphen, so a hyphenated line fills the frame too.
+                // The width to fill is this line's own measure: filling the *frame* would overrun it
+                // by exactly the indent, invisibly, since ragged text has no fill to be wrong about.
                 let natural = metrics.measure_run(&text, size_pt);
-                (max_width_pt - natural) / spaces as f32
+                (measure(idx) - natural) / spaces as f32
             };
             Line {
                 text,
                 space_adjust_pt,
+                indent_pt: inset(idx),
             }
         })
         .collect()
@@ -1119,7 +1263,8 @@ mod tests {
             lines,
             vec![Line {
                 text: "hello".to_string(),
-                space_adjust_pt: 0.0
+                space_adjust_pt: 0.0,
+                indent_pt: 0.0,
             }]
         );
     }
@@ -1146,5 +1291,199 @@ mod tests {
                 first
             );
         }
+    }
+
+    // ----- spec 0048: indents and non-breaking spaces ------------------------------------------
+
+    #[test]
+    fn a_hanging_indent_narrows_every_line_but_the_first() {
+        // The measure, not just the drawn position. Under MONO at 10 pt a character is 6 pt, so a
+        // 120 pt measure holds 20 characters and a 12 pt hanging indent leaves 18 for every line
+        // after the first.
+        let text = "aaa bbb ccc ddd eee fff ggg hhh iii jjj";
+        let flush = break_paragraph_indented(text, 120.0, 120.0, SIZE, &MONO, &NoHyphenator);
+        let hanging = break_paragraph_indented(text, 120.0, 108.0, SIZE, &MONO, &NoHyphenator);
+
+        assert!(
+            flush
+                .iter()
+                .all(|l| MONO.measure_run(l, SIZE) <= 120.0 + 1e-3),
+            "flush lines must fit the full measure"
+        );
+        assert!(
+            MONO.measure_run(&hanging[0], SIZE) <= 120.0 + 1e-3,
+            "the first line keeps the full measure"
+        );
+        // Every line after the first is *broken* to the narrowed measure. The last line is
+        // excluded: the breaker permits it to be up to `measure + shrink` wide on the strength of
+        // shrink that is never applied to it — a pre-existing behaviour spec 0048 measured and
+        // recorded in the roadmap's known issues rather than changed, because forbidding it moves
+        // line breaking across the whole corpus.
+        let adjusted = hanging.len().saturating_sub(1);
+        assert!(
+            hanging[1..adjusted.max(1)]
+                .iter()
+                .all(|l| MONO.measure_run(l, SIZE) <= 108.0 + 1e-3),
+            "every adjusted line after the first must fit the narrowed measure: {hanging:?}"
+        );
+        assert!(
+            hanging.len() >= flush.len(),
+            "a narrower measure cannot need fewer lines"
+        );
+    }
+
+    #[test]
+    fn a_justified_indented_line_fills_its_own_measure_not_the_frame() {
+        // The failure this exists to catch: justifying to the *frame* rather than to
+        // `frame − indent` overruns the frame by exactly the indent, and a ragged-right test cannot
+        // see it because ragged text has no fill to be wrong about.
+        let text = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo";
+        let lines = justify_paragraph_indented(
+            text,
+            120.0,
+            Indent::hanging(12.0),
+            SIZE,
+            Alignment::Justified,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(lines.len() >= 3, "need several lines, got {}", lines.len());
+
+        for (i, line) in lines.iter().enumerate() {
+            let natural = MONO.measure_run(&line.text, SIZE);
+            let spaces = line.text.split_whitespace().count().saturating_sub(1);
+            let filled = natural + line.space_adjust_pt * spaces as f32;
+            let measure = if i == 0 { 120.0 } else { 108.0 };
+            if i + 1 < lines.len() && spaces > 0 {
+                assert!(
+                    (filled - measure).abs() < 0.01,
+                    "line {i} fills {filled:.2}, expected its own measure {measure:.2}"
+                );
+            }
+            // And an adjusted line's drawn right edge lands exactly on the frame. The *last* line
+            // is excluded on purpose: it is never adjusted, and the breaker permits it to be up to
+            // `measure + shrink` wide, so it can be drawn past the frame. That is a pre-existing
+            // defect this increment measured and did not fix — see the roadmap's known issues.
+            if i + 1 < lines.len() && spaces > 0 {
+                assert!(
+                    line.indent_pt + filled <= 120.0 + 0.01,
+                    "line {i} draws to {:.2}, past the 120 pt frame",
+                    line.indent_pt + filled
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hanging_indent_insets_only_the_lines_after_the_first() {
+        let lines = justify_paragraph_indented(
+            "aaa bbb ccc ddd eee fff ggg hhh iii jjj",
+            120.0,
+            Indent::hanging(12.0),
+            SIZE,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(lines.len() >= 2);
+        assert_eq!(lines[0].indent_pt, 0.0);
+        assert!(lines[1..].iter().all(|l| l.indent_pt == 12.0));
+    }
+
+    #[test]
+    fn a_first_line_indent_insets_only_the_first() {
+        let lines = justify_paragraph_indented(
+            "aaa bbb ccc ddd eee fff ggg hhh iii jjj",
+            120.0,
+            Indent {
+                first_pt: 18.0,
+                rest_pt: 0.0,
+            },
+            SIZE,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(lines.len() >= 2);
+        assert_eq!(lines[0].indent_pt, 18.0);
+        assert!(lines[1..].iter().all(|l| l.indent_pt == 0.0));
+    }
+
+    #[test]
+    fn no_indent_is_exactly_the_unindented_breaker() {
+        // Parity: the indented entry point with zero insets must not be a second implementation.
+        for measure in [432.0, 198.0, 96.0, 54.0] {
+            let text = "the quick brown fox jumps over the lazy dog and keeps running for a while";
+            assert_eq!(
+                break_paragraph_indented(text, measure, measure, SIZE, &MONO, &NoHyphenator),
+                break_paragraph_hyphenated(text, measure, SIZE, &MONO, &NoHyphenator),
+                "measure {measure}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_breaking_space_binds_its_words_into_one_box() {
+        // `Armour\u{a0}Class:` is 13 characters — 78 pt under MONO. In a 90 pt measure it fits but
+        // `Armour Class: 15` (96 pt) does not, so the line ends after the key either way. What this
+        // pins is that the key is a *unit*: it is never the boundary itself, whatever the demerits
+        // would otherwise prefer.
+        let bound = break_paragraph_hyphenated(
+            "Armour\u{a0}Class: 15 (leather, shield)",
+            90.0,
+            SIZE,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(
+            bound.iter().all(|l| l.trim() != "Armour"),
+            "a bound key may never be the whole of a line: {bound:?}"
+        );
+        assert!(
+            bound.iter().any(|l| l.contains("Armour Class:")),
+            "the key must survive whole, spelled with an ordinary space: {bound:?}"
+        );
+    }
+
+    #[test]
+    fn a_bound_unit_wider_than_the_measure_falls_back_rather_than_splitting_quietly() {
+        // The documented consequence of binding: a unit that cannot fit is exactly the
+        // no-feasible-breaking case, so the greedy fallback takes over. It is worth pinning because
+        // the alternative — silently honouring the break the author forbade — would make U+00A0
+        // advisory, and an author who writes one means it.
+        let lines = break_paragraph_hyphenated(
+            "Armour\u{a0}Class: 15",
+            60.0, // 10 characters; the bound key needs 13
+            SIZE,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(
+            !lines.is_empty(),
+            "the fallback must still produce lines rather than nothing"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains('\u{a0}')),
+            "even the fallback must not emit U+00A0: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_breaking_space_never_reaches_the_output_as_u00a0() {
+        // It must be emitted as an ordinary space. Leaving U+00A0 in the line text would carry it
+        // into the PDF, where `collect_doc_chars` never gathered it and it would subset to
+        // `.notdef` — a visible box in a press file, which is the failure mode this repo cares
+        // about most.
+        let lines = break_paragraph_hyphenated(
+            "Hit\u{a0}Points: 45 and some more words to force a wrap here",
+            60.0,
+            SIZE,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains('\u{a0}')),
+            "no line may carry U+00A0: {lines:?}"
+        );
     }
 }

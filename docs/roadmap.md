@@ -910,7 +910,7 @@ Every increment carries the `Document::sample()` export byte-hash regression bul
 | 2 | 0045 | [Table continuation — break between rows, repeat the header](#0045-table-continuation) | medium |
 | 3 | 0046 | [Stat-block continuation — keep together, else break at a section](#0046-stat-block-continuation) | medium |
 | 4 | 0047 | [Master statics: alignment and page-parity mirroring; `FORMAT_VERSION` 3](#0047-master-static-alignment) | medium |
-| 5 | 0048 | [Hanging indent and a tab stop — key/value pairs that stay paired](#0048-hanging-indent-and-tab-stops) | medium |
+| 5 | 0048 | [Hanging indent and non-breaking spaces — key/value pairs that stay paired](#0048-hanging-indent-and-tab-stops) | medium |
 | 6 | 0049 | [POD presets — the printer's requirements as data](#0049-pod-presets) | medium |
 | 7 | 0050 | [Preflight over placed geometry — effective dpi and the live area](#0050-geometry-preflight) | medium |
 | 8 | 0051 | [Knuth-Plass active-node pruning — closing the superlinear cliff](#0051-line-break-pruning) | small |
@@ -1195,6 +1195,13 @@ to JSON must not change the document `/ID` for a document that has no statics, o
 asserting on a masters-bearing fixture as well as on the sample.
 
 ### 0048 hanging-indent-and-tab-stops
+
+> **Shipped without the tab stop.** `Line` is one string with evenly distributed gaps; a tab stop
+> sets *part* of a line at an absolute x, which needs a line to be a sequence of positioned
+> segments — a model change rippling through both painters and the PDF writer. Spec 0048 ships the
+> indent plus U+00A0 binding instead, which is what actually keeps a key whole, and records the
+> reasoning. The original key-splitting sighting could not be reproduced with current metrics.
+
 
 **A hanging indent and a single tab stop: key/value pairs that stay paired** · size: medium ·
 branch: `feat/hanging-indent`
@@ -1503,13 +1510,18 @@ now names the M3 increment that closes it; an entry whose increment ships is del
 increment's PR, not left here as a fixed-but-still-listed defect.
 
 
-- **A stat block's attribute keys wrap mid-key in a narrow measure.** *(Scheduled: M3 spec 0048.)* `Armour Class: 15 (leather,
-  shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so
-  the key/value pairing is lost. Proper key/value columns or a hanging indent would fix it and
-  neither exists in the layout engine. Related, and the reason the colon is there at all:
-  `break_by_width` normalizes every run of inter-word whitespace to a single space, so a
-  wider-looking `"{key}  {value}"` separator collapses to an ordinary word space and separates
-  nothing. Found by rendering spec 0038's panel.
+- **A paragraph's last line may be drawn past its measure.** `base_demerits` permits a last line up
+  to `measure + shrink`, on the strength of shrink that `justify_paragraph_*` never applies to it:
+  a last line gets `space_adjust_pt: 0.0` and is drawn at its natural width. Measured by spec 0048 —
+  a 120 pt measure with a 12 pt hanging indent draws a last line to 126 pt.
+
+  The fix is one line (`is_last && natural > l` ⇒ infeasible) and it is *correct*, which is what
+  makes it worth its own increment rather than a drive-by. It moves line breaking across the corpus,
+  so spec 0051's equivalence digest has to be re-derived deliberately; and it makes stat-block
+  sections tall enough to stop fitting a narrow `rulebook` column, which sends a block down spec
+  0046's uncuttable path and off the bottom of the page. A 0046 test caught exactly that when it was
+  tried. Not a regression — this has been true since spec 0017 — but an indent makes it easy to hit,
+  which is how it was found.
 
 ## Open questions
 

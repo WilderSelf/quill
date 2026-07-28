@@ -370,7 +370,9 @@ fn render_page(
                 let ascent = font.ascent_pt(*font_size_pt);
                 for (li, line) in lines.iter().enumerate() {
                     let top_y = frame.y_pt + ascent + li as f32 * leading_pt;
-                    let (x, y) = geom::flip(g, frame.x_pt, top_y);
+                    // The line's own left inset (spec 0048) — the same field the screen painter
+                    // adds, so press and screen cannot disagree about an indent.
+                    let (x, y) = geom::flip(g, frame.x_pt + line.indent_pt, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
                     show_line(&mut content, font, line, *font_size_pt);
@@ -677,6 +679,7 @@ mod tests {
                 lines: vec![Line {
                     text: "Hi".to_string(),
                     space_adjust_pt: 0.0,
+                    indent_pt: 0.0,
                 }],
                 color,
             }],
@@ -813,6 +816,7 @@ mod tests {
                 lines: vec![Line {
                     text: text.to_string(),
                     space_adjust_pt,
+                    indent_pt: 0.0,
                 }],
                 color: Color::Gray { v: 0.0 },
             }],
