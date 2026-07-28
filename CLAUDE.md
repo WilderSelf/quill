@@ -4,9 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing app for
-semi-professional hobbyist TTRPG publishers** — art-heavy game books up to ~500 pages that
-must export **press-ready PDF/X** for print-on-demand (DriveThruRPG, Lulu, IngramSpark).
+An open-source, cross-platform (Linux/macOS/Windows) **desktop publishing application** — long,
+art-heavy books up to ~500 pages that must export **press-ready PDF/X** for print-on-demand
+(Lulu, IngramSpark, DriveThruRPG).
+
+**Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
+application second.** Illustrated game books are the flagship use case — the audience it is designed
+for, the corpus its fixtures come from, and the reason its POD presets exist — but every *mechanism*
+must be a general one that a game book happens to use, never one only a game book can use. A stat
+block is a panelled multi-section record; a random table is a range-lookup table; a rulebook
+template is a two-column reference template. **A genre-shaped mechanism is a defect here, not a
+feature** — and M4 proved it is the worse mechanism for the genre too: `StatBlock`'s six fixed
+fields could not express a game system whose creatures are set differently, and spec 0054's
+declarations could. Apply this test to every new type, field, style name and template slug. The
+argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
 **Status: M1 complete — editing core + text-layout.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
@@ -113,8 +124,23 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 **M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
 **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and content packs).
-**M0–M4 done**; M0's sole open item is the manual POD upload.
+TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and
+content packs) → **M5** the general typographic core (the neutral core, inline runs, character
+styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
+an index, a book) → **M7** graphics and colour.
+**M0–M4 done**; M0's sole open item is the manual POD upload. **M5 is decomposed** into specs
+0062–0066; M6–M7 are named, not decomposed.
+
+**Why M5 exists: quill cannot bold a word.** `Block::Body` and `Block::Heading` each carry one
+`String` and one `Color`, so there is no styled run anywhere in the workspace — which is why the
+importer refuses emphasis on purpose. Character styles, drop caps, small caps, OpenType feature
+control and tracking are all properties of a *run*, so all of them are downstream of that one gap.
+M4 shipped a mechanism for sharing a look before the look could include an italic.
+
+**Not scheduled, and deliberately so:** the direct-manipulation authoring surface (move, resize,
+rotate, group, guides, snap, layers, undo/redo). The `app` crate opens a document, scrolls it and
+edits the text of a block; a WYSIWYG object editor is a milestone in its own right and needs the
+content model to carry inline formatting, sections and anchored objects first — which is M5–M7.
 
 ## Planning: spec-driven development
 
