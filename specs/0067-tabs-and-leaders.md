@@ -1,7 +1,7 @@
 # 0067 — Tab stops and leaders
 
-**Milestone:** M5 · **Status:** implemented (mechanism); the contents-list re-expression is deferred
-and named below
+**Milestone:** M5 · **Status:** implemented; the contents-list re-expression deferred below **shipped
+as spec 0070**
 
 ## Why
 
@@ -89,7 +89,13 @@ stretching it would move text away from the stop it was placed at. Asserted on a
 - A document that names no stops, or names stops it does not use, is unmoved — `SAMPLE_EXPORT_DIGEST`
   does not move.
 
-## Deferred, and named rather than half-done
+## Deferred, and named rather than half-done — **since closed by spec 0070**
+
+The analysis below is kept as written, because it is what spec 0070 started from and it names the
+question correctly. The answer: `w_pt` is **ink** (spec 0069's decision), so the mechanism's widths
+are the right ones and the hand-rolled columns were the defect — every x position and dot count came
+out byte-identical, three widths moved deliberately, and the ellipsis clipping stayed contents-
+specific exactly as predicted here.
 
 **The generated contents list (spec 0041) is not yet re-expressed through this mechanism.** The
 roadmap sets that as this increment's acceptance criterion, with the current placed geometry as the

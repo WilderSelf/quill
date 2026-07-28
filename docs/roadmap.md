@@ -19,7 +19,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
-| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | specs 0062–0067 shipped; **closing out via 0068–0070**, the increments its two known issues turned into once they were measured |
+| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0070 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took and remains sequenced and unbuilt |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
@@ -2376,6 +2376,7 @@ component text sections, list markers, and the contents list. The three that are
 ### 0070 contents-list-through-tabs
 
 **The generated contents list is a tabbed paragraph** · size: small · branch: `feat/toc-through-tabs`
+· **shipped**
 
 Deletes `measure_toc`'s hand-rolled indent/clip/leader arithmetic in favour of one right tab stop
 with a dot leader. The pattern spec 0054 used to retire the hand-written component measurement.
@@ -2390,6 +2391,28 @@ with a dot leader. The pattern spec 0054 used to retire the hand-written compone
 - The `/Link` hot area is asserted to cover the title text and **not** the dot leader — the defect
   named in the known issue, which no test covers today.
 - The ellipsis clipping stays in the contents list. It is not a tab rule.
+
+**As built.** 64 lines of hand-rolled placement retired; the equivalence held exactly. Three things
+worth carrying beyond the spec:
+
+- **The oracle is the deleted code, not a golden.** `toc_reference_geometry` in the layout engine's
+  tests is a transcription of 0041's arithmetic, and every x is compared on `f32::to_bits` rather
+  than to a tolerance. A golden captured after the change would have proved nothing, and a tolerance
+  is how an equivalence quietly stops being one.
+- **Float addition is not associative, and it nearly mattered.** The old leader origin was
+  `(indent + title_w) + gap`; the mechanism computes `indent + (title_w + gap)`. Over a random scan
+  of 200,000 plausible operand triples the two differ by one ulp in ~0.2% of cases — and the dot
+  count differed in *none*. Neither fixture (monospace, and the bundled font through
+  `lay_out_for_press`) hits the band, verified by diffing bit-exact geometry dumps against a build of
+  `main`. The bit-exact assertion is what would report it if a future metrics change moved a case
+  into it.
+- **The `/Link` defect was invisible to the suite by construction, and that is the transferable
+  finding.** Both existing tests compare the link rect to the title run's frame — the *same*
+  rectangle — so they move together and pass under either semantics. Confirmed by reintroducing the
+  defect: the new test fails (`the hot area must end where the title's ink ends: 402 vs 99.3`) while
+  both old ones still pass. A test that derives its expectation from the object under test asserts
+  only that the object agrees with itself; the fix was to name something the defect cannot move with
+  it — the leader's origin, and the title's advance measured straight from the export font.
 
 ### 0071 compress-content-streams
 
@@ -2444,29 +2467,6 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   *inside* a section when no section boundary fits is the part that does not. Until then the
   limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
   it says in as many words that it inverts when the fix ships.
-
-- **The generated contents list is not yet re-expressed through spec 0067's tab mechanism.**
-  Sequenced as spec 0070, behind 0068 and 0069. 0067 ships the mechanism and 0041's hand-rolled
-  version still stands beside it. Laying `"{clipped title}\t{number}"` against one right stop at
-  `width - indent`, with a `.` leader of `gap_pt: TOC_LEADER_GAP_PT`, reproduces every **x
-  position** and the leader's dot count exactly. Two **widths** do not: `measure_toc` gives the
-  title part `w_pt: title_max` — the column it was clipped to — and the leader part
-  `w_pt: leader_end - leader_x`, the gap rather than the drawn dots.
-
-  **The question that blocked it is answered in the decisions log: `w_pt` is ink.** So the
-  mechanism's values are the correct ones and `measure_toc`'s are the defect, which inverts this
-  increment's acceptance criterion — every x position and dot count is byte-identical, and the two
-  widths deliberately move. A third width moves with them, unlisted until the audit that settled
-  this: the contents list's *own* title part carries `w_pt: width`, the whole frame measure
-  (crates/layout-engine/src/lib.rs:1379-1389). The ellipsis clipping stays contents-specific either
-  way — it is not a tab rule, it is "an entry does not wrap".
-
-  It also fixes a defect nobody had filed. The entry title is the only part in the workspace
-  carrying `link_page`, so spec 0052's `/Link` hot area is emitted from `title_max`: in a screen
-  export the clickable region spans the whole clip column, running past the end of the title and
-  across the dot leader. The comment at crates/layout-engine/src/lib.rs:2110-2112 claims a link
-  whose hot area has drifted off its own text is "structurally impossible"; today that is true
-  vertically and false horizontally.
 
 ## Open questions
 

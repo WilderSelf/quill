@@ -130,6 +130,10 @@ An image is the one variant where the old rule and the new agree, and it is unto
 
 ### One stated exception, and its expiry
 
+**Expired: spec 0070 shipped and the exception is gone.** The entries are now a tabbed line laid
+against one right stop, and their widths are ink like everything else. The paragraph below is what
+this spec committed to, kept because the commitment is what made the exception safe to write.
+
 The contents list's **entries** — title, leader, page number — still report their columns. Spec 0070
 deletes that arithmetic outright in favour of one right tab stop with a dot leader, and its
 equivalence claim is that every x and every dot count stays byte-identical to spec 0041's while the
