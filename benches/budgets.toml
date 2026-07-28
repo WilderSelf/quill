@@ -65,10 +65,25 @@ incremental_blocks_measured = 2.0
 
 [line_breaking]
 # One Knuth-Plass justification pass over one generated body paragraph. Measured 64.2.
+#
+# Spec 0051's pruning cut this by ~4x as a side effect, but the ceiling stays where it was: 64.2 was
+# recorded on the reference machine and 0051 was measured on a faster one (43.8 before, 10.0 after),
+# so re-pinning would silently import a different machine's speed into the gate. The ratio below is
+# the entry that carries 0051's improvement, because a ratio is machine-independent.
 us_per_paragraph = 70.0
-# An 8x longer paragraph. Measured 35.8x, which is SUPERLINEAR — see the note below. The budget
-# records today's reality so a further regression is still caught; it is not an endorsement.
-length_scaling_ratio = 40.0
+# An 8x longer paragraph. **Was 35.8x — superlinear, the defect spec 0051 closed. Now 8.1-8.9x**
+# (same machine: 34.2x before the fix, 8.3x after), i.e. linear to within measurement noise, which
+# is what active-node pruning is supposed to buy. Pinned at 12.0 rather than at ~9 to leave room for
+# a log factor on inputs whose active window is wider than this corpus's; with tolerance_factor the
+# gate fires at 24x, well under the 34x the unpruned algorithm measured, so losing the pruning again
+# fails here.
+length_scaling_ratio = 12.0
+# One paragraph of 20,000 words — a stat block or table flattened into a single paragraph, which is
+# the input the superlinearity actually hurt. **Before spec 0051 this took 49,750 ms**; measured 4.4
+# after. The ceiling is 25.0 (gate fires at 50 ms), generous enough for a shared CI runner several
+# times slower than the reference machine and still 1000x below the old behaviour: this entry is a
+# hang detector, not a stopwatch.
+pathological_20k_words_ms = 25.0
 
 [proxy_cache]
 # Decoding and downsampling one 1200x900 linked image into a screen proxy. Measured 6.31.
@@ -78,18 +93,4 @@ ms_per_image = 7.0
 # 0024's incremental-invalidation claim stated as a number. Measured speedup is ~8300x, so there is
 # enormous headroom — the gate fires only if skipping stops working, which is the point.
 warm_speedup_floor = 0.01
-
-# ---------------------------------------------------------------------------------------------
-# Known issue, found by this harness on its first run
-#
-# `line_breaking.length_scaling_ratio` measures 35.8x for an 8x longer paragraph. Linear would be
-# 8x and fully quadratic 64x, so Knuth-Plass here is behaving closer to O(n^2) than to O(n). The
-# textbook algorithm keeps this near-linear by pruning active nodes that can no longer lead to a
-# feasible break; that pruning appears to be missing or ineffective.
-#
-# Not fixed in spec 0027, deliberately: this increment lands the measuring stick, and changing the
-# line breaker in the same commit would mean changing the thing being measured and the measurement
-# together. It is low-severity in practice — real paragraphs are 30-90 words, where the absolute
-# cost is ~64 us — but it is a genuine cliff for pathological input, such as a stat block or table
-# flattened into one very long paragraph. Tracked in docs/roadmap.md.
 
