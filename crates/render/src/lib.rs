@@ -1,9 +1,14 @@
 //! On-screen rendering and the linked-image proxy cache.
 //!
-//! Real rendering will use a GPU canvas (`skia-safe`, evaluating `vello`). This scaffold implements
-//! the proxy-cache *policy* and now the real **proxy pixels** — decoded, downsampled screen proxies
-//! so full-resolution art is only touched at export — which is central to staying fast on 500-page,
-//! image-heavy books. PNG proxies land first (spec 0021); JPEG/other formats are later increments.
+//! Rendering emits a backend-neutral paint list ([`paint`]) which is then rasterized on the CPU by
+//! `tiny-skia` ([`raster`]) — spec 0033. A GPU backend (`vello`/`wgpu`) can replace the rasterizer
+//! without touching layout; see the decisions log in `docs/roadmap.md` for why not `skia-safe`.
+//!
+//! This crate also owns the proxy-cache *policy* and the real **proxy pixels** — decoded,
+//! downsampled screen proxies so full-resolution art is only touched at export — which is central
+//! to staying fast on 500-page, image-heavy books. PNG (spec 0021) and JPEG (0022) are decoded;
+//! the cache is populated from a document's linked assets (0023) and invalidated on `mtime + size`
+//! (0024). An on-disk persisted cache and content-hash invalidation remain named follow-ups.
 
 use quill_core_model::Asset;
 use std::collections::HashMap;
