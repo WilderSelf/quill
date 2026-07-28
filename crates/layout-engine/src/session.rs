@@ -102,7 +102,7 @@ pub struct LayoutSession {
     /// Block order and content fingerprints from the previous pass, for diffing.
     previous: Vec<(BlockId, u64)>,
     /// Fingerprint of everything *other* than block content that layout depends on: the stylesheet,
-    /// page setup and master pages.
+    /// page setup, master pages and the per-page master assignments (spec 0035).
     ///
     /// Without this the diff sees only blocks, so restyling the document — or changing its margins,
     /// or its master page — looks like "nothing changed" and the session returns the previous pages
@@ -459,9 +459,12 @@ fn content_fingerprint(block: &Block) -> u64 {
 /// derived, so it tracks the struct automatically. It runs once per relayout, against layout that
 /// costs milliseconds.
 fn context_fingerprint(doc: &Document) -> u64 {
+    // `doc.pages` belongs here for exactly the reason the rest of this list does (spec 0035):
+    // reassigning page 7's master changes page 7's geometry without touching a single block, so a
+    // fingerprint blind to it would see "nothing changed" and hand back the previous pages.
     let text = format!(
-        "{:?}|{:?}|{:?}|{:?}",
-        doc.page_setup, doc.styles, doc.master_pages, doc.default_master
+        "{:?}|{:?}|{:?}|{:?}|{:?}",
+        doc.page_setup, doc.styles, doc.master_pages, doc.default_master, doc.pages
     );
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {
@@ -491,7 +494,7 @@ fn style_fingerprint(styles: &StyleSheet, block: &Block) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quill_core_model::{Color, Document};
+    use quill_core_model::{Color, Document, Margins, MasterPage, PageOverride};
     use quill_text_layout::{MonospaceRunMetrics, NoHyphenator};
 
     const MONO: MonospaceRunMetrics = MonospaceRunMetrics { em_ratio: 0.6 };
@@ -704,6 +707,67 @@ mod tests {
         assert_eq!(
             after.pages, full,
             "a restyle must not reuse stale measurements"
+        );
+    }
+
+    #[test]
+    fn reassigning_a_pages_master_invalidates_the_session() {
+        // Spec 0035. The page list is context, not content: reassigning page 1's master changes
+        // that page's geometry without touching a single block, so a fingerprint blind to it would
+        // see "nothing changed" and hand back the previous pages — a stale document presented as a
+        // current one.
+        //
+        // Asserted in BOTH directions on purpose. The invalidate half alone would pass against an
+        // implementation that invalidates on everything; the reuse half alone would pass against
+        // one that never invalidates. Only the pair pins the behavior.
+        let mut doc = doc_of(200);
+        doc.master_pages = vec![
+            MasterPage {
+                margins: Some(Margins::uniform(72.0)),
+                ..MasterPage::plain("deep")
+            },
+            MasterPage {
+                margins: Some(Margins::uniform(18.0)),
+                ..MasterPage::plain("shallow")
+            },
+        ];
+        doc.default_master = Some("shallow".into());
+
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        // Reuse: an untouched document costs nothing.
+        let unchanged = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            unchanged.stats.blocks_measured, 0,
+            "an unchanged document must not re-measure"
+        );
+
+        // Invalidate: a page-list edit alone must reach the pages.
+        doc.pages = vec![
+            PageOverride { master: None },
+            PageOverride {
+                master: Some("deep".into()),
+            },
+        ];
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            after.stats.pages_reused, 0,
+            "a page-list change must invalidate, not reuse"
+        );
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&doc, &MONO, &NoHyphenator),
+            "and the result must match a full pass"
+        );
+
+        // Reuse again, this time with a page list actually present. Without this the reuse half
+        // above would only prove the *old* context is stable, not a context containing a page
+        // list — and "invalidates on everything" would pass the pair.
+        let settled = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            settled.stats.blocks_measured, 0,
+            "a page list that did not change must not invalidate either"
         );
     }
 

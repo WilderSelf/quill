@@ -201,44 +201,49 @@ impl PageTemplate for UniformTemplate {
     }
 }
 
-/// A [`PageTemplate`] built from a document's page setup and its default master page (spec 0030).
+/// A [`PageTemplate`] built from a document's page setup and its master pages (specs 0030, 0035).
 ///
 /// This is where authored layout finally reaches the engine: margins, column count and gutter come
-/// from the master, and its statics are stamped onto every page with `{page}` resolved.
+/// from the master governing each page, and that master's statics are stamped onto the page with
+/// `{page}` resolved.
 ///
 /// With no master and zero margins it produces exactly [`Frame::full_page`], so a document that
 /// declares neither lays out as it always did.
+///
+/// The master is resolved **per page** rather than once, because spec 0035 lets a document assign a
+/// different master to page 0 (a chapter opener, a title page) than to the body. Resolution itself
+/// lives on [`Document::master_for`] so the engine and the model cannot disagree about which master
+/// a page has.
 pub struct DocumentTemplate<'a> {
+    doc: &'a Document,
     page_setup: &'a PageSetup,
-    master: Option<&'a MasterPage>,
     styles: &'a StyleSheet,
 }
 
 impl<'a> DocumentTemplate<'a> {
     pub fn new(doc: &'a Document) -> DocumentTemplate<'a> {
-        // An unknown `default_master` name resolves to no master rather than an error: a renamed
-        // master should degrade to the document's own page setup, not refuse to lay the book out.
-        let master = doc
-            .default_master
-            .as_deref()
-            .and_then(|name| doc.master_pages.iter().find(|m| m.name == name));
         DocumentTemplate {
+            doc,
             page_setup: &doc.page_setup,
-            master,
             styles: &doc.styles,
         }
     }
 
-    /// The margins in effect: the master's if it sets them, else the document's.
-    fn margins(&self) -> Margins {
-        self.master
+    /// The master governing `page_index`, or none.
+    fn master(&self, page_index: usize) -> Option<&'a MasterPage> {
+        self.doc.master_for(page_index)
+    }
+
+    /// The margins in effect on `page_index`: the master's if it sets them, else the document's.
+    fn margins(&self, page_index: usize) -> Margins {
+        self.master(page_index)
             .and_then(|m| m.margins)
             .unwrap_or(self.page_setup.margins)
     }
 
     /// The text area of `page_index`, after margins are taken off the trim.
     fn content_rect(&self, page_index: usize) -> Rect {
-        let m = self.margins();
+        let m = self.margins(page_index);
         let (left, right) = m.left_right(page_index, self.page_setup.facing_pages);
         Rect {
             x_pt: left,
@@ -252,8 +257,9 @@ impl<'a> DocumentTemplate<'a> {
 impl PageTemplate for DocumentTemplate<'_> {
     fn frames(&self, page_index: usize) -> Vec<Frame> {
         let area = self.content_rect(page_index);
-        let columns = self.master.map(|m| m.columns).unwrap_or(1).max(1);
-        let gutter = self.master.map(|m| m.gutter_pt).unwrap_or(0.0);
+        let master = self.master(page_index);
+        let columns = master.map(|m| m.columns).unwrap_or(1).max(1);
+        let gutter = master.map(|m| m.gutter_pt).unwrap_or(0.0);
 
         let col_w = (area.w_pt - (columns - 1) as f32 * gutter) / columns as f32;
         // A gutter wide enough to consume the text area would give negative-width, overlapping
@@ -275,7 +281,7 @@ impl PageTemplate for DocumentTemplate<'_> {
     }
 
     fn statics(&self, page_index: usize) -> Vec<PlacedBlock> {
-        let Some(master) = self.master else {
+        let Some(master) = self.master(page_index) else {
             return Vec::new();
         };
         master
@@ -759,7 +765,9 @@ pub(crate) fn flow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quill_core_model::{Asset, Block, Color, Document, Metadata, PageSetup, Size};
+    use quill_core_model::{
+        Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size,
+    };
     use quill_text_layout::{Hyphenator, MonospaceRunMetrics, NoHyphenator};
     use quill_text_layout::{BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
 
@@ -1427,6 +1435,7 @@ mod tests {
             styles: StyleSheet::default(),
             master_pages: Vec::new(),
             default_master: None,
+            pages: Vec::new(),
         };
         // Give the blocks ids, as a loaded document would have (spec 0026).
         doc.assign_missing_block_ids().expect("fresh blocks");
@@ -1514,6 +1523,7 @@ mod tests {
             styles: StyleSheet::default(),
             master_pages: Vec::new(),
             default_master: None,
+            pages: Vec::new(),
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -2067,6 +2077,170 @@ mod tests {
             PlacedBlock::Text { frame, .. } => assert_eq!(frame.x_pt, 50.0),
             _ => panic!("expected text"),
         }
+    }
+
+    // --- Per-page master assignment (spec 0035) -----------------------------------------------
+
+    /// A document with an `opener` master (deep top margin, no furniture) and a `body` master
+    /// (shallow top margin, a folio), defaulting to `body`.
+    fn doc_with_opener_and_body(blocks: Vec<Block>) -> Document {
+        let opener = MasterPage {
+            margins: Some(Margins {
+                top_pt: 108.0,
+                bottom_pt: 36.0,
+                inside_pt: 36.0,
+                outside_pt: 36.0,
+            }),
+            ..MasterPage::plain("opener")
+        };
+        let body = MasterPage {
+            margins: Some(Margins::uniform(36.0)),
+            statics: vec![MasterStatic::Text {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 620.0,
+                    w_pt: 432.0,
+                    h_pt: 12.0,
+                },
+                text: "{page}".into(),
+                color: Color::Gray { v: 0.0 },
+                style: Some("body".into()),
+            }],
+            ..MasterPage::plain("body")
+        };
+        let mut doc = doc_with_blocks(blocks);
+        doc.master_pages = vec![opener, body];
+        doc.default_master = Some("body".into());
+        doc
+    }
+
+    fn frame_y(page: &LaidOutPage) -> f32 {
+        match &page.blocks[0] {
+            PlacedBlock::Text { frame, .. } => frame.y_pt,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_page_override_gives_that_page_its_own_geometry() {
+        // The chapter-opener case, which is the whole reason this exists: page 0 starts 108 pt down
+        // the page, every page after it at the body master's 36 pt.
+        let mut doc = doc_with_opener_and_body(many_lines(200));
+        doc.pages = vec![PageOverride {
+            master: Some("opener".into()),
+        }];
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 3, "need a body page to compare against");
+        assert_eq!(frame_y(&pages[0]), 108.0);
+        assert_eq!(frame_y(&pages[1]), 36.0);
+        assert_eq!(frame_y(&pages[2]), 36.0);
+    }
+
+    #[test]
+    fn an_unknown_page_master_falls_back_to_the_default_then_to_the_page_setup() {
+        // Both fallback steps, because a renamed master must cost the page its furniture and not
+        // cost the author the page — the same posture as an unknown style name.
+        let mut doc = doc_with_opener_and_body(vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        doc.pages = vec![PageOverride {
+            master: Some("was-renamed".into()),
+        }];
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            frame_y(&pages[0]),
+            36.0,
+            "unknown page master should fall back to `body`"
+        );
+
+        doc.default_master = Some("also-renamed".into());
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            frame_y(&pages[0]),
+            0.0,
+            "with the default gone too, the document's own page setup governs"
+        );
+    }
+
+    #[test]
+    fn an_override_that_names_no_master_falls_through_to_the_default() {
+        // `Some(PageOverride { master: None })` is not the same as "no master": an entry that
+        // declines to override still gets the document's default.
+        let mut doc = doc_with_opener_and_body(vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        doc.pages = vec![PageOverride { master: None }];
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(frame_y(&pages[0]), 36.0);
+    }
+
+    #[test]
+    fn a_page_list_need_not_match_the_document_length() {
+        // Short: governs what it covers, the rest fall back. Long: the surplus is ignored rather
+        // than being an error, because the content that justified those entries may just have been
+        // deleted.
+        let mut doc = doc_with_opener_and_body(many_lines(200));
+        doc.pages = vec![PageOverride {
+            master: Some("opener".into()),
+        }];
+        let short = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(short.len() >= 2);
+        assert_eq!(frame_y(&short[1]), 36.0);
+
+        doc.pages = (0..short.len() + 50)
+            .map(|i| PageOverride {
+                master: (i == 0).then(|| "opener".to_string()),
+            })
+            .collect();
+        let long = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(long.len(), short.len(), "surplus entries add no pages");
+        assert_eq!(frame_y(&long[0]), 108.0);
+    }
+
+    #[test]
+    fn statics_resolve_against_the_pages_own_master() {
+        // The first thing in the engine to vary statics *between* pages: the opener carries no
+        // folio, the body master does, and the token is still one-based.
+        let mut doc = doc_with_opener_and_body(many_lines(200));
+        doc.pages = vec![PageOverride {
+            master: Some("opener".into()),
+        }];
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 2);
+        assert!(pages[0].statics.is_empty(), "the opener has no furniture");
+        match &pages[1].statics[0] {
+            PlacedBlock::Text { lines, .. } => assert_eq!(lines[0].text, "2"),
+            other => panic!("expected a folio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_page_statics_still_do_not_consume_flow_space() {
+        // Spec 0029's invariant, re-asserted because statics now differ from page to page: adding
+        // furniture must not move a single line of the text it labels.
+        let mut with = doc_with_opener_and_body(many_lines(200));
+        with.pages = vec![PageOverride {
+            master: Some("opener".into()),
+        }];
+        let mut without = with.clone();
+        for m in &mut without.master_pages {
+            m.statics.clear();
+        }
+        let a = lay_out(&with, &MONO, &NoHyphenator);
+        let b = lay_out(&without, &MONO, &NoHyphenator);
+        assert_eq!(a.len(), b.len());
+        for (pa, pb) in a.iter().zip(b.iter()) {
+            assert_eq!(pa.blocks, pb.blocks, "flowed content must be identical");
+        }
+    }
+
+    #[test]
+    fn the_page_list_round_trips_through_the_document() {
+        let mut doc = doc_with_opener_and_body(vec![Block::body("x", Color::Gray { v: 0.0 })]);
+        doc.pages = vec![
+            PageOverride {
+                master: Some("opener".into()),
+            },
+            PageOverride { master: None },
+        ];
+        let back = Document::from_json(&doc.to_json().expect("save")).expect("load");
+        assert_eq!(back.pages, doc.pages);
     }
 
     #[test]

@@ -32,7 +32,7 @@ Top-level shape (illustrative; the authoritative schema is the `serde` types in
   "master_pages": [ { "name": "body", "columns": 2, "gutter_pt": 12,
                       "statics": [ { "kind": "text", "rect": { ... }, "text": "The Dungeon — {page}" } ] } ],
   "default_master": "body",
-  "spreads": [ { "pages": [ { "master": "...", "frames": [ ... ] } ] } ],
+  "pages": [ { "master": "chapter-opener" }, {} ],
   "styles": { "paragraph": { "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" }, "h1": { ... } } },
   "content": [ /* semantic blocks: headings, body, stat blocks, tables, random tables */ ],
   "revision": 0,
@@ -49,6 +49,18 @@ margins, column count, gutter and repeating furniture shared by the pages it gov
 static's text resolves to the one-based page number. `default_master` names the master applied to
 the document; an unknown name degrades to the document's own page setup rather than refusing to open
 the file.
+
+`pages` (spec 0035) overrides that default per page, positionally — `pages[i]` governs page `i`.
+A page's master is its own override, else `default_master`, else none, and a name matching no master
+falls through to the next step rather than failing, on the same principle: a renamed master costs
+the page its furniture, never the author their page. The list need not match the document's length;
+pages beyond it fall back, and entries beyond the document are ignored. The list is omitted from the
+manifest entirely when empty, so a document that never assigns a master reads exactly as it did
+before spec 0035 — which is why this addition needed no `format_version` bump.
+
+Because assignment is positional, content that pushes the book by a page slides every subsequent
+assignment. That is the accepted trade for M2; anchoring a master to the chapter it opens is
+recorded as an open question in `docs/roadmap.md`.
 
 ## Versioning
 
@@ -90,5 +102,9 @@ the wrong block's layout.
 ## Two linked representations
 
 The model carries both a **semantic content** tree (the easy authoring layer) and a **layout**
-(spreads/frames/threads — the pro layer); frames reference content, so editing content reflows
-layout. See `CLAUDE.md` and the plan for how these interact.
+(master pages, the per-page assignment list, frames and threads — the pro layer); frames reference
+content, so editing content reflows layout. See `CLAUDE.md` and the roadmap for how these interact.
+
+("Spreads" appeared in earlier drafts of this document as the layout container. No such type was
+ever built: the layout layer is `master_pages` + `pages`, described above. Facing-page behavior
+lives in `page_setup.facing_pages` and in the inside/outside margins, not in a spread object.)
