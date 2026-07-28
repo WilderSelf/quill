@@ -14,8 +14,9 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
     Asset, Block, BlockId, Color, Document, Margins, MasterPage, MasterStatic, PageSetup,
-    ParagraphStyle, Rect, StatBlock, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_ATTR_STYLE,
-    STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE,
+    ParagraphStyle, Rect, StatBlock, StyleSheet, Table, TextAlign, PAGE_TOKEN,
+    STATBLOCK_ATTR_STYLE, STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE, TABLE_CELL_STYLE,
+    TABLE_HEADER_STYLE,
 };
 use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -495,11 +496,25 @@ pub(crate) enum Measured {
         fill: Option<Color>,
         stroke: Option<Stroke>,
         parts: Vec<PanelPart>,
-        /// Horizontal rules inside the panel, as offsets from its top. What gives the panel
-        /// internal structure — without them the sections run together and it reads as a tinted
-        /// paragraph rather than as a stat block.
-        rules: Vec<f32>,
+        /// Decoration inside the panel, positioned relative to its top-left: the hairlines that
+        /// separate a stat block's sections, the shaded bands behind a table's alternating rows.
+        ///
+        /// Generalized from a list of rule offsets when tables arrived (spec 0039). A rule and a
+        /// zebra band are the same thing — a filled rectangle at an offset — and one list means the
+        /// paint order is decided in one place rather than two.
+        decorations: Vec<PanelRect>,
     },
+}
+
+/// One decorative rectangle inside a [`Measured::Panel`], relative to the panel's top-left.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PanelRect {
+    pub dx_pt: f32,
+    pub dy_pt: f32,
+    pub w_pt: f32,
+    pub h_pt: f32,
+    pub fill: Option<Color>,
+    pub stroke: Option<Stroke>,
 }
 
 /// One styled run inside a [`Measured::Panel`], positioned relative to the panel's top-left.
@@ -560,6 +575,9 @@ pub(crate) fn measure_block(
                 height,
             ))
         }
+        Block::Table { table, color, .. } => Some(measure_table(
+            table, *color, width, styles, metrics, hyphenator,
+        )),
         Block::StatBlock { stat, color, .. } => Some(measure_stat_block(
             stat, *color, width, styles, metrics, hyphenator,
         )),
@@ -645,7 +663,7 @@ fn measure_stat_block(
         push_group(&mut runs, section.clone());
     }
 
-    let mut rules: Vec<f32> = Vec::new();
+    let mut decorations: Vec<PanelRect> = Vec::new();
     for (idx, (text, style_name, starts_section)) in runs.into_iter().enumerate() {
         let style = styles
             .paragraph
@@ -665,7 +683,14 @@ fn measure_stat_block(
         // the panel's own edge above it.
         if starts_section && idx > 0 {
             y += SECTION_RULE_GAP_PT;
-            rules.push(y);
+            decorations.push(PanelRect {
+                dx_pt: STATBLOCK_PADDING_PT,
+                dy_pt: y,
+                w_pt: inner_w,
+                h_pt: SECTION_RULE_PT,
+                fill: Some(STATBLOCK_STROKE.color),
+                stroke: None,
+            });
             y += SECTION_RULE_GAP_PT;
         }
         let n = lines.len();
@@ -687,9 +712,147 @@ fn measure_stat_block(
             fill: Some(STATBLOCK_FILL),
             stroke: Some(STATBLOCK_STROKE),
             parts,
-            rules,
+            decorations,
         },
         height,
+    )
+}
+
+/// Padding inside each table cell, so text never touches a rule or its neighbour's column.
+pub const TABLE_CELL_PADDING_PT: f32 = 3.0;
+
+/// The shade behind alternate rows. Light enough that 9 pt text stays legible over it, and far
+/// enough inside the ink limit that it can never be what fails preflight.
+const TABLE_ZEBRA_FILL: Color = Color::Gray { v: 0.94 };
+
+/// The rule under a table's header row.
+const TABLE_HEADER_RULE_PT: f32 = 0.75;
+
+/// Break a table into cells, row bands and a header rule (spec 0039).
+///
+/// Rows are measured to the tallest cell in the row, so a wrapped cell pushes its whole row down
+/// rather than overlapping the row beneath. Reuses spec 0038's panel seam: a cell is a `PanelPart`
+/// and a zebra band is a `PanelRect`, so tables and stat blocks share one placement path.
+fn measure_table(
+    table: &Table,
+    color: Color,
+    width: f32,
+    styles: &StyleSheet,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> (Measured, f32) {
+    let count = table.column_count();
+    if count == 0 || table.rows.is_empty() && table.header.is_none() {
+        // An empty table occupies nothing rather than drawing an empty box.
+        return (
+            Measured::Panel {
+                fill: None,
+                stroke: None,
+                parts: Vec::new(),
+                decorations: Vec::new(),
+            },
+            0.0,
+        );
+    }
+
+    let fractions = table.normalized_columns(count);
+    // Column x offsets and widths, in points, with the cell padding taken off the *measure* so a
+    // wrapped cell stays inside its column rather than being broken wide and then drawn inset.
+    let mut x = 0.0;
+    let mut columns: Vec<(f32, f32)> = Vec::with_capacity(count);
+    for f in &fractions {
+        let w = width * f;
+        columns.push((
+            x + TABLE_CELL_PADDING_PT,
+            (w - TABLE_CELL_PADDING_PT * 2.0).max(1.0),
+        ));
+        x += w;
+    }
+
+    let header_style = styles
+        .paragraph
+        .get(TABLE_HEADER_STYLE)
+        .copied()
+        .unwrap_or_default();
+    let cell_style = styles
+        .paragraph
+        .get(TABLE_CELL_STYLE)
+        .copied()
+        .unwrap_or_default();
+
+    let mut parts: Vec<PanelPart> = Vec::new();
+    let mut decorations: Vec<PanelRect> = Vec::new();
+    let mut y = 0.0;
+
+    let lay_row =
+        |cells: &[String], style: ParagraphStyle, y: &mut f32, parts: &mut Vec<PanelPart>| {
+            let mut row_h: f32 = style.leading_pt;
+            for (i, cell) in cells.iter().enumerate().take(count) {
+                let (cx, cw) = columns[i];
+                let lines = justify_paragraph_hyphenated(
+                    cell,
+                    cw,
+                    style.font_size_pt,
+                    Alignment::Left,
+                    metrics,
+                    hyphenator,
+                );
+                row_h = row_h.max(lines.len() as f32 * style.leading_pt);
+                parts.push(PanelPart {
+                    dx_pt: cx,
+                    dy_pt: *y + TABLE_CELL_PADDING_PT,
+                    w_pt: cw,
+                    lines,
+                    color,
+                    font_size_pt: style.font_size_pt,
+                    leading_pt: style.leading_pt,
+                });
+            }
+            // The row's height is its tallest cell: a wrapped cell must push the row down, not overlap
+            // the one beneath it.
+            let h = row_h + TABLE_CELL_PADDING_PT * 2.0;
+            *y += h;
+            h
+        };
+
+    if let Some(header) = &table.header {
+        lay_row(header, header_style, &mut y, &mut parts);
+        decorations.push(PanelRect {
+            dx_pt: 0.0,
+            dy_pt: y,
+            w_pt: width,
+            h_pt: TABLE_HEADER_RULE_PT,
+            fill: Some(Color::Gray { v: 0.35 }),
+            stroke: None,
+        });
+        y += TABLE_HEADER_RULE_PT;
+    }
+
+    for (i, row) in table.rows.iter().enumerate() {
+        let band_top = y;
+        let h = lay_row(row, cell_style, &mut y, &mut parts);
+        if table.zebra && i % 2 == 1 {
+            // Behind the row's text. `decorations` are emitted before `parts`, so ordering is
+            // structural rather than something each caller has to remember.
+            decorations.push(PanelRect {
+                dx_pt: 0.0,
+                dy_pt: band_top,
+                w_pt: width,
+                h_pt: h,
+                fill: Some(TABLE_ZEBRA_FILL),
+                stroke: None,
+            });
+        }
+    }
+
+    (
+        Measured::Panel {
+            fill: None,
+            stroke: None,
+            parts,
+            decorations,
+        },
+        y,
     )
 }
 
@@ -985,29 +1148,37 @@ pub(crate) fn flow(
                     fill,
                     stroke,
                     parts,
-                    rules,
+                    decorations,
                 } => {
                     // The panel first, so it sits behind its own text — the same
                     // decoration-before-content order the writer and the paint list rely on.
-                    let mut out = vec![PlacedBlock::Rect {
+                    //
+                    // Omitted entirely when it has neither fill nor stroke. A table has no outer
+                    // panel, only bands and a rule, and spec 0037's rule is that a rectangle
+                    // drawing nothing emits nothing — it belongs here as much as in the writer, or
+                    // every table carries an invisible rect through the whole pipeline.
+                    let mut out = Vec::new();
+                    if fill.is_some() || stroke.is_some() {
+                        out.push(PlacedBlock::Rect {
+                            frame: Rect {
+                                x_pt: frame.rect.x_pt,
+                                y_pt: y,
+                                w_pt: frame.rect.w_pt,
+                                h_pt: height,
+                            },
+                            fill,
+                            stroke,
+                        });
+                    }
+                    out.extend(decorations.into_iter().map(|d| PlacedBlock::Rect {
                         frame: Rect {
-                            x_pt: frame.rect.x_pt,
-                            y_pt: y,
-                            w_pt: frame.rect.w_pt,
-                            h_pt: height,
+                            x_pt: frame.rect.x_pt + d.dx_pt,
+                            y_pt: y + d.dy_pt,
+                            w_pt: d.w_pt,
+                            h_pt: d.h_pt,
                         },
-                        fill,
-                        stroke,
-                    }];
-                    out.extend(rules.into_iter().map(|dy| PlacedBlock::Rect {
-                        frame: Rect {
-                            x_pt: frame.rect.x_pt + STATBLOCK_PADDING_PT,
-                            y_pt: y + dy,
-                            w_pt: (frame.rect.w_pt - STATBLOCK_PADDING_PT * 2.0).max(0.0),
-                            h_pt: SECTION_RULE_PT,
-                        },
-                        fill: Some(STATBLOCK_STROKE.color),
-                        stroke: None,
+                        fill: d.fill,
+                        stroke: d.stroke,
                     }));
                     out.extend(parts.into_iter().map(|p| PlacedBlock::Text {
                         source: block.id(),
@@ -2858,6 +3029,242 @@ mod tests {
                 "a run overran the panel's right padding"
             );
         }
+    }
+
+    // --- Tables (spec 0039) ---------------------------------------------------------------------
+
+    fn table_doc(table: quill_core_model::Table) -> Document {
+        let mut doc = doc_with_blocks(vec![Block::Table {
+            id: BlockId::UNASSIGNED,
+            table,
+            color: Color::Gray { v: 0.0 },
+        }]);
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    fn simple_table() -> quill_core_model::Table {
+        quill_core_model::Table {
+            columns: vec![0.25, 0.75],
+            header: Some(vec!["Roll".into(), "Result".into()]),
+            rows: vec![
+                vec!["1-3".into(), "Goblins".into()],
+                vec!["4-6".into(), "Bandits".into()],
+            ],
+            zebra: true,
+        }
+    }
+
+    fn cells(page: &LaidOutPage) -> Vec<(f32, f32, String)> {
+        page.blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, lines, .. } => {
+                    Some((frame.x_pt, frame.w_pt, lines[0].text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_columns_land_at_exact_fractions_of_the_measure() {
+        // 432 pt frame, widths 0.25/0.75 ⇒ columns at x = 0 and x = 108, each inset by the 3 pt
+        // cell padding: text starts at 3 and 111, measuring 108 - 6 = 102 and 324 - 6 = 318.
+        let doc = table_doc(simple_table());
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let c = cells(&pages[0]);
+        assert_eq!(c.len(), 6, "header plus two rows, two columns each");
+        assert!((c[0].0 - 3.0).abs() < 0.01, "column 0 x: {:?}", c[0]);
+        assert!((c[0].1 - 102.0).abs() < 0.01, "column 0 width: {:?}", c[0]);
+        assert!((c[1].0 - 111.0).abs() < 0.01, "column 1 x: {:?}", c[1]);
+        assert!((c[1].1 - 318.0).abs() < 0.01, "column 1 width: {:?}", c[1]);
+    }
+
+    #[test]
+    fn table_column_widths_are_normalized_not_taken_literally() {
+        // `[1, 3]` must mean the same as `[0.25, 0.75]` — an author should not have to make the
+        // widths sum to one, and taking them literally would run the table off the frame.
+        let doc = table_doc(quill_core_model::Table {
+            columns: vec![1.0, 3.0],
+            ..simple_table()
+        });
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let c = cells(&pages[0]);
+        assert!((c[1].0 - 111.0).abs() < 0.01, "column 1 x: {:?}", c[1]);
+    }
+
+    #[test]
+    fn a_degenerate_column_width_falls_back_to_an_equal_split() {
+        // Authoring posture, matching the over-wide gutter in spec 0030: a bad width costs the
+        // look, never the content. A zero-width column would silently swallow its cells.
+        for columns in [vec![0.0, 1.0], vec![-1.0, 2.0], vec![1.0]] {
+            let doc = table_doc(quill_core_model::Table {
+                columns,
+                ..simple_table()
+            });
+            let pages = lay_out(&doc, &MONO, &NoHyphenator);
+            let c = cells(&pages[0]);
+            assert_eq!(c.len(), 6, "no cell may be lost");
+            assert!(
+                (c[1].0 - 219.0).abs() < 0.01,
+                "an equal split puts column 1 at 216 + 3: {:?}",
+                c[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_cell_pushes_its_whole_row_down() {
+        // Row height is the tallest cell's. Without that a wrapped cell overlaps the row beneath.
+        let long = "a fairly long cell value that will certainly wrap to more than one line here";
+        let doc = table_doc(quill_core_model::Table {
+            columns: vec![0.5, 0.5],
+            header: None,
+            rows: vec![
+                vec!["short".into(), long.into()],
+                vec!["next".into(), "row".into()],
+            ],
+            zebra: false,
+        });
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let c = cells(&pages[0]);
+
+        let row0_y = match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => frame.y_pt,
+            other => panic!("expected a cell, got {other:?}"),
+        };
+        let row1_y = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame, lines, .. } if lines[0].text == "next" => {
+                    Some(frame.y_pt)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("the second row");
+
+        let wrapped_lines = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, .. } if lines.len() > 1 => Some(lines.len()),
+                _ => None,
+            })
+            .next()
+            .expect("the long cell must actually wrap");
+        assert!(wrapped_lines >= 2);
+        assert!(
+            row1_y >= row0_y + wrapped_lines as f32 * 11.5,
+            "the next row must clear the wrapped cell: {row0_y} -> {row1_y}"
+        );
+        assert_eq!(c.len(), 4);
+    }
+
+    #[test]
+    fn zebra_shades_alternate_rows_and_nothing_when_switched_off() {
+        // On: one band per odd row, behind the text. Off: no bands at all. Both directions, so this
+        // cannot pass against an implementation that always (or never) bands.
+        let banded = table_doc(quill_core_model::Table {
+            rows: (0..5)
+                .map(|i| vec![format!("{i}"), format!("row {i}")])
+                .collect(),
+            ..simple_table()
+        });
+        let pages = lay_out(&banded, &MONO, &NoHyphenator);
+        let rects: Vec<&PlacedBlock> = pages[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, PlacedBlock::Rect { .. }))
+            .collect();
+        // Two odd rows (indices 1 and 3) plus the header rule.
+        assert_eq!(rects.len(), 3, "two bands and a header rule");
+
+        let plain = table_doc(quill_core_model::Table {
+            zebra: false,
+            header: None,
+            ..simple_table()
+        });
+        let pages = lay_out(&plain, &MONO, &NoHyphenator);
+        assert!(
+            !pages[0]
+                .blocks
+                .iter()
+                .any(|b| matches!(b, PlacedBlock::Rect { .. })),
+            "zebra off and no header ⇒ no decoration at all"
+        );
+    }
+
+    #[test]
+    fn decoration_paints_before_the_cells_it_sits_behind() {
+        let doc = table_doc(simple_table());
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let first_text = pages[0]
+            .blocks
+            .iter()
+            .position(|b| matches!(b, PlacedBlock::Text { .. }))
+            .expect("cells");
+        let last_rect = pages[0]
+            .blocks
+            .iter()
+            .rposition(|b| matches!(b, PlacedBlock::Rect { .. }))
+            .expect("decoration");
+        assert!(last_rect < first_text, "bands must sit behind the text");
+    }
+
+    #[test]
+    fn an_empty_table_occupies_nothing_and_does_not_panic() {
+        let doc = table_doc(quill_core_model::Table::default());
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].blocks.is_empty());
+    }
+
+    #[test]
+    fn a_random_table_lays_out_through_the_conversion() {
+        // End to end: the component that already existed, on a page at last.
+        let random = quill_core_model::RandomTable {
+            die: 6,
+            entries: vec![
+                quill_core_model::TableEntry {
+                    low: 1,
+                    high: 3,
+                    result: "Goblins".into(),
+                },
+                quill_core_model::TableEntry {
+                    low: 4,
+                    high: 4,
+                    result: "One bandit".into(),
+                },
+            ],
+        };
+        let doc = table_doc(quill_core_model::Table::from_random(&random));
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let texts: Vec<String> = cells(&pages[0]).into_iter().map(|c| c.2).collect();
+        assert_eq!(
+            texts,
+            ["d6", "Result", "1-3", "Goblins", "4", "One bandit"],
+            "a one-value range must read `4`, not `4-4`"
+        );
+    }
+
+    #[test]
+    fn a_five_hundred_row_table_places_every_cell() {
+        // Correctness at scale. A table this size overflows its frame — blocks do not split across
+        // frames (the roadmap's known issue) — but no cell may be lost.
+        let rows: Vec<Vec<String>> = (0..500)
+            .map(|i| vec![format!("{i}"), format!("result {i}")])
+            .collect();
+        let doc = table_doc(quill_core_model::Table {
+            rows,
+            header: None,
+            ..simple_table()
+        });
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let placed: usize = pages.iter().map(|p| cells(p).len()).sum();
+        assert_eq!(placed, 1000, "every cell of every row must be placed");
     }
 
     // --- Heading index (spec 0040) --------------------------------------------------------------

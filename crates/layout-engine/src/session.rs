@@ -450,6 +450,29 @@ fn content_fingerprint(block: &Block) -> u64 {
             eat(b"i");
             eat(asset.as_bytes());
         }
+        Block::Table { table, .. } => {
+            // Every cell, the header, the widths and the zebra flag: all of them change the
+            // measurement, and a key that misses one returns a stale layout (spec 0031).
+            eat(b"t");
+            for w in &table.columns {
+                eat(&w.to_bits().to_le_bytes());
+            }
+            eat(&[table.zebra as u8]);
+            if let Some(header) = &table.header {
+                for cell in header {
+                    eat(cell.as_bytes());
+                    eat(b"\x1f");
+                }
+            }
+            eat(b"\x1e");
+            for row in &table.rows {
+                for cell in row {
+                    eat(cell.as_bytes());
+                    eat(b"\x1f");
+                }
+                eat(b"\x1e");
+            }
+        }
         Block::StatBlock { stat, .. } => {
             // Every field, not a summary. A key that misses a dimension the measurement depends on
             // returns a stale layout and the document is silently wrong (spec 0031) — and a stat
