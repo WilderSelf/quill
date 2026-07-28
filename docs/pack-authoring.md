@@ -162,6 +162,9 @@ and **two** for fine ones (a row). Two *sections* per fragment can make the smal
 than a frame, at which point nothing is cut and the panel runs off the page.
 
 A section marked `"repeat": true` is the prefix every continuation re-states — a table's header row.
+It must come **before every ordinary section**: the interpreter builds the prefix from everything
+emitted so far, so a repeated section with content above it would re-state that content too and a cut
+component would duplicate it on every continuation. Refused when the pack is read.
 
 ### Colour
 
@@ -173,6 +176,15 @@ Two families, `gray` and `cmyk`:
 
 There is deliberately no RGB. A press file must not contain it, and the cheapest way to guarantee a
 pack never introduces one is for the format to be unable to say it.
+
+### Measurements
+
+Every measurement — `padding_pt`, `width_pt`, `thickness_pt`, `gap_above_pt`, `gap_below_pt`,
+`cell_padding_pt` — must be **finite and non-negative**, and a pack declaring otherwise is refused.
+
+Unlike a style name, geometry has no sane fallback. A negative panel padding draws the component's
+text outside its own panel and off the page, and the safe-area preflight exempts anything outward of
+trim as deliberate bleed — so a bad number would reach paper with nothing reporting it.
 
 ### The styles a definition names
 
@@ -351,6 +363,9 @@ Deliberately, and each with an error naming the thing that is wrong:
 | an empty `source` or `license` | provenance is not optional |
 | an asset path that is absolute or contains `..` | a pack is the one artifact that routinely comes from someone else |
 | a definition with no sections, no `source`, or no `style` | it cannot lay anything out |
+| a `repeat` section with ordinary content above it | every continuation would duplicate that content |
+| a negative or non-finite measurement | it would draw off the page with nothing reporting it |
+| a pack `name` or `version` containing `..`, `/`, or nothing | they build the install path, so either would escape the pack root |
 | two sections rendering the same field | it silently sets the content twice |
 | a definition filed under a name it does not answer to | the definition validated is not the one that would be laid out |
 | a required pack that is not installed | see above — never a quiet fallback |

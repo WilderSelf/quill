@@ -48,6 +48,16 @@ Four shapes, which is what the two bundled components need and no more:
 | `pairs` | `Pairs(Vec<(String,String)>)` | one run per pair, `key⟨sep⟩value`, the key's words joined by U+00A0 so it cannot break |
 | `rows` | `Rows(Vec<Vec<String>>)` | one row of cells per element, across the component's columns |
 
+A `repeat` section must come **before every ordinary one**. `repeat` means "the prefix each
+continuation re-states", and the interpreter implements it by capturing everything emitted so far —
+so a repeated section with content above it re-states that content too, and a cut component
+duplicates it on every continuation. Refused by `ComponentDef::validate`.
+
+Every declared measurement — panel padding, stroke width, rule thickness and gaps, cell padding —
+must be finite and non-negative. Geometry has no sane fallback the way a style name does: a negative
+padding draws text outside its own panel and off the page, and spec 0050's safe-area check exempts
+anything outward of trim as deliberate bleed, so nothing downstream would report it.
+
 The instance carries `ComponentFields`, a `BTreeMap<String, FieldValue>`. A field the definition
 names and the instance omits contributes nothing; a field the instance carries and the definition
 does not name is ignored. Both are the authoring posture, not errors.
@@ -76,7 +86,10 @@ emit today. Its rules, stated because they are what the byte-identical criterion
   empty-table case, which must not draw an empty box.
 
 `SplitGranularity::Sections` records a cut boundary at each emitted section (the stat block);
-`Elements` records one at each element of the last non-repeated section (the table's rows).
+`Elements` records one at each element of **every non-repeated section** (the table's rows). A
+`repeat` section records none at all — it is the prefix every fragment begins with, not content that
+can be left behind, and giving it a boundary would hand item 0 the prefix alone and overfill every
+continuation by exactly one row.
 
 Columns are shared across every `rows` section, so a header and its body agree: the count is the
 widest element seen, and the widths come from the `Widths` field the definition names, through the
@@ -105,6 +118,8 @@ the definition:
 - `EmptyName`, `SectionMissingSource`, `SectionMissingStyle`, `NoSections` — malformed shape.
 - `DuplicateSectionSource` — two sections rendering the same field, which is always an authoring
   mistake and silently doubles content.
+- `RepeatNotAPrefix` — a `repeat` section with ordinary content above it. See above.
+- `BadMeasure` — a negative or non-finite measurement. See above.
 
 Validation runs on document load (`Document::from_json`), so a malformed definition is refused
 before it can produce geometry. A style name that does not resolve is **not** an error: it falls

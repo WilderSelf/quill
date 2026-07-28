@@ -1567,9 +1567,15 @@ pub(crate) fn flow(
             // block pushed down by the snap may no longer fit, and must then move on like any
             // other. `O(1)`, reading one number and writing one — the grid is per frame and local,
             // and a global recompute is a named non-goal.
+            //
+            // A block that occupies nothing is skipped: an empty table draws no ink, and snapping
+            // it would push everything after it down by up to a whole step for a block the reader
+            // cannot see.
             if let Some(grid) = grid {
-                let off = measured.first_baseline_offset(metrics).unwrap_or(0.0);
-                y = grid.snap_down(y + off) - off;
+                if height > 0.0 {
+                    let off = measured.first_baseline_offset(metrics).unwrap_or(0.0);
+                    y = grid.snap_down(y + off) - off;
+                }
             }
             let bottom = frame.rect.y_pt + frame.rect.h_pt;
 

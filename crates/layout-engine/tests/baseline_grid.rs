@@ -447,3 +447,111 @@ fn a_style_whose_leading_is_not_a_grid_multiple_is_named() {
     // A grid that is not usable reports nothing rather than dividing by zero.
     assert!(BaselineGrid::new(0.0).off_grid_styles(&styles).is_empty());
 }
+
+/// A **component** cut across a frame boundary: every fragment's first baseline is on the grid.
+///
+/// The gap the original 0058 tests left. `a_continuations_first_baseline_is_on_the_grid` covers a
+/// split *paragraph*, and `components_snap_as_body_text_does` covers an *unsplit* component — but a
+/// component fragment reaches `first_baseline_offset` through `Measured::split_at`, which rebases
+/// every part's `dy_pt` by `cut - repeat_h` and prepends the repeated prefix. If that rebasing and
+/// the snap disagreed, a continued stat block or table would sit a few points off the grid and
+/// nothing here would have said so.
+#[test]
+fn each_fragment_of_a_split_component_snaps() {
+    let long_table = Table {
+        columns: vec![2.0, 1.0],
+        header: Some(vec!["Item".into(), "Cost".into()]),
+        rows: (1..=30)
+            .map(|i| vec![format!("Item number {i}"), format!("{i} gp")])
+            .collect(),
+        zebra: true,
+    };
+    let creature = StatBlock {
+        name: "Cave Troll".into(),
+        overview: vec!["Large giant, chaotic evil.".into()],
+        attributes: vec![("Armour Class".into(), "15".into())],
+        details: (0..6).map(|i| format!("Detail {i}.")).collect(),
+        actions: (0..6).map(|i| format!("Action {i}.")).collect(),
+        reactions: vec!["Parry.".into()],
+    };
+
+    // Short enough that both composites must be cut, tall enough that a fragment still fits.
+    let doc = gridded_doc(
+        Size {
+            w_pt: 360.0,
+            h_pt: 240.0,
+        },
+        vec![
+            Block::body(PROSE[0], INK),
+            Block::Table {
+                id: BlockId::UNASSIGNED,
+                table: long_table,
+                color: INK,
+            },
+            Block::StatBlock {
+                id: BlockId::UNASSIGNED,
+                stat: creature,
+                color: INK,
+            },
+        ],
+    );
+    let pages = lay_out(&doc, &METRICS, &NoHyphenator);
+    assert!(
+        pages.len() >= 3,
+        "want both composites cut, got {} pages",
+        pages.len()
+    );
+
+    // A fragment is identified by (page, source): a block that appears on more than one page was
+    // cut, and each appearance is a fragment whose topmost run must land on the grid.
+    let mut first_run: std::collections::BTreeMap<(usize, u64), (f32, f32)> = Default::default();
+    for page in &pages {
+        for b in &page.blocks {
+            if let PlacedBlock::Text {
+                frame,
+                source,
+                font_size_pt,
+                ..
+            } = b
+            {
+                let e = first_run
+                    .entry((page.index, source.0))
+                    .or_insert((frame.y_pt, *font_size_pt));
+                if frame.y_pt < e.0 {
+                    *e = (frame.y_pt, *font_size_pt);
+                }
+            }
+        }
+    }
+
+    let split_blocks: std::collections::BTreeSet<u64> = {
+        let mut counts: std::collections::BTreeMap<u64, usize> = Default::default();
+        for (_, id) in first_run.keys() {
+            *counts.entry(*id).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, n)| n > 1)
+            .map(|(id, _)| id)
+            .collect()
+    };
+    assert!(
+        split_blocks.len() >= 2,
+        "want the table and the stat block both cut, got {} split block(s)",
+        split_blocks.len()
+    );
+
+    let mut off: Vec<((usize, u64), f32)> = Vec::new();
+    for (key, (y, size)) in &first_run {
+        let baseline = y + METRICS.ascent_pt(*size);
+        let k = ((baseline - GRID.origin_pt) / GRID.step_pt).round();
+        let delta = baseline - (GRID.origin_pt + k * GRID.step_pt);
+        if delta.abs() > 0.01 {
+            off.push((*key, delta));
+        }
+    }
+    assert!(
+        off.is_empty(),
+        "these (page, block) fragments start off the grid: {off:?}"
+    );
+}
