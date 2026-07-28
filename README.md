@@ -2,15 +2,22 @@
 
 > **Quill** is a working codename — the product name is still to be decided.
 
-An open-source, cross-platform desktop publishing app for **semi-professional hobbyist TTRPG
-publishers** — art-heavy game books up to ~500 pages that need **press-ready PDF/X** output for
-print-on-demand (DriveThruRPG, Lulu, IngramSpark).
+An open-source, cross-platform **desktop publishing application** — long, art-heavy books up to
+~500 pages that need **press-ready PDF/X** output for print-on-demand (Lulu, IngramSpark,
+DriveThruRPG).
 
-It aims to fill a real gap: today's tools force a choice between *easy but not print-grade*
-(Homebrewery, GM Binder) and *print-grade but expensive/hard/slow-on-long-documents* (InDesign,
-Affinity Publisher, Scribus). Quill targets a **hybrid**: an easy structured-content on-ramp
-that flows into a real frame/master-page layout engine with correct PDF/X export — fast enough
-to stay smooth at 500 pages.
+Quill is a general-purpose desktop publishing application first. Its flagship audience is
+independent publishers of illustrated game books, and that is where its fixtures, its templates and
+its print-on-demand presets come from — but every mechanism in it is a general one. A panelled
+record, a range-lookup table, a two-column reference layout: a cookbook, a field guide, a hardware
+manual and a thesis want each of those on exactly the same terms, and a mechanism only one genre can
+use is treated here as a defect rather than a feature.
+
+It aims to fill a real gap: today's tools force a choice between *easy but not print-grade* and
+*print-grade but expensive, hard, or slow on long documents* (InDesign, Affinity Publisher,
+Scribus). Quill targets a **hybrid**: an easy structured-content on-ramp that flows into a real
+frame/master-page layout engine with correct PDF/X export — fast enough to stay smooth at 500
+pages.
 
 ## Status
 
