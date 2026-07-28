@@ -637,8 +637,8 @@ failure that matters. The keep-together and split tests are the two that justify
 panel but loses a line, or a keep-together that infinite-loops by moving a block that never fits, are
 both plausible. The "never fits anywhere" case needs an explicit escape (place it and overflow, do
 not loop) or a 500-page document with one oversized stat block hangs the app — the same
-termination-bound hazard spec 0031 recorded. Knuth-Plass superlinearity (see Known issues) is more
-exposed here than anywhere: a stat block's `details` entries are prose and could plausibly be long.
+termination-bound hazard spec 0031 recorded. Knuth-Plass superlinearity (spec 0051, since fixed) was
+more exposed here than anywhere: a stat block's `details` entries are prose and could plausibly be long.
 
 ### 0039 tables
 
@@ -897,8 +897,9 @@ the foot of a column**, **furniture sits where a bound book puts it**, and **the
 the printer is checked against the printer's actual requirements** rather than against one
 hard-coded set of numbers that happens to be DriveThruRPG's.
 
-Three of the four items in "Known issues" below are M3 work, and the largest of them — a block never
-splits across frames — has now been hit by three separate increments. M3 opens by building it once.
+Every item left in "Known issues" below is M3 work, and the largest of them — a block never splits
+across frames — has now been hit by three separate increments. M3 opens by building it once. (The
+list was four items when M3 was decomposed; spec 0051 has since shipped and deleted its own.)
 
 Same rule as M1 and M2: each increment compiles, its tests pass, and it is a coherent PR on its own.
 Every increment carries the `Document::sample()` export byte-hash regression bullet.
@@ -1500,15 +1501,6 @@ The spec must state its version field and its migration posture up front.
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. Each entry
 now names the M3 increment that closes it; an entry whose increment ships is deleted in that
 increment's PR, not left here as a fixed-but-still-listed defect.
-
-- **Knuth-Plass line breaking is superlinear in paragraph length.** *(Scheduled: M3 spec 0051.)* An 8× longer paragraph costs
-  ~36× the time (linear would be 8×, quadratic 64×), so active-node pruning is missing or
-  ineffective. Found by spec 0027's harness on its first run. Low severity in practice — real
-  paragraphs are 30–90 words, ~64 µs each — but a genuine cliff for pathological input such as a
-  stat block or table flattened into one very long paragraph, which this product's users plausibly
-  produce. Deliberately not fixed inside 0027: changing the line breaker and the measurement in one
-  commit would leave neither trustworthy. `benches/budgets.toml` pins today's value so a further
-  regression is still caught.
 
 
 - **A stat block's attribute keys wrap mid-key in a narrow measure.** *(Scheduled: M3 spec 0048.)* `Armour Class: 15 (leather,

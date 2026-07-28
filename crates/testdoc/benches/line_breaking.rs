@@ -87,5 +87,48 @@ fn main() {
     println!("length scaling: 8x the words costs {ratio:.2}x the time");
     budgets.check("line_breaking.length_scaling_ratio", ratio, &mut failures);
 
+    // The pathological case spec 0051 exists for: one paragraph of 20,000 words — a stat block or a
+    // table flattened into a single paragraph, which spec 0043's importer makes easy to produce by
+    // accident. Before pruning this took ~50 SECONDS, which is not a slow benchmark but a hung app;
+    // it is measured here so the cliff cannot come back unnoticed. Timed once, not `min_of`: the
+    // budget is a hang detector with three orders of magnitude of headroom, so run-to-run noise is
+    // irrelevant and a repeat would only make the bench slower.
+    let pathological: String = pool_words(&paragraphs, 20_000);
+    let t0 = std::time::Instant::now();
+    std::hint::black_box(justify_paragraph_hyphenated(
+        &pathological,
+        FRAME_WIDTH_PT,
+        quill_text_layout::BODY_FONT_SIZE_PT,
+        Alignment::Justified,
+        &HARNESS_METRICS,
+        &NoHyphenator,
+    ));
+    let pathological_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("pathological: one 20,000-word paragraph in {pathological_ms:.1} ms");
+    budgets.check(
+        "line_breaking.pathological_20k_words_ms",
+        pathological_ms,
+        &mut failures,
+    );
+
     budget::report(failures);
+}
+
+/// One paragraph of exactly `n` words, drawn in order from the generated corpus and wrapped around.
+///
+/// Real generated prose rather than one word repeated: Knuth-Plass cost is driven by how many
+/// *feasible* breakpoints each line's active window holds, and a single repeated word would give
+/// every candidate identical width — an easier, unrepresentative shape.
+fn pool_words(paragraphs: &[&str], n: usize) -> String {
+    let pool: Vec<&str> = paragraphs
+        .iter()
+        .flat_map(|p| p.split_whitespace())
+        .collect();
+    assert!(!pool.is_empty(), "generator produced no words");
+    pool.iter()
+        .cycle()
+        .take(n)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
