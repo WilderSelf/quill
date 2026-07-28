@@ -686,6 +686,46 @@ pub struct ParagraphStyle {
     pub italic: bool,
 }
 
+/// Where a tab stops, how the text there is aligned, and what fills the gap before it (spec 0067).
+///
+/// In [`StyleSheet`] keyed by style name rather than on [`ParagraphStyle`], and that is the design
+/// fork this spec resolves: `ParagraphStyle` is `Copy` and is looked up and copied per block per
+/// measurement, so a `Vec<TabStop>` on it would either cost a heap allocation on that path or force
+/// the type to stop being `Copy`. A fixed-size array was considered and rejected — eight stops is
+/// both an arbitrary ceiling and ~96 bytes copied per block.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TabStop {
+    /// Distance from the frame's left edge, in points.
+    pub position_pt: Pt,
+    #[serde(default)]
+    pub align: TabAlign,
+    /// What fills the gap in front of this stop. `None` leaves it blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader: Option<Leader>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabAlign {
+    #[default]
+    Left,
+    Centre,
+    Right,
+    /// The decimal separator sits at the stop. What counts as the separator is stated rather than
+    /// taken from a locale: layout must not depend on the machine that runs it.
+    Decimal,
+}
+
+/// A repeated character filling the gap in front of a stop — a dot leader in a contents list, a
+/// rule in a price list.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Leader {
+    pub glyph: char,
+    /// Blank space left at each end, so the leader never touches the text on either side.
+    #[serde(default)]
+    pub gap_pt: Pt,
+}
+
 /// A **named** run treatment (spec 0065).
 ///
 /// Exactly the fields [`InlineStyle`] carries, and deliberately the same shape: a named treatment
@@ -1002,6 +1042,10 @@ pub fn heading_style_name(level: u8) -> String {
 pub struct StyleSheet {
     #[serde(default)]
     pub paragraph: BTreeMap<String, ParagraphStyle>,
+    /// Tab stops, keyed by the *paragraph* style they belong to (spec 0067). Resolved beside the
+    /// paragraph style and passed by reference, which is what keeps `ParagraphStyle` `Copy`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tabs: BTreeMap<String, Vec<TabStop>>,
     /// Named run treatments (spec 0065) — the ones this document *authored*.
     ///
     /// The four built-ins are deliberately **not** in here. They are resolved by
@@ -1195,6 +1239,7 @@ impl Default for StyleSheet {
         }
         StyleSheet {
             paragraph,
+            tabs: BTreeMap::new(),
             character: BTreeMap::new(),
         }
     }
@@ -1214,6 +1259,22 @@ impl StyleSheet {
     /// authoring-posture fallback specs 0028 and 0054 both take — losing text because a style was
     /// renamed, or because the pack defining it is missing, would be far worse than setting it
     /// plainly.
+    /// The tab stops a block's paragraph style names, in ascending position order (spec 0067).
+    ///
+    /// Empty when the style names none, which is every document that predates them — and is what
+    /// lets the measurement path skip the mechanism entirely rather than lay out a tabless line
+    /// through it.
+    pub fn tabs_for(&self, block: &Block) -> &[TabStop] {
+        let name = match block {
+            Block::Heading { style, level, .. } => {
+                style.clone().unwrap_or_else(|| heading_style_name(*level))
+            }
+            Block::Body { style, .. } => style.clone().unwrap_or_else(|| BODY_STYLE.to_string()),
+            _ => return &[],
+        };
+        self.tabs.get(&name).map_or(&[], |v| v.as_slice())
+    }
+
     pub fn character(&self, name: &str) -> Option<CharacterStyle> {
         self.character
             .get(name)

@@ -1165,6 +1165,15 @@ pub(crate) fn measure_block(
             // not be able to move a break, or the run model would be a layout change rather than a
             // generalization. What comes back is per-line spans naming the run each stretch is from.
             let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+            // A paragraph whose style names tab stops, and whose text actually contains a tab, is
+            // positioned by those stops rather than broken to the measure (spec 0067). Both
+            // conditions, so a document that names stops it does not use lays out exactly as it did.
+            let stops = styles.tabs_for(block);
+            if !stops.is_empty() && texts.iter().any(|t| t.contains('\t')) {
+                return Some(measure_tabbed(
+                    &texts, stops, &style, *color, width, metrics,
+                ));
+            }
             // Each run's own face, size and tracking (spec 0064). Empty when they all resolve to
             // the paragraph's, which is the path that must not move a glyph.
             let formats = run_formats(runs, &style, styles);
@@ -1278,6 +1287,76 @@ const TOC_LEADER_GAP_PT: f32 = 4.0;
 /// a dot leader between them. Two runs rather than one string of dots because the number has to
 /// land at an exact x, and padding a string with dots would put it wherever the last dot happened
 /// to fall.
+/// A paragraph positioned by its tab stops (spec 0067).
+///
+/// One line, and deliberately: a tabbed paragraph is a *row* — a contents entry, a price line, a
+/// bibliography entry, a specification sheet's key and value. Wrapping one is a different mechanism
+/// (which stop does a continuation line start at?) and is named as a non-goal rather than guessed
+/// at. Text that outruns its stop goes to the next stop, and a segment with no stop left butts
+/// against what precedes it, so nothing is ever dropped.
+///
+/// Built as panel parts, which is what the generated contents list has been since spec 0041 — the
+/// same shape, now produced by a general mechanism instead of by hand.
+fn measure_tabbed(
+    texts: &[&str],
+    stops: &[quill_core_model::TabStop],
+    style: &ParagraphStyle,
+    color: Color,
+    width: f32,
+    metrics: &impl RunMetrics,
+) -> (Measured, f32) {
+    let joined: String = texts.concat();
+    let stops: Vec<quill_text_layout::TabStop> = stops
+        .iter()
+        .map(|t| quill_text_layout::TabStop {
+            // A stop past the measure would place text off the frame; clamped, because a stop is a
+            // house style's number and a measure is the page's.
+            position_pt: t.position_pt.min(width),
+            align: match t.align {
+                quill_core_model::TabAlign::Left => quill_text_layout::TabAlign::Left,
+                quill_core_model::TabAlign::Centre => quill_text_layout::TabAlign::Centre,
+                quill_core_model::TabAlign::Right => quill_text_layout::TabAlign::Right,
+                quill_core_model::TabAlign::Decimal => quill_text_layout::TabAlign::Decimal,
+            },
+            leader: t.leader.map(|l| quill_text_layout::Leader {
+                glyph: l.glyph,
+                gap_pt: l.gap_pt,
+            }),
+        })
+        .collect();
+
+    let size = style.font_size_pt;
+    let segments = quill_text_layout::lay_tabs(&joined, &stops, &|s| metrics.measure_run(s, size));
+    let parts: Vec<PanelPart> = segments
+        .into_iter()
+        .map(|seg| PanelPart {
+            dx_pt: seg.x_pt,
+            dy_pt: style.space_before_pt,
+            w_pt: seg.w_pt,
+            // Each segment is drawn where the stops put it, so it carries no justification: a tab is
+            // a hard position, and stretching the gap in front of one would move the stop.
+            lines: vec![Line::single_run(seg.text, 0.0, 0.0)],
+            color,
+            font_size_pt: size,
+            leading_pt: style.leading_pt,
+            link_page: None,
+        })
+        .collect();
+
+    let height = style.space_before_pt + style.leading_pt + style.space_after_pt;
+    (
+        Measured::Panel {
+            fill: None,
+            stroke: None,
+            parts,
+            decorations: Vec::new(),
+            // One line: there is nothing to split between.
+            split: None,
+        },
+        height,
+    )
+}
+
 fn measure_toc(
     title: &str,
     max_level: u8,

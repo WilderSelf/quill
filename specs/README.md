@@ -75,6 +75,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0064 | [The font family, and the overrides that move a glyph](0064-font-family.md) | M5 | implemented |
 | 0065 | [A named run treatment, as there is a named paragraph treatment](0065-character-styles.md) | M5 | implemented |
 | 0066 | [Lists: bullets, numbering, and the counter that survives repagination](0066-lists.md) | M5 | implemented |
+| 0067 | [Tab stops and leaders](0067-tabs-and-leaders.md) | M5 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),
 and the content-pack authoring guide in [`../docs/pack-authoring.md`](../docs/pack-authoring.md).
