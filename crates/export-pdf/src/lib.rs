@@ -2029,6 +2029,7 @@ mod tests {
                         weight: Some(quill_core_model::Weight::BOLD),
                         ..quill_core_model::InlineStyle::EMPTY
                     },
+                    character: None,
                 },
             ],
             Color::Gray { v: 0.0 },
@@ -2045,6 +2046,7 @@ mod tests {
                     weight: Some(quill_core_model::Weight::BOLD),
                     ..quill_core_model::InlineStyle::EMPTY
                 },
+                character: None,
             }],
             Color::Gray { v: 0.0 },
         ));
@@ -2071,6 +2073,7 @@ mod tests {
                     weight: Some(quill_core_model::Weight::BOLD),
                     ..quill_core_model::InlineStyle::EMPTY
                 },
+                character: None,
             }],
             Color::Gray { v: 0.0 },
         ));
@@ -2106,6 +2109,7 @@ mod tests {
                         weight: Some(quill_core_model::Weight::BOLD),
                         ..quill_core_model::InlineStyle::EMPTY
                     },
+                    character: None,
                 },
                 quill_core_model::Run::plain(" and a tail"),
             ],
@@ -2952,6 +2956,7 @@ mod tests {
                         }),
                         ..quill_core_model::InlineStyle::EMPTY
                     },
+                    character: None,
                 },
                 quill_core_model::Run::plain(" and ordinary prose again."),
             ],
@@ -2989,6 +2994,7 @@ mod tests {
                         }),
                         ..quill_core_model::InlineStyle::EMPTY
                     },
+                    character: None,
                 },
             ],
             Color::Gray { v: 0.0 },

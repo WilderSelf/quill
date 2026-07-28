@@ -315,3 +315,56 @@ fn extraction_carries_only_the_documents_own_definitions() {
     );
     assert!(pack.components.contains_key(STATBLOCK_COMPONENT));
 }
+
+/// Spec 0065: a pack's look includes the run treatments it was designed against.
+///
+/// `quill pack extract` lifts a book's stylesheet, and a stylesheet now has two maps. A pack that
+/// carried paragraph treatments but not the character styles its runs name would ship half a look —
+/// and the half it dropped is the one that decides what a lead-in or an emphasis looks like.
+#[test]
+fn extract_carries_the_character_styles_a_books_runs_name() {
+    use quill_core_model::{CharacterStyle, InlineStyle, Run, Weight};
+
+    let mut book = Document::sample();
+    book.styles.character.insert(
+        "house-lead".into(),
+        CharacterStyle {
+            weight: Some(Weight::BOLD),
+            tracking_pt: Some(0.4),
+            ..CharacterStyle::EMPTY
+        },
+    );
+    book.content = vec![Block::body_runs(
+        vec![
+            Run {
+                text: "The vault door".into(),
+                style: InlineStyle::EMPTY,
+                character: Some("house-lead".into()),
+            },
+            Run::plain(" had not opened in three hundred years."),
+        ],
+        INK,
+    )];
+    book.assign_missing_block_ids().expect("ids");
+
+    let pack = PackManifest::extract_from(
+        &book,
+        "house",
+        "House style",
+        "1.0.0",
+        "https://example.com",
+        "CC-BY-4.0",
+    );
+    let carried = pack
+        .styles
+        .character
+        .get("house-lead")
+        .expect("the pack must carry the style its runs name");
+    assert_eq!(carried.weight, Some(Weight::BOLD));
+    assert_eq!(carried.tracking_pt, Some(0.4));
+
+    // And it survives a round trip through the on-disk form, which is what a consumer installs.
+    let json = pack.to_json().expect("serialize");
+    let back = PackManifest::from_json(&json).expect("parse");
+    assert_eq!(back.styles.character.get("house-lead"), Some(carried));
+}

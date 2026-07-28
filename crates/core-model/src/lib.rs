@@ -340,6 +340,11 @@ pub struct Run {
     /// What this run sets differently. Empty is the common case and the one that must cost nothing.
     #[serde(default, skip_serializing_if = "InlineStyle::is_empty")]
     pub style: InlineStyle,
+    /// The named treatment this run is set in (spec 0065), resolved against the stylesheet's
+    /// `character` map. Beside `style` rather than inside it, for the same reason `Block::style` is
+    /// beside a block's fields: a name is not an override, it is what the overrides apply *to*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
 }
 
 impl Run {
@@ -348,6 +353,7 @@ impl Run {
         Run {
             text: text.into(),
             style: InlineStyle::EMPTY,
+            character: None,
         }
     }
 }
@@ -680,6 +686,59 @@ pub struct ParagraphStyle {
     pub italic: bool,
 }
 
+/// A **named** run treatment (spec 0065).
+///
+/// Exactly the fields [`InlineStyle`] carries, and deliberately the same shape: a named treatment
+/// and an unnamed one are the same thing said in two places, and a field a style could express but
+/// an override could not would be a field an author could not opt out of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct CharacterStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_pt: Option<Pt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_pt: Option<Pt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_shift_pt: Option<Pt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<Weight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+}
+
+impl CharacterStyle {
+    pub const EMPTY: CharacterStyle = CharacterStyle {
+        size_pt: None,
+        color: None,
+        tracking_pt: None,
+        baseline_shift_pt: None,
+        weight: None,
+        italic: None,
+    };
+
+    /// This style with `over` applied on top, **field by field** (spec 0065).
+    ///
+    /// Field by field and not wholesale: a run naming `strong` and overriding only its colour is
+    /// bold *and* recoloured, because a weight is not displaced by an override of something else.
+    pub fn with(self, over: InlineStyle) -> CharacterStyle {
+        CharacterStyle {
+            size_pt: over.size_pt.or(self.size_pt),
+            color: over.color.or(self.color),
+            tracking_pt: over.tracking_pt.or(self.tracking_pt),
+            baseline_shift_pt: over.baseline_shift_pt.or(self.baseline_shift_pt),
+            weight: over.weight.or(self.weight),
+            italic: over.italic.or(self.italic),
+        }
+    }
+}
+
+impl From<InlineStyle> for CharacterStyle {
+    fn from(s: InlineStyle) -> CharacterStyle {
+        CharacterStyle::EMPTY.with(s)
+    }
+}
+
 /// A paragraph set as a list item: what marks it, and at what depth (spec 0066).
 ///
 /// A property of the *paragraph*, not a block type of its own. A list is a run of consecutive
@@ -860,6 +919,60 @@ pub const TABLE_HEADER_STYLE: &str = "table-header";
 /// A table's body cells.
 pub const TABLE_CELL_STYLE: &str = "table-cell";
 
+/// Emphasis — the *name* a run is set in, not the treatment it resolves to (spec 0065).
+///
+/// Named for what it means rather than for what it looks like, which is the whole point of naming a
+/// treatment: a house style that sets emphasis as letterspaced small caps edits `emphasis`, while a
+/// document that had said `italic` would have to be re-authored.
+pub const EMPHASIS_STYLE: &str = "emphasis";
+/// Strong emphasis.
+pub const STRONG_STYLE: &str = "strong";
+/// Both at once — what `***this***` imports to.
+pub const STRONG_EMPHASIS_STYLE: &str = "strong-emphasis";
+/// A paragraph's opening phrase, set apart from the prose that follows it.
+pub const LEAD_IN_STYLE: &str = "lead-in";
+
+/// The named run treatments every stylesheet starts with (spec 0065).
+///
+/// Four, not the five the roadmap named: `code` is deliberately absent, because a code treatment is
+/// a *monospace face* and the bundled family has one design. A `code` that set nothing but a
+/// slightly smaller size would look like a mistake rather than like code, and shipping a named
+/// treatment that does not produce the treatment is the failure spec 0064's announced-substitution
+/// rule exists to avoid. It arrives when a document can name a second family.
+pub fn builtin_character_styles() -> BTreeMap<String, CharacterStyle> {
+    let mut out = BTreeMap::new();
+    out.insert(
+        EMPHASIS_STYLE.to_string(),
+        CharacterStyle {
+            italic: Some(true),
+            ..CharacterStyle::EMPTY
+        },
+    );
+    out.insert(
+        STRONG_STYLE.to_string(),
+        CharacterStyle {
+            weight: Some(Weight::BOLD),
+            ..CharacterStyle::EMPTY
+        },
+    );
+    out.insert(
+        STRONG_EMPHASIS_STYLE.to_string(),
+        CharacterStyle {
+            weight: Some(Weight::BOLD),
+            italic: Some(true),
+            ..CharacterStyle::EMPTY
+        },
+    );
+    out.insert(
+        LEAD_IN_STYLE.to_string(),
+        CharacterStyle {
+            weight: Some(Weight::BOLD),
+            ..CharacterStyle::EMPTY
+        },
+    );
+    out
+}
+
 /// A generated table of contents' own heading (spec 0041).
 pub const TOC_TITLE_STYLE: &str = "toc-title";
 
@@ -889,6 +1002,15 @@ pub fn heading_style_name(level: u8) -> String {
 pub struct StyleSheet {
     #[serde(default)]
     pub paragraph: BTreeMap<String, ParagraphStyle>,
+    /// Named run treatments (spec 0065) — the ones this document *authored*.
+    ///
+    /// The four built-ins are deliberately **not** in here. They are resolved by
+    /// [`StyleSheet::character`] when the map does not answer, so a document that uses `emphasis`
+    /// without redefining it writes nothing about it to disk: the built-in can then be improved
+    /// without migrating every document that ever named it, and no document's bytes move for a
+    /// treatment it never authored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub character: BTreeMap<String, CharacterStyle>,
 }
 
 impl Default for StyleSheet {
@@ -1071,7 +1193,10 @@ impl Default for StyleSheet {
                 },
             );
         }
-        StyleSheet { paragraph }
+        StyleSheet {
+            paragraph,
+            character: BTreeMap::new(),
+        }
     }
 }
 
@@ -1082,6 +1207,20 @@ impl StyleSheet {
     /// `h{level}` for a heading). An unknown name falls back to `body` and finally to
     /// [`ParagraphStyle::default`] — a missing style must not lose the text. Losing a paragraph
     /// because its style was renamed would be far worse than setting it in the body face.
+    /// The named run treatment `name` resolves to, or `None` if nothing defines it (spec 0065).
+    ///
+    /// A document's own `character` map wins, then the built-ins. `None` is not an error: the run
+    /// lays out with the paragraph's treatment and its own overrides still apply, which is the
+    /// authoring-posture fallback specs 0028 and 0054 both take — losing text because a style was
+    /// renamed, or because the pack defining it is missing, would be far worse than setting it
+    /// plainly.
+    pub fn character(&self, name: &str) -> Option<CharacterStyle> {
+        self.character
+            .get(name)
+            .copied()
+            .or_else(|| builtin_character_styles().get(name).copied())
+    }
+
     pub fn resolve(&self, block: &Block) -> ParagraphStyle {
         let named = match block {
             Block::Heading { style, level, .. } => {

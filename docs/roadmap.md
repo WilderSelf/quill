@@ -2077,7 +2077,7 @@ the workspace is measured against would spend the very thing 0064's parity crite
 ### 0065 character-styles
 
 **A named run treatment, as there is a named paragraph treatment** · size: medium · branch:
-`feat/character-styles`
+`feat/character-styles` · **shipped**
 
 Spec 0028's argument, one level down: changing "every lead-in in the book" has to be one edit. The
 stylesheet gains `character: BTreeMap<String, CharacterStyle>`; a run names a style, an override, or
@@ -2097,6 +2097,23 @@ both, with the override winning field by field.
   than overridden.
 - A content pack (0055) can carry character styles, and `quill pack extract` (0057) extracts them —
   otherwise a pack's "look" is missing the half this milestone added.
+
+**What it produced**
+
+- `SAMPLE_EXPORT_DIGEST` did not move. The built-ins are resolved at lookup rather than written into
+  every stylesheet, which is why: a document that uses `emphasis` without redefining it writes
+  nothing about it to disk, so no document's bytes move for a treatment it never authored — and the
+  built-in can be improved later without migrating every document that named it.
+- **`code` is not among the four shipped**, and that is a decision. A code treatment is a monospace
+  *face*, and the bundled family has one design; a `code` that set nothing but a smaller size would
+  look like a mistake rather than like code. `emphasis`, `strong`, `strong-emphasis` and `lead-in`
+  ship. `code` arrives with a second family.
+- The importer now writes the **name** rather than the values: `**bold**` imports as a run naming
+  `strong`, so a house style that sets strong emphasis differently has something to change.
+- One defect found: `style_fingerprint` listed the fields it hashed by hand, and had silently
+  stopped covering three that move a glyph — `indent` (0048), `list` (0066) and `weight`/`italic`
+  (0064). It now hashes the resolved style by `Debug`, plus the character styles the block's runs
+  name, which is what makes the reflow claim above true rather than approximately true.
 
 ### 0066 lists
 

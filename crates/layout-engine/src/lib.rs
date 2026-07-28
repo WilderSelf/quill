@@ -15,8 +15,8 @@ use component::measure_component;
 pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
-    builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, Color,
-    ComponentLibrary, Document, ListMarker, Margins, MasterPage, MasterStatic, PageSetup,
+    builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
+    Color, ComponentLibrary, Document, ListMarker, Margins, MasterPage, MasterStatic, PageSetup,
     ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT,
     TOC_TITLE_STYLE,
 };
@@ -1052,26 +1052,51 @@ pub(crate) fn list_markers(content: &[Block], styles: &StyleSheet) -> BTreeMap<B
     out
 }
 
-/// Each run's resolved ink: its own override, or the paragraph's (spec 0063).
+/// A run's treatment, resolved through all three layers: the paragraph, the character style it
+/// names, and its own overrides (spec 0065).
+///
+/// One function, because the three consumers — ink, format and baseline shift — must not be able to
+/// disagree about precedence. Field by field, so a run naming `strong` and overriding only its
+/// colour stays bold.
+fn resolved_style(run: &quill_core_model::Run, styles: &StyleSheet) -> CharacterStyle {
+    // A name that resolves to nothing is not an error: the run lays out with the paragraph's
+    // treatment and its own overrides still apply. Losing text because a style was renamed — or
+    // because the pack that defined it is missing — would be far worse than setting it plainly,
+    // which is the posture specs 0028 and 0054 both take.
+    let named = run
+        .character
+        .as_deref()
+        .and_then(|name| styles.character(name))
+        .unwrap_or(CharacterStyle::EMPTY);
+    named.with(run.style)
+}
+
+/// Each run's resolved ink: its named style, its own override, or the paragraph's (specs 0063,
+/// 0065).
 ///
 /// Resolved once, here, so that nothing downstream has to know how an override resolves — the
 /// writer and the screen painter must not be able to disagree about a run's colour, which is the
 /// same rule `Line::indent_pt` follows.
-fn run_inks(runs: &[quill_core_model::Run], paragraph: Color) -> Vec<Color> {
+fn run_inks(runs: &[quill_core_model::Run], paragraph: Color, styles: &StyleSheet) -> Vec<Color> {
     runs.iter()
-        .map(|r| r.style.color.unwrap_or(paragraph))
+        .map(|r| resolved_style(r, styles).color.unwrap_or(paragraph))
         .collect()
 }
 
-/// Each run's resolved format: its own overrides folded onto the paragraph's treatment (spec 0064).
+/// Each run's resolved format: its named style and its own overrides folded onto the paragraph's
+/// treatment (specs 0064, 0065).
 ///
 /// Empty when every run resolves to the breaker's own default — regular, upright, untracked, at the
-/// paragraph's size — which is every document that names no override anywhere, on the style or on a
-/// run. That emptiness is load-bearing: the breaker, the writer and the painter all take their
-/// pre-family path when there is one format, so those documents lay out and export byte for byte as
-/// they did. It is emptiness against *the default*, not against the paragraph: a bold paragraph
-/// style is a format the breaker has to be told about.
-fn run_formats(runs: &[quill_core_model::Run], style: &ParagraphStyle) -> Vec<RunFormat> {
+/// paragraph's size — which is every document that names no style and no override anywhere. That
+/// emptiness is load-bearing: the breaker, the writer and the painter all take their pre-family path
+/// when there is one format, so those documents lay out and export byte for byte as they did. It is
+/// emptiness against *the default*, not against the paragraph: a bold paragraph style is a format
+/// the breaker has to be told about.
+fn run_formats(
+    runs: &[quill_core_model::Run],
+    style: &ParagraphStyle,
+    styles: &StyleSheet,
+) -> Vec<RunFormat> {
     let paragraph = RunFormat {
         size_pt: style.font_size_pt,
         weight: style.weight.0,
@@ -1080,17 +1105,16 @@ fn run_formats(runs: &[quill_core_model::Run], style: &ParagraphStyle) -> Vec<Ru
     };
     let formats: Vec<RunFormat> = runs
         .iter()
-        .map(|r| RunFormat {
-            size_pt: r.style.size_pt.unwrap_or(paragraph.size_pt),
-            weight: r.style.weight.map_or(paragraph.weight, |w| w.0),
-            italic: r.style.italic.unwrap_or(paragraph.italic),
-            tracking_pt: r.style.tracking_pt.unwrap_or(0.0),
+        .map(|r| {
+            let s = resolved_style(r, styles);
+            RunFormat {
+                size_pt: s.size_pt.unwrap_or(paragraph.size_pt),
+                weight: s.weight.map_or(paragraph.weight, |w| w.0),
+                italic: s.italic.unwrap_or(paragraph.italic),
+                tracking_pt: s.tracking_pt.unwrap_or(0.0),
+            }
         })
         .collect();
-    // Empty means "the breaker's own default", which is regular, upright and untracked at the
-    // paragraph's size — *not* "the paragraph's format". A bold paragraph style must therefore be
-    // spelled out, or the line would be measured regular and drawn bold, which is a line drawn past
-    // its measure with nothing to catch it.
     if paragraph == RunFormat::plain(style.font_size_pt) && formats.iter().all(|f| *f == paragraph)
     {
         return Vec::new();
@@ -1098,14 +1122,14 @@ fn run_formats(runs: &[quill_core_model::Run], style: &ParagraphStyle) -> Vec<Ru
     formats
 }
 
-/// Each run's baseline shift, in points, positive up (spec 0064).
+/// Each run's baseline shift, in points, positive up (specs 0064, 0065).
 ///
 /// Not part of [`RunFormat`]: it moves a glyph without changing an advance, so it is a drawing
 /// property and must not invalidate a line break. Empty when no run shifts.
-fn run_shifts(runs: &[quill_core_model::Run]) -> Vec<f32> {
+fn run_shifts(runs: &[quill_core_model::Run], styles: &StyleSheet) -> Vec<f32> {
     let shifts: Vec<f32> = runs
         .iter()
-        .map(|r| r.style.baseline_shift_pt.unwrap_or(0.0))
+        .map(|r| resolved_style(r, styles).baseline_shift_pt.unwrap_or(0.0))
         .collect();
     if shifts.iter().all(|s| *s == 0.0) {
         return Vec::new();
@@ -1143,7 +1167,7 @@ pub(crate) fn measure_block(
             let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
             // Each run's own face, size and tracking (spec 0064). Empty when they all resolve to
             // the paragraph's, which is the path that must not move a glyph.
-            let formats = run_formats(runs, &style);
+            let formats = run_formats(runs, &style, styles);
             let lines = justify_runs_indented(
                 &texts,
                 &formats,
@@ -1167,9 +1191,9 @@ pub(crate) fn measure_block(
                 Measured::Text {
                     lines,
                     color: *color,
-                    run_colors: run_inks(runs, *color),
+                    run_colors: run_inks(runs, *color, styles),
                     run_formats: formats,
-                    run_shifts: run_shifts(runs),
+                    run_shifts: run_shifts(runs, styles),
                     marker: markers.get(&block.id()).cloned(),
                     style,
                 },
@@ -6136,10 +6160,10 @@ mod tests {
         )];
 
         assert!(
-            run_formats(&runs, &plain).is_empty(),
+            run_formats(&runs, &plain, &StyleSheet::default()).is_empty(),
             "a regular paragraph of plain runs takes the pre-family path"
         );
-        let formats = run_formats(&runs, &bold);
+        let formats = run_formats(&runs, &bold, &StyleSheet::default());
         assert_eq!(
             formats,
             vec![RunFormat {
@@ -6154,5 +6178,213 @@ mod tests {
         // That the bold format then *measures* wider is `quill-fonts`' claim, asserted there
         // (`a_run_measures_in_the_face_it_names`) — this crate is generic over `RunMetrics` and
         // names no font, which is the property that keeps it testable with a monospace stub.
+    }
+
+    /// Spec 0065's precedence, one field at a time: paragraph < character style < inline override.
+    ///
+    /// Exhaustive by field rather than by example, because the failure this guards against is
+    /// exactly a field that resolves in the wrong order while the others look right — and because
+    /// "the override wins" is not the rule. The rule is that it wins *for the field it names*.
+    #[test]
+    fn precedence_is_paragraph_then_character_style_then_override_field_by_field() {
+        use quill_core_model::{CharacterStyle, InlineStyle, Run, Weight};
+
+        let mut styles = StyleSheet::default();
+        styles.character.insert(
+            "named".into(),
+            CharacterStyle {
+                size_pt: Some(12.0),
+                color: Some(Color::Gray { v: 0.5 }),
+                tracking_pt: Some(1.0),
+                baseline_shift_pt: Some(2.0),
+                weight: Some(Weight::BOLD),
+                italic: Some(true),
+            },
+        );
+        let paragraph = quill_core_model::ParagraphStyle {
+            font_size_pt: 10.0,
+            ..quill_core_model::ParagraphStyle::default()
+        };
+        let ink = Color::Gray { v: 0.0 };
+
+        let run = |style: InlineStyle, named: bool| Run {
+            text: "x".into(),
+            style,
+            character: named.then(|| "named".to_string()),
+        };
+        // An empty result means "the breaker's own default", which is the contract `run_formats`
+        // documents — so the helper spells that out rather than indexing into nothing.
+        let fmt = |r: &Run| {
+            run_formats(std::slice::from_ref(r), &paragraph, &styles)
+                .first()
+                .copied()
+                .unwrap_or(RunFormat::plain(paragraph.font_size_pt))
+        };
+        let shift = |r: &Run| {
+            run_shifts(std::slice::from_ref(r), &styles)
+                .first()
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let colour = |r: &Run| run_inks(std::slice::from_ref(r), ink, &styles)[0];
+
+        // Layer 1 only: the paragraph.
+        let plain = run(InlineStyle::EMPTY, false);
+        assert_eq!(fmt(&plain).size_pt, 10.0);
+        assert_eq!(fmt(&plain).weight, 400);
+        assert!(!fmt(&plain).italic);
+        assert_eq!(fmt(&plain).tracking_pt, 0.0);
+        assert_eq!(shift(&plain), 0.0);
+        assert_eq!(colour(&plain), ink);
+
+        // Layer 2: the named style fills every field the paragraph left.
+        let named = run(InlineStyle::EMPTY, true);
+        assert_eq!(fmt(&named).size_pt, 12.0);
+        assert_eq!(fmt(&named).weight, 700);
+        assert!(fmt(&named).italic);
+        assert_eq!(fmt(&named).tracking_pt, 1.0);
+        assert_eq!(shift(&named), 2.0);
+        assert_eq!(colour(&named), Color::Gray { v: 0.5 });
+
+        // Layer 3, field by field: each override displaces its own field and *only* its own.
+        let over_size = run(
+            InlineStyle {
+                size_pt: Some(14.0),
+                ..InlineStyle::EMPTY
+            },
+            true,
+        );
+        assert_eq!(fmt(&over_size).size_pt, 14.0);
+        assert_eq!(fmt(&over_size).weight, 700, "the style's weight survives");
+        assert_eq!(fmt(&over_size).tracking_pt, 1.0);
+
+        let over_weight = run(
+            InlineStyle {
+                weight: Some(Weight::REGULAR),
+                ..InlineStyle::EMPTY
+            },
+            true,
+        );
+        assert_eq!(fmt(&over_weight).weight, 400);
+        assert_eq!(fmt(&over_weight).size_pt, 12.0, "the style's size survives");
+
+        let over_italic = run(
+            InlineStyle {
+                italic: Some(false),
+                ..InlineStyle::EMPTY
+            },
+            true,
+        );
+        assert!(!fmt(&over_italic).italic);
+        assert!(fmt(&over_italic).weight == 700);
+
+        let over_tracking = run(
+            InlineStyle {
+                tracking_pt: Some(0.25),
+                ..InlineStyle::EMPTY
+            },
+            true,
+        );
+        assert_eq!(fmt(&over_tracking).tracking_pt, 0.25);
+
+        let over_shift = run(
+            InlineStyle {
+                baseline_shift_pt: Some(-1.0),
+                ..InlineStyle::EMPTY
+            },
+            true,
+        );
+        assert_eq!(shift(&over_shift), -1.0);
+
+        let over_colour = run(
+            InlineStyle {
+                color: Some(Color::Gray { v: 0.9 }),
+                ..InlineStyle::EMPTY
+            },
+            true,
+        );
+        assert_eq!(colour(&over_colour), Color::Gray { v: 0.9 });
+        assert_eq!(fmt(&over_colour).weight, 700, "recolouring stays bold");
+    }
+
+    /// A run naming a style nothing defines lays out with the paragraph's treatment, and its own
+    /// overrides still apply. Losing text because a style was renamed — or because the pack that
+    /// defined it is missing — would be far worse than setting it plainly.
+    #[test]
+    fn an_unknown_character_style_falls_back_without_losing_the_overrides() {
+        use quill_core_model::{InlineStyle, Run, Weight};
+
+        let styles = StyleSheet::default();
+        let paragraph = quill_core_model::ParagraphStyle::default();
+        let run = Run {
+            text: "x".into(),
+            style: InlineStyle {
+                weight: Some(Weight::BOLD),
+                ..InlineStyle::EMPTY
+            },
+            character: Some("no-such-style".into()),
+        };
+        let fmt = run_formats(std::slice::from_ref(&run), &paragraph, &styles)[0];
+        assert_eq!(fmt.size_pt, paragraph.font_size_pt, "the paragraph's size");
+        assert_eq!(fmt.weight, 700, "the run's own override still applies");
+    }
+
+    /// The four built-in names resolve without any document authoring them — which is what lets an
+    /// imported document be *styled* rather than overridden.
+    #[test]
+    fn the_built_in_character_styles_resolve_out_of_the_box() {
+        use quill_core_model::{InlineStyle, Run};
+
+        let styles = StyleSheet::default();
+        assert!(
+            styles.character.is_empty(),
+            "the built-ins are resolved, not written into every document"
+        );
+        let paragraph = quill_core_model::ParagraphStyle::default();
+        let of = |name: &str| {
+            let run = Run {
+                text: "x".into(),
+                style: InlineStyle::EMPTY,
+                character: Some(name.into()),
+            };
+            run_formats(std::slice::from_ref(&run), &paragraph, &styles)[0]
+        };
+        assert!(of(quill_core_model::EMPHASIS_STYLE).italic);
+        assert_eq!(of(quill_core_model::EMPHASIS_STYLE).weight, 400);
+        assert_eq!(of(quill_core_model::STRONG_STYLE).weight, 700);
+        assert!(!of(quill_core_model::STRONG_STYLE).italic);
+        let both = of(quill_core_model::STRONG_EMPHASIS_STYLE);
+        assert!(both.italic && both.weight == 700);
+        assert_eq!(of(quill_core_model::LEAD_IN_STYLE).weight, 700);
+    }
+
+    /// A document may redefine a built-in, and its own definition wins.
+    #[test]
+    fn a_document_can_redefine_a_built_in_style() {
+        use quill_core_model::{CharacterStyle, InlineStyle, Run};
+
+        let mut styles = StyleSheet::default();
+        styles.character.insert(
+            quill_core_model::EMPHASIS_STYLE.into(),
+            CharacterStyle {
+                tracking_pt: Some(0.5),
+                ..CharacterStyle::EMPTY
+            },
+        );
+        let run = Run {
+            text: "x".into(),
+            style: InlineStyle::EMPTY,
+            character: Some(quill_core_model::EMPHASIS_STYLE.into()),
+        };
+        let fmt = run_formats(
+            std::slice::from_ref(&run),
+            &quill_core_model::ParagraphStyle::default(),
+            &styles,
+        )[0];
+        assert_eq!(fmt.tracking_pt, 0.5);
+        assert!(
+            !fmt.italic,
+            "the house definition replaces the built-in rather than merging with it"
+        );
     }
 }
