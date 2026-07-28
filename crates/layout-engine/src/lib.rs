@@ -167,6 +167,26 @@ pub enum PlacedBlock {
         fill: Option<Color>,
         stroke: Option<Stroke>,
     },
+    /// A **candidate** internal link: this rectangle, if the export target allows annotations,
+    /// navigates to `target_page` (spec 0052).
+    ///
+    /// It draws nothing — not on screen, not on press. It is geometry plus a destination, and what
+    /// becomes of it is the *exporter's* decision: the `Screen` profile turns it into a `/Link`
+    /// annotation, and the `Press` profile puts it through spec 0042's `annotation_finding` and
+    /// therefore emits nothing at all, since PDF/X requires annotations outside the BleedBox and
+    /// quill writes `MediaBox == BleedBox`.
+    ///
+    /// Emitted in *both* profiles on purpose. Layout must not depend on the export target: a
+    /// document that paginated differently per profile would make the press and screen files
+    /// disagree about what is on which page, which is the one difference a reader comparing them
+    /// would actually notice.
+    Link {
+        frame: Rect,
+        /// See [`PlacedBlock::Text::source`].
+        source: BlockId,
+        /// Zero-based index of the page this link navigates to.
+        target_page: usize,
+    },
 }
 
 /// A rectangle's outline.
@@ -835,6 +855,13 @@ pub(crate) struct PanelPart {
     pub color: Color,
     pub font_size_pt: f32,
     pub leading_pt: f32,
+    /// Zero-based page this run links to, for the runs that are navigation rather than prose — a
+    /// contents entry's title (spec 0052). `None` for every other run.
+    ///
+    /// Carried on the part rather than re-derived by the writer because the part is what gets
+    /// sliced when a panel is cut across a frame boundary (spec 0045): a link travels with the run
+    /// it belongs to, into whichever fragment that run ends up in, for free.
+    pub link_page: Option<usize>,
 }
 
 /// Break/size `block` against a frame of `width` points, returning the placement payload and its
@@ -1060,6 +1087,7 @@ fn measure_stat_block(
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
+            link_page: None,
         });
         y += n as f32 * style.leading_pt + style.space_after_pt;
     }
@@ -1186,6 +1214,7 @@ fn measure_table(
                     color,
                     font_size_pt: style.font_size_pt,
                     leading_pt: style.leading_pt,
+                    link_page: None,
                 });
             }
             // The row's height is its tallest cell: a wrapped cell must push the row down, not overlap
@@ -1305,6 +1334,8 @@ fn measure_toc(
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
+            // The contents list's own heading points nowhere; only its entries do.
+            link_page: None,
         });
         y += style.leading_pt + style.space_after_pt;
     }
@@ -1348,6 +1379,10 @@ fn measure_toc(
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
+            // The entry's destination (spec 0052). Recorded on the *title* run, which is the entry's
+            // placed text, and taken from the same `h.page_index` the printed number is derived from
+            // — so a link and the number beside it can never disagree about where the heading is.
+            link_page: Some(h.page_index),
         });
 
         // The leader fills the gap and stops short of the number, so the two never overlap.
@@ -1369,6 +1404,7 @@ fn measure_toc(
                     color,
                     font_size_pt: style.font_size_pt,
                     leading_pt: style.leading_pt,
+                    link_page: None,
                 });
             }
         }
@@ -1387,6 +1423,7 @@ fn measure_toc(
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
+            link_page: None,
         });
 
         y += style.leading_pt + style.space_after_pt;
@@ -1918,19 +1955,32 @@ fn place_measured(
                 fill: d.fill,
                 stroke: d.stroke,
             }));
-            out.extend(parts.into_iter().map(|p| PlacedBlock::Text {
-                source,
-                frame: Rect {
+            for p in parts {
+                let rect = Rect {
                     x_pt: frame.rect.x_pt + p.dx_pt,
                     y_pt: y + p.dy_pt,
                     w_pt: p.w_pt,
                     h_pt: p.lines.len() as f32 * p.leading_pt,
-                },
-                lines: p.lines,
-                color: p.color,
-                font_size_pt: p.font_size_pt,
-                leading_pt: p.leading_pt,
-            }));
+                };
+                // The link candidate is emitted from the *same* rectangle as the run it belongs to
+                // (spec 0052), rather than from a separately computed one: a link whose hot area
+                // has drifted off its own text is the defect this makes structurally impossible.
+                if let Some(target_page) = p.link_page {
+                    out.push(PlacedBlock::Link {
+                        source,
+                        frame: rect,
+                        target_page,
+                    });
+                }
+                out.push(PlacedBlock::Text {
+                    source,
+                    frame: rect,
+                    lines: p.lines,
+                    color: p.color,
+                    font_size_pt: p.font_size_pt,
+                    leading_pt: p.leading_pt,
+                });
+            }
             out
         }
     }
@@ -2323,7 +2373,8 @@ mod tests {
             .map(|b| match b {
                 PlacedBlock::Text { frame, .. }
                 | PlacedBlock::Image { frame, .. }
-                | PlacedBlock::Rect { frame, .. } => frame.x_pt,
+                | PlacedBlock::Rect { frame, .. }
+                | PlacedBlock::Link { frame, .. } => frame.x_pt,
             })
             .collect();
         assert!(
@@ -2587,7 +2638,8 @@ mod tests {
             .map(|b| match b {
                 PlacedBlock::Text { frame, .. }
                 | PlacedBlock::Image { frame, .. }
-                | PlacedBlock::Rect { frame, .. } => frame.x_pt,
+                | PlacedBlock::Rect { frame, .. }
+                | PlacedBlock::Link { frame, .. } => frame.x_pt,
             })
             .collect();
         // Partition, not just presence: the 8-line-tall first column holds exactly the first 8
@@ -3586,7 +3638,9 @@ mod tests {
                 PlacedBlock::Text { frame: f, .. } | PlacedBlock::Image { frame: f, .. } => {
                     same_width(f.x_pt, frame.rect.x_pt).then_some(f.y_pt + f.h_pt)
                 }
-                PlacedBlock::Rect { .. } => None,
+                // Neither draws content: a decoration is sized by what it decorates, and a link
+                // candidate is not ink at all (spec 0052).
+                PlacedBlock::Rect { .. } | PlacedBlock::Link { .. } => None,
             })
             .fold(None, |acc: Option<f32>, y| {
                 Some(acc.map_or(y, |a: f32| a.max(y)))
@@ -4091,7 +4145,8 @@ mod tests {
                 let (y, h) = match b {
                     PlacedBlock::Text { frame, .. }
                     | PlacedBlock::Rect { frame, .. }
-                    | PlacedBlock::Image { frame, .. } => (frame.y_pt, frame.h_pt),
+                    | PlacedBlock::Image { frame, .. }
+                    | PlacedBlock::Link { frame, .. } => (frame.y_pt, frame.h_pt),
                 };
                 assert!(
                     y + h <= bottom + 0.01,
@@ -4593,6 +4648,7 @@ mod tests {
                     }
                     PlacedBlock::Rect { frame, .. } => (frame.y_pt, frame.h_pt, "rect".into()),
                     PlacedBlock::Image { frame, .. } => (frame.y_pt, frame.h_pt, "image".into()),
+                    PlacedBlock::Link { frame, .. } => (frame.y_pt, frame.h_pt, "link".into()),
                 };
                 assert!(
                     y + h <= bottom + 0.01,
@@ -4679,6 +4735,55 @@ mod tests {
             .filter(|c| c.len() == 2)
             .map(|c| (c[0].clone(), c[1].clone()))
             .collect()
+    }
+
+    #[test]
+    fn every_contents_entry_carries_a_link_candidate_over_its_own_title_run() {
+        // Spec 0052. Three properties, and the third is the one that matters: a candidate per
+        // entry, each pointing at the page its heading landed on, and each sharing a rectangle
+        // *exactly* with the title run it belongs to. A link whose hot area has drifted off its
+        // text is a defect no parser reports and no page-count test notices.
+        let doc = toc_doc(2, &[(1, "Alpha"), (1, "Beta"), (1, "Gamma")], 60);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let index = heading_index(&doc, &pages);
+
+        let links: Vec<(Rect, usize)> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Link {
+                    frame, target_page, ..
+                } => Some((*frame, *target_page)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links.len(), index.len(), "one candidate per listed heading");
+
+        for ((title, _), (rect, target)) in toc_entries(&doc, &pages).iter().zip(&links) {
+            let heading = index
+                .iter()
+                .find(|h| &h.text == title)
+                .expect("a heading for every entry");
+            assert_eq!(
+                *target, heading.page_index,
+                "'{title}' must link to the page it is on"
+            );
+            // The title run with this text, on the contents page rather than the chapter opener.
+            let run = pages
+                .iter()
+                .flat_map(|p| p.blocks.iter())
+                .filter_map(|b| match b {
+                    PlacedBlock::Text { frame, lines, .. } if lines[0].text == *title => {
+                        Some(*frame)
+                    }
+                    _ => None,
+                })
+                .find(|f| *f == *rect);
+            assert!(
+                run.is_some(),
+                "'{title}' link rect {rect:?} must coincide with its own placed title run"
+            );
+        }
     }
 
     #[test]

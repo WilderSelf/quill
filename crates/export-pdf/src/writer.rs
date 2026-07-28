@@ -1,10 +1,12 @@
-//! Assembles the PDF/X object graph (writer §1-4) for the level selected in [`ExportOptions`]
-//! (PDF/X-1a:2001 or PDF/X-3:2002).
+//! Assembles the PDF object graph (writer §1-4) for the profile and level selected in
+//! [`ExportOptions`] — PDF/X-1a:2001 or PDF/X-3:2002 under [`ExportProfile::Press`], or a
+//! non-conformant linked file under [`ExportProfile::Screen`] (spec 0052).
 //!
 //! Consumes laid-out pages plus the document and writes bytes: catalog + pages tree, one page per
 //! `LaidOutPage` (`MediaBox == BleedBox`, centered `TrimBox`), an embedded subset font, image
 //! XObjects (grayscale `/DeviceGray` or color `/DeviceCMYK`), the ICC `OutputIntent`, and the XMP
-//! identification packet. Both X-1a:2001 and
+//! identification packet — plus, under the screen profile, one `/Link` annotation per contents
+//! entry. Both X-1a:2001 and
 //! X-3:2002 pin the header to **PDF 1.3**; the only per-level difference the trivial layout
 //! reaches is the `GTS_PDFX*` identification strings.
 
@@ -12,7 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
-use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, TrappingStatus};
+use pdf_writer::types::{
+    ActionType, AnnotationType, CidFontType, FontFlags, SystemInfo, TrappingStatus,
+};
 use pdf_writer::writers::OutputIntent;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 
@@ -21,7 +25,7 @@ use quill_core_model::{Color, Document};
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 
 use crate::images::Pixels;
-use crate::{fonts, geom, icc, images, ExportError, ExportOptions};
+use crate::{fonts, geom, icc, images, ExportError, ExportOptions, ExportProfile};
 
 // Body/heading font size and line advance, in points. Shared with the layout engine (spec 0015)
 // so glyphs are measured and drawn at the same size and land on the rows layout reserved.
@@ -48,12 +52,30 @@ pub fn write_pdf(
     // --- Inputs: ICC bytes, images --------------------------------------------------------
     // The font is built once in `export` (it is also the layout engine's metrics source, spec 0015)
     // and passed in.
-    let icc_bytes = std::fs::read(&opts.output_intent_icc)
-        .map_err(|e| ExportError::Icc(format!("reading '{}': {e}", opts.output_intent_icc)))?;
-    icc::check_icc(&icc_bytes).map_err(ExportError::Icc)?;
+    //
+    // The screen profile writes no OutputIntent and may be given no profile at all (spec 0052). A
+    // profile that *is* supplied is still read, validated and used for RGB→CMYK conversion under
+    // both profiles — the screen file carries the same ink as the press file; only the
+    // OutputIntent dictionary and the PDF/X identification differ, because writing an OutputIntent
+    // into a file that is not PDF/X would be claiming a conformance it does not have.
+    let want_icc =
+        opts.profile == ExportProfile::Press || !opts.output_intent_icc.trim().is_empty();
+    let icc_bytes = if want_icc {
+        let bytes = std::fs::read(&opts.output_intent_icc)
+            .map_err(|e| ExportError::Icc(format!("reading '{}': {e}", opts.output_intent_icc)))?;
+        icc::check_icc(&bytes).map_err(ExportError::Icc)?;
+        Some(bytes)
+    } else {
+        None
+    };
+    // Written only for PDF/X. A screen export with a supplied profile uses it for colour and emits
+    // no OutputIntent object.
+    let write_output_intent_obj = opts.profile == ExportProfile::Press;
 
-    // Color images are converted to CMYK against the OutputIntent profile (spec 0005).
-    let cmyk = RgbToCmyk::from_output_profile(&icc_bytes);
+    // Color images are converted to CMYK against the OutputIntent profile (spec 0005). With no
+    // profile, `RgbToCmyk` falls back to its naive path — which preflight records as the cost of
+    // omitting `--icc`, rather than leaving it to be discovered in the file.
+    let cmyk = RgbToCmyk::from_output_profile(icc_bytes.as_deref().unwrap_or_default());
 
     // Decode each distinct placed image once (missing/unsupported → skipped). The base directory
     // comes from the caller (spec 0025) — resolving against the process working directory silently
@@ -91,7 +113,10 @@ pub fn write_pdf(
     let page_tree_id = alloc.bump();
     let info_id = alloc.bump();
     let xmp_id = alloc.bump();
-    let icc_id = alloc.bump();
+    // Allocated only when an OutputIntent is actually written. A reference with no object behind it
+    // is legal (the xref gets a free entry) but it is a lie in the file, and the screen profile is
+    // the profile that must not look like it half-claims PDF/X.
+    let icc_id = write_output_intent_obj.then(|| alloc.bump());
     let type0_id = alloc.bump();
     let cid_id = alloc.bump();
     let descriptor_id = alloc.bump();
@@ -101,11 +126,40 @@ pub fn write_pdf(
     }
     let page_refs: Vec<(Ref, Ref)> = pages.iter().map(|_| (alloc.bump(), alloc.bump())).collect();
 
+    // Link annotations (spec 0052). Allocated *after* every press object, and only for annotations
+    // that will actually be written, so a press export — which produces none — allocates exactly
+    // the references it always did and its bytes cannot move.
+    let mut annots: Vec<Vec<PendingLink>> = Vec::with_capacity(pages.len());
+    for (i, page) in pages.iter().enumerate() {
+        let mut on_page = Vec::new();
+        for block in page.statics.iter().chain(page.blocks.iter()) {
+            let PlacedBlock::Link {
+                frame, target_page, ..
+            } = block
+            else {
+                continue;
+            };
+            if !annotation_is_legal(opts.profile, frame, &doc.page_setup, i) {
+                continue;
+            }
+            on_page.push(PendingLink {
+                id: alloc.bump(),
+                rect: *frame,
+                target_page: *target_page,
+            });
+        }
+        annots.push(on_page);
+    }
+
     // Bookmarks (spec 0042). A 500-page PDF with no outline is unusable, and until now the writer
     // emitted a catalog and a page tree and nothing navigational at all.
     let outline = OutlineTree::build(&quill_layout_engine::heading_index(doc, pages), &mut alloc);
 
     // --- Build the document ---------------------------------------------------------------
+    // `Some(level)` for a press export, `None` for a screen one (spec 0052). Read once here so the
+    // info dictionary and the XMP packet cannot disagree about what the file claims.
+    let pdfx = opts.profile.pdfx(opts.version);
+
     let mut pdf = Pdf::new();
     pdf.set_version(1, 3); // PDF/X-1a:2001 == PDF 1.3
 
@@ -119,9 +173,13 @@ pub fn write_pdf(
         if let Some(root) = outline.root {
             cat.outlines(root);
         }
-        let mut intents = cat.output_intents();
-        write_output_intent(intents.push(), icc_id);
-        intents.finish();
+        // PDF/X only. A screen file states no output condition at all rather than one a viewer
+        // might read as a press guarantee.
+        if let Some(icc_id) = icc_id {
+            let mut intents = cat.output_intents();
+            write_output_intent(intents.push(), icc_id);
+            intents.finish();
+        }
         cat.finish();
     }
 
@@ -142,12 +200,17 @@ pub fn write_pdf(
         info.creator(TextStr("Quill"));
         info.producer(TextStr("Quill export-pdf"));
         info.trapped(TrappingStatus::NotTrapped);
-        info.pair(
-            Name(b"GTS_PDFXVersion"),
-            Str(opts.version.identifier().as_bytes()),
-        );
-        if let Some(conf) = opts.version.conformance() {
-            info.pair(Name(b"GTS_PDFXConformance"), Str(conf.as_bytes()));
+        // The identification keys are the *claim* of conformance, so the screen profile omits them
+        // entirely rather than writing a weaker string (spec 0052). One source for the decision,
+        // shared with the XMP packet below, so the two halves of the identification cannot disagree.
+        if let Some(version) = pdfx {
+            info.pair(
+                Name(b"GTS_PDFXVersion"),
+                Str(version.identifier().as_bytes()),
+            );
+            if let Some(conf) = version.conformance() {
+                info.pair(Name(b"GTS_PDFXConformance"), Str(conf.as_bytes()));
+            }
         }
         info.finish();
     }
@@ -155,16 +218,18 @@ pub fn write_pdf(
     // XMP metadata packet (uncompressed).
     let id_hex = doc_id_hex(doc);
     {
-        let xmp = crate::xmp::build_xmp(opts.version, &doc.metadata.title, &id_hex, &id_hex);
+        let xmp = crate::xmp::build_xmp(pdfx, &doc.metadata.title, &id_hex, &id_hex);
         let mut s = pdf.stream(xmp_id, &xmp);
         s.pair(Name(b"Type"), Name(b"Metadata"));
         s.pair(Name(b"Subtype"), Name(b"XML"));
         s.finish();
     }
 
-    // ICC profile stream (DestOutputProfile, /N 4).
-    {
-        let mut icc_stream = pdf.icc_profile(icc_id, &icc_bytes);
+    // ICC profile stream (DestOutputProfile, /N 4). Written only alongside the OutputIntent that
+    // references it — an orphan profile stream in a screen file would be dead weight in every copy
+    // a customer downloads.
+    if let (Some(icc_id), Some(bytes)) = (icc_id, icc_bytes.as_ref()) {
+        let mut icc_stream = pdf.icc_profile(icc_id, bytes);
         icc_stream.n(4);
         icc_stream.finish();
     }
@@ -221,10 +286,39 @@ pub fn write_pdf(
             }
             xo.finish();
             res.finish();
+            // `/Annots` is written only when the page actually has one. An empty array is legal and
+            // would still be an `/Annots` key in a press file, which is precisely the thing spec
+            // 0052's press test looks for — so "no annotations" has to mean *no key*.
+            if !annots[i].is_empty() {
+                p.annotations(annots[i].iter().map(|a| a.id));
+            }
             p.finish();
         }
 
         pdf.stream(*content_id, &content).finish();
+    }
+
+    // Link annotation objects (spec 0052). None under the press profile, by the PDF/X rule above.
+    for (i, page_links) in annots.iter().enumerate() {
+        let g = geom::page_geom(&doc.page_setup, i);
+        for link in page_links {
+            let mut a = pdf.annotation(link.id);
+            a.subtype(AnnotationType::Link);
+            a.rect(annot_rect(&g, &link.rect));
+            // `/Border [0 0 0]`: no visible box. A viewer's default border is a 1-unit rectangle
+            // drawn around every link, which would put a frame around every contents entry.
+            a.border(0.0, 0.0, 0.0, None);
+            if let Some((target, _)) = page_refs.get(link.target_page) {
+                // `Fit`, matching the outline's destinations (spec 0042): the whole page is what a
+                // contents entry means, and it survives the reader's own zoom setting.
+                a.action()
+                    .action_type(ActionType::GoTo)
+                    .destination()
+                    .page(*target)
+                    .fit();
+            }
+            a.finish();
+        }
     }
 
     // Trailer file identifier (deterministic → reproducible golden output).
@@ -233,6 +327,48 @@ pub fn write_pdf(
 
     out.write_all(&pdf.finish())?;
     Ok(())
+}
+
+/// A link annotation that is going to be written: its object reference, its rectangle in page
+/// (top-left) space, and the page it navigates to.
+struct PendingLink {
+    id: Ref,
+    rect: quill_core_model::Rect,
+    target_page: usize,
+}
+
+/// Whether an annotation at `rect` may be written under `profile` (spec 0052).
+///
+/// The press profile does **not** ask "is this the screen profile?" — it asks spec 0042's question,
+/// [`crate::annotation_finding`], which is the PDF/X rule stated as code. Because quill writes
+/// `MediaBox == BleedBox` (spec 0013), every annotation on the page fails it and a press file
+/// therefore contains none. Writing it as the rule rather than as `if screen { … }` is what makes
+/// the press file's emptiness a *consequence of PDF/X* rather than of a branch someone can flip,
+/// and it stays correct if the two boxes ever diverge.
+fn annotation_is_legal(
+    profile: ExportProfile,
+    rect: &quill_core_model::Rect,
+    page_setup: &quill_core_model::PageSetup,
+    page_index: usize,
+) -> bool {
+    match profile {
+        ExportProfile::Press => crate::annotation_finding(rect, page_setup, page_index).is_none(),
+        // A screen file claims no PDF/X conformance, so the BleedBox rule does not apply to it.
+        ExportProfile::Screen => true,
+    }
+}
+
+/// A placed rectangle (top-left origin, the space `PlacedBlock` uses) as a PDF `/Rect`
+/// (bottom-left origin).
+///
+/// Flipped through the same [`geom`] offsets the content stream uses, not a second convention —
+/// spec 0013's one-source-of-truth rule. A link whose hot area is flipped by a different formula
+/// from the text under it is a defect no parser would ever report.
+fn annot_rect(g: &geom::PageGeom, rect: &quill_core_model::Rect) -> Rect {
+    let x0 = g.off_x + rect.x_pt;
+    let y1 = g.media_h - (g.off_y + rect.y_pt);
+    let y0 = y1 - rect.h_pt;
+    Rect::new(x0, y0, x0 + rect.w_pt, y1)
 }
 
 /// A decoded image plus its assigned reference and content-stream name.
@@ -428,6 +564,10 @@ fn render_page(
                     content.restore_state();
                 }
             }
+            // A link candidate is navigation, not ink: it contributes no content-stream operator in
+            // either profile. Under `Screen` it becomes an `/Annots` entry outside the stream;
+            // under `Press` it becomes nothing at all (spec 0052).
+            PlacedBlock::Link { .. } => {}
         }
     }
     content.finish().as_slice().to_vec()

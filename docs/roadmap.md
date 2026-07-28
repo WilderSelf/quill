@@ -806,6 +806,11 @@ intersects the BleedBox is a `Severity::Error`. That check has nothing to guard 
 exactly when it is cheap to add and exactly the spec-0013 lesson — the validator and the writer must
 agree on the rule before anything relies on it.
 
+*(Since shipped: spec 0052 is what relies on it. The screen profile emits the link annotations this
+increment could not, and the press profile runs every one of them through `annotation_finding` — so
+a press file's emptiness is now a consequence of this check rather than of there being nothing to
+check.)*
+
 **Acceptance criteria**
 
 - Regression: `Document::sample()` export byte-hash **changes** (the catalog gains `/Outlines`), so
@@ -1415,7 +1420,9 @@ and the corpus must be large enough to be meaningful (the 500-page testdoc is th
 ### 0052 screen-profile
 
 **The screen profile: a second export target, with clickable internal links** · size: large ·
-branch: `feat/screen-profile`
+branch: `feat/screen-profile` · **shipped** — see `specs/0052-screen-profile.md` for what was built
+and the non-goals it is bounded by. The press export of `Document::sample()` is byte-identical at
+8786 bytes, verified with `cmp`.
 
 The open question "do clickable internal links ever ship?" has a real answer: **not in the press
 file, and yes in a second one.** PDF/X-1a requires annotations outside the BleedBox and a TOC entry
@@ -1547,10 +1554,16 @@ trim edge while the CI golden path never moves.
 
 Answered by M3's decomposition: **stat blocks, tables and paragraphs share one splitting mechanism**
 — spec 0044 builds it as a `\vsplit` over an already-measured vertical list, so the measurement
-cache gains no height dimension, and 0045/0046 consume it. And **clickable internal links ship in a
-second export profile** — spec 0052 adds a `Screen` profile carrying annotations, leaving the `Press`
-profile PDF/X-conformant and provably annotation-free, rather than compromising one file to serve
-both.
+cache gains no height dimension, and 0045/0046 consume it.
+
+**Closed by spec 0052 (shipped): clickable internal links ship in a second export profile.** No
+longer an open question in either direction. `ExportOptions::profile` selects `Press` (the default,
+byte-identical to what shipped before) or `Screen`, which carries `/Link` annotations for contents
+entries and claims no PDF/X conformance. The press file is *provably* annotation-free — asserted by
+parsing the emitted PDF for any `/Annots` key over a document that really does produce link
+candidates — because the writer gates every annotation on spec 0042's `annotation_finding` rather
+than on a per-profile branch. `Screen` is deliberately not an RGB profile, and does not grow
+compression, downsampling or reader spreads; see the non-goals in `specs/0052-screen-profile.md`.
 
 ## Beyond M3
 

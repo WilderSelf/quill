@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use quill_core_model::{import, Document, Template, Tpub};
 use quill_export_pdf::{
-    export, preflight, synth_cmyk_profile, ExportOptions, PdfxVersion, PreflightReport, Severity,
+    export, preflight, synth_cmyk_profile, ExportOptions, ExportProfile, PdfxVersion,
+    PreflightReport, Severity,
 };
 
 #[derive(Parser)]
@@ -108,6 +109,24 @@ impl From<PdfxArg> for PdfxVersion {
     }
 }
 
+/// Which of the two files to write (spec 0052).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProfileArg {
+    /// Press-ready PDF/X. Requires `--icc`. The default.
+    Press,
+    /// The customer's file: clickable contents links, **not** press-ready.
+    Screen,
+}
+
+impl From<ProfileArg> for ExportProfile {
+    fn from(v: ProfileArg) -> Self {
+        match v {
+            ProfileArg::Press => ExportProfile::Press,
+            ProfileArg::Screen => ExportProfile::Screen,
+        }
+    }
+}
+
 #[derive(Args)]
 struct DocArgs {
     /// Path to a `.tpub` `document.json` (optional; falls back to the built-in sample).
@@ -121,12 +140,17 @@ struct ExportArgs {
     /// Output PDF path.
     #[arg(short, long)]
     output: String,
-    /// PDF/X conformance level.
+    /// PDF/X conformance level. Ignored by `--profile screen`, which claims no conformance.
     #[arg(long, value_enum, default_value_t = PdfxArg::X1a)]
     pdfx: PdfxArg,
-    /// ICC profile for the PDF/X OutputIntent.
+    /// Export profile: `press` (PDF/X, the default) or `screen` (clickable links, not press-ready).
+    #[arg(long, value_enum, default_value_t = ProfileArg::Press)]
+    profile: ProfileArg,
+    /// ICC profile for the PDF/X OutputIntent. Required by `--profile press`; optional for
+    /// `--profile screen`, which writes no OutputIntent but will use a supplied profile for
+    /// RGB image conversion.
     #[arg(long)]
-    icc: String,
+    icc: Option<String>,
     /// TrueType (.ttf) or CFF OpenType (.otf) font to embed; defaults to the bundled Source Serif 4.
     #[arg(long)]
     font: Option<String>,
@@ -192,6 +216,22 @@ fn print_report(report: &PreflightReport) {
         };
         println!("  [{tag}] {:?}: {}", f.check, f.message);
     }
+    // A shorter report under a profile that checks fewer things must say so (spec 0052). "No
+    // findings" over an unstated subset of the checks is the shape of a false pass.
+    if !report.skipped.is_empty() {
+        println!(
+            "  applied: {}",
+            report
+                .applied()
+                .iter()
+                .map(|c| format!("{c:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for s in &report.skipped {
+            println!("  skipped: {:?} — {}", s.check, s.reason);
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -241,9 +281,29 @@ fn main() -> ExitCode {
                 }
             };
             let doc = loaded.doc;
+            // Press requires an OutputIntent, and this is a hard error naming the flag rather than
+            // a preflight finding: a press export with no profile is a mistake to correct, not a
+            // document to fix. Screen may omit it entirely.
+            if args.profile == ProfileArg::Press && args.icc.is_none() {
+                eprintln!(
+                    "error: --icc is required by --profile press (PDF/X needs an ICC \
+                     OutputIntent); pass --profile screen for a non-press, linked PDF"
+                );
+                return ExitCode::FAILURE;
+            }
+            if args.profile == ProfileArg::Screen {
+                // Printed before anything else, and unconditionally. A user who ships this file to
+                // a printer has to have read past a line that says not to.
+                println!(
+                    "profile: screen — NOT press-ready. This file carries clickable contents \
+                     links and claims no PDF/X conformance (no GTS_PDFXVersion, no OutputIntent). \
+                     Send the --profile press export to the printer."
+                );
+            }
             let opts = ExportOptions {
                 version: args.pdfx.into(),
-                output_intent_icc: args.icc,
+                profile: args.profile.into(),
+                output_intent_icc: args.icc.unwrap_or_default(),
                 font_path: args.font,
                 force: args.force,
                 asset_root: loaded.asset_root,

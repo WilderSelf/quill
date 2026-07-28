@@ -168,6 +168,11 @@ pub fn paint_page(
                     src_h: proxy.height,
                 });
             }
+            // A link candidate (spec 0052) is a destination attached to a rectangle, not ink. It
+            // paints nothing here for the same reason it paints nothing in the PDF writer: the
+            // *text* under it is already drawn by its own `Text` block, and a canvas that tinted or
+            // underlined links would be showing the reader something the printed page will not have.
+            PlacedBlock::Link { .. } => {}
         }
     }
     ops
@@ -206,6 +211,36 @@ mod tests {
         let a = paint_page(&page, &geom, &font, &cache);
         let b = paint_page(&page, &geom, &font, &cache);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_link_candidate_paints_nothing() {
+        // Spec 0052: a link is a destination attached to a rectangle, not ink. The screen canvas
+        // must show exactly what the printed page will — a highlighted or boxed contents entry on
+        // screen would be a preview of something the press file does not contain.
+        let (mut page, geom, font) = sample_page();
+        page.blocks = vec![PlacedBlock::Link {
+            frame: quill_core_model::Rect {
+                x_pt: 10.0,
+                y_pt: 20.0,
+                w_pt: 80.0,
+                h_pt: 30.0,
+            },
+            source: quill_core_model::BlockId::UNASSIGNED,
+            target_page: 3,
+        }];
+        let ops = paint_page(&page, &geom, &font, &ProxyCache::new());
+        // The page fill is the only op a blank page carries; nothing may be added on top of it.
+        let bare = paint_page(
+            &LaidOutPage {
+                blocks: Vec::new(),
+                ..page.clone()
+            },
+            &geom,
+            &font,
+            &ProxyCache::new(),
+        );
+        assert_eq!(ops, bare, "a link candidate must contribute no paint op");
     }
 
     // --- Decoration (spec 0037) ---------------------------------------------------------------
