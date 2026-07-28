@@ -64,6 +64,12 @@ struct NewArgs {
     /// Template slug. See `--list`.
     #[arg(long)]
     template: Option<String>,
+    /// Path to a user-authored template file (spec 0053). Mutually exclusive with `--template`.
+    ///
+    /// A path, not a name: there is deliberately no template directory and no search path, so
+    /// nothing can go missing behind the user's back.
+    #[arg(long, conflicts_with = "template")]
+    from: Option<String>,
     /// Output `.tpub` path.
     #[arg(short, long)]
     output: Option<String>,
@@ -590,41 +596,44 @@ fn import_document(args: ImportArgs) -> ExitCode {
     }
 }
 
-/// `quill new` — start a document from a built-in template (spec 0036).
+/// `quill new` — start a document from a built-in template (spec 0036) or a user-authored template
+/// file (spec 0053).
 fn new_document(args: NewArgs) -> ExitCode {
     if args.list {
+        // `--list` names the *bundled* set, which is what it has always meant: a user-authored
+        // template is a path the user already has, not something to enumerate.
         for t in Template::bundled() {
             println!("{:<10} {} — {}", t.name, t.title, t.description);
         }
         return ExitCode::SUCCESS;
     }
 
-    let Some(name) = args.template.as_deref() else {
-        eprintln!("error: --template is required (or pass --list)");
-        return ExitCode::FAILURE;
-    };
-    // A typo must not silently produce a document from the wrong template — or from a default one,
-    // which is the same mistake wearing a friendlier face.
-    let Some(template) = Template::by_name(name) else {
-        eprintln!(
-            "error: unknown template '{name}'; available: {}",
-            Template::names().join(", ")
-        );
-        return ExitCode::FAILURE;
+    let template = match resolve_template(&args) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
     };
     let Some(output) = args.output.as_deref() else {
         eprintln!("error: --output is required");
         return ExitCode::FAILURE;
     };
 
-    let mut doc = Document::from_template(template);
+    let doc_template = &template;
+    let mut doc = Document::from_template(doc_template);
 
-    // Seed the page setup from the preset (spec 0049), so the on-ramp starts printable for the
-    // chosen vendor. The bleed is always taken. The *trim* is taken only when the template's own
-    // trim is not one the preset lists: applying "the preset's first trim" unconditionally would
-    // retrim the US-Letter `playtest` template to 6×9 and leave its folio static off the page —
-    // master furniture silently breaking is exactly what this repo forbids. When the trim does have
-    // to move, say so, because the furniture then genuinely needs a look.
+    // Seed from the preset (spec 0049), with the precedence spec 0053 argues for and this resolves
+    // to: **the preset supplies the bleed, the template keeps its trim, and a disagreement is
+    // reported rather than acted on.**
+    //
+    // Bleed is a press floor living entirely outside the trim box, so taking the preset's costs the
+    // design nothing. The trim is the opposite: a template's furniture is authored *against* it —
+    // the bundled folios derive their y from the page height and their width from the trim — so
+    // retrimming moves the page without moving the geometry authored for it, and nothing at layout
+    // time catches it, because furniture does not participate in the flow. Silently relocating a
+    // folio onto the last line of text, or past the trim, is exactly the press corruption
+    // `CLAUDE.md` says to prefer a visible failure over.
     if let Some(name) = args.preset.as_deref() {
         let preset = match resolve_preset(&Some(name.to_string())) {
             Ok(p) => p,
@@ -633,28 +642,20 @@ fn new_document(args: NewArgs) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        doc.page_setup.bleed_pt = preset.bleed_pt;
+        doc.page_setup.bleed_pt = doc.page_setup.bleed_pt.max(preset.bleed_pt);
         if !preset.lists_trim(doc.page_setup.trim) {
-            if let Some(trim) = preset.trim_sizes.first() {
-                eprintln!(
-                    "warning: template '{}' trims to {}x{}pt, which preset '{}' does not list; \
-                     retrimming to {}x{}pt — check the master furniture",
-                    name,
-                    doc.page_setup.trim.w_pt,
-                    doc.page_setup.trim.h_pt,
-                    preset.name,
-                    trim.w_pt,
-                    trim.h_pt
-                );
-                doc.page_setup.trim = *trim;
-            }
+            eprintln!(
+                "warning: this template trims to {}x{}pt, which preset '{}' does not list; \
+                 keeping the template's trim — confirm it with the printer",
+                doc.page_setup.trim.w_pt, doc.page_setup.trim.h_pt, preset.name
+            );
         }
     }
 
     // A template links no assets, so the container carries the manifest alone.
     match Tpub::write(&doc, Path::new(output), &[]) {
         Ok(()) => {
-            println!("wrote {output} from template '{name}'");
+            println!("wrote {output} from template '{}'", template.name);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -662,4 +663,29 @@ fn new_document(args: NewArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Find the template `quill new` was asked for: a bundled slug, or a file.
+///
+/// Owned rather than `&'static`, because a loaded template is not static and a document does not
+/// care which of the two it came from. `clap` has already refused `--template` and `--from`
+/// together, so exactly one of the three arms below applies.
+fn resolve_template(args: &NewArgs) -> Result<Template, String> {
+    if let Some(path) = args.from.as_deref() {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+        // The typed load error names what is wrong with the *template* — a malformed file and one
+        // written by a newer Quill are different problems and say so (spec 0053).
+        return Template::from_json(&text).map_err(|e| format!("{path}: {e}"));
+    }
+    let Some(name) = args.template.as_deref() else {
+        return Err("--template or --from is required (or pass --list)".into());
+    };
+    // A typo must not silently produce a document from the wrong template — or from a default one,
+    // which is the same mistake wearing a friendlier face.
+    Template::by_name(name).cloned().ok_or_else(|| {
+        format!(
+            "unknown template '{name}'; available: {}",
+            Template::names().join(", ")
+        )
+    })
 }
