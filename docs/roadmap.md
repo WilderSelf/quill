@@ -17,7 +17,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
-| **M3** | Pro polish + POD presets | not started |
+| **M3** | Pro polish + POD presets | decomposed — specs 0044–0053 sequenced below |
 | **M4** | Plugins / ecosystem | not started |
 
 ## Decisions log
@@ -889,11 +889,619 @@ increment never closes. Round-tripping *out* to markdown is not in scope and sho
 non-goal. The stat-block and table fences duplicate structure that 0038/0039 defined in Rust types —
 that duplication must be a serde derive over the same types, not a second hand-written schema.
 
+## M3 increments
+
+M2 got a beginner from a `.md` file to a templated book that exports press-clean. M3 is about the
+book being *right* rather than merely produced: **content that does not fit stops being abandoned at
+the foot of a column**, **furniture sits where a bound book puts it**, and **the file that goes to
+the printer is checked against the printer's actual requirements** rather than against one
+hard-coded set of numbers that happens to be DriveThruRPG's.
+
+Three of the four items in "Known issues" below are M3 work, and the largest of them — a block never
+splits across frames — has now been hit by three separate increments. M3 opens by building it once.
+
+Same rule as M1 and M2: each increment compiles, its tests pass, and it is a coherent PR on its own.
+Every increment carries the `Document::sample()` export byte-hash regression bullet.
+
+| # | Spec | Increment | Size |
+|---|---|---|---|
+| 1 | 0044 | [Block fragmentation — the vertical list, break opportunities, and `split_at`](#0044-block-fragmentation) | large |
+| 2 | 0045 | [Table continuation — break between rows, repeat the header](#0045-table-continuation) | medium |
+| 3 | 0046 | [Stat-block continuation — keep together, else break at a section](#0046-stat-block-continuation) | medium |
+| 4 | 0047 | [Master statics: alignment and page-parity mirroring; `FORMAT_VERSION` 3](#0047-master-static-alignment) | medium |
+| 5 | 0048 | [Hanging indent and a tab stop — key/value pairs that stay paired](#0048-hanging-indent-and-tab-stops) | medium |
+| 6 | 0049 | [POD presets — the printer's requirements as data](#0049-pod-presets) | medium |
+| 7 | 0050 | [Preflight over placed geometry — effective dpi and the live area](#0050-geometry-preflight) | medium |
+| 8 | 0051 | [Knuth-Plass active-node pruning — closing the superlinear cliff](#0051-line-break-pruning) | small |
+| 9 | 0052 | [The screen profile — a second export target, with clickable links](#0052-screen-profile) | large |
+| 10 | 0053 | [User-authored templates — `quill new --from`](#0053-user-authored-templates) | small |
+
+## M3 sequencing rationale
+
+**Chain 1 — fragmentation is one mechanism, built once, then consumed twice.** The roadmap has
+recorded three callers wanting a block to split: paragraphs (spec 0036's ragged two-column feet),
+stat blocks (descoped from 0038) and tables (descoped from 0039). Building it inside any one of them
+would be the second of three implementations. 0044 therefore builds the mechanism and lands it on
+the simplest caller — a paragraph, where `text-layout` already emits a `Vec<Line>` that is a list of
+independently paintable items — and 0045 and 0046 are then thin: each teaches its own `Measured`
+variant where its break opportunities are, and inherits everything else. If 0044's design is wrong,
+it is wrong before two more increments are built on it, which is why the paragraph case ships alone.
+
+This chain also answers the open question "should stat blocks and tables share one splitting
+mechanism?" — **yes, and paragraphs share it too**; see the decision recorded in 0044 below.
+
+**Chain 2 — typographic polish is independent of fragmentation and can interleave.** 0047 (master
+static alignment) and 0048 (hanging indent) both fix defects found by *rendering* an M2 page, and
+neither touches the flow loop. 0047 is sequenced ahead of 0048 because it is the one that changes a
+serialized type — it takes `FORMAT_VERSION` to 3 and writes the v2→v3 migration — and a format bump
+is cheaper to land while no other increment is mid-flight against the model. 0048 then depends on
+nothing but `text-layout`.
+
+**Chain 3 — the presets are data before they are checks.** 0049 turns four numbers that are
+currently compile-time constants (`MAX_INK_COVERAGE_PCT`, `min_dpi`'s 300/600, `DEFAULT_BLEED_PT`)
+into fields of a named `PodPreset`, and adds the one number the workspace has never had: a **safety
+margin**, the distance from trim inside which POD vendors will not guarantee content survives
+trimming. 0050 then adds the two checks that need a preset *and* a laid-out page to be meaningful —
+an image's dpi at the size it was actually placed, and content intruding into the safety margin.
+0050 cannot precede 0049 because both of its checks need a number only a preset carries; and both
+are `preflight_pages`-shaped, i.e. over placed geometry, which is where spec 0037 already proved
+model-level preflight is blind.
+
+**0051 and 0052 are deliberately unchained.** 0051 is a self-contained algorithmic fix to a cliff
+spec 0027 measured and `benches/budgets.toml` already pins; it can ship at any point and is placed
+late only because it is the increment whose absence hurts least. 0052 is placed last of the
+substantial work because it is the one that changes what "export" means — a second profile, a second
+conformance target — and it should not be in flight while 0049/0050 are changing what export
+*checks*. 0053 is the milestone's smallest increment and closes a follow-up already named in the
+code (`crates/core-model/src/template.rs:7-9`).
+
+**Cross-cutting: fragmentation is the one that can silently corrupt.** Five of M3's ten increments
+touch the flow loop or export, but only the fragmentation chain can lose content — a split that
+drops its remainder produces a book that is missing a paragraph, which no numeric test notices
+unless it is asked to. Every increment in that chain therefore carries a **conservation** assertion:
+the concatenation of every fragment equals the unsplit block, asserted over the whole document, not
+per block. This is the same posture as `a_five_hundred_row_table_places_every_cell`
+(crates/layout-engine/src/lib.rs:3510) — no cell may be lost — generalized to the mechanism that can
+now lose them.
+
+## M3 increment detail
+
+### 0044 block-fragmentation
+
+**Block fragmentation: measured blocks become vertical lists with break opportunities, and the flow
+loop splits rather than abandons** · size: large · branch: `feat/block-fragmentation`
+
+The pagination loop at crates/layout-engine/src/lib.rs:1311-1459 measures a block against the frame
+width and, if `y + height > bottom && !frame_empty`, moves the *whole* block to the next frame. On a
+single-column page that is invisible; on spec 0036's two-column `rulebook` template it leaves a
+visible hole at the foot of a column whenever the next paragraph is taller than the space left.
+
+The recorded objection to fixing it is that splitting means "measure this for at most H points",
+which puts height into `MeasureKey` (crates/layout-engine/src/session.rs:93-99) and turns one cache
+entry per block into one per block *per available height* — thrashing the hot path spec 0031 exists
+to keep cold.
+
+**That objection is avoidable, and avoiding it is this increment's central design decision.**
+Splitting is not a second kind of measurement; it is a *derivation over the measurement already
+cached*. A paragraph broken by Knuth-Plass at width W yields a line list that does not depend on how
+much vertical space is available — the optimal break is a function of the measure, not of the
+column's remaining height. Choosing where to cut that list is therefore a pure function of the
+cached `Measured` plus an available height, and needs no cache entry of its own. This is exactly
+TeX's separation between `\linebreak` (breaks a paragraph into a vertical list, once, for a measure)
+and `\vsplit` (cuts an already-built vertical list to a height), and quill adopts it by name.
+
+Concretely, `Measured` (crates/layout-engine/src/lib.rs:485) gains two methods and no new field:
+
+- `break_opportunities(&self) -> Vec<BreakPoint>`, where `BreakPoint { at: usize, height_before:
+  f32, penalty: Penalty }` — `at` is an index into the variant's own item list (lines, rows,
+  sections), `height_before` is the height consumed by everything before it, and `penalty` says how
+  bad a break here is (`Penalty::Forbidden` is not returned at all; a widow/orphan violation is
+  returned with a discouraging penalty so the chooser can take it only when nothing else fits).
+- `split_at(&self, at: usize) -> (Measured, Measured)` — the fragment and the remainder, both fully
+  measured, at the same width.
+
+The flow loop's doesn't-fit branch then tries `split_at` at the best break opportunity that fits
+before falling back to today's move-whole behavior. `FlowState`
+(crates/layout-engine/src/lib.rs:1175) gains `split_at: usize` (0 = the block's start) so a
+checkpoint can resume mid-block, which is what makes the incremental path
+(crates/layout-engine/src/session.rs:220) work across a split.
+
+**Widows and orphans.** A paragraph may not leave one line behind or carry one line forward: the
+minimum on each side is 2 lines, a named constant, and a paragraph of 3 or fewer lines does not
+split at all. This is a real typographic rule, not a nicety — a single line stranded at the top of a
+column is the defect a reader notices first.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged (the sample is single-column and its
+  blocks fit), and the Ghostscript CI job stays green.
+- **Conservation, asserted document-wide.** For a document laid out into pages, concatenating the
+  text of every `PlacedBlock::Text` whose `source` is block B, in page then y order, reproduces B's
+  full line list exactly — asserted over a multi-page, multi-column document where at least four
+  blocks split. No line duplicated, none lost, none reordered.
+- A 20-line paragraph entering a frame with room for 12 lines places 12 lines in that frame and 8 in
+  the next, at the same width, with the 13th line's text starting the continuation — asserted by
+  line text, not just by count.
+- Widow/orphan: a paragraph with room for exactly 1 line at the foot of a column moves whole instead
+  of splitting; a split that would leave 1 line in the remainder takes a break one line earlier.
+  Both asserted directly, and a 3-line paragraph never splits.
+- The two-column `rulebook` template's ragged-foot defect is gone: laying out continuous body text
+  into a 2-column page fills the left column to within one line's leading of its bottom before the
+  right column starts — asserted numerically, and shown in a rendered page image attached to the PR
+  (this increment's whole value proposition is "the page looks right", which is the class of defect
+  spec 0036 proved numbers miss).
+- `MeasureKey` is unchanged — asserted structurally by a test that lays out a document with many
+  splits and checks `blocks_measured` equals the count of *distinct* (block, width) pairs, not the
+  count of placements. A split must cost zero extra measurements.
+- Incremental parity: `LayoutSession`'s output equals a full relayout for a document containing
+  splits, after an edit before, inside and after a split block — three separate assertions, matching
+  session.rs's existing parity tests.
+- Resuming from a checkpoint that lands mid-block reproduces the same pages as resuming from the
+  block's start — the `FlowState.split_at` invariant, asserted directly.
+- The heading index still reports the page a heading's *first* line landed on when the heading
+  splits, and `crates/layout-engine/src/lib.rs:217-220`'s doc comment — which currently says a
+  heading cannot appear twice "because a block is placed whole into one frame and never split" — is
+  corrected in the same PR. A doc comment that becomes false is a defect.
+- `benches/budgets.toml`: `ms_per_page` and `scaling_ratio` stay within budget; the flow loop gained
+  a branch, not a cost.
+- An image block still moves whole — `Measured::Image` returns no break opportunities. Asserted, so
+  that "everything is splittable" is never assumed.
+
+**Test strategy** — The conservation test is written first and is the one that must never be
+weakened; it is the only test that catches the failure mode that matters (content silently lost).
+Geometry assertions are exact arithmetic in the repo's style. The rendered-page check follows spec
+0036's precedent: produce the image, look at it, attach it.
+
+**Risks** — The incremental path is the hazard. `FlowState` is the resume contract and
+`rebuild_checkpoints`/`diff_pages` (crates/layout-engine/src/session.rs) both assume a checkpoint
+sits on a block boundary; a mid-block checkpoint that is not correctly restored produces a document
+that is subtly different after an edit than after a full relayout — silent, and only in the
+incremental direction, which is the direction users actually experience. The parity tests are the
+guard and must cover an edit *inside* a split block specifically. Second risk: the "derivation, not
+re-measurement" decision is only sound because line breaking is height-independent; if a later
+increment introduces a block whose measurement genuinely depends on available height, that block
+must return no break opportunities rather than quietly violating the cache contract, and the spec
+must say so.
+
+### 0045 table-continuation
+
+**Table continuation: break between rows, repeat the header** · size: medium · branch:
+`feat/table-continuation`
+
+Spec 0039 promised breaking between rows with the header repeating on the continuation, and both
+were descoped onto 0044's mechanism. With `break_opportunities`/`split_at` in place this becomes
+what it should always have been: `Measured::Panel` for a table reports a break opportunity between
+each pair of rows, and `split_at` returns a fragment ending at that row plus a remainder that
+*re-emits the header* at its top.
+
+The header repeat is what makes this more than a mechanical application of 0044: the remainder is
+not a suffix of the fragment's item list, it is a suffix with the header prepended, and its height
+is therefore not `total - height_before`. `split_at` returning both halves fully measured — rather
+than an index the caller re-measures — is what makes this expressible.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged.
+- Conservation: every row of a 500-row table appears exactly once across all fragments, in order,
+  and no cell text is lost — the existing `a_five_hundred_row_table_places_every_cell` test
+  (crates/layout-engine/src/lib.rs:3510) is strengthened from "every cell placed somewhere" to
+  "every cell placed exactly once, in row order", and its comment about blocks not splitting is
+  removed.
+- A table with a header that spans three frames repeats the header at the top of frames 2 and 3 and
+  not anywhere else — asserted by counting header-text placements (exactly 3) and by their y
+  positions being the top of each fragment.
+- A table with `header: None` splits with no repeat and loses nothing.
+- Zebra striping continues correctly across a break: the row that starts a continuation is striped
+  according to its index in the *whole* table, not its index in the fragment — asserted, because
+  getting this wrong produces two adjacent same-colored rows at a page boundary, which looks like a
+  rendering bug and is the sort of thing only a render shows.
+- A table row taller than a whole empty frame is placed whole and overflows rather than looping —
+  the `frame_empty` guard still holds. Asserted.
+- The panel decoration (`PlacedBlock::Rect`) closes at the bottom of each fragment and reopens at
+  the top of the continuation, rather than one rect spanning a page break. Asserted by rect count
+  and bounds.
+- A rendered image of a table breaking across a page is attached to the PR.
+
+**Test strategy** — Row-conservation first, then header-repeat counting, then zebra parity at the
+seam. The zebra test is the one that would not have been written without asking "what does this look
+like", so it is written deliberately.
+
+**Risks** — The header's height is charged to every fragment, so a naive "does the next row fit"
+check that forgets the repeated header will overfill the continuation by exactly one header. That is
+an off-by-one with a visible symptom and needs its own assertion. Second: a table whose header alone
+plus one row exceeds a frame has no valid break at all and must fall back to placing whole rather
+than producing an empty fragment and looping forever.
+
+### 0046 stat-block-continuation
+
+**Stat-block continuation: keep together when it fits, break at a section boundary when it does
+not** · size: medium · branch: `feat/stat-block-continuation`
+
+Spec 0038's original promise, now buildable. A stat block is a composite of named sections — name,
+overview, attributes, details, actions, reactions (crates/components-ttrpg/src/lib.rs:10) — and its
+break opportunities are the boundaries *between* those sections, never inside one. Keep-together
+stays the default and remains free: a stat block that fits a frame is placed whole exactly as today,
+because 0044's loop only tries to split a block that does not fit.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged.
+- `a_stat_block_moves_whole_to_the_next_frame_rather_than_splitting`
+  (crates/layout-engine/src/lib.rs:3221) is *replaced*, not deleted, by two tests: a stat block that
+  fits the next frame still moves whole to it (keep-together preferred over splitting), and one that
+  fits no frame splits at a section boundary. The preference order is the assertion.
+- Conservation: every section's text appears exactly once across the fragments.
+- No break falls inside a section — asserted by checking every fragment boundary against the section
+  list, so an attributes list is never cut between two attributes.
+- A stat block whose *first* section alone exceeds a frame is placed whole and overflows, rather
+  than producing an empty fragment.
+- The panel closes and reopens per fragment (as 0045), and the continuation's panel starts at the
+  frame top.
+- A rendered image of a stat block breaking across a column is attached to the PR.
+
+**Test strategy** — The preference-order test is the one that pins the actual behavior change and is
+written first, because "splits correctly" is worthless if it splits things that should have moved.
+
+**Risks** — Sections are coarse: a stat block with a very long `actions` section and nothing else
+will still overflow. That is the accepted behavior for this increment and must be stated as a
+non-goal rather than half-fixed; splitting *inside* a section is a paragraph problem and 0044
+already solves it for paragraphs, but wiring per-section paragraph splitting through the composite
+is a follow-up, recorded not smuggled.
+
+### 0047 master-static-alignment
+
+**Master statics gain alignment and page-parity mirroring; `FORMAT_VERSION` 3** · size: medium ·
+branch: `feat/master-static-alignment`
+
+`MasterStatic::Text` (spec 0030) is drawn as one line from its rect's left edge, and the same rect
+is used on rectos and versos alike. A running head cannot be centred and a folio cannot sit at the
+outside corner of a spread — the two most conventional placements in a bound book. Spec 0036's
+templates work around it by insetting the folio to the fore-edge margin, which was found by
+*rendering* a template page: every numeric test passed while the folio printed hard against the
+trim, where the guillotine goes.
+
+The fix belongs on the static, not on each template: an `align: Alignment` resolved within the
+static's rect, and an x that resolves inside/outside by page parity exactly as `Margins` already
+does (crates/core-model/src/lib.rs:132-139). Both are serialized fields on a 0030 type, so this
+takes `FORMAT_VERSION` to 3 and writes the v2→v3 migration — the first format bump since 0030.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged (the sample has no masters).
+- A v2 document loads, migrates and lays out identically to before — asserted by laying out a
+  committed v2 fixture and comparing placed geometry to the pre-migration expectation, not merely by
+  "it loads". Migration correctness is the whole point of the version bump.
+- A `FORMAT_VERSION` 4 document is still rejected with the typed 0025 error; a v1 document still
+  migrates through v2 to v3. The full chain is asserted.
+- A centred running head is centred to 0.01 pt in its rect on a 3-page document; a right-aligned one
+  is flush right.
+- A folio with parity-resolved x sits at the *outside* corner on both a recto and a verso — asserted
+  as two different x values on two adjacent pages, which is the defect this increment exists to fix.
+- Bundled templates (spec 0036) are updated to use real alignment rather than the fore-edge inset
+  workaround, and the roadmap's known-issue entry is removed in the same PR.
+- A rendered spread showing a recto and a verso side by side is attached to the PR, with the folios
+  visibly at opposite corners and clear of the trim.
+- `docs/format-spec.md` documents v3 and its migration row (the spec-0030 precedent), and a test
+  parses the doc's own example.
+
+**Test strategy** — Migration first, geometry second, render third. The migration fixture is
+committed as bytes so it cannot drift with the code that writes it.
+
+**Risks** — A format bump touches load, save, migrate and every fixture. The specific hazard is a
+migration that is *lossy in the identity direction*: a v2 document that migrates to v3 and back out
+to JSON must not change the document `/ID` for a document that has no statics, or every existing
+`.tpub` silently re-exports as a different file. That is the byte-hash bullet, and here it needs
+asserting on a masters-bearing fixture as well as on the sample.
+
+### 0048 hanging-indent-and-tab-stops
+
+**A hanging indent and a single tab stop: key/value pairs that stay paired** · size: medium ·
+branch: `feat/hanging-indent`
+
+`Armour Class: 15 (leather, shield)` breaks after `Armour` in the ~150 pt column of the two-column
+`rulebook` template, so the key/value pairing is lost — found by rendering spec 0038's panel. The
+related cause is that `break_by_width` normalizes every run of inter-word whitespace to a single
+space, so a wider-looking `"{key}  {value}"` separator collapses to an ordinary word space and
+separates nothing.
+
+Two additions to `text-layout`, both paragraph-level and both serialized on `ParagraphStyle`:
+
+- **`indent: Indent`** — a first-line indent and a hanging indent (a negative first-line indent
+  against a body indent), which is what makes a wrapped attribute line up under its value rather
+  than under its key.
+- **A single tab stop** — a position at which a key/value separator sets the value's left edge, so
+  the values in a list of attributes form a column. One stop, not a stop list: the stat-block case
+  needs exactly one, and a general stop list is a non-goal to be named explicitly.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged (`Indent::default()` is zero on both
+  edges and no default style sets a tab stop, so nothing that exists today moves).
+- A paragraph with a hanging indent of 12 pt puts its first line at x and every subsequent line at
+  x + 12, asserted to 0.01 pt for both the screen paint list and the PDF writer's output — one
+  shaper, two derivation sites, and this is exactly the kind of change that drifts them.
+- A key/value line whose value starts at a 60 pt tab stop places the value's first glyph at x + 60,
+  and a wrapped value's continuation lines align to the stop rather than to the key.
+- The stat-block attribute defect is fixed: rendering spec 0038's panel in a ~150 pt measure shows
+  no attribute key broken across lines — asserted structurally (no line ends inside a key) *and*
+  shown in an attached render.
+- Justified text with a hanging indent still justifies to the correct measure: the available width
+  for a continuation line is the frame width minus the indent, not the frame width — asserted,
+  because getting this wrong produces lines that overrun the frame by exactly the indent and is
+  invisible in a ragged-right test.
+- Interaction with 0044: a paragraph with a hanging indent that splits keeps the indent on the
+  continuation's lines (they are not first lines). Asserted.
+- The roadmap's stat-block known-issue entry is removed in the same PR.
+
+**Test strategy** — Metric assertions in `text-layout`, then a placed-geometry assertion in
+`layout-engine`, then the same geometry through both painters. The both-painters test is the
+load-bearing one.
+
+**Risks** — Indents interact with justification, with hyphenation and now with fragmentation, and
+the failure mode is a line that is slightly too long — which no test sees unless it asserts the
+measure. The justified-width criterion above exists for that reason. Second: `break_by_width`'s
+whitespace normalization is long-standing behavior other code may rely on; the tab stop is added
+*beside* it rather than by changing it.
+
+### 0049 pod-presets
+
+**POD presets: the printer's requirements as data, not as constants** · size: medium · branch:
+`feat/pod-presets`
+
+Everything quill checks at preflight is one vendor's numbers, hard-coded: `MAX_INK_COVERAGE_PCT =
+240.0` (crates/color/src/lib.rs:15), `min_dpi`'s 300/600 (crates/export-pdf/src/lib.rs:181-187),
+`DEFAULT_BLEED_PT = 9.0` (crates/core-model/src/lib.rs:41), and `PdfxVersion` defaulting to X-1a.
+They are DriveThruRPG's, they are reasonable, and they are invisible — a user printing with a vendor
+that wants something different has no way to say so and no way to find out they should have.
+
+Introduce `PodPreset`, a named bundle of the requirements one vendor states:
+
+```
+PodPreset {
+    name, source: String, retrieved: String,   // provenance: which page, which date
+    trim_sizes: Vec<Size>,                     // the trims this vendor offers
+    bleed_pt: Pt,
+    safety_pt: Pt,                             // NEW: content inside this of trim is at risk
+    max_ink_pct: f32,
+    min_dpi_color: f32, min_dpi_line_art: f32,
+    pdfx: PdfxVersion,
+}
+```
+
+The `source`/`retrieved` fields are not decoration. Vendor requirements change, and a preset that
+cannot be audited against its source becomes wrong silently — the same failure class as a CI job
+that is not a required context. Every bundled preset states where its numbers came from and when,
+and a test asserts every preset carries both.
+
+Bundled: `generic` (the conservative intersection — the default, and what the current constants
+become), plus one preset per named vendor the product targets. `PodPreset::generic()` must be
+numerically identical to today's constants so that adding presets changes no existing behavior.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged, and `quill preflight` with no
+  `--preset` produces byte-identical output to today — asserted by a golden report, because the
+  whole increment is a refactor plus a flag and any behavior change is a bug.
+- `MAX_INK_COVERAGE_PCT`, `min_dpi` and the bleed floor are read from a preset at every call site;
+  a grep-style structural test asserts no preflight code path still reads the bare constants.
+  (`clamp_cmyk_u8`'s per-pixel clamp is a separate question and is explicitly *out* of scope: it
+  rewrites pixels, so making it preset-dependent changes image bytes. Named as a follow-up.)
+- `quill preflight --preset lulu` and `quill export --preset lulu` accept the flag, and an unknown
+  preset name fails with the available names listed, not with a panic.
+- A document whose ink is within `generic`'s limit but over a stricter preset's fails under that
+  preset and passes under `generic` — asserted both directions, which is the only test that proves
+  presets do anything.
+- A document whose trim is not among a preset's `trim_sizes` produces a Warning, not an Error: an
+  unusual trim is a conversation with the printer, not a corrupt file. The severity choice is
+  asserted, and follows the repo's "prefer a visible failure over silent corruption" rule in the
+  direction that does not block a legitimate document.
+- Every bundled preset carries a non-empty `source` and `retrieved`; asserted for all of them.
+- `docs/format-spec.md` states that a preset is an *export-time* concern and is deliberately not
+  serialized into `.tpub` (a document is not bound to one printer), and a test asserts a preset name
+  round-trips through the CLI rather than through the document.
+- `quill new --preset <name>` seeds `PageSetup` from the preset's first trim and bleed, so the
+  on-ramp starts printable for the chosen vendor.
+
+**Test strategy** — The golden-report test first (this is a refactor and must prove it), then the
+strict-vs-generic pair, then the provenance assertion. Table-driven over the bundled presets.
+
+**Risks** — The numbers themselves. A preset that misstates a vendor's requirement is worse than no
+preset, because it looks authoritative — this is the "prefer a visible failure" rule applied to
+data. Mitigations, all in-spec: `generic` is the default and is the conservative intersection, so a
+user who never picks a vendor is never *loosened*; every vendor preset carries its source and
+retrieval date; and the spec states plainly that vendor presets are a convenience to be confirmed
+against the vendor's current specification, not a warranty. Second risk: turning constants into
+parameters touches every preflight call site and the temptation is to thread a preset through
+functions that do not need one — the `clamp_cmyk_u8` exclusion above is the boundary.
+
+### 0050 geometry-preflight
+
+**Preflight over placed geometry: effective dpi and the live area** · size: medium · branch:
+`feat/geometry-preflight`
+
+Two press defects quill cannot currently see, both of which need a laid-out page rather than a
+document:
+
+- **Effective dpi.** `ImageResolution` checks `Asset.dpi` — the image's *native* resolution as
+  authored (crates/export-pdf/src/lib.rs:240-253). A 300 dpi image scaled up to twice its natural
+  size prints at 150 dpi and passes today. The real quantity is pixels ÷ placed inches, and it is
+  only knowable after layout.
+- **The live area.** Nothing checks that content stays clear of the trim by the vendor's safety
+  margin. Text that is inside the page but 2 mm from the guillotine is the defect spec 0036's folio
+  had, caught by eye rather than by a check — and every book has dozens of chances to reproduce it.
+
+Both extend `preflight_pages` (crates/export-pdf/src/lib.rs:392-429), which spec 0037 already
+established as the pass that sees synthesized geometry, and both read their thresholds from 0049's
+preset.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; the sample passes both new checks
+  under `generic` (asserted, so the golden path is proven clean rather than assumed).
+- A 300 dpi image placed at 2× its natural size reports an `ImageResolution` Error stating the
+  effective dpi (150) and the required one — the message names both numbers, because a preflight
+  message that does not say by how much you missed is a message the user cannot act on.
+- The same image placed at 1× passes. The boundary (exactly at the threshold) passes.
+- A `PlacedBlock` whose frame intrudes into the safety margin reports a new `CheckId::SafeArea`
+  finding naming the page index and the edge; content wholly inside passes.
+- Master statics are checked too — the folio defect was furniture, not flowed content — and a test
+  reproduces spec 0036's original fore-edge folio and asserts it now *fails* preflight. That test is
+  the increment's proof of worth.
+- Bleed-side content is not flagged: a full-bleed image deliberately extends past trim, and flagging
+  it would train users to ignore the check. A placed block extending *outward* past trim is exempt;
+  one falling *inward* of the safety line is not. The distinction is asserted.
+- `--preset` selects the thresholds; under a preset with `safety_pt: 0.0` the safe-area check is
+  inert.
+- Findings are per-page and deduplicated: a 500-page document with one systematically misplaced
+  master static reports it once per page, not once per placed block, and the report stays readable.
+
+**Test strategy** — The reproduce-the-0036-folio test is written first and is the acceptance
+criterion that matters; the rest are boundary cases around it.
+
+**Risks** — False positives destroy a preflight's value faster than false negatives, because a user
+who learns to ignore the report ignores the real finding too. The bleed-exemption criterion is the
+main guard. Second: effective dpi needs the placed rect, and an image's placed size is derived from
+`px_w`/`px_h` and `dpi` today — the check must not become circular by deriving the placed size from
+the very field it is checking. It must read the *laid-out* rect.
+
+### 0051 line-break-pruning
+
+**Knuth-Plass active-node pruning: closing the superlinear cliff** · size: small · branch:
+`feat/line-break-pruning`
+
+Spec 0027's harness measured it on its first run: an 8× longer paragraph costs ~36× the time, where
+linear would be 8× and quadratic 64×. Active-node pruning is missing or ineffective. Low severity
+for 30–90 word paragraphs at ~64 µs each, but a genuine cliff for pathological input — a stat block
+or table flattened into one very long paragraph, which this product's users plausibly produce, and
+which 0043's importer makes easy to produce by accident.
+
+Classic Knuth-Plass prunes the active list two ways: drop nodes whose line cannot reach the current
+position without exceeding the badness threshold, and cap the active set, retrying with a looser
+threshold if no feasible breakpoint survives. The fix is bounded and local to
+`break_paragraph_hyphenated` (crates/text-layout/src/lib.rs:231).
+
+**Acceptance criteria**
+
+- **Output is unchanged for every paragraph in the test corpus** — pruning must remove only nodes
+  that could not have won. Asserted by breaking a corpus of paragraphs before and after and
+  comparing line lists exactly; this is the increment's central risk and its central test. If any
+  output moves, the pruning is wrong, not the test.
+- `Document::sample()` export byte-hash unchanged — which follows from the above, and is asserted
+  separately because it is the one that reaches press.
+- The scaling ratio in `benches/budgets.toml` improves measurably and the new value is pinned:
+  an 8× longer paragraph costs no more than ~12× (approaching linear with a log factor), replacing
+  today's ~36×. The budget file records both the old and new numbers so the improvement is legible.
+- A pathological input — one paragraph of 20,000 words — completes within a stated wall-clock bound
+  on CI rather than being untestable. Today's behavior on that input is measured and recorded in the
+  spec before the fix, so the improvement is a number and not an impression.
+- No behavior change when a paragraph has no feasible breaking: the existing fallback still fires,
+  asserted by an unbreakable-long-word case.
+
+**Test strategy** — Corpus equivalence first, and it gates everything else. Then the bench.
+
+**Risks** — Pruning that is slightly too aggressive changes line breaks in rare paragraphs, which
+changes page breaks, which changes the export hash — a silent typographic regression that a
+performance test would call a success. Corpus equivalence is the only thing standing in front of it
+and the corpus must be large enough to be meaningful (the 500-page testdoc is the natural source).
+
+### 0052 screen-profile
+
+**The screen profile: a second export target, with clickable internal links** · size: large ·
+branch: `feat/screen-profile`
+
+The open question "do clickable internal links ever ship?" has a real answer: **not in the press
+file, and yes in a second one.** PDF/X-1a requires annotations outside the BleedBox and a TOC entry
+sits mid-text-block by definition, so a link and a press-conformant file are mutually exclusive on
+the same page. Every publisher in this product's audience ships two PDFs — a press file to the
+printer and a screen file to customers — so the honest design is two profiles, not a compromise
+neither is happy with.
+
+`ExportOptions` gains a `profile: ExportProfile` of `Press` (today's behavior, unchanged and
+default) or `Screen`. The screen profile: emits `/Annots` link annotations for TOC entries and
+outline destinations (0041/0042 already produce the destinations), does not claim PDF/X
+conformance — no `GTS_PDFXVersion`, no OutputIntent requirement — and relaxes nothing else. It is
+deliberately *not* an RGB profile: colour conversion is a separate question and converting is how
+you ship the wrong colours.
+
+The load-bearing property is that adding the screen profile must make the press path *provably*
+unchanged, and the guard is spec 0042's `annotation_finding` — which already exists, checks exactly
+this, and has never had anything to check.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged under the default (`Press`) profile.
+  Byte-identical, not "equivalent".
+- **The press profile emits zero annotations, asserted by parsing the emitted PDF** for any
+  `/Annots` key — not by asserting the code path is not taken. A structural assertion over the
+  output is the only one that survives refactoring.
+- Under `Screen`, a TOC entry is a link annotation whose rect covers the entry's placed text and
+  whose destination is the heading's page — asserted by parsing the PDF and following the
+  destination to the expected page index.
+- Under `Screen`, `GTS_PDFXVersion` is absent and the XMP does not claim conformance; under `Press`
+  both are present exactly as today. Asserted both ways.
+- `quill export --profile screen` works without `--icc`, and the CLI says clearly that the result is
+  not press-ready. Under `Press`, `--icc` stays required.
+- The Ghostscript CI job gains a *second* invocation asserting the screen file is a valid PDF (not
+  PDF/X) while the press file remains PDF/X-conformant — and, per the lesson this repo already paid
+  for, the new job is added to the required contexts in the same change. A check that is not a
+  required context is not a gate.
+- Preflight under `Screen` reports the checks that still apply and states which it skipped, rather
+  than silently passing a file it barely examined.
+- A page count and file size comparison between the two profiles is in the PR, so the difference is
+  visible rather than asserted.
+
+**Test strategy** — Parse the produced PDFs. This increment's claims are all about what is or is not
+in the file, and only reading the file can support them.
+
+**Risks** — Two profiles is two things to keep correct, and the failure that matters is the press
+file quietly acquiring a screen feature. The parse-the-output assertion is the guard, and it is
+written as a *press* test rather than a screen test for that reason. Second risk: scope. Clickable
+links are the point; a screen profile that also grows RGB, compression, or reader-spreads never
+closes. Everything but annotations and the conformance keys is an explicit non-goal.
+
+### 0053 user-authored-templates
+
+**User-authored templates: `quill new --from`** · size: small · branch: `feat/user-templates`
+
+`Template::bundled()` says it in the code (crates/core-model/src/template.rs:7-9): user-authored
+templates are an M3 follow-up. A `Template` is already a serializable bundle of page setup, styles
+and master pages; the only thing missing is loading one from a path instead of from the three
+compiled-in constructors. This is the increment that turns 0036 from three starters into an
+extensible system, and it is last because it is worth nothing until the things a template can
+express — aligned statics (0047), indents (0048), preset-seeded geometry (0049) — actually exist.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; `quill new --list` still lists the
+  three bundled templates and `--template <slug>` is unchanged.
+- `quill new --from my-template.json -o book.tpub` produces a document whose page setup, styles and
+  masters equal the file's — asserted field by field, not by "it produced a file".
+- A round-trip: every bundled template serializes to a file that loads back to an equal `Template`.
+  This is the test that proves the format is real rather than write-only, and it is table-driven over
+  all three.
+- A malformed or newer-versioned template file fails with a typed error naming the problem, matching
+  spec 0025's load-contract posture. Asserted for both a syntax error and a version mismatch.
+- A template referencing a style a document later fails to resolve still lays out, per the
+  authoring-posture fallback the repo already uses — losing the styling beats losing the page.
+- `quill new --from` composes with `--preset` (0049): the preset seeds trim and bleed, the template
+  supplies styles and masters, and the precedence between them when both specify a trim is stated in
+  the spec and asserted. Undefined precedence is how this feature becomes confusing.
+- `docs/format-spec.md` documents the template file as a versioned, published format, and a test
+  parses the doc's own example.
+
+**Test strategy** — Round-trip first, then the error cases, then composition with `--preset`.
+
+**Risks** — Small increment, one real hazard: a template file is a *published format* the moment it
+ships, so it needs the same version discipline as `.tpub` rather than being an ad-hoc JSON dump.
+The spec must state its version field and its migration posture up front.
+
 ## Known issues
 
-Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten.
+Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. Each entry
+now names the M3 increment that closes it; an entry whose increment ships is deleted in that
+increment's PR, not left here as a fixed-but-still-listed defect.
 
-- **Knuth-Plass line breaking is superlinear in paragraph length.** An 8× longer paragraph costs
+- **Knuth-Plass line breaking is superlinear in paragraph length.** *(Scheduled: M3 spec 0051.)* An 8× longer paragraph costs
   ~36× the time (linear would be 8×, quadratic 64×), so active-node pruning is missing or
   ineffective. Found by spec 0027's harness on its first run. Low severity in practice — real
   paragraphs are 30–90 words, ~64 µs each — but a genuine cliff for pathological input such as a
@@ -902,7 +1510,7 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   commit would leave neither trustworthy. `benches/budgets.toml` pins today's value so a further
   regression is still caught.
 
-- **A master static has no alignment and is not mirrored by page parity.** `MasterStatic::Text`
+- **A master static has no alignment and is not mirrored by page parity.** *(Scheduled: M3 spec 0047.)* `MasterStatic::Text`
   (spec 0030) is drawn as one line starting at its rect's left edge, and the same rect is used on
   rectos and versos alike. So a running head cannot be centred or set flush to the fore-edge, and a
   folio cannot sit at the outside corner of a spread — the two most conventional placements in a
@@ -913,7 +1521,7 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   already does), not on each template. Not done in 0036 because it changes a serialized 0030 type
   and would have carried a model change inside a templates increment.
 
-- **A block never splits across frames — now wanted by three callers.** The pagination loop
+- **A block never splits across frames — now wanted by three callers.** *(Scheduled: M3 specs 0044, 0045, 0046.)* The pagination loop
   moves a whole block to the next frame when it does not fit, rather than breaking the paragraph
   across the column boundary. On a single-column page this is invisible; on spec 0036's two-column
   `rulebook` template it leaves a visible gap at the foot of a column whenever the next paragraph is
@@ -938,7 +1546,7 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   onto. **Three callers now want one mechanism** — paragraphs, stat blocks and tables — which is the
   strongest argument yet that it should be built once, deliberately, rather than three times.
 
-- **A stat block's attribute keys wrap mid-key in a narrow measure.** `Armour Class: 15 (leather,
+- **A stat block's attribute keys wrap mid-key in a narrow measure.** *(Scheduled: M3 spec 0048.)* `Armour Class: 15 (leather,
   shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so
   the key/value pairing is lost. Proper key/value columns or a hanging indent would fix it and
   neither exists in the layout engine. Related, and the reason the colon is there at all:
@@ -955,17 +1563,38 @@ decided explicitly rather than by accident.
 - Does the CI perf gate assert any wall-clock at all, or only work counters plus same-run ratios? The plan uses ratios and a 2x blowup ceiling; a stricter gate would need self-hosted or pinned runners.
 - Deferred by design: `text-layout::Line` still carries no glyph ids or positions, so spec 0033's renderer re-shapes each line through the shared `quill-fonts` shaper and derives word positions from `space_adjust_pt`, exactly as `writer::render_page` does for `TJ`. That keeps one shaper but two derivation sites. Is that acceptable through M1, or should `text-layout` emit positioned glyph runs (spec 0016's still-open named non-goal, including shaping-GID ↔ subset-GID reconciliation) before the app shell ships?
 - Is per-page master assignment by **index** (spec 0035) the right anchor, or should a master be attached to the chapter it opens? Index-based assignment means a TOC that grows by a page slides every chapter opener by one (spec 0041 names this). Anchoring to a heading's `BlockId` would survive repagination but needs a notion of "section" the model does not have. M2 ships index-based; M3 should decide whether that survives contact with a real book.
-- Should stat blocks and tables share one splitting mechanism? Spec 0038 defines keep-together-else-split-at-a-section-boundary and 0039 defines break-between-rows-repeat-the-header. They are the same shape. If 0038's turns out to generalize, 0039 reuses it; if it does not, the repo carries two breaking rules and should say why.
-- Do clickable internal links ever ship? Spec 0042 excludes them because PDF/X-1a requires annotations outside the BleedBox and a TOC entry sits mid-text-block by definition. The options are a non-PDF/X "screen PDF" export profile alongside the press one, or never. This is an M3 POD-preset question.
+- Should a `PodPreset` ever be recorded *in* a `.tpub`? Spec 0049 says no — a document is not bound
+  to one printer, and a persisted preset would go stale inside a file nobody re-opens. The cost is
+  that the vendor a book was built for is not recoverable from the book. If that turns out to matter
+  in practice, the answer is a non-authoritative hint field, not a binding.
+- Does per-section paragraph splitting inside a stat block ever ship? Spec 0046 breaks between
+  sections only, so a stat block whose single `actions` section overflows a frame still overflows.
+  The mechanism to fix it exists after 0044; wiring it through the composite is the open part.
 
 Answered by M2's decomposition, kept here as pointers: master statics are pre-placed geometry that
 resolves a style name (moved to the decisions log), and `PageSetup::default()` keeps zero margins
 permanently — spec 0036 gives templates real margins instead, so the on-ramp never starts at the
 trim edge while the CI golden path never moves.
 
-## Beyond M2
+Answered by M3's decomposition: **stat blocks, tables and paragraphs share one splitting mechanism**
+— spec 0044 builds it as a `\vsplit` over an already-measured vertical list, so the measurement
+cache gains no height dimension, and 0045/0046 consume it. And **clickable internal links ship in a
+second export profile** — spec 0052 adds a `Screen` profile carrying annotations, leaving the `Press`
+profile PDF/X-conformant and provably annotation-free, rather than compromising one file to serve
+both.
 
-M3 (pro polish + POD presets) and M4 (plugins / ecosystem) are not yet decomposed into increments.
-They are sketched in `CLAUDE.md` and will be sequenced here once M2 closes, following the same rule:
-a spec per feature, ordered by dependency, each independently shippable. The open questions above
-are the M3 inputs.
+## Beyond M3
+
+M4 (plugins / ecosystem) is not yet decomposed into increments. It is sketched in `CLAUDE.md` and
+will be sequenced here once M3 closes, following the same rule: a spec per feature, ordered by
+dependency, each independently shippable. The open questions above are its inputs.
+
+Two things M3 deliberately does *not* attempt, recorded so their absence is a decision:
+
+- **A baseline grid.** `CLAUDE.md` names it as a `layout-engine` responsibility and nothing
+  implements it; specs 0019, 0020 and 0028 each deferred it explicitly. It interacts with leading,
+  with fragmentation (0044) and with indents (0048), so it is cheaper after all three than beside
+  any of them.
+- **The M0 manual item.** A real POD upload validated with a B2A-equipped CMYK profile is not
+  automatable and is not an increment; 0049's presets narrow what that upload has to prove, but do
+  not replace it.
