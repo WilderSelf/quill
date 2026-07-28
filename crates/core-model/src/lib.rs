@@ -55,7 +55,7 @@ pub type Pt = f32;
 /// every static left-aligned in an unmirrored rect, putting the folio in the gutter on every verso.
 /// Either could then save that back over the original. Refusing to open is the correct outcome;
 /// quietly dropping the layout is exactly the silent corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -328,6 +328,66 @@ impl fmt::Display for BlockId {
     }
 }
 
+/// A stretch of text set differently from its neighbours (spec 0063).
+///
+/// A paragraph is an ordered list of these. Before they existed a block carried one `String` and one
+/// `Color`, so quill could not set a single word differently from the words beside it — and every
+/// absent typographic feature that is a property of a *run* (character styles, drop caps, small
+/// caps, tracking, baseline shift) was downstream of that.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub text: String,
+    /// What this run sets differently. Empty is the common case and the one that must cost nothing.
+    #[serde(default, skip_serializing_if = "InlineStyle::is_empty")]
+    pub style: InlineStyle,
+}
+
+impl Run {
+    /// A run that sets nothing differently — the paragraph's own treatment.
+    pub fn plain(text: impl Into<String>) -> Run {
+        Run {
+            text: text.into(),
+            style: InlineStyle::EMPTY,
+        }
+    }
+}
+
+/// A run's overrides of the paragraph treatment it sits in.
+///
+/// Every field is an `Option` *override* rather than a value, so "absent" and "the same as the
+/// paragraph's" stay distinguishable: editing a paragraph style must move a run that did not opt
+/// out, and must not move one that did.
+///
+/// Weight and italic are deliberately absent — see spec 0064. They are not a model gap: `quill-fonts`
+/// has exactly one face, so bold is a font *family* the workspace does not have rather than an
+/// override this struct is missing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct InlineStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_pt: Option<Pt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
+    /// Extra letter-spacing, in points per character. Negative tightens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_pt: Option<Pt>,
+    /// Vertical offset from the baseline. Positive raises — a superscript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_shift_pt: Option<Pt>,
+}
+
+impl InlineStyle {
+    pub const EMPTY: InlineStyle = InlineStyle {
+        size_pt: None,
+        color: None,
+        tracking_pt: None,
+        baseline_shift_pt: None,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        *self == InlineStyle::EMPTY
+    }
+}
+
 /// A semantic content block — the "easy" authoring layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -336,7 +396,10 @@ pub enum Block {
         #[serde(default)]
         id: BlockId,
         level: u8,
-        text: String,
+        /// The heading's text, as one or more styled runs (spec 0063). A `FORMAT_VERSION` 3
+        /// document's single `text` string migrates to one plain run.
+        runs: Vec<Run>,
+        /// The paragraph's ink. A run may override it.
         color: Color,
         /// Overrides the structural default (`h{level}`). `None` is the common case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,7 +408,9 @@ pub enum Block {
     Body {
         #[serde(default)]
         id: BlockId,
-        text: String,
+        /// The paragraph's text, as one or more styled runs (spec 0063).
+        runs: Vec<Run>,
+        /// The paragraph's ink. A run may override it.
         color: Color,
         /// Overrides the structural default (`body`). `None` is the common case.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,7 +519,17 @@ impl Block {
     pub fn body(text: impl Into<String>, color: Color) -> Block {
         Block::Body {
             id: BlockId::UNASSIGNED,
-            text: text.into(),
+            runs: vec![Run::plain(text)],
+            color,
+            style: None,
+        }
+    }
+
+    /// A body paragraph of already-built runs.
+    pub fn body_runs(runs: Vec<Run>, color: Color) -> Block {
+        Block::Body {
+            id: BlockId::UNASSIGNED,
+            runs,
             color,
             style: None,
         }
@@ -465,9 +540,22 @@ impl Block {
         Block::Heading {
             id: BlockId::UNASSIGNED,
             level,
-            text: text.into(),
+            runs: vec![Run::plain(text)],
             color,
             style: None,
+        }
+    }
+
+    /// The block's text with its run structure flattened away.
+    ///
+    /// For consumers that want the characters and not the treatment — subsetting, the heading index,
+    /// a diagnostic. Anything that *sets* the text must read the runs.
+    pub fn plain_text(&self) -> Option<String> {
+        match self {
+            Block::Heading { runs, .. } | Block::Body { runs, .. } => {
+                Some(runs.iter().map(|r| r.text.as_str()).collect())
+            }
+            _ => None,
         }
     }
 
@@ -1352,7 +1440,10 @@ mod tests {
         };
         assert_eq!(*id, BlockId(7));
         assert_eq!(panel.name, "Astrolabe");
-        assert_eq!(FORMAT_VERSION, 3, "renaming is not a format change");
+        // `FORMAT_VERSION` has since moved to 4, for runs (spec 0063) and not for the rename —
+        // which is exactly why the tag and field above are asserted directly rather than through
+        // the version number. A pre-0062 block deserializes without a migration because its
+        // *block* wire form never changed.
     }
 
     #[test]

@@ -118,8 +118,10 @@ fn corpus() -> Vec<String> {
     doc.content
         .iter()
         .filter_map(|b| match b {
-            quill_core_model::Block::Body { text, .. }
-            | quill_core_model::Block::Heading { text, .. } => Some(text.clone()),
+            b
+            @ (quill_core_model::Block::Body { .. } | quill_core_model::Block::Heading { .. }) => {
+                b.plain_text()
+            }
             _ => None,
         })
         .collect()

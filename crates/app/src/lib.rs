@@ -419,7 +419,7 @@ mod tests {
             .find(|b| b.id() == id)
             .unwrap();
         match block {
-            Block::Body { text, .. } => assert_eq!(text, "replaced"),
+            b @ Block::Body { .. } => assert_eq!(b.plain_text().unwrap(), "replaced"),
             _ => panic!("expected a body block"),
         }
         assert_eq!(block.id(), id, "editing must preserve block identity");

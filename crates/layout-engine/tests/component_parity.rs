@@ -33,12 +33,45 @@ const INK: Color = Color::Gray { v: 0.0 };
 /// stops covering a dimension the moment `PlacedBlock` grows one.
 fn digest(pages: &[LaidOutPage]) -> u64 {
     let text = format!("{pages:?}");
+    digest_str(&text)
+}
+
+fn digest_str(text: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// The digest with spec 0063's two new `Debug` fields textually removed.
+///
+/// The digest is deliberately `Debug`-based so a new field cannot slip past it — which means a new
+/// field also moves it even when no geometry did. Stripping them recovers the pre-0063 rendering
+/// exactly, so the old constant still has to match: that is what separates "the struct grew" from
+/// "the layout moved", and it is the only reason the constants below could be re-derived.
+fn digest_pre_0063(pages: &[LaidOutPage]) -> u64 {
+    let text = format!("{pages:?}");
+    let text = regex_free_strip(&text, "spans: [", "]");
+    let text = regex_free_strip(&text, "run_colors: [", "]");
+    digest_str(&text)
+}
+
+/// Remove every `open .. close` region, plus the `, ` that separated it from the next field.
+fn regex_free_strip(text: &str, open: &str, close: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(open) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + open.len()..];
+        let j = after.find(close).expect("a Debug list closes");
+        let mut tail = &after[j + close.len()..];
+        tail = tail.strip_prefix(", ").unwrap_or(tail);
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn lay(content: Vec<Block>, w_pt: f32, h_pt: f32) -> Vec<LaidOutPage> {
@@ -224,16 +257,49 @@ const EXPECTED: &[(&str, u64)] = &[
     ("mixed flow", 0xd75f_5e98_0a5b_34ad),
 ];
 
+/// The same corpus under the *complete* `Debug` rendering, including spec 0063's `spans` and
+/// `run_colors`.
+///
+/// Two sets rather than one, because they answer two different questions. `EXPECTED` is the
+/// geometry, and its constants have not moved since spec 0060 — proving 0063 changed no placed
+/// position, size or text. This set is the structure, and it keeps the digest's original virtue:
+/// a field nobody thought to list still cannot slip past it.
+const EXPECTED_FULL: &[(&str, u64)] = &[
+    ("statblock whole", 0xe9a9_a381_1b7c_34ef),
+    ("statblock narrow", 0xd7bf_4757_ae84_c047),
+    ("statblock absent sections", 0x1ec5_0338_61b5_8c77),
+    ("statblock split", 0xfe2d_77a6_b6d0_a629),
+    ("table whole", 0x0357_776a_51dd_b24e),
+    ("table wrapped", 0xf54e_298b_4314_9dee),
+    ("table split", 0xe0d8_c23c_47c8_a326),
+    ("table headerless", 0x1e98_6c0e_678a_da77),
+    ("table empty", 0x20a5_06c7_2af7_0c53),
+    ("mixed flow", 0x22c8_b796_2e79_347a),
+];
+
 #[test]
 fn the_bundled_components_produce_byte_identical_geometry() {
     let expected: std::collections::BTreeMap<&str, u64> = EXPECTED.iter().copied().collect();
+    let full_expected: std::collections::BTreeMap<&str, u64> =
+        EXPECTED_FULL.iter().copied().collect();
     let mut drift: Vec<String> = Vec::new();
     for (name, content, w, h) in corpus() {
-        let got = digest(&lay(content, w, h));
+        let pages = lay(content, w, h);
+        let got = digest_pre_0063(&pages);
         match expected.get(name) {
             Some(&want) if want == got => {}
             Some(&want) => drift.push(format!("  {name}: expected {want:#x}, got {got:#x}")),
             None => drift.push(format!("  {name}: no expectation recorded, got {got:#x}")),
+        }
+        let full = digest(&pages);
+        match full_expected.get(name) {
+            Some(&want) if want == full => {}
+            Some(&want) => drift.push(format!(
+                "  {name} (structure): expected {want:#x}, got {full:#x}"
+            )),
+            None => drift.push(format!(
+                "  {name} (structure): no expectation recorded, got {full:#x}"
+            )),
         }
     }
     assert!(

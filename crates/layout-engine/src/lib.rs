@@ -19,7 +19,7 @@ use quill_core_model::{
     ComponentLibrary, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle, Rect,
     StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
 };
-use quill_text_layout::{justify_paragraph_indented, Alignment, Hyphenator, Line, RunMetrics};
+use quill_text_layout::{justify_runs_indented, Alignment, Hyphenator, Line, RunMetrics};
 
 /// A positioned rectangular region that content flows into. The layout engine fills a frame
 /// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
@@ -138,6 +138,11 @@ pub enum PlacedBlock {
         /// Broken lines, each carrying its inter-word justification adjustment (spec 0017 incr. 2).
         lines: Vec<Line>,
         color: Color,
+        /// The resolved ink of each authored run, indexed by [`quill_text_layout::Span::run`]
+        /// (spec 0063). Empty means the block predates runs or has exactly one, and every span
+        /// takes `color` — the path the writer and the painter took before runs existed.
+        #[allow(clippy::doc_markdown)]
+        run_colors: Vec<Color>,
         /// The size the text was measured at. Carried here because `PlacedBlock` is all the writer
         /// and the screen renderer see: without it they would have to re-derive the size from the
         /// document, and any disagreement would put glyphs in the wrong place (spec 0028).
@@ -257,11 +262,12 @@ pub fn heading_index_of(content: &[Block], pages: &[LaidOutPage]) -> Vec<Heading
             if !source.is_assigned() || !seen.insert(*source) {
                 continue;
             }
-            let Some(Block::Heading { level, text, .. }) =
+            let Some(block @ Block::Heading { level, .. }) =
                 content.iter().find(|b| b.id() == *source)
             else {
                 continue;
             };
+            let text = &block.plain_text().unwrap_or_default();
             out.push(HeadingEntry {
                 id: *source,
                 level: *level,
@@ -458,11 +464,17 @@ impl PageTemplate for DocumentTemplate<'_> {
                             // so it is not broken. A running head that overflows its rect is an
                             // authoring problem, and one that is visible on screen.
                             lines: vec![Line {
+                                spans: vec![quill_text_layout::Span {
+                                    run: 0,
+                                    len_bytes: resolved.len(),
+                                }],
                                 text: resolved,
                                 space_adjust_pt: 0.0,
                                 indent_pt: 0.0,
                             }],
                             color: *color,
+                            // Furniture is one run by construction.
+                            run_colors: Vec::new(),
                             font_size_pt: ps.font_size_pt,
                             leading_pt: ps.leading_pt,
                         }
@@ -561,7 +573,12 @@ type AssetIndex<'a> = BTreeMap<&'a str, &'a Asset>;
 pub(crate) enum Measured {
     Text {
         lines: Vec<Line>,
+        /// The paragraph's ink — the colour a line's spans fall back to.
         color: Color,
+        /// The resolved ink of each authored run, indexed by [`quill_text_layout::Span::run`]
+        /// (spec 0063). One entry per run, already folded with the paragraph's colour, so no
+        /// consumer has to know how an override resolves.
+        run_colors: Vec<Color>,
         style: ParagraphStyle,
     },
     Image {
@@ -775,6 +792,7 @@ impl Measured {
             Measured::Text {
                 lines,
                 color,
+                run_colors,
                 style,
             } => {
                 if at == 0 || at >= lines.len() {
@@ -784,6 +802,10 @@ impl Measured {
                 let head = Measured::Text {
                     lines: lines[..at].to_vec(),
                     color: *color,
+                    // Both halves keep the whole run table: a span's `run` indexes the paragraph's
+                    // runs, and re-basing it per fragment would make a continuation's spans mean
+                    // something different from its head's.
+                    run_colors: run_colors.clone(),
                     style: *style,
                 };
                 // The continuation carries no space-above: it does not start the paragraph. The
@@ -792,6 +814,7 @@ impl Measured {
                 let tail_lines = lines[at..].to_vec();
                 let tail_h = tail_lines.len() as f32 * style.leading_pt + style.space_after_pt;
                 let tail = Measured::Text {
+                    run_colors: run_colors.clone(),
                     lines: tail_lines,
                     color: *color,
                     style: ParagraphStyle {
@@ -925,6 +948,17 @@ pub(crate) struct BlockContext<'a> {
     pub components: &'a ComponentLibrary,
 }
 
+/// Each run's resolved ink: its own override, or the paragraph's (spec 0063).
+///
+/// Resolved once, here, so that nothing downstream has to know how an override resolves — the
+/// writer and the screen painter must not be able to disagree about a run's colour, which is the
+/// same rule `Line::indent_pt` follows.
+fn run_inks(runs: &[quill_core_model::Run], paragraph: Color) -> Vec<Color> {
+    runs.iter()
+        .map(|r| r.style.color.unwrap_or(paragraph))
+        .collect()
+}
+
 pub(crate) fn measure_block(
     block: &Block,
     width: f32,
@@ -939,7 +973,7 @@ pub(crate) fn measure_block(
         components,
     } = *ctx;
     match block {
-        Block::Heading { text, color, .. } | Block::Body { text, color, .. } => {
+        Block::Heading { runs, color, .. } | Block::Body { runs, color, .. } => {
             // Size, leading and alignment now come from the document's stylesheet rather than from
             // crate constants (spec 0028). Before this, every block in every document was set at
             // body size — a heading differed from body text only by being ragged-left.
@@ -948,8 +982,12 @@ pub(crate) fn measure_block(
                 TextAlign::Justified => Alignment::Justified,
                 TextAlign::Left => Alignment::Left,
             };
-            let lines = justify_paragraph_indented(
-                text,
+            // The runs are one paragraph to the breaker (spec 0063): a change of treatment must
+            // not be able to move a break, or the run model would be a layout change rather than a
+            // generalization. What comes back is per-line spans naming the run each stretch is from.
+            let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+            let lines = justify_runs_indented(
+                &texts,
                 width,
                 quill_text_layout::Indent {
                     first_pt: style.indent.first_pt,
@@ -970,6 +1008,7 @@ pub(crate) fn measure_block(
                 Measured::Text {
                     lines,
                     color: *color,
+                    run_colors: run_inks(runs, *color),
                     style,
                 },
                 height,
@@ -1076,11 +1115,7 @@ fn measure_toc(
             dx_pt: 0.0,
             dy_pt: y,
             w_pt: width,
-            lines: vec![Line {
-                text: title.to_string(),
-                space_adjust_pt: 0.0,
-                indent_pt: 0.0,
-            }],
+            lines: vec![Line::single_run(title.to_string(), 0.0, 0.0)],
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
@@ -1121,11 +1156,7 @@ fn measure_toc(
             dx_pt: indent,
             dy_pt: y,
             w_pt: title_max,
-            lines: vec![Line {
-                text: text.clone(),
-                space_adjust_pt: 0.0,
-                indent_pt: 0.0,
-            }],
+            lines: vec![Line::single_run(text.clone(), 0.0, 0.0)],
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
@@ -1146,11 +1177,7 @@ fn measure_toc(
                     dx_pt: leader_x,
                     dy_pt: y,
                     w_pt: leader_end - leader_x,
-                    lines: vec![Line {
-                        text: ".".repeat(dots),
-                        space_adjust_pt: 0.0,
-                        indent_pt: 0.0,
-                    }],
+                    lines: vec![Line::single_run(".".repeat(dots), 0.0, 0.0)],
                     color,
                     font_size_pt: style.font_size_pt,
                     leading_pt: style.leading_pt,
@@ -1165,11 +1192,7 @@ fn measure_toc(
             dx_pt: width - number_w,
             dy_pt: y,
             w_pt: number_w,
-            lines: vec![Line {
-                text: number,
-                space_adjust_pt: 0.0,
-                indent_pt: 0.0,
-            }],
+            lines: vec![Line::single_run(number, 0.0, 0.0)],
             color,
             font_size_pt: style.font_size_pt,
             leading_pt: style.leading_pt,
@@ -1699,9 +1722,11 @@ fn place_measured(
         Measured::Text {
             lines,
             color,
+            run_colors,
             style,
         } => vec![PlacedBlock::Text {
             source,
+            run_colors,
             // The frame starts *below* the style's space-above: that space belongs to this
             // block's height (so pagination reserves it) but no text is drawn in it.
             frame: Rect {
@@ -1787,6 +1812,9 @@ fn place_measured(
                     frame: rect,
                     lines: p.lines,
                     color: p.color,
+                    // A panel part is one run: its text comes from a component field, and rich
+                    // text inside a declared component's sections is a later increment.
+                    run_colors: Vec::new(),
                     font_size_pt: p.font_size_pt,
                     leading_pt: p.leading_pt,
                 });
@@ -2811,6 +2839,7 @@ mod tests {
         }
         fn statics(&self, page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
             vec![PlacedBlock::Text {
+                run_colors: Vec::new(),
                 source: BlockId::UNASSIGNED,
                 frame: Rect {
                     x_pt: 0.0,
@@ -2818,11 +2847,7 @@ mod tests {
                     w_pt: 432.0,
                     h_pt: 12.0,
                 },
-                lines: vec![Line {
-                    text: format!("{}", page_index + 1),
-                    space_adjust_pt: 0.0,
-                    indent_pt: 0.0,
-                }],
+                lines: vec![Line::single_run(format!("{}", page_index + 1), 0.0, 0.0)],
                 color: Color::Gray { v: 0.0 },
                 font_size_pt: 9.0,
                 leading_pt: 11.0,
@@ -5598,7 +5623,9 @@ mod tests {
         let mut doc = Document::from_template(&template);
         doc.content.push(Block::Body {
             id: quill_core_model::BlockId::UNASSIGNED,
-            text: "A dank corridor stretches into darkness.".into(),
+            runs: vec![quill_core_model::Run::plain(
+                "A dank corridor stretches into darkness.",
+            )],
             color: Color::Gray { v: 0.0 },
             style: Some("no-such-body-style".into()),
         });

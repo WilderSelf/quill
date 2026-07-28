@@ -81,6 +81,19 @@ pub enum PaintOp {
 /// recoverable and obvious; refusing to draw the page around it would make a 500-page book
 /// unopenable because one asset moved. (Export takes the opposite view for the same reason it
 /// always does: a silently dropped image reaching a print shop is not recoverable.)
+/// Whether every span of this line resolves to the same ink (spec 0063).
+///
+/// Colours are `f32` and so not `Eq`; compared by debug form, as the writer does, so the two
+/// painters cannot disagree about whether a line needs splitting.
+fn line_is_one_ink(line: &quill_text_layout::Line, run_colors: &[quill_core_model::Color]) -> bool {
+    let mut inks = line
+        .spans
+        .iter()
+        .map(|sp| run_colors.get(sp.run).map(|c| format!("{c:?}")));
+    let first = inks.next().flatten();
+    inks.all(|c| c == first)
+}
+
 pub fn paint_page(
     page: &LaidOutPage,
     geom: &PageGeom,
@@ -108,6 +121,7 @@ pub fn paint_page(
                 frame,
                 lines,
                 color,
+                run_colors,
                 font_size_pt,
                 leading_pt,
                 ..
@@ -117,17 +131,48 @@ pub fn paint_page(
                 // gets it (spec 0032). One source, so screen and page agree about where a line sits.
                 let ascent = font.ascent_pt(*font_size_pt);
                 for (i, line) in lines.iter().enumerate() {
-                    ops.push(PaintOp::Text {
-                        // A line's own left inset (spec 0048), added here and in the PDF writer
-                        // from the same field, so the two derivation sites cannot disagree about
-                        // which lines are indented.
-                        x_pt: geom.off_x + frame.x_pt + line.indent_pt,
-                        baseline_pt: geom.off_y + frame.y_pt + ascent + i as f32 * leading_pt,
-                        text: line.text.clone(),
-                        size_pt: *font_size_pt,
-                        space_adjust_pt: line.space_adjust_pt,
-                        rgb,
-                    });
+                    let x0 = geom.off_x + frame.x_pt + line.indent_pt;
+                    let baseline_pt = geom.off_y + frame.y_pt + ascent + i as f32 * leading_pt;
+                    // One op per line unless the line's runs really are set in different inks
+                    // (spec 0063). The single-ink path is the one every existing document takes,
+                    // and it must stay exactly what it was.
+                    if run_colors.is_empty() || line_is_one_ink(line, run_colors) {
+                        ops.push(PaintOp::Text {
+                            // A line's own left inset (spec 0048), added here and in the PDF writer
+                            // from the same field, so the two derivation sites cannot disagree about
+                            // which lines are indented.
+                            x_pt: x0,
+                            baseline_pt,
+                            text: line.text.clone(),
+                            size_pt: *font_size_pt,
+                            space_adjust_pt: line.space_adjust_pt,
+                            rgb,
+                        });
+                        continue;
+                    }
+                    // A span starts where everything before it ends: its natural width plus the
+                    // justification already spent on the spaces behind it. That is the same
+                    // accumulation the writer's `TJ` array performs, from the same metrics, which
+                    // is what keeps screen and press from disagreeing about where a run begins.
+                    let mut at = 0usize;
+                    for sp in &line.spans {
+                        let end = (at + sp.len_bytes).min(line.text.len());
+                        let before = &line.text[..at];
+                        let piece = &line.text[at..end];
+                        let spaces = before.matches(' ').count() as f32;
+                        let dx =
+                            quill_text_layout::RunMetrics::measure_run(font, before, *font_size_pt)
+                                + spaces * line.space_adjust_pt;
+                        ops.push(PaintOp::Text {
+                            x_pt: x0 + dx,
+                            baseline_pt,
+                            text: piece.to_string(),
+                            size_pt: *font_size_pt,
+                            space_adjust_pt: line.space_adjust_pt,
+                            rgb: run_colors.get(sp.run).map_or(rgb, quill_color::to_srgb),
+                        });
+                        at = end;
+                    }
                 }
             }
             PlacedBlock::Rect {
@@ -465,6 +510,7 @@ mod tests {
         let font = Font::bundled();
         let mut page = lay_out(&doc, &font, &HypherHyphenator)[0].clone();
         page.statics = vec![PlacedBlock::Text {
+            run_colors: Vec::new(),
             source: quill_core_model::BlockId::UNASSIGNED,
             frame: quill_core_model::Rect {
                 x_pt: 0.0,
@@ -472,11 +518,11 @@ mod tests {
                 w_pt: 400.0,
                 h_pt: 12.0,
             },
-            lines: vec![quill_text_layout::Line {
-                text: "running head".into(),
-                space_adjust_pt: 0.0,
-                indent_pt: 0.0,
-            }],
+            lines: vec![quill_text_layout::Line::single_run(
+                "running head",
+                0.0,
+                0.0,
+            )],
             color: Color::Gray { v: 0.5 },
             font_size_pt: 9.0,
             leading_pt: 11.0,

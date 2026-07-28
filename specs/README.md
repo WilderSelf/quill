@@ -71,6 +71,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0060 | [A line may not be drawn past its measure](0060-last-line-measure.md) | M4 | implemented |
 | 0061 | [The gallery and the pack authoring guide](0061-gallery-and-guide.md) | M4 | implemented |
 | 0062 | [The neutral core: a mechanism is general or it is a bug](0062-neutral-core.md) | M5 | implemented |
+| 0063 | [Inline runs: the paragraph stops being a `String`](0063-inline-runs.md) | M5 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),
 and the content-pack authoring guide in [`../docs/pack-authoring.md`](../docs/pack-authoring.md).

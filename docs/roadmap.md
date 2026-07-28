@@ -1866,9 +1866,21 @@ here.
 |---|---|---|---|
 | 1 | 0062 | [The neutral core — a mechanism is general or it is a bug](#0062-neutral-core) | medium |
 | 2 | 0063 | [Inline runs — the paragraph stops being a `String`](#0063-inline-runs) | large |
-| 3 | 0064 | [Character styles — a named run treatment, as there is a named paragraph treatment](#0064-character-styles) | medium |
-| 4 | 0065 | [Lists — bullets, numbering, and the counter that survives repagination](#0065-lists) | medium |
-| 5 | 0066 | [Tab stops and leaders](#0066-tabs-and-leaders) | medium |
+| 3 | 0064 | [The font family, and the overrides that move a glyph](#0064-font-family) | large |
+| 4 | 0065 | [Character styles — a named run treatment, as there is a named paragraph treatment](#0065-character-styles) | medium |
+| 5 | 0066 | [Lists — bullets, numbering, and the counter that survives repagination](#0066-lists) | medium |
+| 6 | 0067 | [Tab stops and leaders](#0067-tabs-and-leaders) | medium |
+
+**0063 shipped, and split itself in two — which the plan did not anticipate.** It was written as one
+increment carrying the run model *and* every override. Building it found the overrides fall into two
+kinds with nothing in common: `color` changes ink, while `size_pt`, `tracking_pt`, `baseline_shift_pt`
+and weight/italic change what a *box measures*. The second kind means threading a size through every
+prefix sum, the shrink allowance, spec 0060's natural-width rule and spec 0051's pruning monotonicity
+argument; weight and italic additionally need a font *family*, which `quill-fonts` does not have — one
+embedded face, no index by weight or style, one PDF resource name `F0`. Neither is provable in the
+same breath as the run model, because both move glyphs and 0063's whole claim is that nothing moved.
+So 0063 shipped the structure, the span pipeline and colour; **0064 is the metrics and the faces**,
+and it inherits the importer's `**bold**`/`*italic*` with them. The later increments renumber.
 
 ## M5 sequencing rationale
 
@@ -1877,23 +1889,22 @@ increment below adds call sites to the surfaces 0062 renames; doing it last woul
 twice. It is also the increment that carries no risk — it must not move a single byte of output —
 which makes it the right one to establish the milestone's regression discipline on.
 
-**0063 → 0064, the run model and what names it.** 0063 is the milestone's spine and its only format
+**0063 → 0064 → 0065, the run model, the faces, and what names them.** 0063 is the milestone's spine and its only format
 break (`FORMAT_VERSION` 4). It changes the type every other crate reads: shaping, measurement,
 justification, the PDF writer, the screen renderer, the component interpreter and the importer all
 consume block text today as one string. The rule that makes it tractable is that a paragraph of one
 run must lay out *byte-identically* to the same paragraph as a string — the generalisation is proven
 by the absence of a diff, exactly as spec 0044's splitting mechanism and spec 0054's component
-interpreter both were. 0064 then gives runs named, reusable treatments, which is what turns "bold
-this word" into "this is a `lead-in`", and is the character-level twin of spec 0028's paragraph
-styles.
+interpreter both were. 0064 then makes the metric-bearing overrides real and gives the workspace a font family;
+0065 gives runs named, reusable treatments, which is what turns "bold this word" into "this is a
+`lead-in`", and is the character-level twin of spec 0028's paragraph styles.
 
-**0065 → 0066, the paragraph features that need runs to exist.** A list marker is a run in a
-different style at a tab position; a leader is a run repeated to fill a measure. Building either
-before 0063 would mean building it twice. They are last because they are the two most visible
+**0066 → 0067, the paragraph features that need runs to exist.** A list marker is a run in a
+different style at a tab position; a leader is a run repeated to fill a measure. Building either before 0063 would mean building it twice. They are last because they are the two most visible
 remaining holes in what a publisher can type, and because each is small once the run model is there.
 
-**Cross-cutting: every increment carries the export byte-hash bullet**, as M1–M4 did. Only 0063
-legitimately moves it, and it states *what* moved and proves it was only that — the discipline spec
+**Cross-cutting: every increment carries the export byte-hash bullet**, as M1–M4 did. Only 0063 and
+0064 legitimately move it, and it states *what* moved and proves it was only that — the discipline spec
 0038 established and spec 0042 extended to structural change.
 
 **Cross-cutting: everything here must compose with what M4 shipped.** A declared component's
@@ -1950,61 +1961,78 @@ content is content; the test this milestone applies is about mechanism.
 
 ### 0063 inline-runs
 
-**The paragraph stops being a `String`** · size: large · branch: `feat/inline-runs`
+**The paragraph stops being a `String`** · size: large · branch: `feat/inline-runs` · **shipped**
 
-`Block::Body` and `Block::Heading` carry `text: String` and one `Color`. They gain instead an
-ordered `Vec<Run>`, where a `Run` is a string plus an optional set of *inline overrides*: weight,
-style (italic), size, colour, tracking, and baseline shift. A run with no overrides is exactly the
-paragraph style resolved for the block, which is what makes the no-diff criterion below reachable.
+`Block::Body` and `Block::Heading` carried `text: String` and one `Color`. They carry instead an
+ordered `Vec<Run>`, where a `Run` is a string plus an optional `InlineStyle`: size, colour, tracking
+and baseline shift. A run with no overrides is exactly the paragraph style resolved for the block,
+which is what makes the no-diff result reachable at all.
 
-The break is real and gets a version: `FORMAT_VERSION` 4, with a v3 → v4 load migration that turns
-`{"text": "…", "color": …}` into a single run. A v3 document loaded, migrated, laid out and exported
-must produce **byte-identical** output to the same document under the v3 code — that is the whole
-proof that the run model is a generalisation and not a rewrite.
+**Of those, only `color` takes effect here** — the rest are declared so the format does not move
+twice, and are 0064's work. The reason is in the note above the table: colour changes ink, the others
+change what a box measures.
 
-Shaping is where the cost lands. `quill-fonts` shapes a string against one face; a mixed-weight
-paragraph is several shaping calls whose results must be concatenated with correct advances, and
-Knuth-Plass must break across a run boundary as if it were not there. The measurement cache
-(spec 0031) keys on block content, so its fingerprint grows a run dimension.
+`Line` gains `spans: Vec<Span>` naming the run each stretch of it came from, tracked through the item
+stream (each box carries its byte offset in the concatenated paragraph) rather than recovered from the
+output, so the map is exact by construction. The runs are one paragraph to the breaker: a change of
+treatment must not move a break, and a word straddling a boundary is one word, hyphenated as one.
+
+`FORMAT_VERSION` 4, with `migrate_3_to_4` replacing `text` with `runs`.
+
+**What it produced**
+
+- `Document::sample()`'s export moved **only by its identifiers**: 8786 bytes both sides, 124
+  differing bytes, all inside the XMP `DocumentID`/`InstanceID` or the trailer `/ID`.
+- **No component geometry moved at all.** Spec 0054's parity digests are `Debug`-based and so move
+  when a struct grows a field; stripping the two new fields reproduces the pre-0063 rendering exactly
+  and every one of the ten constants still matches. The corpus now asserts twice — geometry against
+  the unmoved constants, structure against new ones — which keeps the digest's original virtue that a
+  field nobody thought to list cannot slip past it.
+- text-layout's 34 pre-existing tests passed unchanged: breaking is not a function of run structure.
+
+### 0064 font-family
+
+**The font family, and the overrides that move a glyph** · size: large · branch: `feat/font-family`
+
+What 0063 declared and did not honour, plus the two overrides a reader expects first. These are one
+increment because they are one problem: every one of them changes what a box measures.
+
+`quill-fonts` has exactly one face — `Font::bundled()` parses one embedded `SourceSerif4-Regular.ttf`,
+nothing indexes faces by weight or style, `shape`/`measure_run`/`ascent_pt` take a size and no face
+selector, and `export-pdf` subsets one program and emits one resource name `F0`. So bold is not a
+missing field; it is a missing font family, multi-face subsetting, and a resource dictionary with more
+than one entry.
 
 **Acceptance criteria**
 
-- Regression: `Document::sample()`'s export byte-hash *moves only by its identifiers* — the sample is
-  unchanged content in a new format version, so the document `/ID` and XMP identifiers move and
-  nothing else. Proven by the spec 0038 procedure: export against the committed parity ICC before
-  and after, `cmp -l`, and confirm every differing offset falls inside the XMP `DocumentID`/
-  `InstanceID` or the trailer `/ID`, with length unchanged.
-- **A single-run paragraph lays out byte-identically to the same paragraph as a string** — asserted
-  over the full fixture corpus at the `PlacedBlock` level, not just the exported bytes.
-- A v3 `.tpub` loads, migrates and exports byte-identically to what the v3 code produced from it. A
-  v4 file loaded by v3 code fails with the typed newer-version error spec 0025 defines.
-- A paragraph mixing regular and bold shapes correctly across the boundary: the advance at the join
-  is the sum of the two runs' advances, kerning is not applied across faces (they are different
-  fonts; a cross-face kern pair does not exist), and a rendered line is attached to the PR.
-- Line breaking is unchanged by run structure: the same paragraph split into three runs at arbitrary
-  points breaks at the same places, to 0.01 pt, as the one-run form.
-- Hyphenation crosses a run boundary correctly — a word split across two runs is one word to the
-  hyphenator, or the spec states and tests the opposite rule.
-- A run whose overrides name a font variant the family does not have falls back to the nearest
-  available and says so once per export on stderr, rather than silently setting it regular. Visible
-  failure over silent wrongness, per `CLAUDE.md`.
-- Preflight (0050) and ink coverage run over every run's colour, not just the block's — asserted with
-  a paragraph whose fourth run is over the ink limit.
-- A **declared component** (0054) whose section text carries runs measures and splits correctly, and
-  a packed component from `examples/packs/` is in the corpus.
-- The baseline grid (0058) is unmoved by run structure: a gridded line's position is set by its own
-  leading, not by its tallest run, and a mixed-size paragraph on a grid is asserted.
-- `quill import` gains `**bold**` and `*italic*`, which the importer previously refused for want of a
-  target; its "six constructs completely" posture is updated in the same PR.
-- `benches/budgets.toml`: shaping cost for a single-run paragraph unchanged; a documented,
-  proportionate budget for the mixed-run case. `incremental_blocks_measured` unchanged.
+- A `FontFamily` selects a face by weight and style, with a documented fallback when the family lacks
+  the requested one — announced once per export on stderr rather than silently set regular. Visible
+  failure over silent wrongness.
+- Source Serif 4's bold and italic instances ship beside the regular one, under the same OFL, and the
+  licence note in `README.md` covers them.
+- Per-run `size_pt` and `tracking_pt` reach the breaker: a box measures at its own run's size, glue
+  measures at the size of the run it sits in, and a mixed-size paragraph is asserted against a
+  hand-computed width.
+- Spec 0051's pruning stays sound with per-box sizes — its monotonicity argument is re-stated against
+  the new widths, or the pruning is narrowed and said so. Spec 0060's natural-width rule likewise.
+- `baseline_shift_pt` is emitted as `Ts` and reset; `tracking_pt` as `Tc`.
+- The export subsets every face actually used, and only those; a document using no bold embeds no
+  bold program.
+- A paragraph mixing regular and bold shapes correctly across the boundary: the advance at the join is
+  the sum of the two runs' advances, and no kern pair is applied across faces (they are different
+  fonts; a cross-face pair does not exist). A rendered line is attached to the PR.
+- The baseline grid (0058) is unmoved: a gridded line's position is set by the paragraph's leading,
+  not by its tallest run, asserted on a mixed-size paragraph.
+- `quill import` gains `**bold**` and `*italic*`, which it refused for want of a target; its "six
+  constructs completely" posture is updated in the same PR.
+- A document that uses no metric-bearing override exports byte-identically to what 0063 produced.
+- `benches/budgets.toml`: single-face shaping cost unchanged; a documented, proportionate budget for
+  the mixed-face case.
 
-**Risks** — This is the largest change to `core-model` since the format existed and it touches every
-downstream crate. The byte-identity criteria are the only thing that will catch a subtle drift in
-advances or breaking, and they must be asserted over the corpus that exercises justification,
-hyphenation, fragmentation, the grid and the component interpreter — not a simple case.
+**Risks** — This is the increment that moves glyphs, and it moves them everywhere the fixtures look.
+The "no override ⇒ byte-identical" criterion is what separates a bug from the intended change.
 
-### 0064 character-styles
+### 0065 character-styles
 
 **A named run treatment, as there is a named paragraph treatment** · size: medium · branch:
 `feat/character-styles`
@@ -2028,7 +2056,7 @@ both, with the override winning field by field.
 - A content pack (0055) can carry character styles, and `quill pack extract` (0057) extracts them —
   otherwise a pack's "look" is missing the half this milestone added.
 
-### 0065 lists
+### 0066 lists
 
 **Bullets, numbering, and the counter that survives repagination** · size: medium · branch:
 `feat/lists`
@@ -2058,7 +2086,7 @@ just edited.
 - `quill import` maps `-` and `1.` markdown lists to it, replacing the "kept as body text" fallback.
 - A document with no list exports byte-identically to before this increment.
 
-### 0066 tabs-and-leaders
+### 0067 tabs-and-leaders
 
 **Tab stops and leaders** · size: medium · branch: `feat/tabs-and-leaders`
 

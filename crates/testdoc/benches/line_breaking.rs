@@ -19,11 +19,11 @@ fn main() {
     // Pull real generated prose rather than one repeated string: Knuth-Plass cost depends on the
     // number of feasible breakpoints, so a single sentence repeated would measure the wrong shape.
     let doc = document_with_blocks(&SynthSpec::default(), 2_000);
-    let paragraphs: Vec<&str> = doc
+    let paragraphs: Vec<String> = doc
         .content
         .iter()
         .filter_map(|b| match b {
-            quill_core_model::Block::Body { text, .. } => Some(text.as_str()),
+            quill_core_model::Block::Body { .. } => b.plain_text(),
             _ => None,
         })
         .collect();
@@ -32,7 +32,7 @@ fn main() {
     let elapsed = budget::min_of(3, || {
         for p in &paragraphs {
             std::hint::black_box(justify_paragraph_hyphenated(
-                p,
+                p.as_str(),
                 FRAME_WIDTH_PT,
                 quill_text_layout::BODY_FONT_SIZE_PT,
                 Alignment::Justified,
@@ -93,7 +93,8 @@ fn main() {
     // it is measured here so the cliff cannot come back unnoticed. Timed once, not `min_of`: the
     // budget is a hang detector with three orders of magnitude of headroom, so run-to-run noise is
     // irrelevant and a repeat would only make the bench slower.
-    let pathological: String = pool_words(&paragraphs, 20_000);
+    let refs: Vec<&str> = paragraphs.iter().map(String::as_str).collect();
+    let pathological: String = pool_words(&refs, 20_000);
     let t0 = std::time::Instant::now();
     std::hint::black_box(justify_paragraph_hyphenated(
         &pathological,

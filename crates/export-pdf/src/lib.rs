@@ -341,7 +341,37 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     let preset = &opts.preset;
 
     // Colors: no RGB in output; every color within the ink limit.
+    //
+    // "Every colour" means every *run's*, not just the block's (spec 0063). A run's override is ink
+    // that reaches the page exactly as the block's does, and a preflight that read one and not the
+    // other would pass a document with an over-inked word in it — the silent-corruption failure
+    // this crate exists to prevent.
     for (i, block) in doc.content.iter().enumerate() {
+        if let Block::Heading { runs, .. } | Block::Body { runs, .. } = block {
+            for (ri, run) in runs.iter().enumerate() {
+                let Some(color) = run.style.color.as_ref() else {
+                    continue;
+                };
+                if matches!(color, Color::Rgb { .. }) {
+                    push_error(
+                        &mut report,
+                        CheckId::ColorSpace,
+                        format!(
+                            "block {i} run {ri} uses RGB; press output must be CMYK or grayscale"
+                        ),
+                    );
+                } else if !within_ink_limit_pct(color, preset.max_ink_pct) {
+                    push_error(
+                        &mut report,
+                        CheckId::InkCoverage,
+                        format!(
+                            "block {i} run {ri} exceeds {}% total ink coverage",
+                            preset.max_ink_pct
+                        ),
+                    );
+                }
+            }
+        }
         let color = match block {
             Block::Heading { color, .. }
             | Block::Body { color, .. }
@@ -765,7 +795,11 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
     set.insert('-');
     for block in &doc.content {
         match block {
-            Block::Heading { text, .. } | Block::Body { text, .. } => set.extend(text.chars()),
+            // Every run's text, not the block's: a run the subsetter never saw would set to
+            // `.notdef` boxes in the press file (spec 0063).
+            Block::Heading { runs, .. } | Block::Body { runs, .. } => {
+                set.extend(runs.iter().flat_map(|r| r.text.chars()))
+            }
             // Spec 0026's silent-failure case, and the reason every variant-adding increment
             // carries a non-ASCII export test: a character this collector misses is not an error
             // anywhere, it just renders as `.notdef` in the finished PDF.
@@ -1519,7 +1553,16 @@ mod tests {
     /// No content, font or metadata stream moved. The sample has no stat block, so nothing it draws
     /// could have changed — which is what makes an identifier-only diff the expected result here
     /// rather than a hopeful one.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x6792_4808_db3d_24f5;
+    ///
+    /// Changed again by spec 0063, and again only in the document's identity. A paragraph is now an
+    /// ordered list of runs, so `doc.to_json()` carries `runs` where it carried `text` and
+    /// `format_version` 4 where it carried 3 — and the `/ID` derived from it moves. Verified by the
+    /// same procedure: exported against the committed parity ICC before and after, **8786 bytes
+    /// both sides**, 124 differing bytes, and every one of them inside the XMP
+    /// `DocumentID`/`InstanceID` or the trailer `/ID`. Not one byte of a content, font or metadata
+    /// stream moved — which is the claim the whole increment rests on, since a run model that moved
+    /// a glyph would be a layout change rather than a generalization.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0xe777_4c24_c90e_a993;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2399,6 +2442,7 @@ mod tests {
 
     fn text_at(x: f32, y: f32, w: f32, h: f32) -> PlacedBlock {
         PlacedBlock::Text {
+            run_colors: Vec::new(),
             source: quill_core_model::BlockId(1),
             frame: Rect {
                 x_pt: x,
@@ -2619,5 +2663,78 @@ mod tests {
         for id in [CheckId::TrimSize, CheckId::SafeArea] {
             assert!(CheckId::ALL.contains(&id), "{id:?} must be in CheckId::ALL");
         }
+    }
+
+    #[test]
+    fn a_runs_colour_override_reaches_the_content_stream() {
+        // The end-to-end claim of spec 0063: a word set in a different ink is a different ink in
+        // the press file. Before runs, one `set_fill` was emitted per block and there was no way
+        // to say this at all.
+        let mut doc = Document::sample();
+        doc.content.push(Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("Ordinary prose and then "),
+                quill_core_model::Run {
+                    text: "a warning".into(),
+                    style: quill_core_model::InlineStyle {
+                        color: Some(Color::Cmyk {
+                            c: 0.0,
+                            m: 1.0,
+                            y: 1.0,
+                            k: 0.0,
+                        }),
+                        ..quill_core_model::InlineStyle::EMPTY
+                    },
+                },
+                quill_core_model::Run::plain(" and ordinary prose again."),
+            ],
+            Color::Gray { v: 0.0 },
+        ));
+        doc.assign_missing_block_ids().expect("ids");
+        let (opts, icc) = opts_with_real_icc("run_ink");
+        let mut bytes: Vec<u8> = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("export");
+        let _ = std::fs::remove_file(icc);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("0 1 1 0 k"),
+            "the run's CMYK fill must appear in a content stream"
+        );
+    }
+
+    #[test]
+    fn an_over_inked_run_is_caught_by_preflight() {
+        // Ink is ink wherever it is authored. A preflight that read the block's colour and not its
+        // runs' would pass a document with an over-inked word in it — silent press corruption,
+        // which is the failure this crate exists to prevent.
+        let mut doc = Document::sample();
+        doc.content.push(Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("Fine. "),
+                quill_core_model::Run {
+                    text: "Far too much ink.".into(),
+                    style: quill_core_model::InlineStyle {
+                        color: Some(Color::Cmyk {
+                            c: 1.0,
+                            m: 1.0,
+                            y: 1.0,
+                            k: 1.0,
+                        }),
+                        ..quill_core_model::InlineStyle::EMPTY
+                    },
+                },
+            ],
+            Color::Gray { v: 0.0 },
+        ));
+        doc.assign_missing_block_ids().expect("ids");
+        let report = preflight(&doc, &opts_with_icc());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.check == CheckId::InkCoverage && f.message.contains("run 1")),
+            "expected an ink finding naming the run: {:?}",
+            report.findings
+        );
     }
 }
