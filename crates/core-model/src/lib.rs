@@ -624,6 +624,123 @@ pub struct ParagraphStyle {
     /// did — `FORMAT_VERSION` does not move.
     #[serde(default, skip_serializing_if = "Indent::is_zero")]
     pub indent: Indent,
+    /// Set as a list item (spec 0066). `None` is the common case and costs nothing: a document that
+    /// names no list serializes and lays out exactly as it did before lists existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<ListSpec>,
+}
+
+/// A paragraph set as a list item: what marks it, and at what depth (spec 0066).
+///
+/// A property of the *paragraph*, not a block type of its own. A list is a run of consecutive
+/// paragraphs that happen to be marked; making it a container would mean a second flow model, and
+/// nothing about breaking, fragmentation or the grid works differently inside one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ListSpec {
+    pub marker: ListMarker,
+    /// The first ordinal at this level. Ignored by a bullet.
+    #[serde(default = "one_u32")]
+    pub start: u32,
+    /// Nesting depth, `0` outermost. Each level counts independently.
+    #[serde(default)]
+    pub level: u8,
+}
+
+fn one_u32() -> u32 {
+    1
+}
+
+/// What stands in a list item's gutter.
+///
+/// A single glyph and a single suffix rather than strings, so a [`ParagraphStyle`] stays `Copy` —
+/// it is passed by value through the whole measurement path, and a heap allocation there would be
+/// paid per block per re-layout. It is also what markers actually are: a bullet is one character,
+/// and `1.` is a counter plus one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ListMarker {
+    /// A fixed glyph, repeated for every item.
+    Bullet { glyph: char },
+    /// A counter, formatted and suffixed — `1.`, `iv)`, `C.`.
+    Number {
+        format: NumberFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suffix: Option<char>,
+    },
+}
+
+/// How an ordinal is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NumberFormat {
+    Decimal,
+    LowerAlpha,
+    UpperAlpha,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl NumberFormat {
+    /// Format `n` (1-based). `0` and anything a format cannot express fall back to decimal, because
+    /// a marker that silently vanished would leave an item looking like body text.
+    pub fn format(self, n: u32) -> String {
+        match self {
+            NumberFormat::Decimal => n.to_string(),
+            NumberFormat::LowerAlpha => alpha(n, b'a'),
+            NumberFormat::UpperAlpha => alpha(n, b'A'),
+            NumberFormat::LowerRoman => roman(n).to_lowercase(),
+            NumberFormat::UpperRoman => roman(n),
+        }
+    }
+}
+
+/// Bijective base-26: 1 → `a`, 26 → `z`, 27 → `aa`. Not ordinary base-26, which would need a zero
+/// digit and would write the 27th item as `ba`.
+fn alpha(n: u32, base: u8) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    let mut out = Vec::new();
+    let mut n = n;
+    while n > 0 {
+        let rem = ((n - 1) % 26) as u8;
+        out.push(base + rem);
+        n = (n - 1) / 26;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("ascii")
+}
+
+/// Additive-subtractive roman numerals. Above 3999 there is no standard form, so it falls back to
+/// decimal rather than emitting something a reader would have to decode.
+fn roman(n: u32) -> String {
+    if n == 0 || n > 3999 {
+        return n.to_string();
+    }
+    const TABLE: &[(u32, &str)] = &[
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    let mut n = n;
+    for (v, sym) in TABLE {
+        while n >= *v {
+            out.push_str(sym);
+            n -= v;
+        }
+    }
+    out
 }
 
 /// A paragraph's left insets, in points (spec 0048).
@@ -671,6 +788,7 @@ impl Default for ParagraphStyle {
             space_before_pt: 0.0,
             space_after_pt: 0.0,
             indent: Indent::ZERO,
+            list: None,
         }
     }
 }
@@ -692,6 +810,14 @@ pub const TABLE_CELL_STYLE: &str = "table-cell";
 
 /// A generated table of contents' own heading (spec 0041).
 pub const TOC_TITLE_STYLE: &str = "toc-title";
+
+/// A bulleted list item (spec 0066).
+pub const LIST_BULLET_STYLE: &str = "list-bullet";
+/// A numbered list item.
+pub const LIST_NUMBER_STYLE: &str = "list-number";
+/// The gutter a list marker sits in: every line of an item is inset by this, and the marker is
+/// drawn outside it at the frame's edge.
+pub const LIST_GUTTER_PT: Pt = 14.0;
 
 /// The style for a contents entry at heading level `level` (`toc-1`..`toc-6`).
 pub fn toc_entry_style_name(level: u8) -> String {
@@ -717,6 +843,41 @@ impl Default for StyleSheet {
     fn default() -> Self {
         let mut paragraph = BTreeMap::new();
         paragraph.insert(BODY_STYLE.to_string(), ParagraphStyle::default());
+        // The two conventional list treatments, ready to name (spec 0066). Ragged rather than
+        // justified: a list item is usually short, and justifying two words across a measure is
+        // the defect that makes a list look broken.
+        //
+        // The indent is *uniform*, not spec 0048's hanging shape: every line of an item is inset by
+        // the gutter and the marker is drawn outside it, so a wrapped line lines up under the item's
+        // text. A hanging indent would leave the first line flush with the marker and inset only
+        // the wraps, which is the key/value shape and reads as a broken list.
+        for (name, marker) in [
+            (LIST_BULLET_STYLE, ListMarker::Bullet { glyph: '\u{2022}' }),
+            (
+                LIST_NUMBER_STYLE,
+                ListMarker::Number {
+                    format: NumberFormat::Decimal,
+                    suffix: Some('.'),
+                },
+            ),
+        ] {
+            paragraph.insert(
+                name.to_string(),
+                ParagraphStyle {
+                    align: TextAlign::Left,
+                    indent: Indent {
+                        first_pt: LIST_GUTTER_PT,
+                        rest_pt: LIST_GUTTER_PT,
+                    },
+                    list: Some(ListSpec {
+                        marker,
+                        start: 1,
+                        level: 0,
+                    }),
+                    ..ParagraphStyle::default()
+                },
+            );
+        }
         // A conventional descending scale. Headings are ragged-left because justifying a one-line
         // heading would stretch it across the measure; and they carry space above so they separate
         // from the text they follow.
@@ -731,6 +892,7 @@ impl Default for StyleSheet {
             paragraph.insert(
                 heading_style_name(level),
                 ParagraphStyle {
+                    list: None,
                     font_size_pt: size,
                     leading_pt: leading,
                     align: TextAlign::Left,
@@ -746,6 +908,7 @@ impl Default for StyleSheet {
         paragraph.insert(
             PANEL_TITLE_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 13.0,
                 leading_pt: 16.0,
                 align: TextAlign::Left,
@@ -757,6 +920,7 @@ impl Default for StyleSheet {
         paragraph.insert(
             PANEL_ATTR_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.0,
                 align: TextAlign::Left,
@@ -768,6 +932,7 @@ impl Default for StyleSheet {
         paragraph.insert(
             PANEL_BODY_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
                 // Ragged, not justified: a stat block sits in a narrow panel where justification
@@ -783,6 +948,7 @@ impl Default for StyleSheet {
         paragraph.insert(
             TABLE_HEADER_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
                 align: TextAlign::Left,
@@ -794,6 +960,7 @@ impl Default for StyleSheet {
         paragraph.insert(
             TABLE_CELL_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
                 // Ragged: a table cell is a narrow measure, and justifying one opens rivers a
@@ -809,6 +976,7 @@ impl Default for StyleSheet {
         paragraph.insert(
             TOC_TITLE_STYLE.to_string(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 18.0,
                 leading_pt: 22.0,
                 align: TextAlign::Left,
@@ -822,6 +990,7 @@ impl Default for StyleSheet {
             paragraph.insert(
                 toc_entry_style_name(level),
                 ParagraphStyle {
+                    list: None,
                     font_size_pt: size,
                     leading_pt: size + 4.0,
                     align: TextAlign::Left,
@@ -1644,6 +1813,7 @@ mod tests {
         sheet.paragraph.insert(
             "sidebar".into(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 8.0,
                 leading_pt: 9.5,
                 align: TextAlign::Left,
@@ -1679,6 +1849,7 @@ mod tests {
         doc.styles.paragraph.insert(
             "callout".into(),
             ParagraphStyle {
+                list: None,
                 font_size_pt: 13.5,
                 leading_pt: 16.0,
                 align: TextAlign::Left,

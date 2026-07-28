@@ -1562,7 +1562,14 @@ mod tests {
     /// `DocumentID`/`InstanceID` or the trailer `/ID`. Not one byte of a content, font or metadata
     /// stream moved — which is the claim the whole increment rests on, since a run model that moved
     /// a glyph would be a layout change rather than a generalization.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0xe777_4c24_c90e_a993;
+    ///
+    /// Changed again by spec 0066, and again only in the document's identity — the same shape spec
+    /// 0038 first recorded. `StyleSheet::default()` gains the two built-in list treatments, so
+    /// `doc.to_json()` differs and the `/ID` derived from it moves. Verified rather than accepted:
+    /// **8786 bytes both sides**, 128 differing bytes, every one inside the XMP
+    /// `DocumentID`/`InstanceID` or the trailer `/ID`. The sample contains no list, so nothing it
+    /// draws could have changed.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x29b3_771f_6bfb_a2bd;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;

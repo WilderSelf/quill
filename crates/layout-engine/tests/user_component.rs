@@ -109,6 +109,7 @@ fn styled_sheet() -> StyleSheet {
     styles.paragraph.insert(
         "clock-title".into(),
         ParagraphStyle {
+            list: None,
             font_size_pt: 12.0,
             leading_pt: 15.0,
             align: TextAlign::Left,
@@ -120,6 +121,7 @@ fn styled_sheet() -> StyleSheet {
     styles.paragraph.insert(
         "clock-body".into(),
         ParagraphStyle {
+            list: None,
             font_size_pt: 9.0,
             leading_pt: 11.5,
             align: TextAlign::Left,
