@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use quill_core_model::{page_geom, Block, BlockId, Document, LoadError, Tpub};
+use quill_core_model::{page_geom, Block, BlockId, Document, LoadError, Template, Tpub};
 use quill_fonts::Font;
 use quill_layout_engine::{LaidOutPage, LayoutSession, LayoutStats};
 use quill_render::{paint_page, PaintOp, PopulateReport, ProxyCache};
@@ -86,6 +86,14 @@ impl AppState {
     /// Open the built-in sample, for a first run with no file.
     pub fn sample() -> AppState {
         AppState::from_document(Document::sample(), PathBuf::from("."))
+    }
+
+    /// Start a new, empty document from a built-in template (spec 0036).
+    ///
+    /// The asset root is the current directory: the document links nothing yet, and the first save
+    /// is what gives it a real home.
+    pub fn new_from_template(template: &Template) -> AppState {
+        AppState::from_document(Document::from_template(template), PathBuf::from("."))
     }
 
     pub fn from_document(doc: Document, asset_root: PathBuf) -> AppState {
@@ -459,5 +467,51 @@ mod tests {
             "larger text should need more pages: {before} -> {}",
             state.page_count()
         );
+    }
+
+    #[test]
+    fn a_new_document_from_a_template_opens_and_paints() {
+        // The empty-content path through the whole shell: open, lay out, scroll, paint. Nothing in
+        // the app had ever handled a document with no blocks — every other test here opens one that
+        // already has content (spec 0036).
+        for t in Template::bundled() {
+            let mut state = AppState::new_from_template(t);
+            assert!(
+                state.page_count() >= 1,
+                "template `{}` must open to at least one page",
+                t.name
+            );
+            assert!(state.document().content.is_empty());
+
+            let ops = state.paint_visible();
+            assert!(
+                !ops.is_empty(),
+                "template `{}` must paint the page itself even with no content",
+                t.name
+            );
+            assert!(state.painted_pages() >= 1);
+        }
+    }
+
+    #[test]
+    fn a_template_document_accepts_its_first_paragraph() {
+        // A starter is only useful if it can be typed into. This is the first edit a beginner
+        // makes, and it goes through the same session every other edit does.
+        let mut state =
+            AppState::new_from_template(Template::by_name("adventure").expect("bundled"));
+        let doc = state.document_mut();
+        doc.content.push(Block::body(
+            "The road out of town is longer than it looks.",
+            quill_core_model::Color::Gray { v: 0.0 },
+        ));
+        doc.assign_missing_block_ids().expect("ids");
+        doc.bump_revision();
+
+        let outcome = state.relayout();
+        assert!(
+            !outcome.repaint.is_empty(),
+            "the first paragraph must repaint"
+        );
+        assert_eq!(state.pages()[0].blocks.len(), 1);
     }
 }

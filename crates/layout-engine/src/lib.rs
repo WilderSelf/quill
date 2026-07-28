@@ -2243,6 +2243,92 @@ mod tests {
         assert_eq!(back.pages, doc.pages);
     }
 
+    // --- Document templates (spec 0036) --------------------------------------------------------
+
+    #[test]
+    fn a_template_document_lays_out_with_its_opener_on_page_zero() {
+        // The end-to-end claim of the on-ramp: from a template, without authoring any layout, page
+        // 0 is a chapter opener and pages 1+ are body.
+        for name in ["adventure", "rulebook"] {
+            let t = quill_core_model::Template::by_name(name).expect("bundled");
+            let mut doc = Document::from_template(t);
+            doc.content = many_lines(400);
+            doc.assign_missing_block_ids().expect("ids");
+
+            let pages = lay_out(&doc, &MONO, &NoHyphenator);
+            assert!(pages.len() >= 3, "{name}: need body pages to compare");
+
+            let opener_top = t
+                .master_pages
+                .iter()
+                .find(|m| m.name == quill_core_model::OPENER_MASTER)
+                .and_then(|m| m.margins)
+                .expect("opener margins")
+                .top_pt;
+            let body_top = t
+                .master_pages
+                .iter()
+                .find(|m| m.name == quill_core_model::BODY_MASTER)
+                .and_then(|m| m.margins)
+                .expect("body margins")
+                .top_pt;
+
+            assert!(
+                (frame_y(&pages[0]) - opener_top).abs() < 0.01,
+                "{name}: page 0"
+            );
+            assert!(
+                (frame_y(&pages[1]) - body_top).abs() < 0.01,
+                "{name}: page 1"
+            );
+            assert!(
+                pages[0].statics.is_empty(),
+                "{name}: a chapter opener carries no folio"
+            );
+            match &pages[1].statics[0] {
+                PlacedBlock::Text { lines, .. } => assert_eq!(lines[0].text, "2"),
+                other => panic!("{name}: expected a folio, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_template_document_still_produces_a_page() {
+        // Nothing in the workspace had ever laid out a document with no blocks before templates
+        // existed. A starter must open, not produce zero pages or panic.
+        for t in quill_core_model::Template::bundled() {
+            let doc = Document::from_template(t);
+            let pages = lay_out(&doc, &MONO, &NoHyphenator);
+            assert_eq!(pages.len(), 1, "template `{}`", t.name);
+            assert!(pages[0].blocks.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_two_column_template_really_gives_two_frames() {
+        // Guards the arithmetic in the bundled rulebook: 432 - 54 - 40 = 338 pt of text area, two
+        // columns with a 14 pt gutter ⇒ 162 pt each at x = 54 and x = 230.
+        // The template is facing-pages, so the spine margin swaps sides: a recto starts at the
+        // 54 pt inside margin, a verso at the 40 pt fore-edge. Both are asserted, because a
+        // template that got this backwards would drift every other spread toward the gutter and
+        // still look right on page 0.
+        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let doc = Document::from_template(t);
+        let template = DocumentTemplate::new(&doc);
+
+        let recto = template.frames(0);
+        assert_eq!(recto.len(), 2);
+        assert!((recto[0].rect.w_pt - 162.0).abs() < 0.01);
+        assert!((recto[1].rect.w_pt - 162.0).abs() < 0.01);
+        assert!((recto[0].rect.x_pt - 54.0).abs() < 0.01);
+        assert!((recto[1].rect.x_pt - 230.0).abs() < 0.01);
+
+        let verso = template.frames(1);
+        assert_eq!(verso.len(), 2);
+        assert!((verso[0].rect.x_pt - 40.0).abs() < 0.01);
+        assert!((verso[0].rect.w_pt - 162.0).abs() < 0.01);
+    }
+
     #[test]
     fn many_images_all_place_through_the_asset_index() {
         // Resolution used to be a linear scan of `assets` run once per candidate frame per block —

@@ -44,6 +44,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0033 | [Screen render: paint list, rasterizer, `quill render`](0033-screen-render.md) | M1 | implemented |
 | 0034 | [egui app shell](0034-egui-app-shell.md) | M1 | implemented |
 | 0035 | [Per-page master assignment](0035-per-page-master-assignment.md) | M2 | implemented |
+| 0036 | [Document templates + `quill new`](0036-document-templates.md) | M2 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind
