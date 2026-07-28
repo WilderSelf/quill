@@ -285,8 +285,10 @@ out to this syntax is also a non-goal.
 - `#` … `######` followed by a space — a heading of that level. `#1` is a word, not a heading.
 - Blank-line-separated runs of text — a body paragraph; newlines inside one are soft.
 - `![alt](asset-id)` — an image block referencing a linked asset by id.
-- `:::statblock` … `:::` — one `key: value` per line, where `key` is `name`, `overview`, `detail`,
-  `action`, `reaction`, or `attr` (whose value is `name = value`).
+- `:::panel` … `:::` — a titled record of named sections, one `key: value` per line, where `key` is
+  `name`, `overview`, `detail`, `action`, `reaction`, or `attr` (whose value is `name = value`).
+  `:::statblock` is the same fence under its pre-0062 name and parses identically; both spellings
+  are permanent.
 - `:::table` … `:::` — pipe-delimited rows; the first is the header, and a `|---|` separator row is
   ignored as markdown furniture.
 - `:::toc` … `:::` — a generated contents list, taking `title:` and `max_level:`.
@@ -304,11 +306,11 @@ into darkness.
 
 ![a map](map1)
 
-:::statblock
-name: Goblin
-overview: Small humanoid, chaotic evil
-attr: Armour Class = 15
-action: Scimitar. +4 to hit.
+:::panel
+name: Astrolabe, mariner's
+overview: Cast brass, Iberian, c. 1580.
+attr: Diameter = 180 mm
+detail: Alidade replaced; limb graduated in single degrees.
 :::
 
 :::table

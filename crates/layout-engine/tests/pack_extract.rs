@@ -167,9 +167,9 @@ fn second_book(pack: &PackManifest) -> Document {
             INK,
         ),
         Block::body("Also short.", INK),
-        Block::StatBlock {
+        Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 name: "Rust Wight".into(),
                 overview: vec!["Medium undead, lawful evil.".into()],
                 attributes: vec![("Armour Class".into(), "13".into())],

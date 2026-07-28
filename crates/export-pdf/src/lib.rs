@@ -345,7 +345,7 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
         let color = match block {
             Block::Heading { color, .. }
             | Block::Body { color, .. }
-            | Block::StatBlock { color, .. }
+            | Block::Panel { color, .. }
             | Block::Table { color, .. }
             | Block::Component { color, .. }
             | Block::Toc { color, .. } => Some(color),
@@ -769,17 +769,17 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
             // Spec 0026's silent-failure case, and the reason every variant-adding increment
             // carries a non-ASCII export test: a character this collector misses is not an error
             // anywhere, it just renders as `.notdef` in the finished PDF.
-            Block::StatBlock { stat, .. } => {
-                set.extend(stat.name.chars());
-                for (k, v) in &stat.attributes {
+            Block::Panel { panel, .. } => {
+                set.extend(panel.name.chars());
+                for (k, v) in &panel.attributes {
                     set.extend(k.chars());
                     set.extend(v.chars());
                 }
                 for section in [
-                    &stat.overview,
-                    &stat.details,
-                    &stat.actions,
-                    &stat.reactions,
+                    &panel.overview,
+                    &panel.details,
+                    &panel.actions,
+                    &panel.reactions,
                 ] {
                     for line in section {
                         set.extend(line.chars());
@@ -787,7 +787,7 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
                 }
             }
             Block::Table { table, .. } => {
-                // Same silent-failure surface as the stat block: a header or cell this collector
+                // Same silent-failure surface as the panel block: a header or cell this collector
                 // misses renders as `.notdef` boxes with no error anywhere.
                 for cell in table.header.iter().flatten() {
                     set.extend(cell.chars());
@@ -1228,9 +1228,9 @@ mod tests {
         // pipeline — it renders as a `.notdef` box in the finished PDF. Every section of a stat
         // block is checked, because each is a separate place the collector could have forgotten.
         let mut doc = Document::sample();
-        doc.content.push(Block::StatBlock {
+        doc.content.push(Block::Panel {
             id: quill_core_model::BlockId::UNASSIGNED,
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 name: "Cráeblóð".into(),
                 overview: vec!["Ǫverview".into()],
                 attributes: vec![("Ǎttr".into(), "Vǻlue".into())],
@@ -1260,9 +1260,9 @@ mod tests {
         // The colour check walks `Block` variants, so a new variant it does not mention is a new
         // way for RGB to reach a press file.
         let mut doc = Document::sample();
-        doc.content.push(Block::StatBlock {
+        doc.content.push(Block::Panel {
             id: quill_core_model::BlockId::UNASSIGNED,
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 name: "Goblin".into(),
                 ..Default::default()
             },

@@ -2571,7 +2571,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quill-components-ttrpg"
+name = "quill-components"
 version = "0.0.0"
 dependencies = [
  "serde",
@@ -2583,7 +2583,7 @@ name = "quill-core-model"
 version = "0.0.0"
 dependencies = [
  "flate2",
- "quill-components-ttrpg",
+ "quill-components",
  "serde",
  "serde_json",
  "zip",

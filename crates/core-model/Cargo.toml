@@ -18,7 +18,7 @@ zip = { workspace = true }
 # on its default pure-Rust backend. Without this line `cargo build -p quill-core-model` fails, and
 # only builds that also pull in `export-pdf` (which brings flate2 with defaults) appear to work.
 flate2 = { workspace = true }
-# The TTRPG components (stat blocks, random tables) are part of the *document*, so the model owns
+# The portable components (panels, tables, range tables) are part of the *document*, so the model owns
 # them (spec 0038). The dependency runs this way — model depends on components, never the reverse —
 # because a component is portable content that must be expressible without knowing about documents.
-quill-components-ttrpg = { workspace = true }
+quill-components = { workspace = true }

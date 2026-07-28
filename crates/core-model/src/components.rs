@@ -9,7 +9,7 @@
 //! functions before this spec. They are byte-for-byte the same numbers: the acceptance criterion
 //! for 0054 is that re-expressing the bundled components as definitions moves no geometry at all.
 
-use quill_components_ttrpg::{
+use quill_components::{
     ComponentDef, ComponentLibrary, DefColor, DefStroke, PanelDef, RuleDef, SectionDef,
     SectionShape, SplitDef, SplitGranularity, ZebraDef, COMPONENT_DEF_VERSION,
     STATBLOCK_FIELD_ACTIONS, STATBLOCK_FIELD_ATTRIBUTES, STATBLOCK_FIELD_DETAILS,
@@ -18,8 +18,7 @@ use quill_components_ttrpg::{
 };
 
 use crate::{
-    STATBLOCK_ATTR_STYLE, STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE, TABLE_CELL_STYLE,
-    TABLE_HEADER_STYLE,
+    PANEL_ATTR_STYLE, PANEL_BODY_STYLE, PANEL_TITLE_STYLE, TABLE_CELL_STYLE, TABLE_HEADER_STYLE,
 };
 
 /// The name the bundled stat-block definition is registered and resolved under.
@@ -28,11 +27,11 @@ pub const STATBLOCK_COMPONENT: &str = "statblock";
 pub const TABLE_COMPONENT: &str = "table";
 
 /// Padding between a stat block's panel edge and its text, on all four sides.
-pub const STATBLOCK_PADDING_PT: f32 = 6.0;
+pub const PANEL_PADDING_PT: f32 = 6.0;
 
 /// The panel's background tint. 8% black — enough to read as a panel on paper, far enough inside
 /// the ink limit that it can never be the thing that fails preflight.
-const STATBLOCK_FILL: DefColor = DefColor::Gray { v: 0.92 };
+const PANEL_FILL: DefColor = DefColor::Gray { v: 0.92 };
 
 /// The panel's outer rule, and the ink its section hairlines are drawn in.
 const STATBLOCK_RULE_INK: DefColor = DefColor::Gray { v: 0.35 };
@@ -77,7 +76,7 @@ fn section_rule() -> RuleDef {
 fn lines_section(source: &str) -> SectionDef {
     SectionDef {
         source: source.into(),
-        style: STATBLOCK_BODY_STYLE.into(),
+        style: PANEL_BODY_STYLE.into(),
         shape: SectionShape::Lines,
         rule_above: Some(section_rule()),
         rule_below: None,
@@ -87,7 +86,7 @@ fn lines_section(source: &str) -> SectionDef {
 
 /// The stat block, as a definition.
 ///
-/// The section order is the one `StatBlock`'s own doc comment states — name, overview, attributes,
+/// The section order is the one `Panel`'s own doc comment states — name, overview, attributes,
 /// details, actions, reactions — which is the order the compact layout this mirrors reads in.
 /// Getting it wrong puts the creature's type *after* its armour class, which is visibly not a stat
 /// block; the first draft of spec 0038 did exactly that and only the render showed it.
@@ -96,17 +95,17 @@ pub fn statblock_definition() -> ComponentDef {
         version: COMPONENT_DEF_VERSION,
         name: STATBLOCK_COMPONENT.into(),
         panel: PanelDef {
-            fill: Some(STATBLOCK_FILL),
+            fill: Some(PANEL_FILL),
             stroke: Some(DefStroke {
                 color: STATBLOCK_RULE_INK,
                 width_pt: STATBLOCK_STROKE_PT,
             }),
-            padding_pt: STATBLOCK_PADDING_PT,
+            padding_pt: PANEL_PADDING_PT,
         },
         sections: vec![
             SectionDef {
                 source: STATBLOCK_FIELD_NAME.into(),
-                style: STATBLOCK_TITLE_STYLE.into(),
+                style: PANEL_TITLE_STYLE.into(),
                 shape: SectionShape::Text,
                 rule_above: None,
                 rule_below: None,
@@ -115,7 +114,7 @@ pub fn statblock_definition() -> ComponentDef {
             lines_section(STATBLOCK_FIELD_OVERVIEW),
             SectionDef {
                 source: STATBLOCK_FIELD_ATTRIBUTES.into(),
-                style: STATBLOCK_ATTR_STYLE.into(),
+                style: PANEL_ATTR_STYLE.into(),
                 // A colon, not the two spaces spec 0038 first used: `break_by_width` normalizes
                 // every run of inter-word whitespace to a single U+0020, so the intended visual gap
                 // collapsed and "Armour Class 15 (leather, shield)" read as one sentence. With no

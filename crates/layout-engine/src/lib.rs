@@ -995,9 +995,9 @@ pub(crate) fn measure_block(
             metrics,
             hyphenator,
         )),
-        Block::StatBlock { stat, color, .. } => Some(measure_component(
+        Block::Panel { panel, color, .. } => Some(measure_component(
             components.get(STATBLOCK_COMPONENT)?,
-            &stat.to_fields(),
+            &panel.to_fields(),
             *color,
             width,
             styles,
@@ -1799,7 +1799,7 @@ fn place_measured(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quill_core_model::{DefColor, SectionShape, STATBLOCK_PADDING_PT};
+    use quill_core_model::{DefColor, SectionShape, PANEL_PADDING_PT};
     use quill_text_layout::justify_paragraph_hyphenated;
 
     /// A definition's declared colour as the engine's own, so a test asserts against the
@@ -1814,7 +1814,7 @@ mod tests {
 
     /// The bundled stat block's panel tint.
     #[allow(non_snake_case)]
-    fn STATBLOCK_FILL() -> Color {
+    fn PANEL_FILL() -> Color {
         ink(quill_core_model::statblock_definition()
             .panel
             .fill
@@ -3332,7 +3332,7 @@ mod tests {
     fn a_template_document_lays_out_with_its_opener_on_page_zero() {
         // The end-to-end claim of the on-ramp: from a template, without authoring any layout, page
         // 0 is a chapter opener and pages 1+ are body.
-        for name in ["adventure", "rulebook"] {
+        for name in ["digest", "reference"] {
             let t = quill_core_model::Template::by_name(name).expect("bundled");
             let mut doc = Document::from_template(t);
             doc.content = many_lines(400);
@@ -3395,7 +3395,7 @@ mod tests {
         // 54 pt inside margin, a verso at the 40 pt fore-edge. Both are asserted, because a
         // template that got this backwards would drift every other spread toward the gutter and
         // still look right on page 0.
-        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let t = quill_core_model::Template::by_name("reference").expect("bundled");
         let doc = Document::from_template(t);
         let template = DocumentTemplate::new(&doc);
 
@@ -3430,7 +3430,7 @@ mod tests {
         //
         // The residual 15 pt is the widow rule's floor and not a miss: a legal fragment needs two
         // lines (25 pt), so a gap smaller than that is one the engine is right to leave.
-        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let t = quill_core_model::Template::by_name("reference").expect("bundled");
         let mut doc = Document::from_template(t);
         doc.content = (0..120)
             .map(|i| {
@@ -3539,7 +3539,7 @@ mod tests {
         // The built-in treatment, which is where the defect lived: a wrapped attribute lines up
         // under its value rather than under its key. `statblock-attr` carries the hanging indent in
         // `StyleSheet::default()`, so dropping a stat block in gets it with no authoring.
-        let stat = quill_core_model::StatBlock {
+        let panel = quill_core_model::Panel {
             name: "Barrow Wight".into(),
             overview: vec![],
             attributes: vec![(
@@ -3550,9 +3550,9 @@ mod tests {
             actions: vec![],
             reactions: vec![],
         };
-        let mut content = vec![Block::StatBlock {
+        let mut content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat,
+            panel,
             color: Color::Gray { v: 0.0 },
         }];
         content[0].set_id(BlockId(1));
@@ -3597,8 +3597,8 @@ mod tests {
 
     // --- Stat blocks (spec 0038) ----------------------------------------------------------------
 
-    fn goblin() -> quill_core_model::StatBlock {
-        quill_core_model::StatBlock {
+    fn goblin() -> quill_core_model::Panel {
+        quill_core_model::Panel {
             name: "Goblin".into(),
             overview: vec!["Small humanoid, chaotic".into()],
             attributes: vec![("AC".into(), "15".into()), ("HP".into(), "7".into())],
@@ -3609,9 +3609,9 @@ mod tests {
     }
 
     fn stat_doc() -> Document {
-        let mut doc = doc_with_blocks(vec![Block::StatBlock {
+        let mut doc = doc_with_blocks(vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: goblin(),
+            panel: goblin(),
             color: Color::Gray { v: 0.0 },
         }]);
         doc.assign_missing_block_ids().expect("ids");
@@ -3644,7 +3644,7 @@ mod tests {
 
     #[test]
     fn a_stat_blocks_text_is_inset_by_the_padding_on_every_side() {
-        // The panel spans the frame; every run sits `STATBLOCK_PADDING_PT` inside it, and the last
+        // The panel spans the frame; every run sits `PANEL_PADDING_PT` inside it, and the last
         // run's baseline block ends at least a padding above the panel's bottom edge.
         let doc = stat_doc();
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -3661,30 +3661,30 @@ mod tests {
             let PlacedBlock::Text { frame, .. } = r else {
                 panic!("expected text")
             };
-            assert!((frame.x_pt - (panel.x_pt + STATBLOCK_PADDING_PT)).abs() < 0.01);
-            assert!((frame.w_pt - (panel.w_pt - STATBLOCK_PADDING_PT * 2.0)).abs() < 0.01);
-            assert!(frame.y_pt >= panel.y_pt + STATBLOCK_PADDING_PT - 0.01);
+            assert!((frame.x_pt - (panel.x_pt + PANEL_PADDING_PT)).abs() < 0.01);
+            assert!((frame.w_pt - (panel.w_pt - PANEL_PADDING_PT * 2.0)).abs() < 0.01);
+            assert!(frame.y_pt >= panel.y_pt + PANEL_PADDING_PT - 0.01);
         }
         let last = match runs.last().unwrap() {
             PlacedBlock::Text { frame, .. } => frame.y_pt + frame.h_pt,
             _ => unreachable!(),
         };
         assert!(
-            last <= panel.y_pt + panel.h_pt - STATBLOCK_PADDING_PT + 0.01,
+            last <= panel.y_pt + panel.h_pt - PANEL_PADDING_PT + 0.01,
             "the bottom padding must be inside the panel"
         );
     }
 
     #[test]
     fn a_stat_block_reads_in_the_order_the_component_documents() {
-        // `StatBlock`'s own doc comment states the compact layout as
+        // `Panel`'s own doc comment states the compact layout as
         // Overview / Attributes / Details / Actions / Reactions, after the name. The first draft
         // put the attributes before the overview, which puts a creature's armour class above its
         // type — visibly not a stat block, and invisible to every assertion until it was rendered.
         let mut doc = stat_doc();
-        doc.content[0] = Block::StatBlock {
+        doc.content[0] = Block::Panel {
             id: doc.content[0].id(),
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 name: "Name".into(),
                 overview: vec!["Overview".into()],
                 attributes: vec![("Attr".into(), "1".into())],
@@ -3744,8 +3744,8 @@ mod tests {
                 unreachable!()
             };
             assert!(fill.is_some() && stroke.is_none(), "a rule is a thin fill");
-            assert!((frame.x_pt - (panel.x_pt + STATBLOCK_PADDING_PT)).abs() < 0.01);
-            assert!((frame.w_pt - (panel.w_pt - STATBLOCK_PADDING_PT * 2.0)).abs() < 0.01);
+            assert!((frame.x_pt - (panel.x_pt + PANEL_PADDING_PT)).abs() < 0.01);
+            assert!((frame.w_pt - (panel.w_pt - PANEL_PADDING_PT * 2.0)).abs() < 0.01);
             assert!(
                 frame.y_pt > panel.y_pt && frame.y_pt < panel.y_pt + panel.h_pt,
                 "a rule must sit inside its panel"
@@ -3811,8 +3811,8 @@ mod tests {
     }
 
     /// A stat block with `n` action lines — long enough to fit no frame at all.
-    fn big_goblin(n: usize) -> quill_core_model::StatBlock {
-        quill_core_model::StatBlock {
+    fn big_goblin(n: usize) -> quill_core_model::Panel {
+        quill_core_model::Panel {
             actions: (0..n)
                 .map(|i| format!("Action {i}. Does something."))
                 .collect(),
@@ -3855,9 +3855,9 @@ mod tests {
         // Spec 0038's original promise, now buildable. The block fits nowhere, so keep-together has
         // nothing to prefer and the fallback applies.
         let mut doc = stat_doc();
-        doc.content = vec![Block::StatBlock {
+        doc.content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: big_goblin(30),
+            panel: big_goblin(30),
             color: Color::Gray { v: 0.0 },
         }];
         doc.assign_missing_block_ids().expect("ids");
@@ -3891,9 +3891,9 @@ mod tests {
         // one, so `AC` and `HP` cannot end up on different pages. Attributes are one section by
         // construction, which is what makes this true rather than lucky.
         let mut doc = stat_doc();
-        doc.content = vec![Block::StatBlock {
+        doc.content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 attributes: (0..6)
                     .map(|i| (format!("Attr{i}"), format!("{i}")))
                     .collect(),
@@ -3927,9 +3927,9 @@ mod tests {
         // One rect per fragment, each bounded by its own fragment — not one rect spanning a page
         // break, which is what a naive implementation draws and what no text assertion notices.
         let mut doc = stat_doc();
-        doc.content = vec![Block::StatBlock {
+        doc.content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: big_goblin(30),
+            panel: big_goblin(30),
             color: Color::Gray { v: 0.0 },
         }];
         doc.assign_missing_block_ids().expect("ids");
@@ -3940,7 +3940,7 @@ mod tests {
         for page in &pages {
             for b in &page.blocks {
                 if let PlacedBlock::Rect { frame, fill, .. } = b {
-                    if *fill == Some(STATBLOCK_FILL()) {
+                    if *fill == Some(PANEL_FILL()) {
                         panels += 1;
                         assert!(
                             frame.y_pt + frame.h_pt <= bottom + 0.01,
@@ -3982,7 +3982,7 @@ mod tests {
         // narrow 162 pt columns and their 378 pt height are what make a cut hard to find: a
         // fragment whose smallest legal cut is larger than the column falls back to being placed
         // whole, and runs off the bottom of the page.
-        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let t = quill_core_model::Template::by_name("reference").expect("bundled");
         let mut doc = Document::from_template(t);
         doc.content = vec![
             Block::body(
@@ -3990,9 +3990,9 @@ mod tests {
                  the engine has a real decision to make about where it goes.",
                 Color::Gray { v: 0.0 },
             ),
-            Block::StatBlock {
+            Block::Panel {
                 id: BlockId::UNASSIGNED,
-                stat: big_goblin(NARROW_COLUMN_SECTIONS),
+                panel: big_goblin(NARROW_COLUMN_SECTIONS),
                 color: Color::Gray { v: 0.0 },
             },
         ];
@@ -4040,7 +4040,7 @@ mod tests {
     /// uncuttable panel is placed badly, never dropped.
     #[test]
     fn a_section_taller_than_its_column_is_placed_whole() {
-        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let t = quill_core_model::Template::by_name("reference").expect("bundled");
         let build = |n: usize| {
             let mut doc = Document::from_template(t);
             doc.content = vec![
@@ -4049,9 +4049,9 @@ mod tests {
                      and the engine has a real decision to make about where it goes.",
                     Color::Gray { v: 0.0 },
                 ),
-                Block::StatBlock {
+                Block::Panel {
                     id: BlockId::UNASSIGNED,
-                    stat: big_goblin(n),
+                    panel: big_goblin(n),
                     color: Color::Gray { v: 0.0 },
                 },
             ];
@@ -4115,9 +4115,9 @@ mod tests {
         // whole and overflow. A section is a unit the reader recognises, so a fragment of one is
         // not a widow the way a single line is.
         let mut doc = stat_doc();
-        doc.content = vec![Block::StatBlock {
+        doc.content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 name: "Barrow Wight".into(),
                 overview: vec!["Medium undead, lawful evil".into()],
                 attributes: vec![],
@@ -4132,9 +4132,7 @@ mod tests {
         let panels: usize = pages
             .iter()
             .flat_map(|p| p.blocks.iter())
-            .filter(
-                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL())),
-            )
+            .filter(|b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(PANEL_FILL())))
             .count();
         assert!(
             panels >= 2,
@@ -4152,9 +4150,9 @@ mod tests {
         // name and an overview do split. Requiring two sections per fragment instead is what made
         // the first version of this increment render a panel off the bottom of the page.
         let mut doc = stat_doc();
-        doc.content = vec![Block::StatBlock {
+        doc.content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 name: (0..400)
                     .map(|i| format!("word{i}"))
                     .collect::<Vec<_>>()
@@ -4172,9 +4170,7 @@ mod tests {
         let panels: usize = pages
             .iter()
             .flat_map(|p| p.blocks.iter())
-            .filter(
-                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL())),
-            )
+            .filter(|b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(PANEL_FILL())))
             .count();
         assert_eq!(panels, 1, "one section ⇒ no legal cut ⇒ placed whole");
     }
@@ -4184,9 +4180,9 @@ mod tests {
         // The padding must come off the measure, not just off the position — otherwise long prose
         // is broken to the full frame width and then drawn inset, so it overruns the panel.
         let mut doc = stat_doc();
-        doc.content[0] = Block::StatBlock {
+        doc.content[0] = Block::Panel {
             id: doc.content[0].id(),
-            stat: quill_core_model::StatBlock {
+            panel: quill_core_model::Panel {
                 actions: vec![
                     "A very long action description that will certainly need to wrap \
                                across more than one line in any reasonable measure at all."
@@ -4205,7 +4201,7 @@ mod tests {
                 continue;
             };
             assert!(
-                frame.x_pt + frame.w_pt <= panel.x_pt + panel.w_pt - STATBLOCK_PADDING_PT + 0.01,
+                frame.x_pt + frame.w_pt <= panel.x_pt + panel.w_pt - PANEL_PADDING_PT + 0.01,
                 "a run overran the panel's right padding"
             );
         }
@@ -4403,24 +4399,25 @@ mod tests {
     }
 
     #[test]
-    fn a_random_table_lays_out_through_the_conversion() {
+    fn a_range_table_lays_out_through_the_conversion() {
         // End to end: the component that already existed, on a page at last.
-        let random = quill_core_model::RandomTable {
-            die: 6,
+        let ranged = quill_core_model::RangeTable {
+            max: 6,
+            label: "d6".into(),
             entries: vec![
-                quill_core_model::TableEntry {
+                quill_core_model::RangeEntry {
                     low: 1,
                     high: 3,
-                    result: "Goblins".into(),
+                    value: "Goblins".into(),
                 },
-                quill_core_model::TableEntry {
+                quill_core_model::RangeEntry {
                     low: 4,
                     high: 4,
-                    result: "One bandit".into(),
+                    value: "One bandit".into(),
                 },
             ],
         };
-        let doc = table_doc(quill_core_model::Table::from_random(&random));
+        let doc = table_doc(quill_core_model::Table::from_range_table(&ranged));
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
         let texts: Vec<String> = cells(&pages[0]).into_iter().map(|c| c.2).collect();
         assert_eq!(

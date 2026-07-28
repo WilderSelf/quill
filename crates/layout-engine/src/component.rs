@@ -1,6 +1,6 @@
 //! The component interpreter (spec 0054).
 //!
-//! One function lays out *any* [`ComponentDef`]. Before this, `measure_stat_block` and
+//! One function lays out *any* [`ComponentDef`]. Before this, `measure_panel` and
 //! `measure_table` did the same job twice, with every tint, inset, hairline and section order
 //! written as a crate constant — so a publisher whose game system sets its creatures differently
 //! could not express it at all.

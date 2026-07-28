@@ -20,7 +20,8 @@
 //! - `#` … `######` — a heading of that level.
 //! - Blank-line-separated runs of text — a body paragraph. Newlines inside one are soft.
 //! - `![](asset-id)` — an image block referencing a linked asset by id.
-//! - `:::statblock` … `:::` — a stat block, one `key: value` per line.
+//! - `:::panel` … `:::` — a panel: a titled record of named sections, one `key: value` per line.
+//!   `:::statblock` is the same fence under its pre-0062 name and still parses.
 //! - `:::table` … `:::` — a table, as pipe-delimited rows; the first row is the header.
 //! - `:::toc` … `:::` — a generated table of contents.
 //!
@@ -34,7 +35,7 @@
 //! - **Anything else** is kept as body text with a **warning** naming the line. A paragraph that
 //!   came out as plain prose is visible and fixable; a paragraph that vanished is not.
 
-use crate::{Block, BlockId, Color, Document, StatBlock, Table, Template};
+use crate::{Block, BlockId, Color, Document, Panel, Table, Template};
 
 /// Something the importer could not honor, with the line it was on.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +112,11 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
             let kind = rest.trim();
             let (body, end) = fence_body(&lines, i + 1);
             match kind {
-                "statblock" => content.push(parse_statblock(&body, i + 2, &mut warnings)),
+                // `statblock` is `panel`'s pre-0062 spelling. Retained rather than deprecated:
+                // it is a published authoring syntax and there is no released version to remove
+                // it in, so silently refusing to parse it would be the failure this repo exists
+                // to avoid (spec 0062).
+                "panel" | "statblock" => content.push(parse_panel(&body, i + 2, &mut warnings)),
                 "table" => content.push(parse_table(&body, i + 2, &mut warnings)?),
                 "toc" => content.push(parse_toc(&body, i + 2, &mut warnings)),
                 other => {
@@ -119,7 +124,7 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
                     return Err(ImportError {
                         line: line_no,
                         message: format!(
-                            "unknown block `:::{other}`; supported: statblock, table, toc"
+                            "unknown block `:::{other}`; supported: panel, table, toc"
                         ),
                     });
                 }
@@ -229,8 +234,8 @@ fn key_value(line: &str) -> Option<(&str, &str)> {
     Some((k.trim(), v.trim()))
 }
 
-fn parse_statblock(body: &[String], first_line: usize, warnings: &mut Vec<Diagnostic>) -> Block {
-    let mut stat = StatBlock::default();
+fn parse_panel(body: &[String], first_line: usize, warnings: &mut Vec<Diagnostic>) -> Block {
+    let mut panel = Panel::default();
     for (offset, line) in body.iter().enumerate() {
         let line_no = first_line + offset;
         let t = line.trim();
@@ -240,19 +245,19 @@ fn parse_statblock(body: &[String], first_line: usize, warnings: &mut Vec<Diagno
         let Some((key, value)) = key_value(t) else {
             warnings.push(Diagnostic {
                 line: line_no,
-                message: "expected `key: value` in a stat block; kept as an overview line".into(),
+                message: "expected `key: value` in a panel; kept as an overview line".into(),
             });
-            stat.overview.push(t.to_string());
+            panel.overview.push(t.to_string());
             continue;
         };
         match key {
-            "name" => stat.name = value.to_string(),
-            "overview" => stat.overview.push(value.to_string()),
-            "detail" | "details" => stat.details.push(value.to_string()),
-            "action" | "actions" => stat.actions.push(value.to_string()),
-            "reaction" | "reactions" => stat.reactions.push(value.to_string()),
+            "name" => panel.name = value.to_string(),
+            "overview" => panel.overview.push(value.to_string()),
+            "detail" | "details" => panel.details.push(value.to_string()),
+            "action" | "actions" => panel.actions.push(value.to_string()),
+            "reaction" | "reactions" => panel.reactions.push(value.to_string()),
             "attr" => match value.split_once('=') {
-                Some((k, v)) => stat.attributes.push((k.trim().into(), v.trim().into())),
+                Some((k, v)) => panel.attributes.push((k.trim().into(), v.trim().into())),
                 None => warnings.push(Diagnostic {
                     line: line_no,
                     message: "an `attr` needs `name = value`; skipped".into(),
@@ -261,21 +266,21 @@ fn parse_statblock(body: &[String], first_line: usize, warnings: &mut Vec<Diagno
             other => {
                 warnings.push(Diagnostic {
                     line: line_no,
-                    message: format!("unknown stat-block field `{other}`; kept as a detail"),
+                    message: format!("unknown panel field `{other}`; kept as a detail"),
                 });
-                stat.details.push(t.to_string());
+                panel.details.push(t.to_string());
             }
         }
     }
-    if stat.name.is_empty() {
+    if panel.name.is_empty() {
         warnings.push(Diagnostic {
             line: first_line,
-            message: "stat block has no `name:`".into(),
+            message: "panel has no `name:`".into(),
         });
     }
-    Block::StatBlock {
+    Block::Panel {
         id: BlockId::UNASSIGNED,
-        stat,
+        panel,
         color: INK,
     }
 }
@@ -368,7 +373,7 @@ mod tests {
     use super::*;
 
     fn tpl() -> &'static Template {
-        Template::by_name("adventure").expect("bundled")
+        Template::by_name("digest").expect("bundled")
     }
 
     fn import_ok(src: &str) -> Imported {
@@ -429,13 +434,13 @@ max_level: 3
             other => panic!("{other:?}"),
         }
         match &c[3] {
-            Block::StatBlock { stat, .. } => {
-                assert_eq!(stat.name, "Goblin");
-                assert_eq!(stat.overview, ["Small humanoid, chaotic evil"]);
-                assert_eq!(stat.attributes, [("Armour Class".into(), "15".into())]);
-                assert_eq!(stat.details, ["Nimble Escape."]);
-                assert_eq!(stat.actions, ["Scimitar. +4 to hit."]);
-                assert_eq!(stat.reactions, ["Warren Cunning."]);
+            Block::Panel { panel, .. } => {
+                assert_eq!(panel.name, "Goblin");
+                assert_eq!(panel.overview, ["Small humanoid, chaotic evil"]);
+                assert_eq!(panel.attributes, [("Armour Class".into(), "15".into())]);
+                assert_eq!(panel.details, ["Nimble Escape."]);
+                assert_eq!(panel.actions, ["Scimitar. +4 to hit."]);
+                assert_eq!(panel.reactions, ["Warren Cunning."]);
             }
             other => panic!("{other:?}"),
         }
@@ -473,10 +478,7 @@ max_level: 3
         let err = import(":::spellcard\nname: Fireball\n:::\n", tpl()).unwrap_err();
         assert_eq!(err.line, 1);
         assert!(err.message.contains("spellcard"), "{}", err.message);
-        assert!(
-            err.message.contains("statblock"),
-            "must list what is supported"
-        );
+        assert!(err.message.contains("panel"), "must list what is supported");
     }
 
     #[test]
@@ -504,6 +506,27 @@ max_level: 3
     }
 
     #[test]
+    fn the_pre_0062_fence_spelling_parses_identically() {
+        // `:::statblock` is `:::panel`'s old name. A published authoring syntax that silently stops
+        // parsing is the failure this repo exists to avoid, so both spellings are permanent and
+        // must produce the same document rather than merely both succeeding.
+        let src = "name: Astrolabe\noverview: A brass instrument.\nattr: Diameter = 180 mm\n";
+        let new_spelling = import_ok(&format!(":::panel\n{src}:::\n"));
+        let old_spelling = import_ok(&format!(":::statblock\n{src}:::\n"));
+        assert_eq!(new_spelling.document, old_spelling.document);
+        assert_eq!(
+            new_spelling.warnings.len(),
+            0,
+            "{:?}",
+            new_spelling.warnings
+        );
+        let Block::Panel { panel, .. } = &new_spelling.document.content[0] else {
+            panic!("expected a panel")
+        };
+        assert_eq!(panel.name, "Astrolabe");
+    }
+
+    #[test]
     fn a_malformed_stat_block_field_warns_and_keeps_the_line() {
         let out =
             import_ok(":::statblock\nname: Goblin\nattr: no equals sign\nwibble: value\n:::\n");
@@ -511,10 +534,14 @@ max_level: 3
         assert_eq!(out.warnings[0].line, 3);
         assert!(out.warnings[0].message.contains("name = value"));
         assert_eq!(out.warnings[1].line, 4);
-        let Block::StatBlock { stat, .. } = &out.document.content[0] else {
+        let Block::Panel { panel, .. } = &out.document.content[0] else {
             panic!("expected a stat block")
         };
-        assert_eq!(stat.details, ["wibble: value"], "the unknown field is kept");
+        assert_eq!(
+            panel.details,
+            ["wibble: value"],
+            "the unknown field is kept"
+        );
     }
 
     #[test]
@@ -536,10 +563,10 @@ max_level: 3
         // Refusing a whole document over three missing characters is the wrong trade when every
         // line the author typed is right there.
         let out = import_ok(":::statblock\nname: Goblin\n");
-        let Block::StatBlock { stat, .. } = &out.document.content[0] else {
+        let Block::Panel { panel, .. } = &out.document.content[0] else {
             panic!("expected a stat block")
         };
-        assert_eq!(stat.name, "Goblin");
+        assert_eq!(panel.name, "Goblin");
     }
 
     #[test]
@@ -569,16 +596,13 @@ max_level: 3
                 Block::Heading { .. } => "heading",
                 Block::Body { .. } => "body",
                 Block::Image { .. } => "image",
-                Block::StatBlock { .. } => "statblock",
+                Block::Panel { .. } => "panel",
                 Block::Table { .. } => "table",
                 Block::Component { .. } => "component",
                 Block::Toc { .. } => "toc",
             })
             .collect();
-        assert_eq!(
-            kinds,
-            ["heading", "body", "image", "statblock", "table", "toc"]
-        );
+        assert_eq!(kinds, ["heading", "body", "image", "panel", "table", "toc"]);
     }
 
     #[test]

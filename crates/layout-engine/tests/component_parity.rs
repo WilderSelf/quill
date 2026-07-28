@@ -16,7 +16,7 @@
 //! section rules, an absent section, a header-less table, an empty table, and both split paths.
 
 use quill_core_model::Rect;
-use quill_core_model::{Asset, Block, BlockId, Color, StatBlock, StyleSheet, Table};
+use quill_core_model::{Asset, Block, BlockId, Color, Panel, StyleSheet, Table};
 use quill_layout_engine::{lay_out_in_frame, Frame, LaidOutPage};
 use quill_text_layout::{MonospaceRunMetrics, NoHyphenator};
 
@@ -64,8 +64,8 @@ fn lay(content: Vec<Block>, w_pt: f32, h_pt: f32) -> Vec<LaidOutPage> {
     )
 }
 
-fn creature() -> StatBlock {
-    StatBlock {
+fn creature() -> Panel {
+    Panel {
         name: "Cave Troll".into(),
         overview: vec!["Large giant, chaotic evil.".into()],
         attributes: vec![
@@ -91,8 +91,8 @@ fn creature() -> StatBlock {
 
 /// A creature with no overview and no reactions: the sections that emit nothing must leave no
 /// hairline and no cut boundary behind.
-fn sparse_creature() -> StatBlock {
-    StatBlock {
+fn sparse_creature() -> Panel {
+    Panel {
         overview: Vec::new(),
         reactions: Vec::new(),
         ..creature()
@@ -135,9 +135,9 @@ fn headerless_table() -> Table {
 /// Every case, and the frame it is laid into. A short frame is what sends a block down the split
 /// path; a tall one keeps it whole.
 fn corpus() -> Vec<(&'static str, Vec<Block>, f32, f32)> {
-    let sb = |stat: StatBlock| Block::StatBlock {
+    let sb = |panel: Panel| Block::Panel {
         id: BlockId::UNASSIGNED,
-        stat,
+        panel,
         color: INK,
     };
     let tb = |table: Table| Block::Table {

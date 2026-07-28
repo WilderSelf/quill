@@ -139,7 +139,7 @@ fn a_preset_travels_on_the_command_line_and_never_into_the_document() {
     let out = quill(&[
         "new",
         "--template",
-        "adventure",
+        "digest",
         "--preset",
         "drivethrurpg",
         "-o",

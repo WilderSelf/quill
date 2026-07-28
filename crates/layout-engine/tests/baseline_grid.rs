@@ -6,9 +6,9 @@
 //! repo. The rest asserts the mechanism on documents that do ask.
 
 use quill_core_model::{
-    BaselineGrid, Block, BlockId, Color, Document, Indent, Margins, PageSetup, ParagraphStyle,
-    Size, StatBlock, StyleSheet, Table, TextAlign, BODY_STYLE, STATBLOCK_BODY_STYLE,
-    STATBLOCK_TITLE_STYLE, TABLE_CELL_STYLE, TABLE_HEADER_STYLE,
+    BaselineGrid, Block, BlockId, Color, Document, Indent, Margins, PageSetup, Panel,
+    ParagraphStyle, Size, StyleSheet, Table, TextAlign, BODY_STYLE, PANEL_BODY_STYLE,
+    PANEL_TITLE_STYLE, TABLE_CELL_STYLE, TABLE_HEADER_STYLE,
 };
 use quill_layout_engine::{lay_out, LaidOutPage, PlacedBlock};
 use quill_text_layout::{MonospaceRunMetrics, NoHyphenator, RunMetrics};
@@ -56,12 +56,12 @@ fn gridded_styles() -> StyleSheet {
         );
     }
     for name in [
-        STATBLOCK_TITLE_STYLE,
-        STATBLOCK_BODY_STYLE,
+        PANEL_TITLE_STYLE,
+        PANEL_BODY_STYLE,
         TABLE_HEADER_STYLE,
         TABLE_CELL_STYLE,
     ] {
-        let indent = if name == STATBLOCK_BODY_STYLE {
+        let indent = if name == PANEL_BODY_STYLE {
             Indent::hanging(10.0)
         } else {
             Indent::ZERO
@@ -286,9 +286,9 @@ fn components_snap_as_body_text_does() {
         },
         vec![
             Block::body(PROSE[0], INK),
-            Block::StatBlock {
+            Block::Panel {
                 id: BlockId::UNASSIGNED,
-                stat: StatBlock {
+                panel: Panel {
                     name: "Cave Troll".into(),
                     overview: vec!["Large giant, chaotic evil.".into()],
                     attributes: vec![
@@ -466,7 +466,7 @@ fn each_fragment_of_a_split_component_snaps() {
             .collect(),
         zebra: true,
     };
-    let creature = StatBlock {
+    let creature = Panel {
         name: "Cave Troll".into(),
         overview: vec!["Large giant, chaotic evil.".into()],
         attributes: vec![("Armour Class".into(), "15".into())],
@@ -488,9 +488,9 @@ fn each_fragment_of_a_split_component_snaps() {
                 table: long_table,
                 color: INK,
             },
-            Block::StatBlock {
+            Block::Panel {
                 id: BlockId::UNASSIGNED,
-                stat: creature,
+                panel: creature,
                 color: INK,
             },
         ],
