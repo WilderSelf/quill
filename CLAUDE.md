@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M1 complete — editing core + text-layout.** M0 (headless PDF/X export) is
+**Status: M0–M4 complete; M5 in progress.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -129,13 +129,17 @@ content packs) → **M5** the general typographic core (the neutral core, inline
 styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
 an index, a book) → **M7** graphics and colour.
 **M0–M4 done**; M0's sole open item is the manual POD upload. **M5 is decomposed** into specs
-0062–0066; M6–M7 are named, not decomposed.
+0062–0067, of which 0062 (the neutral core), 0063 (inline runs), 0064 (the font family) and 0066
+(lists) have shipped; 0065 (character styles) and 0067 (tabs and leaders) remain. M6–M7 are named,
+not decomposed.
 
-**Why M5 exists: quill cannot bold a word.** `Block::Body` and `Block::Heading` each carry one
-`String` and one `Color`, so there is no styled run anywhere in the workspace — which is why the
-importer refuses emphasis on purpose. Character styles, drop caps, small caps, OpenType feature
-control and tracking are all properties of a *run*, so all of them are downstream of that one gap.
-M4 shipped a mechanism for sharing a look before the look could include an italic.
+**Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
+`String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the
+importer refused emphasis on purpose. Spec 0063 gave the paragraph runs and spec 0064 gave the
+workspace a font family, four bundled faces, and per-run size, tracking and baseline shift, so a word
+can now be bolded and imported as bold. Character styles, drop caps, small caps and OpenType feature
+control are the rest of that list, and are what 0065 onward are for. M4 shipped a mechanism for
+sharing a look before the look could include an italic.
 
 **Not scheduled, and deliberately so:** the direct-manipulation authoring surface (move, resize,
 rotate, group, guides, snap, layers, undo/redo). The `app` crate opens a document, scrolls it and

@@ -1,8 +1,10 @@
 //! Font subsetting and composite-font embedding (spec 0002 req 3, spec 0004 user fonts, spec 0011
 //! CFF fonts).
 //!
-//! A font program — the bundled OFL font (Source Serif 4, SIL OFL-1.1, `glyf` outlines) or a
-//! user-supplied file — is subset to only the glyphs a document uses and embedded as a Type0
+//! A font program — one of `quill-fonts`' four bundled Source Serif 4 faces (SIL OFL-1.1, `glyf`
+//! outlines; licence at `crates/fonts/assets/SourceSerif4-LICENSE.txt`) or a
+//! user-supplied file — is subset to only the glyphs a document uses **in that face** and embedded
+//! as a Type0
 //! composite font with Identity-H encoding. The descendant-font flavour follows the outlines
 //! ([`OutlineKind`]): TrueType embeds `glyf` as `FontFile2` under `CIDFontType2`, while CFF (`.otf`)
 //! embeds the bare `CFF ` table as `FontFile3` under `CIDFontType0`. See
@@ -17,6 +19,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use pdf_writer::types::FontFlags;
+use quill_fonts::FaceKey;
 use subsetter::GlyphRemapper;
 use ttf_parser::{Face, GlyphId, Permissions, RawFace, Tag};
 
@@ -34,13 +37,17 @@ pub enum OutlineKind {
     Cff,
 }
 
-/// The bundled font program (full file; subset at export time). SIL OFL-1.1 — see
-/// `assets/SourceSerif4-LICENSE.txt`.
-pub(crate) const FONT_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-Regular.ttf");
+/// The bundled regular program (full file; subset at export time).
+///
+/// Taken from `quill-fonts` rather than from a second copy in this crate's own assets, as it was
+/// until spec 0064: the family's other three faces could only come from there, and one face read
+/// from here while three came from there is two answers to "which program is Source Serif 4".
+/// The bytes are the ones every export byte-hash in the workspace was measured against.
+pub(crate) const FONT_TTF: &[u8] = quill_fonts::BUNDLED_TTF;
 
 /// PostScript-style family name for the bundled font, embedded after the subset tag
 /// (`ABCDEF+<NAME>`). User fonts derive their own name via [`derive_font_name`].
-const FONT_NAME: &str = "SourceSerif4";
+pub(crate) const FONT_NAME: &str = "SourceSerif4";
 
 /// A subset font ready to embed, plus everything needed to encode text against it.
 pub struct EmbeddedFont {
@@ -66,12 +73,6 @@ pub struct EmbeddedFont {
     pub flags: FontFlags,
     /// Character → remapped (subset) glyph id, for content-stream encoding.
     char_to_gid: HashMap<char, u16>,
-    /// The **original** (un-subset) font program, retained so [`EmbeddedFont::shaper`] can build a
-    /// `rustybuzz::Face` over the full cmap/GPOS for kerning/ligature-aware measurement (spec 0016).
-    /// Advances are identical between original and subset, so measured widths match the embedded
-    /// subset; the subset itself can't be reshaped (its GIDs are remapped, and a CFF subset is a
-    /// bare table, not a face).
-    program: Vec<u8>,
 }
 
 impl EmbeddedFont {
@@ -89,57 +90,17 @@ impl EmbeddedFont {
     pub fn ascent_pt(&self, size_pt: f32) -> f32 {
         self.ascent * size_pt / 1000.0
     }
-
-    /// Build a [`ShapingContext`] over this font's original program.
-    ///
-    /// Since spec 0032 the shaping itself lives in `quill-fonts`, so the exporter and the screen
-    /// renderer measure through *the same* code. Two shapers would be free to drift, and a
-    /// disagreement about run width means the screen wraps text in one place and the printed page
-    /// in another.
-    pub fn shaper(&self) -> ShapingContext<'_> {
-        ShapingContext {
-            font: self,
-            shared: quill_fonts::Font::from_bytes(self.program.clone()),
-        }
-    }
 }
 
-/// Per-glyph `hmtx` advances (spec 0015). Line breaking now measures through [`ShapingContext`]
-/// (spec 0016), but this per-char advance stays as its **fallback** (when shaping is unavailable)
-/// and as the anchor a single-glyph run is checked against. An unknown char maps to `.notdef`
-/// (GID 0) and uses its advance — the same fallback as [`EmbeddedFont::encode_line`].
+/// Per-glyph `hmtx` advances (spec 0015). Line breaking measures through the shared shaper in
+/// `quill-fonts` (specs 0016, 0032, 0064); this per-char advance stays as the anchor a single-glyph
+/// run is checked against. An unknown char maps to `.notdef` (GID 0) and uses its advance — the same
+/// fallback as [`EmbeddedFont::encode_line`].
 impl quill_text_layout::CharMetrics for EmbeddedFont {
     fn advance_pt(&self, ch: char, size_pt: f32) -> f32 {
         let gid = self.char_to_gid.get(&ch).copied().unwrap_or(0) as usize;
         let em = self.widths.get(gid).copied().unwrap_or(0.0); // 1000-unit em
         em * size_pt / 1000.0
-    }
-}
-
-/// Run measurement backed by real `rustybuzz` shaping (spec 0016 increment 1): kerning and
-/// ligatures are accounted for across the whole run, unlike the per-char [`CharMetrics`] sum. This
-/// is the `RunMetrics` implementation the export path measures line breaks with; only measurement
-/// changes this increment — the drawn content stream is unchanged.
-pub struct ShapingContext<'a> {
-    /// The font whose advances back the fallback path.
-    font: &'a EmbeddedFont,
-    /// The shared shaper (spec 0032). `None` only if the shared crate cannot parse a program that
-    /// `ttf_parser` already accepted (not expected in practice) — then we degrade gracefully to the
-    /// per-char sum rather than panic.
-    shared: Option<quill_fonts::Font>,
-}
-
-impl quill_text_layout::RunMetrics for ShapingContext<'_> {
-    fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
-        use quill_text_layout::CharMetrics;
-        let Some(shared) = &self.shared else {
-            // Degrade to the kerning-free per-char sum (spec 0015 behavior) if shaping is unavailable.
-            return text
-                .chars()
-                .map(|ch| self.font.advance_pt(ch, size_pt))
-                .sum();
-        };
-        shared.measure_run(text, size_pt)
     }
 }
 
@@ -151,6 +112,67 @@ pub fn build(chars: &BTreeSet<char>) -> Result<EmbeddedFont, ExportError> {
     let mut font = build_from_bytes(FONT_TTF, Some(FONT_NAME), chars)?;
     font.flags |= FontFlags::SERIF;
     Ok(font)
+}
+
+/// The faces a document actually sets text in, each subset to the characters *it* carries
+/// (spec 0064).
+///
+/// One `EmbeddedFont` per used face, and only the used ones: a document with no bold embeds no bold
+/// program. The slot a face occupies is its PDF resource number, so `/F0` stays `/F0` for a document
+/// that uses one face — which is every document that predates this spec.
+pub struct EmbeddedFamily {
+    faces: Vec<(FaceKey, EmbeddedFont)>,
+    /// The same programs, parsed for measurement. Layout measures through this, the writer draws
+    /// through the subsets above, and both come from one set of bytes (spec 0032).
+    metrics: quill_fonts::FontFamily,
+}
+
+/// The face a run format names (spec 0064).
+pub fn face_of(fmt: quill_text_layout::RunFormat) -> FaceKey {
+    FaceKey::new(fmt.weight, fmt.italic)
+}
+
+impl EmbeddedFamily {
+    pub fn new(faces: Vec<(FaceKey, EmbeddedFont)>, metrics: quill_fonts::FontFamily) -> Self {
+        assert!(
+            !faces.is_empty(),
+            "a document sets text in at least one face"
+        );
+        EmbeddedFamily { faces, metrics }
+    }
+
+    pub fn len(&self) -> usize {
+        self.faces.len()
+    }
+
+    pub fn faces(&self) -> impl Iterator<Item = (FaceKey, &EmbeddedFont)> {
+        self.faces.iter().map(|(k, f)| (*k, f))
+    }
+
+    /// The face a run set in `want` is drawn with, as a slot index. A request the document never
+    /// declared — which cannot happen for text that was laid out — falls back to slot 0 rather than
+    /// panicking in the writer.
+    pub fn slot(&self, want: FaceKey) -> usize {
+        let resolved = self.metrics.select(want).key;
+        self.faces
+            .iter()
+            .position(|(k, _)| *k == resolved)
+            .unwrap_or(0)
+    }
+
+    pub fn font(&self, slot: usize) -> &EmbeddedFont {
+        &self.faces[slot].1
+    }
+
+    /// The PDF resource name for a slot: `F0`, `F1`, …
+    pub fn resource_name(slot: usize) -> String {
+        format!("F{slot}")
+    }
+
+    /// The metrics layout measures with.
+    pub fn metrics(&self) -> &quill_fonts::FontFamily {
+        &self.metrics
+    }
 }
 
 /// Subset and measure an arbitrary TrueType (`glyf`) or CFF (`.otf`) font `program` for the given
@@ -239,7 +261,6 @@ pub fn build_from_bytes(
         italic_angle: face.italic_angle(),
         flags,
         char_to_gid,
-        program: program.to_vec(),
     })
 }
 
@@ -516,7 +537,9 @@ mod tests {
     fn single_glyph_run_equals_advance_pt() {
         use quill_text_layout::{CharMetrics, RunMetrics};
         let font = build(&charset("AVo ")).unwrap();
-        let shaper = font.shaper();
+        // Measured through the shared shaper the export actually lays out with (specs 0032, 0064),
+        // over the same program this subset was cut from.
+        let shaper = quill_fonts::Font::from_bytes(FONT_TTF).expect("the bundled face parses");
         for ch in ['A', 'V', 'o', ' '] {
             let shaped = shaper.measure_run(&ch.to_string(), 11.0);
             let per_char = font.advance_pt(ch, 11.0);
@@ -536,7 +559,7 @@ mod tests {
     fn shaped_kern_pair_is_narrower_than_per_char_sum() {
         use quill_text_layout::{CharMetrics, RunMetrics};
         let font = build(&charset("AV")).unwrap();
-        let shaper = font.shaper();
+        let shaper = quill_fonts::Font::from_bytes(FONT_TTF).expect("the bundled face parses");
         let shaped = shaper.measure_run("AV", 11.0);
         let per_char = font.advance_pt('A', 11.0) + font.advance_pt('V', 11.0);
         assert!(

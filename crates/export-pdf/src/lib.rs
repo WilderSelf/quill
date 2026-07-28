@@ -13,6 +13,7 @@
 //! [`ExportProfile::Press`] — the default, PDF/X, no annotations — or [`ExportProfile::Screen`],
 //! which carries clickable contents links and claims no conformance. See [`ExportProfile`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ use quill_color::within_ink_limit_pct;
 use quill_core_model::{
     page_geom, Asset, Block, Color, Document, FieldValue, PageGeom, PageSetup, Rect,
 };
+use quill_fonts::FaceKey;
 
 /// Lay a document out **for the press**: exactly what [`export`] hands the writer.
 ///
@@ -32,11 +34,10 @@ pub fn lay_out_for_press(
     doc: &Document,
     opts: &ExportOptions,
 ) -> Result<Vec<quill_layout_engine::LaidOutPage>, ExportError> {
-    let font = build_font(opts, &collect_doc_chars(doc))?;
-    let shaper = font.shaper();
+    let font = build_family(opts, &collect_doc_faces(doc))?;
     Ok(quill_layout_engine::lay_out(
         doc,
-        &shaper,
+        font.metrics(),
         &quill_fonts::HypherHyphenator,
     ))
 }
@@ -531,13 +532,13 @@ pub fn export(
     // source of shaped advances the layout engine measures with. The shaping context (spec 0016)
     // parses a rustybuzz face over the font once and is shared by the layout pass; the same `font`
     // is then embedded by the writer.
-    let used_chars = collect_doc_chars(doc);
-    let font = build_font(opts, &used_chars)?;
-    let shaper = font.shaper();
+    let used = collect_doc_faces(doc);
+    let font = build_family(opts, &used)?;
+    let shaper = font.metrics();
     // Real en-US hyphenation (spec 0018 incr. 2, shared with the screen path by spec 0059): words
     // break at legal syllable points, tightening lines and splitting over-wide words.
     let hyphenator = quill_fonts::HypherHyphenator;
-    let pages = quill_layout_engine::lay_out(doc, &shaper, &hyphenator);
+    let pages = quill_layout_engine::lay_out(doc, shaper, &hyphenator);
 
     // Colour checks on the *model* cannot see geometry the engine synthesized (spec 0037). A
     // tinted panel or a rule is ink like any other, but it is not a `Block` — so the checks above,
@@ -789,108 +790,193 @@ pub fn preflight_pages(
 /// The hyphen (`U+002D`) is inserted unconditionally for the same reason (spec 0018 incr. 2):
 /// hyphenation can introduce a trailing `-` on a broken line even when the source text contains no
 /// literal hyphen, so the subset must always carry a real hyphen glyph rather than emit `.notdef`.
-fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
-    let mut set = std::collections::BTreeSet::new();
-    set.insert(' ');
-    set.insert('-');
+/// Which characters each face has to carry (spec 0064).
+///
+/// The export embeds one subset per face a document actually sets text in, so the collector has to
+/// answer per face rather than per document: a bold word's characters must be in the *bold* subset,
+/// or they render as `.notdef` boxes in the press file with no error anywhere — the silent-failure
+/// surface every variant-adding increment since spec 0026 has had to widen.
+///
+/// Only a flowed paragraph selects a face: its style's weight and slant, and then each run's own
+/// override of them. Everything else a document draws — a panel's sections, a table's cells, a
+/// contents entry, a declared component's fields — is set in the paragraph face, so its characters
+/// go into **every** used bucket rather than being attributed to a face nobody can select. A
+/// slightly larger subset is a cost; a `.notdef` in a press file is a defect.
+///
+/// A document that names no weight or slant produces exactly one bucket, holding the whole
+/// document's characters — which is what keeps its export byte-identical.
+fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
+    let mut out: BTreeMap<FaceKey, BTreeSet<char>> = BTreeMap::new();
+    // Everything not attributable to one face, plus the two characters the breaker can synthesize
+    // for any of them: an inter-word space it normalized, and a hyphen it inserted at a break.
+    let mut everywhere: BTreeSet<char> = BTreeSet::new();
+    everywhere.insert(' ');
+    everywhere.insert('-');
+    let mut draws_unattributed_text = false;
+
     for block in &doc.content {
         match block {
-            // Every run's text, not the block's: a run the subsetter never saw would set to
-            // `.notdef` boxes in the press file (spec 0063).
             Block::Heading { runs, .. } | Block::Body { runs, .. } => {
-                set.extend(runs.iter().flat_map(|r| r.text.chars()))
-            }
-            // Spec 0026's silent-failure case, and the reason every variant-adding increment
-            // carries a non-ASCII export test: a character this collector misses is not an error
-            // anywhere, it just renders as `.notdef` in the finished PDF.
-            Block::Panel { panel, .. } => {
-                set.extend(panel.name.chars());
-                for (k, v) in &panel.attributes {
-                    set.extend(k.chars());
-                    set.extend(v.chars());
-                }
-                for section in [
-                    &panel.overview,
-                    &panel.details,
-                    &panel.actions,
-                    &panel.reactions,
-                ] {
-                    for line in section {
-                        set.extend(line.chars());
-                    }
+                let style = doc.styles.resolve(block);
+                let base = FaceKey::new(style.weight.0, style.italic);
+                // The paragraph's own face exists even if every run overrides it: an empty
+                // paragraph still declares one, and a face with nothing in it is still the face
+                // the writer will name.
+                out.entry(base).or_default();
+                for r in runs {
+                    let face = FaceKey::new(
+                        r.style.weight.map_or(base.weight, |w| w.0),
+                        r.style.italic.unwrap_or(base.italic),
+                    );
+                    out.entry(face).or_default().extend(r.text.chars());
                 }
             }
-            Block::Table { table, .. } => {
-                // Same silent-failure surface as the panel block: a header or cell this collector
-                // misses renders as `.notdef` boxes with no error anywhere.
-                for cell in table.header.iter().flatten() {
-                    set.extend(cell.chars());
-                }
-                for row in &table.rows {
-                    for cell in row {
-                        set.extend(cell.chars());
-                    }
-                }
-            }
-            Block::Toc { title, .. } => {
-                // Only the authored title. The entries are generated from heading text, which is
-                // already collected from the headings themselves — and the page numbers are
-                // digits, which the subset always carries because the folio needs them.
-                set.extend(title.chars());
-                set.extend('0'..='9');
-                set.insert('.');
-                set.insert('…');
-            }
-            Block::Component { fields, .. } => {
-                // Every authored field of every instance (spec 0054). Same silent-failure surface
-                // as the two bundled components: a character this collector misses renders as a
-                // `.notdef` box with no error anywhere, so the walk is exhaustive over the value
-                // kinds rather than over the ones the bundled definitions happen to use.
-                for value in fields.values() {
-                    match value {
-                        FieldValue::Text(t) => set.extend(t.chars()),
-                        FieldValue::Lines(lines) => {
-                            for l in lines {
-                                set.extend(l.chars());
-                            }
-                        }
-                        FieldValue::Pairs(pairs) => {
-                            for (k, v) in pairs {
-                                set.extend(k.chars());
-                                set.extend(v.chars());
-                            }
-                        }
-                        FieldValue::Rows(rows) => {
-                            for row in rows {
-                                for cell in row {
-                                    set.extend(cell.chars());
-                                }
-                            }
-                        }
-                        FieldValue::Widths(_) | FieldValue::Flag(_) => {}
-                    }
-                }
+            Block::Panel { .. }
+            | Block::Table { .. }
+            | Block::Toc { .. }
+            | Block::Component { .. } => {
+                everywhere.extend(other_block_chars(block));
+                draws_unattributed_text = true;
             }
             Block::Image { .. } => {}
         }
     }
+
+    // A panel, a table, a contents entry and a list marker are all placed in the *regular* face by
+    // the layout engine, whatever their paragraph style says, so the regular face has to be embedded
+    // whenever any of them is drawn — otherwise a document whose only body style is bold embeds one
+    // program and draws its tables from it.
+    if draws_unattributed_text {
+        out.entry(FaceKey::REGULAR).or_default();
+    }
+    if out.is_empty() {
+        out.insert(FaceKey::REGULAR, BTreeSet::new());
+    }
+    for bucket in out.values_mut() {
+        bucket.extend(everywhere.iter().copied());
+    }
+    out
+}
+
+/// Every character a block that does not select a face draws — see [`collect_doc_faces`].
+fn other_block_chars(block: &Block) -> BTreeSet<char> {
+    let mut set = BTreeSet::new();
+    match block {
+        Block::Panel { panel, .. } => {
+            set.extend(panel.name.chars());
+            for (k, v) in &panel.attributes {
+                set.extend(k.chars());
+                set.extend(v.chars());
+            }
+            for section in [
+                &panel.overview,
+                &panel.details,
+                &panel.actions,
+                &panel.reactions,
+            ] {
+                for line in section {
+                    set.extend(line.chars());
+                }
+            }
+        }
+        Block::Table { table, .. } => {
+            for cell in table.header.iter().flatten() {
+                set.extend(cell.chars());
+            }
+            for row in &table.rows {
+                for cell in row {
+                    set.extend(cell.chars());
+                }
+            }
+        }
+        Block::Toc { title, .. } => {
+            set.extend(title.chars());
+            set.extend('0'..='9');
+            set.insert('.');
+            set.insert('\u{2026}');
+        }
+        Block::Component { fields, .. } => {
+            for value in fields.values() {
+                match value {
+                    FieldValue::Text(t) => set.extend(t.chars()),
+                    FieldValue::Lines(lines) => {
+                        for l in lines {
+                            set.extend(l.chars());
+                        }
+                    }
+                    FieldValue::Pairs(pairs) => {
+                        for (k, v) in pairs {
+                            set.extend(k.chars());
+                            set.extend(v.chars());
+                        }
+                    }
+                    FieldValue::Rows(rows) => {
+                        for row in rows {
+                            for cell in row {
+                                set.extend(cell.chars());
+                            }
+                        }
+                    }
+                    FieldValue::Widths(_) | FieldValue::Flag(_) => {}
+                }
+            }
+        }
+        Block::Heading { .. } | Block::Body { .. } | Block::Image { .. } => {}
+    }
     set
 }
 
-/// Subset and measure the font for `chars`: a user-supplied `font_path` (spec 0004/0011) or the
-/// bundled Source Serif 4.
-fn build_font(
+/// Subset and measure every face the document sets text in, and only those (spec 0064).
+///
+/// The requested faces are resolved through the family first, so a document asking for a weight the
+/// family does not have contributes its characters to the face that will actually draw them — and
+/// is told, once, that the substitution happened. Building a subset for a face nobody can select
+/// would embed a program the file never draws from.
+fn build_family(
     opts: &ExportOptions,
-    chars: &std::collections::BTreeSet<char>,
-) -> Result<fonts::EmbeddedFont, ExportError> {
-    match &opts.font_path {
+    wanted: &BTreeMap<FaceKey, BTreeSet<char>>,
+) -> Result<fonts::EmbeddedFamily, ExportError> {
+    let bundled = opts.font_path.is_none();
+    let family = match &opts.font_path {
         Some(path) => {
             let program = std::fs::read(path)
                 .map_err(|e| ExportError::Font(format!("reading font '{path}': {e}")))?;
-            fonts::build_from_bytes(&program, None, chars)
+            let font = quill_fonts::Font::from_bytes(program)
+                .ok_or_else(|| ExportError::Font(format!("parsing font '{path}'")))?;
+            quill_fonts::FontFamily::single(font)
         }
-        None => fonts::build(chars),
+        None => quill_fonts::FontFamily::bundled(),
+    };
+
+    let mut per_face: BTreeMap<usize, BTreeSet<char>> = BTreeMap::new();
+    for (want, chars) in wanted {
+        let sel = family.select(*want);
+        per_face.entry(sel.index).or_default().extend(chars);
     }
+    if per_face.is_empty() {
+        per_face.insert(family.select(FaceKey::REGULAR).index, BTreeSet::new());
+    }
+
+    let keys: Vec<FaceKey> = family.faces().map(|(k, _)| k).collect();
+    let mut faces = Vec::with_capacity(per_face.len());
+    for (index, chars) in per_face {
+        let key = keys[index];
+        let font = if bundled && key == FaceKey::REGULAR {
+            // The regular bundled face goes through the same call it always did, so a document that
+            // uses one face embeds byte for byte what it embedded before the family existed.
+            fonts::build(&chars)?
+        } else {
+            // Other faces derive their own PostScript name, which is what keeps two embedded
+            // programs from claiming one.
+            let mut font = fonts::build_from_bytes(family.font(index).program(), None, &chars)?;
+            if bundled {
+                font.flags |= pdf_writer::types::FontFlags::SERIF;
+            }
+            font
+        };
+        faces.push((key, font));
+    }
+    Ok(fonts::EmbeddedFamily::new(faces, family))
 }
 
 #[cfg(test)]
@@ -917,10 +1003,10 @@ mod tests {
             d.content = vec![Block::body("alpha\tbeta\ngamma", Color::Gray { v: 0.0 })];
             d
         };
-        let chars = collect_doc_chars(&doc);
+        let chars = doc_chars(&doc);
         assert!(chars.contains(&' '), "space must always be collected");
 
-        let font = build_font(&ExportOptions::default(), &chars).expect("build bundled font");
+        let font = fonts::build(&chars).expect("build bundled font");
         let encoded = font.encode_line(" ");
         assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
         let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
@@ -938,10 +1024,10 @@ mod tests {
             d.content = vec![Block::body("alpha beta gamma", Color::Gray { v: 0.0 })];
             d
         };
-        let chars = collect_doc_chars(&doc);
+        let chars = doc_chars(&doc);
         assert!(chars.contains(&'-'), "hyphen must always be collected");
 
-        let font = build_font(&ExportOptions::default(), &chars).expect("build bundled font");
+        let font = fonts::build(&chars).expect("build bundled font");
         let encoded = font.encode_line("-");
         assert_eq!(encoded.len(), 2, "one glyph = two Identity-H bytes");
         let gid = u16::from_be_bytes([encoded[0], encoded[1]]);
@@ -1258,7 +1344,7 @@ mod tests {
     #[test]
     fn a_stat_blocks_glyphs_reach_the_font_subset() {
         // Spec 0026's silent-failure case, and the reason every variant-adding increment carries
-        // this test: a character `collect_doc_chars` misses is not an error anywhere in the
+        // this test: a character `collect_doc_faces` misses is not an error anywhere in the
         // pipeline — it renders as a `.notdef` box in the finished PDF. Every section of a stat
         // block is checked, because each is a separate place the collector could have forgotten.
         let mut doc = Document::sample();
@@ -1276,7 +1362,7 @@ mod tests {
         });
         doc.assign_missing_block_ids().expect("ids");
 
-        let chars = collect_doc_chars(&doc);
+        let chars = doc_chars(&doc);
         for c in ['á', 'ó', 'Ǫ', 'Ǎ', 'ǻ', 'ï', 'ø', 'œ'] {
             assert!(chars.contains(&c), "{c:?} must reach the font subset");
         }
@@ -1468,6 +1554,12 @@ mod tests {
     }
 
     /// Write the synthesized CMYK profile to a temp file and return options pointing at it.
+    /// Every character the document needs, across every face — what a single-face document's
+    /// subset carries, and the union a multi-face one is checked against.
+    fn doc_chars(doc: &Document) -> BTreeSet<char> {
+        collect_doc_faces(doc).into_values().flatten().collect()
+    }
+
     fn opts_with_real_icc(tag: &str) -> (ExportOptions, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("quill_test_{tag}.icc"));
         std::fs::write(&path, synth_cmyk_profile()).unwrap();
@@ -1909,6 +2001,170 @@ mod tests {
         assert!(matches!(e, ExportError::Icc(_)));
     }
 
+    /// Spec 0064: the export embeds every face the document uses, and only those.
+    ///
+    /// The criterion is counted rather than asserted qualitatively: a `/FontFile2` per embedded
+    /// program, so "a document using no bold embeds no bold program" is a number, and a family that
+    /// quietly embedded all four would fail here rather than silently inflate every press file.
+    #[test]
+    fn a_document_embeds_the_faces_it_uses_and_only_those() {
+        fn font_programs(doc: &Document, tag: &str) -> usize {
+            let (opts, icc) = opts_with_real_icc(tag);
+            let mut buf = Vec::new();
+            export(doc, &opts, &mut buf).expect("export should succeed");
+            let _ = std::fs::remove_file(&icc);
+            String::from_utf8_lossy(&buf).matches("/FontFile2").count()
+        }
+
+        let plain = Document::sample();
+        assert_eq!(font_programs(&plain, "faces_plain"), 1);
+
+        let mut emphasised = Document::sample();
+        emphasised.content.push(quill_core_model::Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("a word set in "),
+                quill_core_model::Run {
+                    text: "bold".into(),
+                    style: quill_core_model::InlineStyle {
+                        weight: Some(quill_core_model::Weight::BOLD),
+                        ..quill_core_model::InlineStyle::EMPTY
+                    },
+                },
+            ],
+            Color::Gray { v: 0.0 },
+        ));
+        assert_eq!(font_programs(&emphasised, "faces_bold"), 2);
+
+        // Still two, not three: an italic *run* that is never added stays unembedded, and the bold
+        // one is not embedded twice for being asked for twice.
+        let mut twice = emphasised.clone();
+        twice.content.push(quill_core_model::Block::body_runs(
+            vec![quill_core_model::Run {
+                text: "bold again".into(),
+                style: quill_core_model::InlineStyle {
+                    weight: Some(quill_core_model::Weight::BOLD),
+                    ..quill_core_model::InlineStyle::EMPTY
+                },
+            }],
+            Color::Gray { v: 0.0 },
+        ));
+        assert_eq!(font_programs(&twice, "faces_twice"), 2);
+    }
+
+    /// A face the family does not have is drawn in the nearest one it does, and the document still
+    /// exports — the visible-failure posture, not a hard error (spec 0064).
+    #[test]
+    fn a_user_font_family_of_one_face_still_exports_a_bold_run() {
+        let (mut opts, icc) = opts_with_real_icc("onefaceuser");
+        opts.font_path = Some(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../fonts/assets/SourceSerif4-Regular.ttf"
+            )
+            .into(),
+        );
+        let mut doc = Document::sample();
+        doc.content.push(quill_core_model::Block::body_runs(
+            vec![quill_core_model::Run {
+                text: "bold".into(),
+                style: quill_core_model::InlineStyle {
+                    weight: Some(quill_core_model::Weight::BOLD),
+                    ..quill_core_model::InlineStyle::EMPTY
+                },
+            }],
+            Color::Gray { v: 0.0 },
+        ));
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("a one-face family must still export");
+        let _ = std::fs::remove_file(&icc);
+        assert_eq!(
+            String::from_utf8_lossy(&buf).matches("/FontFile2").count(),
+            1,
+            "one face was supplied, so one program is embedded"
+        );
+    }
+
+    /// Spec 0064, and the defect an adversarial review of it found: a bold run long enough to fill
+    /// whole lines must be *drawn* from the bold subset, not merely embedded alongside it.
+    ///
+    /// The failure was a uniformity test that compared a line's spans to each other rather than to
+    /// the block's own face: an interior line of a long bold run is uniform — uniformly bold — so it
+    /// took the fast path and was encoded with glyph ids cut from the regular subset. Every one of
+    /// those glyphs drew as `.notdef`. Counted here, because "some text is wrong" is not a
+    /// condition a reader of a press file can be expected to notice.
+    #[test]
+    fn a_bold_run_that_fills_whole_lines_draws_no_notdef() {
+        let long = "the vault door had not opened in three hundred years and the dust on its \
+                    hinges had gone to stone before anyone reached for a tool at all";
+        let mut doc = Document::sample();
+        doc.content.push(quill_core_model::Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("lead in "),
+                quill_core_model::Run {
+                    text: long.into(),
+                    style: quill_core_model::InlineStyle {
+                        weight: Some(quill_core_model::Weight::BOLD),
+                        ..quill_core_model::InlineStyle::EMPTY
+                    },
+                },
+                quill_core_model::Run::plain(" and a tail"),
+            ],
+            Color::Gray { v: 0.0 },
+        ));
+
+        let (opts, icc) = opts_with_real_icc("boldlines");
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("export");
+        let _ = std::fs::remove_file(&icc);
+
+        // Every glyph the content stream shows, and how many of them are `.notdef` (gid 0). The
+        // streams are uncompressed only in `render_page`, so this walks the placed pages instead
+        // and asks the same question of the same encoder the writer uses.
+        let pages = lay_out_for_press(&doc, &opts).expect("layout");
+        let faces = collect_doc_faces(&doc);
+        let family = build_family(&opts, &faces).expect("family");
+        let mut glyphs = 0usize;
+        let mut notdef = 0usize;
+        for page in &pages {
+            for block in page.statics.iter().chain(page.blocks.iter()) {
+                let PlacedBlock::Text {
+                    lines,
+                    run_formats,
+                    weight,
+                    italic,
+                    font_size_pt,
+                    ..
+                } = block
+                else {
+                    continue;
+                };
+                let base = quill_text_layout::RunFormat {
+                    size_pt: *font_size_pt,
+                    weight: *weight,
+                    italic: *italic,
+                    tracking_pt: 0.0,
+                };
+                for line in lines {
+                    let mut at = 0usize;
+                    for sp in &line.spans {
+                        let end = (at + sp.len_bytes).min(line.text.len());
+                        let fmt = run_formats.get(sp.run).copied().unwrap_or(base);
+                        let font = family.font(family.slot(fonts::face_of(fmt)));
+                        for gid in font.encode_line(&line.text[at..end]).chunks(2) {
+                            glyphs += 1;
+                            if gid == [0, 0] {
+                                notdef += 1;
+                            }
+                        }
+                        at = end;
+                    }
+                }
+            }
+        }
+        assert!(glyphs > 200, "sanity: only {glyphs} glyphs drawn");
+        assert_eq!(notdef, 0, "{notdef} of {glyphs} glyphs drew as .notdef");
+    }
+
     /// Spec 0004: a user-supplied `font_path` is embedded instead of the bundled default, with a
     /// BaseFont name derived from that file. Exercised with the bundled ttf on disk so no extra
     /// fixture is needed; the derived name ("SourceSerif…") proves the derive path ran.
@@ -1918,7 +2174,7 @@ mod tests {
         opts.font_path = Some(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/assets/SourceSerif4-Regular.ttf"
+                "/../fonts/assets/SourceSerif4-Regular.ttf"
             )
             .into(),
         );
@@ -2449,6 +2705,10 @@ mod tests {
 
     fn text_at(x: f32, y: f32, w: f32, h: f32) -> PlacedBlock {
         PlacedBlock::Text {
+            run_formats: Vec::new(),
+            run_shifts: Vec::new(),
+            weight: 400,
+            italic: false,
             run_colors: Vec::new(),
             source: quill_core_model::BlockId(1),
             frame: Rect {

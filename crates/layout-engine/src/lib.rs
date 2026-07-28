@@ -20,7 +20,9 @@ use quill_core_model::{
     ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT,
     TOC_TITLE_STYLE,
 };
-use quill_text_layout::{justify_runs_indented, Alignment, Hyphenator, Line, RunMetrics};
+use quill_text_layout::{
+    justify_runs_indented, Alignment, Hyphenator, Line, RunFormat, RunMetrics,
+};
 
 /// A positioned rectangular region that content flows into. The layout engine fills a frame
 /// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
@@ -144,6 +146,17 @@ pub enum PlacedBlock {
         /// takes `color` — the path the writer and the painter took before runs existed.
         #[allow(clippy::doc_markdown)]
         run_colors: Vec<Color>,
+        /// Each authored run's resolved face, size and tracking (spec 0064), indexed the same way as
+        /// `run_colors`. Empty means one format for the whole block — the path the writer and the
+        /// painter took before the family existed, and the one every unstyled document still takes.
+        run_formats: Vec<RunFormat>,
+        /// Each authored run's baseline shift in points, positive up. Empty when none shifts.
+        run_shifts: Vec<f32>,
+        /// The face the block itself is set in — what a span with no override of its own resolves
+        /// to (spec 0064). Carried for the same reason `font_size_pt` is: `PlacedBlock` is all the
+        /// writer and the screen renderer see.
+        weight: u16,
+        italic: bool,
         /// The size the text was measured at. Carried here because `PlacedBlock` is all the writer
         /// and the screen renderer see: without it they would have to re-derive the size from the
         /// document, and any disagreement would put glyphs in the wrong place (spec 0028).
@@ -450,7 +463,18 @@ impl PageTemplate for DocumentTemplate<'_> {
                         // The placed frame is narrowed to the line it holds, so it reports where the
                         // text *is* rather than the box it was aligned in — which is what a geometry
                         // preflight over placed content has to ask.
-                        let line_w = metrics.measure_run(&resolved, ps.font_size_pt);
+                        // Measured in the face the static is drawn in (spec 0064): a bold running
+                        // head measured regular would be aligned to a width it does not have, and
+                        // would report that width to a geometry preflight.
+                        let line_w = metrics.measure_format(
+                            &resolved,
+                            RunFormat {
+                                size_pt: ps.font_size_pt,
+                                weight: ps.weight.0,
+                                italic: ps.italic,
+                                tracking_pt: 0.0,
+                            },
+                        );
                         let x_pt =
                             align.x_for(rect, line_w, page_index, self.page_setup.facing_pages);
                         PlacedBlock::Text {
@@ -461,6 +485,10 @@ impl PageTemplate for DocumentTemplate<'_> {
                             },
                             // Furniture is not content: it has no block, so no identity.
                             source: BlockId::UNASSIGNED,
+                            run_formats: Vec::new(),
+                            run_shifts: Vec::new(),
+                            weight: ps.weight.0,
+                            italic: ps.italic,
                             // Master furniture is a single line at a fixed position; it is not flowed,
                             // so it is not broken. A running head that overflows its rect is an
                             // authoring problem, and one that is visible on screen.
@@ -580,6 +608,11 @@ pub(crate) enum Measured {
         /// (spec 0063). One entry per run, already folded with the paragraph's colour, so no
         /// consumer has to know how an override resolves.
         run_colors: Vec<Color>,
+        /// Each authored run's resolved face, size and tracking (spec 0064), indexed the same way.
+        /// Empty when every run is set in the paragraph's own format.
+        run_formats: Vec<RunFormat>,
+        /// Each authored run's baseline shift in points, positive up. Empty when none shifts.
+        run_shifts: Vec<f32>,
         /// This paragraph's list marker, if it is a list item (spec 0066). Drawn in the gutter at
         /// the first line's baseline, so it never enters the text flow and cannot move a break.
         marker: Option<String>,
@@ -797,6 +830,8 @@ impl Measured {
                 lines,
                 color,
                 run_colors,
+                run_formats,
+                run_shifts,
                 marker,
                 style,
             } => {
@@ -813,6 +848,8 @@ impl Measured {
                     // runs, and re-basing it per fragment would make a continuation's spans mean
                     // something different from its head's.
                     run_colors: run_colors.clone(),
+                    run_formats: run_formats.clone(),
+                    run_shifts: run_shifts.clone(),
                     style: *style,
                 };
                 // The continuation carries no space-above: it does not start the paragraph. The
@@ -822,6 +859,8 @@ impl Measured {
                 let tail_h = tail_lines.len() as f32 * style.leading_pt + style.space_after_pt;
                 let tail = Measured::Text {
                     run_colors: run_colors.clone(),
+                    run_formats: run_formats.clone(),
+                    run_shifts: run_shifts.clone(),
                     // A continuation is not a new item, so it is not marked again — the same rule
                     // spec 0045 applies to a table's header, from the other direction.
                     marker: None,
@@ -1024,6 +1063,56 @@ fn run_inks(runs: &[quill_core_model::Run], paragraph: Color) -> Vec<Color> {
         .collect()
 }
 
+/// Each run's resolved format: its own overrides folded onto the paragraph's treatment (spec 0064).
+///
+/// Empty when every run resolves to the breaker's own default — regular, upright, untracked, at the
+/// paragraph's size — which is every document that names no override anywhere, on the style or on a
+/// run. That emptiness is load-bearing: the breaker, the writer and the painter all take their
+/// pre-family path when there is one format, so those documents lay out and export byte for byte as
+/// they did. It is emptiness against *the default*, not against the paragraph: a bold paragraph
+/// style is a format the breaker has to be told about.
+fn run_formats(runs: &[quill_core_model::Run], style: &ParagraphStyle) -> Vec<RunFormat> {
+    let paragraph = RunFormat {
+        size_pt: style.font_size_pt,
+        weight: style.weight.0,
+        italic: style.italic,
+        tracking_pt: 0.0,
+    };
+    let formats: Vec<RunFormat> = runs
+        .iter()
+        .map(|r| RunFormat {
+            size_pt: r.style.size_pt.unwrap_or(paragraph.size_pt),
+            weight: r.style.weight.map_or(paragraph.weight, |w| w.0),
+            italic: r.style.italic.unwrap_or(paragraph.italic),
+            tracking_pt: r.style.tracking_pt.unwrap_or(0.0),
+        })
+        .collect();
+    // Empty means "the breaker's own default", which is regular, upright and untracked at the
+    // paragraph's size — *not* "the paragraph's format". A bold paragraph style must therefore be
+    // spelled out, or the line would be measured regular and drawn bold, which is a line drawn past
+    // its measure with nothing to catch it.
+    if paragraph == RunFormat::plain(style.font_size_pt) && formats.iter().all(|f| *f == paragraph)
+    {
+        return Vec::new();
+    }
+    formats
+}
+
+/// Each run's baseline shift, in points, positive up (spec 0064).
+///
+/// Not part of [`RunFormat`]: it moves a glyph without changing an advance, so it is a drawing
+/// property and must not invalidate a line break. Empty when no run shifts.
+fn run_shifts(runs: &[quill_core_model::Run]) -> Vec<f32> {
+    let shifts: Vec<f32> = runs
+        .iter()
+        .map(|r| r.style.baseline_shift_pt.unwrap_or(0.0))
+        .collect();
+    if shifts.iter().all(|s| *s == 0.0) {
+        return Vec::new();
+    }
+    shifts
+}
+
 pub(crate) fn measure_block(
     block: &Block,
     width: f32,
@@ -1052,8 +1141,12 @@ pub(crate) fn measure_block(
             // not be able to move a break, or the run model would be a layout change rather than a
             // generalization. What comes back is per-line spans naming the run each stretch is from.
             let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+            // Each run's own face, size and tracking (spec 0064). Empty when they all resolve to
+            // the paragraph's, which is the path that must not move a glyph.
+            let formats = run_formats(runs, &style);
             let lines = justify_runs_indented(
                 &texts,
+                &formats,
                 width,
                 quill_text_layout::Indent {
                     first_pt: style.indent.first_pt,
@@ -1075,6 +1168,8 @@ pub(crate) fn measure_block(
                     lines,
                     color: *color,
                     run_colors: run_inks(runs, *color),
+                    run_formats: formats,
+                    run_shifts: run_shifts(runs),
                     marker: markers.get(&block.id()).cloned(),
                     style,
                 },
@@ -1792,12 +1887,18 @@ fn place_measured(
             lines,
             color,
             run_colors,
+            run_formats,
+            run_shifts,
             marker,
             style,
         } => {
             let text_block = PlacedBlock::Text {
                 source,
                 run_colors,
+                run_formats,
+                run_shifts,
+                weight: style.weight.0,
+                italic: style.italic,
                 // The frame starts *below* the style's space-above: that space belongs to this
                 // block's height (so pagination reserves it) but no text is drawn in it.
                 frame: Rect {
@@ -1837,6 +1938,11 @@ fn place_measured(
                 },
                 lines: vec![Line::single_run(marker, 0.0, 0.0)],
                 color,
+                // A marker is set in the paragraph's own format, so it needs no per-run table.
+                run_formats: Vec::new(),
+                run_shifts: Vec::new(),
+                weight: style.weight.0,
+                italic: style.italic,
                 // One run by construction: a marker is generated, not authored.
                 run_colors: Vec::new(),
                 font_size_pt: style.font_size_pt,
@@ -1916,6 +2022,13 @@ fn place_measured(
                     // A panel part is one run: its text comes from a component field, and rich
                     // text inside a declared component's sections is a later increment.
                     run_colors: Vec::new(),
+                    run_formats: Vec::new(),
+                    run_shifts: Vec::new(),
+                    // A panel's sections are set in the paragraph face. Weight and slant on the
+                    // styles a *declared component* resolves are where the component interpreter
+                    // reads them, and are not this increment's (spec 0064).
+                    weight: 400,
+                    italic: false,
                     font_size_pt: p.font_size_pt,
                     leading_pt: p.leading_pt,
                 });
@@ -2940,6 +3053,10 @@ mod tests {
         }
         fn statics(&self, page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
             vec![PlacedBlock::Text {
+                run_formats: Vec::new(),
+                run_shifts: Vec::new(),
+                weight: 400,
+                italic: false,
                 run_colors: Vec::new(),
                 source: BlockId::UNASSIGNED,
                 frame: Rect {
@@ -3631,6 +3748,8 @@ mod tests {
         styles.paragraph.insert(
             BODY_STYLE.to_string(),
             ParagraphStyle {
+                weight: Default::default(),
+                italic: false,
                 list: None,
                 font_size_pt: BODY_FONT_SIZE_PT,
                 leading_pt: BODY_LINE_HEIGHT_PT,
@@ -5439,6 +5558,8 @@ mod tests {
         styles.paragraph.insert(
             BODY_STYLE.to_string(),
             ParagraphStyle {
+                weight: Default::default(),
+                italic: false,
                 list: None,
                 font_size_pt: BODY_FONT_SIZE_PT,
                 leading_pt: BODY_LINE_HEIGHT_PT,
@@ -5991,5 +6112,47 @@ mod tests {
                 other => panic!("expected an image static, got {other:?}"),
             }
         }
+    }
+
+    /// Spec 0064, and the third face of the same defect: a paragraph *style* that is bold must reach
+    /// the breaker.
+    ///
+    /// `run_formats` is empty when every run resolves to the breaker's own default — regular,
+    /// upright, untracked. It is *not* empty merely because every run matches the paragraph: a bold
+    /// paragraph style with plain runs still has a format the breaker has to be told about, or the
+    /// line is measured regular and drawn bold, and a line drawn wider than it was measured is
+    /// exactly what spec 0060 forbids.
+    #[test]
+    fn a_bold_paragraph_style_reaches_the_breaker() {
+        use quill_core_model::{Run, Weight};
+
+        let plain = quill_core_model::ParagraphStyle::default();
+        let bold = quill_core_model::ParagraphStyle {
+            weight: Weight::BOLD,
+            ..plain
+        };
+        let runs = vec![Run::plain(
+            "the vault door had not opened in three hundred years",
+        )];
+
+        assert!(
+            run_formats(&runs, &plain).is_empty(),
+            "a regular paragraph of plain runs takes the pre-family path"
+        );
+        let formats = run_formats(&runs, &bold);
+        assert_eq!(
+            formats,
+            vec![RunFormat {
+                size_pt: bold.font_size_pt,
+                weight: 700,
+                italic: false,
+                tracking_pt: 0.0,
+            }],
+            "a bold paragraph style must be spelled out for the breaker"
+        );
+
+        // That the bold format then *measures* wider is `quill-fonts`' claim, asserted there
+        // (`a_run_measures_in_the_face_it_names`) — this crate is generic over `RunMetrics` and
+        // names no font, which is the property that keeps it testable with a monospace stub.
     }
 }

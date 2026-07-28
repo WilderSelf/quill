@@ -5,7 +5,7 @@
 //! three-OS CI matrix. The paint list in [`crate::paint`] keeps this module swappable; a GPU
 //! backend would replace this file and nothing else.
 
-use quill_fonts::{Font, PathCmd};
+use quill_fonts::{FaceKey, Font, FontFamily, PathCmd};
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform};
 
 use crate::paint::{PaintOp, PAPER};
@@ -23,7 +23,12 @@ pub struct Raster {
 ///
 /// `scale` is the viewport zoom: 1.0 renders a point as a pixel (72 dpi), 2.0 is a HiDPI or
 /// zoomed-in view. Returns `None` only for a degenerate (zero-area) page.
-pub fn rasterize(ops: &[PaintOp], font: &Font, proxies: &ProxyCache, scale: f32) -> Option<Raster> {
+pub fn rasterize(
+    ops: &[PaintOp],
+    family: &FontFamily,
+    proxies: &ProxyCache,
+    scale: f32,
+) -> Option<Raster> {
     let (page_w, page_h) = ops.iter().find_map(|op| match op {
         PaintOp::Page { w_pt, h_pt } => Some((*w_pt, *h_pt)),
         _ => None,
@@ -70,17 +75,27 @@ pub fn rasterize(ops: &[PaintOp], font: &Font, proxies: &ProxyCache, scale: f32)
                 size_pt,
                 space_adjust_pt,
                 rgb,
+                weight,
+                italic,
+                tracking_pt,
+                baseline_shift_pt,
             } => {
+                // The face the op names, resolved through the same family the layout measured
+                // with — so the screen draws the face the page will (spec 0064).
+                let face = family.select(FaceKey::new(*weight, *italic));
                 draw_text(
                     &mut pixmap,
-                    font,
+                    family.font(face.index),
                     &TextRun {
                         x_pt: *x_pt,
-                        baseline_pt: *baseline_pt,
+                        // A baseline shift raises the glyphs without moving the line: positive is
+                        // up, and the raster's y grows downward.
+                        baseline_pt: *baseline_pt - *baseline_shift_pt,
                         text,
                         size_pt: *size_pt,
                         space_adjust_pt: *space_adjust_pt,
                         rgb: *rgb,
+                        tracking_pt: *tracking_pt,
                     },
                     scale,
                 );
@@ -182,6 +197,8 @@ struct TextRun<'a> {
     size_pt: f32,
     space_adjust_pt: f32,
     rgb: [u8; 3],
+    /// Extra advance per glyph (spec 0064) — the screen half of the PDF's `Tc`.
+    tracking_pt: f32,
 }
 
 fn draw_text(pixmap: &mut Pixmap, font: &Font, run: &TextRun<'_>, scale: f32) {
@@ -192,6 +209,7 @@ fn draw_text(pixmap: &mut Pixmap, font: &Font, run: &TextRun<'_>, scale: f32) {
         size_pt,
         space_adjust_pt,
         rgb,
+        tracking_pt,
     } = *run;
     let mut paint = Paint::default();
     paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], 255);
@@ -208,23 +226,23 @@ fn draw_text(pixmap: &mut Pixmap, font: &Font, run: &TextRun<'_>, scale: f32) {
         } else {
             format!("{word} ")
         };
-        for glyph in font.shape(&piece, size_pt) {
+        // Tracking is spent per glyph, after each one, exactly as a PDF `Tc` spends it — so the
+        // nth glyph of a run starts n trackings further along than shaping alone would put it
+        // (spec 0064).
+        let shaped = font.shape(&piece, size_pt);
+        for (n, glyph) in shaped.iter().enumerate() {
             if let Some(outline) = font.outline(glyph.gid) {
                 fill_glyph(
                     pixmap,
                     &outline.commands,
-                    (pen + glyph.x_pt) * scale,
+                    (pen + glyph.x_pt + n as f32 * tracking_pt) * scale,
                     baseline_pt * scale,
                     size_pt * scale / font.units_per_em(),
                     &paint,
                 );
             }
         }
-        pen += font
-            .shape(&piece, size_pt)
-            .iter()
-            .map(|g| g.advance_pt)
-            .sum::<f32>();
+        pen += shaped.iter().map(|g| g.advance_pt).sum::<f32>() + shaped.len() as f32 * tracking_pt;
         if i != last {
             pen += space_adjust_pt;
         }
@@ -331,9 +349,9 @@ mod tests {
     use quill_fonts::HypherHyphenator;
 
     /// Rasterize the sample document's first page.
-    fn render(scale: f32) -> (Raster, Font) {
+    fn render(scale: f32) -> (Raster, FontFamily) {
         let doc = Document::sample();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let pages = lay_out(&doc, &font, &HypherHyphenator);
         let geom = page_geom(&doc.page_setup, 0);
         let cache = ProxyCache::new();
@@ -354,7 +372,7 @@ mod tests {
         // spec 0033's rule that pixel goldens are flaky across the three-OS matrix. Anti-aliasing
         // is off for rect fills, so the inside pixel is exact.
         let doc = Document::sample();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let geom = page_geom(&doc.page_setup, 0);
         let cache = ProxyCache::new();
         let ops = vec![
@@ -384,7 +402,7 @@ mod tests {
     #[test]
     fn a_stroked_decoration_draws_its_edges_and_not_its_middle() {
         let doc = Document::sample();
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let geom = page_geom(&doc.page_setup, 0);
         let cache = ProxyCache::new();
         let ops = vec![
@@ -457,7 +475,7 @@ mod tests {
         let mut cache = ProxyCache::new();
         assert!(cache.insert_png("map1", &crate::tests_support::tiny_png(16, 16)));
 
-        let font = Font::bundled();
+        let font = FontFamily::bundled();
         let pages = lay_out(&doc, &font, &HypherHyphenator);
         let geom = page_geom(&doc.page_setup, 0);
         let ops = paint_page(&pages[0], &geom, &font, &cache);

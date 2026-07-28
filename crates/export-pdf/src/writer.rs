@@ -46,7 +46,7 @@ pub fn write_pdf(
     doc: &Document,
     opts: &ExportOptions,
     pages: &[LaidOutPage],
-    font: &fonts::EmbeddedFont,
+    family: &fonts::EmbeddedFamily,
     out: &mut impl Write,
 ) -> Result<(), ExportError> {
     // --- Inputs: ICC bytes, images --------------------------------------------------------
@@ -117,10 +117,11 @@ pub fn write_pdf(
     // is legal (the xref gets a free entry) but it is a lie in the file, and the screen profile is
     // the profile that must not look like it half-claims PDF/X.
     let icc_id = write_output_intent_obj.then(|| alloc.bump());
-    let type0_id = alloc.bump();
-    let cid_id = alloc.bump();
-    let descriptor_id = alloc.bump();
-    let fontfile_id = alloc.bump();
+    // One Type0 chain per embedded face (spec 0064). A document that sets text in one face
+    // allocates exactly the four references it always did, in the same order.
+    let font_ids: Vec<[Ref; 4]> = (0..family.len())
+        .map(|_| [alloc.bump(), alloc.bump(), alloc.bump(), alloc.bump()])
+        .collect();
     for img in images_by_id.values_mut() {
         img.id = alloc.bump();
     }
@@ -234,7 +235,9 @@ pub fn write_pdf(
         icc_stream.finish();
     }
 
-    write_font(&mut pdf, font, type0_id, cid_id, descriptor_id, fontfile_id);
+    for ((_, font), ids) in family.faces().zip(&font_ids) {
+        write_font(&mut pdf, font, ids[0], ids[1], ids[2], ids[3]);
+    }
 
     // Image XObjects: grayscale as /DeviceGray, color as /DeviceCMYK (spec 0005).
     for img in images_by_id.values() {
@@ -258,7 +261,7 @@ pub fn write_pdf(
     // Pages.
     for (i, (page, (page_id, content_id))) in pages.iter().zip(&page_refs).enumerate() {
         let g = geom::page_geom(&doc.page_setup, i);
-        let content = render_page(page, &g, font, &images_by_id);
+        let content = render_page(page, &g, family, &images_by_id);
 
         {
             let mut p = pdf.page(*page_id);
@@ -271,7 +274,16 @@ pub fn write_pdf(
             p.contents(*content_id);
 
             let mut res = p.resources();
-            res.fonts().pair(Name(b"F0"), type0_id);
+            {
+                // Every embedded face is available on every page. Naming only the faces a given
+                // page happens to use would make the resource dictionary depend on pagination, and
+                // a page that reflowed into a bold word would need its dictionary rewritten.
+                let mut fonts_dict = res.fonts();
+                for (slot, ids) in font_ids.iter().enumerate() {
+                    let name = fonts::EmbeddedFamily::resource_name(slot);
+                    fonts_dict.pair(Name(name.as_bytes()), ids[0]);
+                }
+            }
             // Only the images actually placed on this page.
             let mut xo = res.x_objects();
             let mut seen = BTreeSet::new();
@@ -473,7 +485,7 @@ fn write_font(
 fn render_page(
     page: &LaidOutPage,
     g: &geom::PageGeom,
-    font: &fonts::EmbeddedFont,
+    family: &fonts::EmbeddedFamily,
     images_by_id: &BTreeMap<String, ImageObj>,
 ) -> Vec<u8> {
     let mut content = Content::new();
@@ -486,16 +498,30 @@ fn render_page(
                 lines,
                 color,
                 run_colors,
+                run_formats,
+                run_shifts,
+                weight,
+                italic,
                 font_size_pt,
                 leading_pt,
                 ..
             } => {
+                // The block's own face and size: what a span with no override of its own is set in
+                // (spec 0064).
+                let base = quill_text_layout::RunFormat {
+                    size_pt: *font_size_pt,
+                    weight: *weight,
+                    italic: *italic,
+                    tracking_pt: 0.0,
+                };
+                let base_slot = family.slot(fonts::face_of(base));
                 content.begin_text();
                 // Per-block size, from the style the layout engine measured with (spec 0028).
                 // Taking it from the placed block rather than re-deriving it is what guarantees the
                 // glyphs are drawn at the size they were broken at — any disagreement between the
                 // two would put text in the wrong place, or overset a frame that measured as fitting.
-                content.set_font(Name(b"F0"), *font_size_pt);
+                let base_name = fonts::EmbeddedFamily::resource_name(base_slot);
+                content.set_font(Name(base_name.as_bytes()), *font_size_pt);
                 // Emit the authored press-legal fill color. Preflight rejects RGB before export,
                 // so `Rgb` is unreachable here; fall back to black (rather than panicking) so a
                 // `--force` export can never abort mid-stream.
@@ -504,7 +530,21 @@ fn render_page(
                     Color::Cmyk { c, m, y, k } => content.set_fill_cmyk(*c, *m, *y, *k),
                     Color::Rgb { .. } => content.set_fill_gray(0.0),
                 };
-                let ascent = font.ascent_pt(*font_size_pt);
+                // The text state actually in force, carried across the whole block. `Tf`, `Tc`,
+                // `Ts` and the fill colour all outlive the line that set them, so a line that
+                // assumes what the block set — rather than what the *previous line* left — draws
+                // its glyphs out of another face's subset. That is `.notdef` boxes in a press file,
+                // so the state is tracked rather than assumed.
+                let mut state = TextState {
+                    slot: base_slot,
+                    size_pt: *font_size_pt,
+                    tracking_pt: 0.0,
+                    shift_pt: 0.0,
+                    ink: fmt_ink(color),
+                };
+                // Ascent is the family's, and the four bundled faces share one set of vertical
+                // metrics, so it is the same wherever a run sits (spec 0064).
+                let ascent = family.font(base_slot).ascent_pt(*font_size_pt);
                 for (li, line) in lines.iter().enumerate() {
                     let top_y = frame.y_pt + ascent + li as f32 * leading_pt;
                     // The line's own left inset (spec 0048) — the same field the screen painter
@@ -512,20 +552,41 @@ fn render_page(
                     let (x, y) = geom::flip(g, frame.x_pt + line.indent_pt, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
-                    // One colour for the whole line is the overwhelmingly common case and the
-                    // one that must stay byte-identical: it takes the path it took before runs
-                    // existed. Only a line whose spans really do disagree pays for the split.
-                    match single_ink(line, run_colors) {
-                        Some(_) => show_line(&mut content, font, line, *font_size_pt),
-                        None => show_line_by_span(
+                    // One colour *and* one format for the whole line is the overwhelmingly common
+                    // case and the one that must stay byte-identical: it takes the path it took
+                    // before runs existed. Note that "one format" is compared against the format
+                    // the line is actually set in, which need not be the block's — a bold run long
+                    // enough to fill a line makes every interior line uniformly bold.
+                    match (
+                        single_ink(line, run_colors, *color),
+                        single_format(line, run_formats, base),
+                        single_shift(line, run_shifts),
+                    ) {
+                        (Some(ink), Some(fmt), Some(shift)) => {
+                            set_state(&mut content, family, &mut state, fmt, shift, ink);
+                            show_line(&mut content, family.font(state.slot), line, fmt.size_pt);
+                        }
+                        _ => show_line_by_span(
                             &mut content,
-                            font,
+                            family,
                             line,
-                            *font_size_pt,
+                            base,
                             run_colors,
+                            run_formats,
+                            run_shifts,
                             *color,
+                            &mut state,
                         ),
                     }
+                }
+                // `Tc` and `Ts` are graphics state and outlive the text object, so a block that set
+                // either has to put it back — the next block re-emits its own `Tf` and fill, but
+                // nothing re-emits a tracking nobody asked for.
+                if state.tracking_pt != 0.0 {
+                    content.set_char_spacing(0.0);
+                }
+                if state.shift_pt != 0.0 {
+                    content.set_rise(0.0);
                 }
                 content.end_text();
             }
@@ -747,17 +808,21 @@ fn set_stroke(content: &mut Content, color: &Color) {
 /// wrong size would misplace every word on a justified line set at anything but body size.
 /// The one ink this line is set in, or `None` if its spans disagree (spec 0063).
 ///
-/// `None` is the only case that costs anything: a block with no run colours, or one whose runs all
-/// resolved to the same ink, is emitted exactly as it was before runs existed — which is what makes
-/// "one run is byte-identical to a string" hold at the byte level and not merely at the geometry.
-fn single_ink(line: &Line, run_colors: &[Color]) -> Option<()> {
-    if run_colors.is_empty() {
-        return Some(());
+/// Compared against `fallback` — the block's own colour — and not merely against the line's first
+/// span, because a line lying wholly inside one recoloured run is uniform in *that* colour, which
+/// is not the block's.
+fn single_ink(line: &Line, run_colors: &[Color], fallback: Color) -> Option<Color> {
+    if run_colors.is_empty() || line.spans.is_empty() {
+        return Some(fallback);
     }
-    let mut inks = line.spans.iter().map(|sp| run_colors.get(sp.run));
-    let first = inks.next().flatten();
-    inks.all(|c| c.map(fmt_ink) == first.map(fmt_ink))
-        .then_some(())
+    let first = run_colors
+        .get(line.spans[0].run)
+        .copied()
+        .unwrap_or(fallback);
+    line.spans
+        .iter()
+        .all(|sp| fmt_ink(&run_colors.get(sp.run).copied().unwrap_or(fallback)) == fmt_ink(&first))
+        .then_some(first)
 }
 
 /// Colours are `f32` and so not `Eq`; compare them by their debug form, which is what the rest of
@@ -766,41 +831,131 @@ fn fmt_ink(c: &Color) -> String {
     format!("{c:?}")
 }
 
-/// Show one line, changing fill colour at each span boundary (spec 0063).
+/// The one format this line is set in, or `None` if its spans disagree (spec 0064).
 ///
-/// Colour operators are ordinary graphics state and are legal inside a text object, so this needs no
-/// `ET`/`BT` pair — the text matrix set for the line stays current across the whole line.
+/// Returns the *line's* format, not the block's. A run long enough to fill a line makes every
+/// interior line of it uniformly bold — uniform, but not uniform in the block's face, and answering
+/// this question against the block would draw those lines from the wrong subset.
+fn single_format(
+    line: &Line,
+    run_formats: &[quill_text_layout::RunFormat],
+    base: quill_text_layout::RunFormat,
+) -> Option<quill_text_layout::RunFormat> {
+    if run_formats.is_empty() || line.spans.is_empty() {
+        return Some(base);
+    }
+    let first = run_formats.get(line.spans[0].run).copied().unwrap_or(base);
+    line.spans
+        .iter()
+        .all(|sp| run_formats.get(sp.run).copied().unwrap_or(base) == first)
+        .then_some(first)
+}
+
+/// The PDF text state a block is currently drawing in.
+///
+/// `Tf`, `Tc`, `Ts` and the fill colour all persist until something changes them, so "what is in
+/// force" is a property of the content stream and not of the line being written. Tracking it means
+/// each operator is emitted exactly when it changes — which is what keeps a single-face block's
+/// stream byte-identical to what it was before the family existed, and what stops a bold line from
+/// leaving the font set to bold for the plain line after it.
+struct TextState {
+    slot: usize,
+    size_pt: f32,
+    tracking_pt: f32,
+    shift_pt: f32,
+    ink: String,
+}
+
+/// The one baseline shift this line is set at, or `None` if its spans disagree (spec 0064).
+fn single_shift(line: &Line, run_shifts: &[f32]) -> Option<f32> {
+    if run_shifts.is_empty() || line.spans.is_empty() {
+        return Some(0.0);
+    }
+    let first = run_shifts.get(line.spans[0].run).copied().unwrap_or(0.0);
+    line.spans
+        .iter()
+        .all(|sp| run_shifts.get(sp.run).copied().unwrap_or(0.0) == first)
+        .then_some(first)
+}
+
+/// Bring the stream's text state to `fmt`/`shift`/`ink`, emitting only the operators that change.
+fn set_state(
+    content: &mut Content,
+    family: &fonts::EmbeddedFamily,
+    state: &mut TextState,
+    fmt: quill_text_layout::RunFormat,
+    shift_pt: f32,
+    ink: Color,
+) {
+    let slot = family.slot(fonts::face_of(fmt));
+    if slot != state.slot || fmt.size_pt != state.size_pt {
+        let name = fonts::EmbeddedFamily::resource_name(slot);
+        content.set_font(Name(name.as_bytes()), fmt.size_pt);
+        state.slot = slot;
+        state.size_pt = fmt.size_pt;
+    }
+    if fmt.tracking_pt != state.tracking_pt {
+        content.set_char_spacing(fmt.tracking_pt);
+        state.tracking_pt = fmt.tracking_pt;
+    }
+    if shift_pt != state.shift_pt {
+        content.set_rise(shift_pt);
+        state.shift_pt = shift_pt;
+    }
+    let want = fmt_ink(&ink);
+    if want != state.ink {
+        set_fill(content, &ink);
+        state.ink = want;
+    }
+}
+
+/// Show one line, changing fill colour, face, size, tracking and baseline shift at each span
+/// boundary (specs 0063, 0064).
+///
+/// Colour and text-state operators are ordinary graphics state and are legal inside a text object,
+/// so this needs no `ET`/`BT` pair — the text matrix set for the line stays current across the whole
+/// line, and PDF advances the text position by the glyphs shown, which are the same glyphs, at the
+/// same widths, that the family measured with.
 ///
 /// Justification is unchanged in meaning: the adjustment goes after every inter-word space, exactly
 /// as [`show_line`] places it. It is emitted in whichever span's array the space falls, so a span
-/// boundary inside a word cannot lose or double an adjustment.
+/// boundary inside a word cannot lose or double an adjustment — and it is computed from *that
+/// span's* size, because the unit is a thousandth of the current font size and a span set at another
+/// size would otherwise spend the wrong amount of space.
+#[allow(clippy::too_many_arguments)]
 fn show_line_by_span(
     content: &mut Content,
-    font: &fonts::EmbeddedFont,
+    family: &fonts::EmbeddedFamily,
     line: &Line,
-    font_size_pt: f32,
+    base: quill_text_layout::RunFormat,
     run_colors: &[Color],
+    run_formats: &[quill_text_layout::RunFormat],
+    run_shifts: &[f32],
     fallback: Color,
+    state: &mut TextState,
 ) {
-    let adjust = if line.space_adjust_pt == 0.0 {
-        0.0
-    } else {
-        -1000.0 * line.space_adjust_pt / font_size_pt
-    };
     let mut at = 0usize;
-    let mut current: Option<String> = None;
     for sp in &line.spans {
         let end = (at + sp.len_bytes).min(line.text.len());
         let piece = &line.text[at..end];
         at = end;
+
+        let fmt = run_formats.get(sp.run).copied().unwrap_or(base);
         let ink = run_colors.get(sp.run).copied().unwrap_or(fallback);
-        if current.as_deref() != Some(fmt_ink(&ink).as_str()) {
-            set_fill(content, &ink);
-            current = Some(fmt_ink(&ink));
-        }
+        // A rise is per span rather than per format: it is the one override that is not part of
+        // `RunFormat`, because it moves a glyph without changing an advance (spec 0064).
+        let shift = run_shifts.get(sp.run).copied().unwrap_or(0.0);
+        set_state(content, family, state, fmt, shift, ink);
+
         if piece.is_empty() {
             continue;
         }
+        let font = family.font(state.slot);
+        let adjust = if line.space_adjust_pt == 0.0 {
+            0.0
+        } else {
+            -1000.0 * line.space_adjust_pt / fmt.size_pt
+        };
         if adjust == 0.0 {
             content.show(Str(&font.encode_line(piece)));
             continue;
@@ -882,6 +1037,17 @@ mod tests {
         BODY_FONT_SIZE_PT as FONT_SIZE_PT, BODY_LINE_HEIGHT_PT as LINE_HEIGHT_PT,
     };
 
+    /// The bundled regular face as a one-face family — what every one of these tests draws with.
+    fn test_family(chars: &BTreeSet<char>) -> fonts::EmbeddedFamily {
+        let font = fonts::build(chars).expect("build bundled font");
+        fonts::EmbeddedFamily::new(
+            vec![(quill_fonts::FaceKey::REGULAR, font)],
+            quill_fonts::FontFamily::single(
+                quill_fonts::Font::from_bytes(quill_fonts::BUNDLED_TTF).expect("parse"),
+            ),
+        )
+    }
+
     /// Build a one-page layout holding a single text block with the given fill color, render it,
     /// and return the (uncompressed) content-stream bytes as a lossy string. Unlike the finished
     /// PDF, `render_page` output is not FlateDecode'd, so fill operators are directly greppable.
@@ -891,11 +1057,15 @@ mod tests {
         let mut chars = BTreeSet::new();
         chars.insert('H');
         chars.insert('i');
-        let font = fonts::build(&chars).expect("build bundled font");
+        let font = test_family(&chars);
         let page = LaidOutPage {
             index: 0,
             statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
+                run_formats: Vec::new(),
+                run_shifts: Vec::new(),
+                weight: 400,
+                italic: false,
                 run_colors: Vec::new(),
                 source: quill_core_model::BlockId::UNASSIGNED,
                 frame: quill_core_model::Rect {
@@ -914,6 +1084,187 @@ mod tests {
         String::from_utf8_lossy(&content).into_owned()
     }
 
+    /// Spec 0064: a line whose spans differ in format switches face, size, tracking and rise at the
+    /// span boundary — and resets the two that are text state, so they cannot leak into the next
+    /// line.
+    #[test]
+    fn a_mixed_format_line_switches_face_tracking_and_rise() {
+        let setup = PageSetup::default();
+        let g = geom::page_geom(&setup, 0);
+        let chars: BTreeSet<char> = "Hiabc".chars().collect();
+        let family = fonts::EmbeddedFamily::new(
+            vec![
+                (
+                    quill_fonts::FaceKey::REGULAR,
+                    fonts::build(&chars).expect("regular"),
+                ),
+                (
+                    quill_fonts::FaceKey::new(700, false),
+                    fonts::build_from_bytes(quill_fonts::BUNDLED_BOLD_TTF, None, &chars)
+                        .expect("bold"),
+                ),
+            ],
+            quill_fonts::FontFamily::bundled(),
+        );
+        let line = Line {
+            text: "Hi abc".into(),
+            spans: vec![
+                quill_text_layout::Span {
+                    run: 0,
+                    len_bytes: 3,
+                },
+                quill_text_layout::Span {
+                    run: 1,
+                    len_bytes: 3,
+                },
+            ],
+            space_adjust_pt: 0.0,
+            indent_pt: 0.0,
+        };
+        let page = LaidOutPage {
+            index: 0,
+            statics: Vec::new(),
+            blocks: vec![PlacedBlock::Text {
+                run_colors: Vec::new(),
+                run_formats: vec![
+                    quill_text_layout::RunFormat::plain(FONT_SIZE_PT),
+                    quill_text_layout::RunFormat {
+                        size_pt: FONT_SIZE_PT,
+                        weight: 700,
+                        italic: false,
+                        tracking_pt: 0.5,
+                    },
+                ],
+                run_shifts: vec![0.0, 2.0],
+                weight: 400,
+                italic: false,
+                source: quill_core_model::BlockId::UNASSIGNED,
+                frame: quill_core_model::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: setup.trim.w_pt,
+                    h_pt: LINE_HEIGHT_PT,
+                },
+                font_size_pt: FONT_SIZE_PT,
+                leading_pt: LINE_HEIGHT_PT,
+                lines: vec![line],
+                color: Color::Gray { v: 0.0 },
+            }],
+        };
+        let content = String::from_utf8_lossy(&render_page(&page, &g, &family, &BTreeMap::new()))
+            .into_owned();
+        assert!(content.contains("/F0"), "the regular face is named");
+        assert!(content.contains("/F1"), "the bold face is named: {content}");
+        assert!(content.contains("0.5 Tc"), "tracking as Tc: {content}");
+        assert!(content.contains("2 Ts"), "baseline shift as Ts: {content}");
+        // Both are text state, so both are put back — a tracking left applied would silently widen
+        // every line after this one.
+        assert!(content.contains("0 Tc"), "tracking reset: {content}");
+        assert!(content.contains("0 Ts"), "rise reset: {content}");
+    }
+
+    /// The defect an adversarial review of spec 0064 found: a line lying **wholly inside** a bold
+    /// run is uniform — uniformly bold — and the first uniformity test compared a line's spans to
+    /// each other rather than to the block's own face. Such a line took the fast path and was shown
+    /// while the *block's* font was current, so its glyph ids were read out of the regular subset
+    /// and drew as `.notdef` boxes.
+    ///
+    /// Asserted on the operator sequence, per line, because that is where it went wrong: what
+    /// matters is which font is in force at each `Tj`, not which fonts appear in the stream.
+    #[test]
+    fn every_line_is_shown_in_the_face_it_was_set_in() {
+        let setup = PageSetup::default();
+        let g = geom::page_geom(&setup, 0);
+        let chars: BTreeSet<char> = "abcdefgh ".chars().collect();
+        let family = fonts::EmbeddedFamily::new(
+            vec![
+                (
+                    quill_fonts::FaceKey::REGULAR,
+                    fonts::build(&chars).expect("regular"),
+                ),
+                (
+                    quill_fonts::FaceKey::new(700, false),
+                    fonts::build_from_bytes(quill_fonts::BUNDLED_BOLD_TTF, None, &chars)
+                        .expect("bold"),
+                ),
+            ],
+            quill_fonts::FontFamily::bundled(),
+        );
+        let span = |run: usize, len: usize| quill_text_layout::Span {
+            run,
+            len_bytes: len,
+        };
+        let line = |text: &str, run: usize| Line {
+            text: text.into(),
+            spans: vec![span(run, text.len())],
+            space_adjust_pt: 0.0,
+            indent_pt: 0.0,
+        };
+        let page = LaidOutPage {
+            index: 0,
+            statics: Vec::new(),
+            blocks: vec![PlacedBlock::Text {
+                run_colors: Vec::new(),
+                // Run 0 regular, run 1 bold, run 2 regular — and one line entirely inside each.
+                run_formats: vec![
+                    quill_text_layout::RunFormat::plain(FONT_SIZE_PT),
+                    quill_text_layout::RunFormat {
+                        size_pt: FONT_SIZE_PT,
+                        weight: 700,
+                        italic: false,
+                        tracking_pt: 0.0,
+                    },
+                    quill_text_layout::RunFormat::plain(FONT_SIZE_PT),
+                ],
+                run_shifts: Vec::new(),
+                weight: 400,
+                italic: false,
+                source: quill_core_model::BlockId::UNASSIGNED,
+                frame: quill_core_model::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: setup.trim.w_pt,
+                    h_pt: 3.0 * LINE_HEIGHT_PT,
+                },
+                font_size_pt: FONT_SIZE_PT,
+                leading_pt: LINE_HEIGHT_PT,
+                lines: vec![line("abc", 0), line("def", 1), line("gh", 2)],
+                color: Color::Gray { v: 0.0 },
+            }],
+        };
+        let content = String::from_utf8_lossy(&render_page(&page, &g, &family, &BTreeMap::new()))
+            .into_owned();
+
+        // Walk the stream tracking the font in force, and record which one each `Tj` was shown in.
+        let mut current = String::new();
+        let mut shown = Vec::new();
+        for op in content.lines() {
+            if let Some(name) = op.split_whitespace().next() {
+                if op.contains(" Tf") && name.starts_with("/F") {
+                    current = name.to_string();
+                }
+            }
+            if op.contains(" Tj") {
+                shown.push(current.clone());
+            }
+        }
+        assert_eq!(
+            shown,
+            vec!["/F0", "/F1", "/F0"],
+            "each line must be shown in its own face:\n{content}"
+        );
+    }
+
+    /// A block set in one face and one size emits exactly what it emitted before the family existed:
+    /// one `Tf`, no `Tc`, no `Ts`.
+    #[test]
+    fn a_single_format_block_emits_no_text_state_it_does_not_need() {
+        let content = render_text_color(Color::Gray { v: 0.0 });
+        assert!(content.contains("/F0"));
+        assert!(!content.contains("Tc"), "no tracking was set: {content}");
+        assert!(!content.contains("Ts"), "no rise was set: {content}");
+    }
+
     /// Render a page holding a single decoration rect and return the greppable content bytes.
     fn render_rect(
         frame: quill_core_model::Rect,
@@ -922,7 +1273,7 @@ mod tests {
     ) -> String {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
-        let font = fonts::build(&BTreeSet::new()).expect("build bundled font");
+        let font = test_family(&BTreeSet::new());
         let page = LaidOutPage {
             index: 0,
             statics: Vec::new(),
@@ -1025,11 +1376,15 @@ mod tests {
         let setup = PageSetup::default();
         let g = geom::page_geom(&setup, 0);
         let chars: BTreeSet<char> = text.chars().collect();
-        let font = fonts::build(&chars).expect("build bundled font");
+        let font = test_family(&chars);
         let page = LaidOutPage {
             index: 0,
             statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
+                run_formats: Vec::new(),
+                run_shifts: Vec::new(),
+                weight: 400,
+                italic: false,
                 run_colors: Vec::new(),
                 source: quill_core_model::BlockId::UNASSIGNED,
                 frame: quill_core_model::Rect {

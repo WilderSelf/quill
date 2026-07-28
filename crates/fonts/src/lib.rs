@@ -21,10 +21,14 @@ mod hyphenate;
 
 pub use hyphenate::HypherHyphenator;
 
-use quill_text_layout::{CharMetrics, RunMetrics};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
+use quill_text_layout::{CharMetrics, RunFormat, RunMetrics};
 use ttf_parser::{Face as TtfFace, GlyphId};
 
-/// The bundled font program. SIL OFL-1.1 — see `assets/SourceSerif4-LICENSE.txt`.
+/// The bundled regular font program. SIL OFL-1.1 — see `assets/SourceSerif4-LICENSE.txt`, which is
+/// the licence for all four faces.
 pub const BUNDLED_TTF: &[u8] = include_bytes!("../assets/SourceSerif4-Regular.ttf");
 
 /// The bundled bold face.
@@ -49,6 +53,151 @@ pub const BUNDLED_FACES: [&[u8]; 4] = [
     BUNDLED_ITALIC_TTF,
     BUNDLED_BOLD_ITALIC_TTF,
 ];
+
+/// Which face of a family: how heavy, and upright or slanted (spec 0064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FaceKey {
+    /// `OS/2` `usWeightClass` — 400 regular, 700 bold.
+    pub weight: u16,
+    pub italic: bool,
+}
+
+impl FaceKey {
+    pub const REGULAR: FaceKey = FaceKey {
+        weight: 400,
+        italic: false,
+    };
+
+    pub fn new(weight: u16, italic: bool) -> FaceKey {
+        FaceKey { weight, italic }
+    }
+}
+
+/// What a family answered a request with.
+#[derive(Debug, Clone, Copy)]
+pub struct Selection {
+    /// The face that will be used — equal to the request when the family had it.
+    pub key: FaceKey,
+    /// Its index in the family, which is also the slot a PDF resource name is derived from.
+    pub index: usize,
+}
+
+/// The faces a document can set text in, indexed by weight and slant (spec 0064).
+///
+/// A family rather than a `Font` because bold is not a flag on a face: every bundled face is a
+/// static instance with no `fvar`, so the four weights and slants quill ships are four font
+/// programs. Selection is by nearest match and is *announced*, because a document that asked for
+/// bold, got regular and was told nothing is a press file that quietly is not what its author wrote.
+pub struct FontFamily {
+    faces: Vec<(FaceKey, Font)>,
+    /// Substitutions already reported, so a warning is printed once per distinct request rather than
+    /// once per run. A warning printed per run is a warning nobody reads.
+    reported: Mutex<BTreeSet<(FaceKey, FaceKey)>>,
+}
+
+impl FontFamily {
+    /// The four faces this build ships.
+    pub fn bundled() -> FontFamily {
+        FontFamily::from_faces(
+            [
+                (FaceKey::new(400, false), BUNDLED_TTF),
+                (FaceKey::new(700, false), BUNDLED_BOLD_TTF),
+                (FaceKey::new(400, true), BUNDLED_ITALIC_TTF),
+                (FaceKey::new(700, true), BUNDLED_BOLD_ITALIC_TTF),
+            ]
+            .into_iter()
+            .map(|(k, p)| (k, Font::from_bytes(p).expect("a bundled face must parse"))),
+        )
+    }
+
+    /// A family of exactly one face — a user-supplied program (spec 0004), which answers every
+    /// request with the one face it has and says so.
+    pub fn single(font: Font) -> FontFamily {
+        let key = FaceKey::new(font.weight(), font.is_italic());
+        FontFamily::from_faces([(key, font)])
+    }
+
+    pub fn from_faces(faces: impl IntoIterator<Item = (FaceKey, Font)>) -> FontFamily {
+        let mut faces: Vec<(FaceKey, Font)> = faces.into_iter().collect();
+        // A stable order, so a PDF resource slot is a function of the family and not of insertion.
+        faces.sort_by_key(|(k, _)| *k);
+        assert!(!faces.is_empty(), "a family needs at least one face");
+        FontFamily {
+            faces,
+            reported: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.faces.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false // `from_faces` asserts otherwise
+    }
+
+    /// Every face, in slot order.
+    pub fn faces(&self) -> impl Iterator<Item = (FaceKey, &Font)> {
+        self.faces.iter().map(|(k, f)| (*k, f))
+    }
+
+    pub fn font(&self, index: usize) -> &Font {
+        &self.faces[index].1
+    }
+
+    /// The regular face — what a caller that knows nothing about runs measures with, and what
+    /// `measure_run` answers for.
+    pub fn regular(&self) -> &Font {
+        self.font(self.select(FaceKey::REGULAR).index)
+    }
+
+    /// Resolve a request to a face this family actually has.
+    ///
+    /// Nearest is defined, not incidental: the requested slant wins first, because an italic set
+    /// upright is wrong in a way a slightly-off weight is not; then the smallest absolute weight
+    /// difference; then the lighter of a tie, because a text face is more often wanted than a
+    /// display one.
+    pub fn select(&self, want: FaceKey) -> Selection {
+        let index = self
+            .faces
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (k, _))| {
+                (
+                    k.italic != want.italic,
+                    k.weight.abs_diff(want.weight),
+                    k.weight,
+                )
+            })
+            .map(|(i, _)| i)
+            .expect("a family has at least one face");
+        let key = self.faces[index].0;
+        if key != want {
+            let first = self
+                .reported
+                .lock()
+                .map(|mut seen| seen.insert((want, key)))
+                .unwrap_or(false);
+            if first {
+                eprintln!(
+                    "warning: this family has no {}; setting it in {} instead",
+                    describe(want),
+                    describe(key)
+                );
+            }
+        }
+        Selection { key, index }
+    }
+}
+
+fn describe(k: FaceKey) -> String {
+    let slant = if k.italic { " italic" } else { "" };
+    match k.weight {
+        400 => format!("regular{slant}"),
+        700 => format!("bold{slant}"),
+        w => format!("weight {w}{slant}"),
+    }
+}
 
 /// A parsed font, ready to measure and draw with.
 ///
@@ -143,6 +292,29 @@ impl Font {
 
     pub fn units_per_em(&self) -> f32 {
         self.units_per_em
+    }
+
+    /// The face's own `OS/2` weight class, so a family built from arbitrary programs indexes them by
+    /// what they say they are rather than by what a file was named.
+    pub fn weight(&self) -> u16 {
+        self.face().weight().to_number()
+    }
+
+    pub fn is_italic(&self) -> bool {
+        self.face().is_italic()
+    }
+
+    /// How many glyphs `text` shapes to — the unit tracking is spent in.
+    pub fn glyph_count(&self, text: &str) -> usize {
+        match rustybuzz::Face::from_slice(&self.program, 0) {
+            Some(face) => {
+                let mut buffer = rustybuzz::UnicodeBuffer::new();
+                buffer.push_str(text);
+                buffer.set_direction(rustybuzz::Direction::LeftToRight);
+                rustybuzz::shape(&face, &[], buffer).len()
+            }
+            None => text.chars().count(),
+        }
     }
 
     /// Ascent in points at a given size — how far below a frame's top the first baseline sits.
@@ -262,6 +434,38 @@ impl RunMetrics for Font {
             .map(|pos| pos.x_advance)
             .sum();
         units as f32 * size_pt / face.units_per_em() as f32
+    }
+}
+
+/// Measurement through a family: a run measures in the face it names (spec 0064).
+impl CharMetrics for FontFamily {
+    fn advance_pt(&self, ch: char, size_pt: f32) -> f32 {
+        self.regular().advance_pt(ch, size_pt)
+    }
+}
+
+impl RunMetrics for FontFamily {
+    /// The regular face, exactly as a lone [`Font`] answers. Every caller that predates the family
+    /// measures what it always measured.
+    fn measure_run(&self, text: &str, size_pt: f32) -> f32 {
+        self.regular().measure_run(text, size_pt)
+    }
+
+    /// Ascent is the family's, not the face's: the four bundled faces share one set of vertical
+    /// metrics precisely so that emphasising a word cannot move the line it sits on.
+    fn ascent_pt(&self, size_pt: f32) -> f32 {
+        RunMetrics::ascent_pt(self.regular(), size_pt)
+    }
+
+    fn measure_format(&self, text: &str, fmt: RunFormat) -> f32 {
+        let font = self.font(self.select(FaceKey::new(fmt.weight, fmt.italic)).index);
+        let base = font.measure_run(text, fmt.size_pt);
+        if fmt.tracking_pt == 0.0 {
+            return base;
+        }
+        // Per shaped glyph, because that is what a PDF `Tc` adds. Counting characters would measure
+        // an `fi` ligature twice and draw it once.
+        base + fmt.tracking_pt * font.glyph_count(text) as f32
     }
 }
 
@@ -466,6 +670,104 @@ mod tests {
         assert!(
             (italic - regular).abs() > 0.01,
             "italic {italic} should not measure as regular {regular}"
+        );
+    }
+
+    #[test]
+    fn the_family_answers_each_request_with_the_face_asked_for() {
+        let family = FontFamily::bundled();
+        assert_eq!(family.len(), 4);
+        for want in [
+            FaceKey::new(400, false),
+            FaceKey::new(700, false),
+            FaceKey::new(400, true),
+            FaceKey::new(700, true),
+        ] {
+            assert_eq!(family.select(want).key, want);
+        }
+    }
+
+    #[test]
+    fn a_missing_face_resolves_to_the_nearest_one_by_a_stated_rule() {
+        let family = FontFamily::bundled();
+        // Slant wins first: a semibold italic is set in the italic, not in the bold upright, even
+        // though 700 is the nearer weight to 600 than 400 is.
+        assert_eq!(
+            family.select(FaceKey::new(600, true)).key,
+            FaceKey::new(700, true)
+        );
+        assert_eq!(
+            family.select(FaceKey::new(300, false)).key,
+            FaceKey::new(400, false)
+        );
+        assert_eq!(
+            family.select(FaceKey::new(900, false)).key,
+            FaceKey::new(700, false)
+        );
+        // A tie goes to the lighter face.
+        assert_eq!(
+            family.select(FaceKey::new(550, false)).key,
+            FaceKey::new(400, false)
+        );
+    }
+
+    #[test]
+    fn a_one_face_family_answers_everything_with_the_face_it_has() {
+        // The user-supplied-font case (spec 0004): asking it for bold italic is not an error, and
+        // is not silent either — `select` reports the substitution on stderr.
+        let family = FontFamily::single(Font::bundled());
+        assert_eq!(family.len(), 1);
+        for want in [FaceKey::new(700, false), FaceKey::new(400, true)] {
+            assert_eq!(family.select(want).key, FaceKey::REGULAR);
+        }
+    }
+
+    #[test]
+    fn a_run_measures_in_the_face_it_names() {
+        let family = FontFamily::bundled();
+        let text = "Handgloves";
+        let regular = family.measure_format(text, RunFormat::plain(12.0));
+        let bold = family.measure_format(
+            text,
+            RunFormat {
+                weight: 700,
+                ..RunFormat::plain(12.0)
+            },
+        );
+        assert!(bold > regular, "bold {bold} vs regular {regular}");
+        // And `measure_run` still answers for the regular face, so every caller that predates the
+        // family measures exactly what it did.
+        assert_eq!(regular, family.measure_run(text, 12.0));
+        assert_eq!(regular, Font::bundled().measure_run(text, 12.0));
+    }
+
+    #[test]
+    fn tracking_is_spent_per_shaped_glyph_not_per_character() {
+        // "office" shapes its `ffi` to one glyph, so tracking must be added six times minus the
+        // ligature's saving — five, not seven. Counting characters would spend what the page does
+        // not draw.
+        let family = FontFamily::bundled();
+        let regular = Font::bundled();
+        let text = "office";
+        let glyphs = regular.glyph_count(text);
+        assert!(glyphs < text.chars().count(), "the ligature should form");
+        let base = family.measure_format(text, RunFormat::plain(12.0));
+        let tracked = family.measure_format(
+            text,
+            RunFormat {
+                tracking_pt: 1.0,
+                ..RunFormat::plain(12.0)
+            },
+        );
+        assert!((tracked - base - glyphs as f32).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_family_ascent_does_not_change_with_the_face() {
+        let family = FontFamily::bundled();
+        assert_eq!(
+            RunMetrics::ascent_pt(&family, 12.0),
+            RunMetrics::ascent_pt(&Font::bundled(), 12.0)
         );
     }
 

@@ -105,6 +105,26 @@ pub trait RunMetrics {
     /// Total shaped advance width of `text` at `size_pt`, in points.
     fn measure_run(&self, text: &str, size_pt: f32) -> f32;
 
+    /// Total advance width of `text` set in `fmt` — its own face, size and tracking (spec 0064).
+    ///
+    /// Defaulted onto [`measure_run`](RunMetrics::measure_run) so every implementation that predates
+    /// the font family — the monospace stub, every test double — measures exactly what it always
+    /// did, and so a paragraph whose runs all share one format goes through the same call it went
+    /// through before formats existed. That is what makes "no metric-bearing override ⇒
+    /// byte-identical" reachable by construction rather than by luck.
+    ///
+    /// The default spends tracking per **character**, which is all it can see. A real implementation
+    /// spends it per **shaped glyph**, because that is what a PDF `Tc` adds, and measuring in a
+    /// different unit than the page is drawn in is the drift this workspace keeps one shaper to
+    /// prevent.
+    fn measure_format(&self, text: &str, fmt: RunFormat) -> f32 {
+        let base = self.measure_run(text, fmt.size_pt);
+        if fmt.tracking_pt == 0.0 {
+            return base;
+        }
+        base + fmt.tracking_pt * text.chars().count() as f32
+    }
+
     /// Distance from the top of a line's box down to its **baseline**, at `size_pt` (spec 0058).
     ///
     /// The layout engine needs this to snap a baseline to a grid line: a `PlacedBlock::Text` is
@@ -118,6 +138,36 @@ pub trait RunMetrics {
     /// already draw with, so all three agree by construction.
     fn ascent_pt(&self, size_pt: f32) -> f32 {
         0.8 * size_pt
+    }
+}
+
+/// Everything about a run that changes what it measures (spec 0064).
+///
+/// Deliberately not the model's `InlineStyle`: this crate depends on no other quill crate, and the
+/// breaker has no business knowing what an override is or how one resolves. It needs four numbers.
+///
+/// `baseline_shift_pt` is **not** among them. It moves a glyph vertically without changing any
+/// advance, so it is a drawing property. Putting it here would invalidate line breaking for an edit
+/// that cannot move a break.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunFormat {
+    pub size_pt: f32,
+    /// `OS/2` `usWeightClass` — 400 regular, 700 bold.
+    pub weight: u16,
+    pub italic: bool,
+    /// Extra advance per glyph. Negative tightens.
+    pub tracking_pt: f32,
+}
+
+impl RunFormat {
+    /// The paragraph's own treatment at `size_pt`: regular, upright, untracked.
+    pub fn plain(size_pt: f32) -> RunFormat {
+        RunFormat {
+            size_pt,
+            weight: 400,
+            italic: false,
+            tracking_pt: 0.0,
+        }
     }
 }
 
@@ -327,6 +377,7 @@ pub fn break_paragraph_shrinkable(
 ) -> Vec<String> {
     break_runs_shrinkable(
         &[text],
+        &[],
         first_width_pt,
         rest_width_pt,
         size_pt,
@@ -337,6 +388,199 @@ pub fn break_paragraph_shrinkable(
     .into_iter()
     .map(|b| b.text)
     .collect()
+}
+
+/// Which format each byte of a concatenated paragraph is set in (spec 0064).
+///
+/// One place, because three callers need the same answer and a second derivation of "where does the
+/// face change" would be a second answer: the breaker splitting boxes, the ragged predicate deciding
+/// whether a word overflows, and [`span_offsets`] placing a span all consult this.
+struct FormatMap<'a> {
+    starts: Vec<usize>,
+    formats: &'a [RunFormat],
+    default: RunFormat,
+}
+
+impl<'a> FormatMap<'a> {
+    fn new(runs: &[&str], formats: &'a [RunFormat], default: RunFormat) -> FormatMap<'a> {
+        let mut starts = Vec::with_capacity(runs.len());
+        let mut acc = 0usize;
+        for r in runs {
+            starts.push(acc);
+            acc += r.len();
+        }
+        FormatMap {
+            starts,
+            formats,
+            default,
+        }
+    }
+
+    /// True when the whole paragraph is one format — the case every document that names no override
+    /// takes, and the one in which every split below is a no-op.
+    fn uniform(&self) -> bool {
+        self.formats.is_empty()
+    }
+
+    fn at(&self, off: usize) -> RunFormat {
+        if self.uniform() {
+            return self.default;
+        }
+        let run = match self.starts.binary_search(&off) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        self.formats.get(run).copied().unwrap_or(self.default)
+    }
+
+    /// The byte offsets where the format actually changes — a subset of the run boundaries. Two
+    /// adjacent runs differing only in colour are one segment and must not be measured apart, or a
+    /// colour change would move a glyph.
+    fn changes(&self) -> Vec<usize> {
+        if self.uniform() {
+            return Vec::new();
+        }
+        self.starts
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(i, _)| self.formats.get(*i) != self.formats.get(i - 1))
+            .map(|(_, at)| *at)
+            .collect()
+    }
+
+    /// Split `[at, at + s.len())` into the maximal stretches of constant format.
+    fn split<'s>(&self, s: &'s str, at: usize) -> Vec<(&'s str, usize)> {
+        if self.uniform() {
+            return vec![(s, at)];
+        }
+        let mut cuts = vec![0usize];
+        for b in self.changes() {
+            if b > at && b < at + s.len() {
+                cuts.push(b - at);
+            }
+        }
+        cuts.push(s.len());
+        cuts.windows(2)
+            .map(|w| (&s[w[0]..w[1]], at + w[0]))
+            .collect()
+    }
+
+    /// Measure a stretch of the paragraph, one call per format segment.
+    ///
+    /// A uniform paragraph is one call on the whole stretch — the same call, with the same shaping
+    /// across the whole string, that measurement was before formats existed.
+    fn measure(&self, s: &str, at: usize, metrics: &impl RunMetrics) -> f32 {
+        self.split(s, at)
+            .into_iter()
+            .map(|(piece, off)| metrics.measure_format(piece, self.at(off)))
+            .sum()
+    }
+}
+
+/// A line's natural drawn width — every span measured in its own format, with consecutive spans of
+/// equal format measured as one string (spec 0064).
+///
+/// The one place that answers "how wide is this line, really". Justification spends the difference
+/// between it and the measure, and a justifier that asked the paragraph's size instead would spend
+/// the difference for a line nobody set: a 14 pt run inside a 10 pt paragraph would be judged
+/// narrow, and the line would be stretched past its measure — which is exactly what spec 0060
+/// forbids, arrived at from the other direction.
+pub fn natural_width(
+    text: &str,
+    spans: &[Span],
+    formats: &[RunFormat],
+    default: RunFormat,
+    metrics: &impl RunMetrics,
+) -> f32 {
+    if formats.is_empty() || spans.is_empty() {
+        return metrics.measure_format(text, default);
+    }
+    let fmt_of = |sp: &Span| formats.get(sp.run).copied().unwrap_or(default);
+    let mut total = 0.0f32;
+    let mut at = 0usize;
+    let mut i = 0usize;
+    while i < spans.len() {
+        let fmt = fmt_of(&spans[i]);
+        let mut j = i;
+        let mut end = at;
+        while j < spans.len() && fmt_of(&spans[j]) == fmt {
+            end += spans[j].len_bytes;
+            j += 1;
+        }
+        let end = end.min(text.len());
+        total += metrics.measure_format(&text[at..end], fmt);
+        at = end;
+        i = j;
+    }
+    total
+}
+
+/// Where each of a line's spans starts, in points from the line's own origin (spec 0064).
+///
+/// The PDF writer and the screen painter both need this, and they must not derive it separately: a
+/// span drawn at one x on screen and another on the page is the drift this workspace keeps one
+/// shaper to prevent. Consecutive spans of equal format are measured as one string, so a line whose
+/// runs differ only in colour is measured exactly as it was before this existed, and a face change
+/// is measured either side of the boundary — which is where the breaker measured it too.
+///
+/// `space_adjust_pt` is spent uniformly per space, as the writer's `TJ` array spends it.
+pub fn span_offsets(
+    line: &Line,
+    formats: &[RunFormat],
+    default: RunFormat,
+    metrics: &impl RunMetrics,
+) -> Vec<f32> {
+    let fmt_of = |sp: &Span| formats.get(sp.run).copied().unwrap_or(default);
+    let width = |piece: &str, fmt: RunFormat| {
+        metrics.measure_format(piece, fmt)
+            + piece.matches(' ').count() as f32 * line.space_adjust_pt
+    };
+
+    let mut out = Vec::with_capacity(line.spans.len());
+    let mut x = 0.0f32;
+    let mut at = 0usize;
+    let mut i = 0usize;
+    while i < line.spans.len() {
+        // The maximal group of consecutive spans set in one format, measured as one string.
+        let fmt = fmt_of(&line.spans[i]);
+        let mut j = i;
+        let mut end = at;
+        while j < line.spans.len() && fmt_of(&line.spans[j]) == fmt {
+            end += line.spans[j].len_bytes;
+            j += 1;
+        }
+        let end = end.min(line.text.len());
+        let mut inner = at;
+        for sp in &line.spans[i..j] {
+            out.push(x + width(&line.text[at..inner.min(line.text.len())], fmt));
+            inner = (inner + sp.len_bytes).min(line.text.len());
+        }
+        x += width(&line.text[at..end], fmt);
+        at = end;
+        i = j;
+    }
+    out
+}
+
+/// Whitespace-separated words with the byte offset each starts at.
+///
+/// `str::split_whitespace` loses the offsets, and an offset is what says which run a word is set in.
+fn word_offsets(text: &str) -> impl Iterator<Item = (&str, usize)> {
+    let mut start = 0usize;
+    let mut out: Vec<(&str, usize)> = Vec::new();
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if i > start {
+                out.push((&text[start..i], start));
+            }
+            start = i + c.len_utf8();
+        }
+    }
+    if start < text.len() {
+        out.push((&text[start..], start));
+    }
+    out.into_iter()
 }
 
 /// One broken line before justification: its text and where each stretch of it came from.
@@ -354,10 +598,14 @@ pub struct BrokenLine {
 /// line: which authored run every stretch of it came from, tracked through the item stream rather
 /// than recovered from the output, so it is exact rather than heuristic.
 ///
-/// Measurement is uniform across runs at `size_pt`. Per-run size and tracking are spec 0064; this
-/// increment carries the run structure and what varies with it that does not move a glyph.
+/// `formats` gives each run its own face, size and tracking (spec 0064). It is either empty — every
+/// run set in the paragraph's own treatment at `size_pt`, which is what every document that names no
+/// override does — or exactly as long as `runs`. An empty `formats` takes the same path the breaker
+/// took before formats existed, which is what keeps those documents byte-identical.
+#[allow(clippy::too_many_arguments)]
 pub fn break_runs_shrinkable(
     runs: &[&str],
+    formats: &[RunFormat],
     first_width_pt: f32,
     rest_width_pt: f32,
     size_pt: f32,
@@ -382,6 +630,9 @@ pub fn break_runs_shrinkable(
             Err(i) => i.saturating_sub(1),
         }
     };
+    // The format a byte is set in (spec 0064). With no formats given there is one, for the whole
+    // paragraph, and every split below is a no-op.
+    let fmts = FormatMap::new(runs, formats, RunFormat::plain(size_pt));
     // Words break at ordinary whitespace only. U+00A0 NO-BREAK SPACE binds its neighbours into a
     // single unbreakable box and is emitted as an ordinary space (spec 0048), which is how a key
     // like `Armour Class:` survives a narrow measure instead of breaking after `Armour` and losing
@@ -442,13 +693,12 @@ pub fn break_runs_shrinkable(
             rest_width_pt
         }
     };
-    let g = metrics.measure_run(" ", size_pt);
-    let stretch = g / 2.0;
-    let shrink = g / 3.0;
-    let hyphen_w = metrics.measure_run("-", size_pt);
-
     // Build the box/glue/penalty item stream. A word splits at its (validated) hyphenation offsets
     // into segment boxes separated by flagged penalties; inter-word glue joins words.
+    //
+    // Glue and penalty carry their own widths rather than reading a paragraph-wide constant: the
+    // space between two words is set in whichever run it was typed in, and a discretionary hyphen is
+    // drawn in the face of the segment it ends (spec 0064).
     enum Item<'a> {
         /// `at` is the box's byte offset in the concatenated paragraph, which is what maps it back
         /// to the run that authored it (spec 0063).
@@ -457,13 +707,50 @@ pub fn break_runs_shrinkable(
             width: f32,
             at: usize,
         },
-        Glue,
-        Penalty,
+        Glue {
+            width: f32,
+            stretch: f32,
+            shrink: f32,
+        },
+        Penalty {
+            hyphen_w: f32,
+        },
     }
     let mut items: Vec<Item> = Vec::new();
+    // A macro rather than a closure: the boxes borrow from a local `String`, whose lifetime has no
+    // name to give a closure's argument. Two call sites, one measurement — the duplication a helper
+    // would have removed is exactly the drift a helper exists to prevent.
+    // The format of the last box pushed. An inter-word space is *reconstructed* into the span of the
+    // box before it (there is no separate span for a character nobody authored), so it must be
+    // *measured* in that box's format too — measuring it in the format of the byte it occupies would
+    // have the breaker and the writer disagree about the width of every space at a face change.
+    let mut last_fmt = fmts.at(0);
+    macro_rules! push_boxes {
+        ($seg:expr, $at:expr) => {{
+            // A box that straddled a face change would be measured entirely in one of the two, and
+            // would shape a kern pair that does not exist across two font programs. Adjacent boxes
+            // with no glue or penalty between them are not a break opportunity, so splitting here
+            // adds no legal break.
+            for (piece, off) in fmts.split($seg, $at) {
+                let fmt = fmts.at(off);
+                items.push(Item::Boxed {
+                    text: piece,
+                    width: metrics.measure_format(piece, fmt),
+                    at: off,
+                });
+                last_fmt = fmt;
+            }
+        }};
+    }
     for (wi, &(word, word_at)) in words.iter().enumerate() {
         if wi > 0 {
-            items.push(Item::Glue);
+            // Measured in the format of the box before it — see `last_fmt`.
+            let g = metrics.measure_format(" ", last_fmt);
+            items.push(Item::Glue {
+                width: g,
+                stretch: g / 2.0,
+                shrink: g / 3.0,
+            });
         }
         let mut prev = 0usize;
         for off in hyphenator.hyphenate(word) {
@@ -472,20 +759,16 @@ pub fn break_runs_shrinkable(
                 continue;
             }
             let seg = &word[prev..off];
-            items.push(Item::Boxed {
-                text: seg,
-                width: metrics.measure_run(seg, size_pt),
-                at: word_at + prev,
+            push_boxes!(seg, word_at + prev);
+            // Likewise the discretionary hyphen: it is drawn in the face of the segment it ends,
+            // and reconstructed into that segment's span.
+            items.push(Item::Penalty {
+                hyphen_w: metrics.measure_format("-", last_fmt),
             });
-            items.push(Item::Penalty);
             prev = off;
         }
         let seg = &word[prev..];
-        items.push(Item::Boxed {
-            text: seg,
-            width: metrics.measure_run(seg, size_pt),
-            at: word_at + prev,
-        });
+        push_boxes!(seg, word_at + prev);
     }
 
     // Prefix sums so a line's natural/stretch/shrink over items[s..e] is O(1). Penalty width is 0
@@ -497,8 +780,12 @@ pub fn break_runs_shrinkable(
     for (i, it) in items.iter().enumerate() {
         let (w, y, z) = match it {
             Item::Boxed { width, .. } => (*width, 0.0, 0.0),
-            Item::Glue => (g, stretch, shrink),
-            Item::Penalty => (0.0, 0.0, 0.0),
+            Item::Glue {
+                width,
+                stretch,
+                shrink,
+            } => (*width, *stretch, *shrink),
+            Item::Penalty { .. } => (0.0, 0.0, 0.0),
         };
         wsum[i + 1] = wsum[i] + w;
         ysum[i + 1] = ysum[i] + y;
@@ -687,8 +974,8 @@ pub fn break_runs_shrinkable(
             s_lo += 1;
         }
         let (extra_w, flagged) = match &items[e] {
-            Item::Glue => (0.0, false),
-            Item::Penalty => (hyphen_w, true),
+            Item::Glue { .. } => (0.0, false),
+            Item::Penalty { hyphen_w } => (*hyphen_w, true),
             Item::Boxed { .. } => continue, // a box is never a line end
         };
         for s in s_lo..=e {
@@ -745,6 +1032,11 @@ pub fn break_runs_shrinkable(
         // Greedy fallback (an over-wide, unbreakable word). Its lines are rebuilt from the source
         // text, so their spans are recovered by walking the same cursor the reconstruction below
         // uses — the fallback is rare but must not lose the run map.
+        // Measured at the paragraph's size rather than per format: this path exists only when some
+        // word is wider than the measure however it is broken, so its lines already overflow and a
+        // more accurate width would not change that. Making it format-aware is a second breaker for
+        // a case that is already a failure, and is named as a non-goal in spec 0064 rather than
+        // half-built here.
         let mut cursor = 0usize;
         return break_by_width(text, rest_width_pt.min(first_width_pt), size_pt, metrics)
             .into_iter()
@@ -774,7 +1066,7 @@ pub fn break_runs_shrinkable(
     let mut lines = Vec::with_capacity(starts.len());
     for (idx, &from) in starts.iter().enumerate() {
         let (content_end, ends_at_penalty) = match starts.get(idx + 1) {
-            Some(&next) => (next - 1, matches!(items[next - 1], Item::Penalty)),
+            Some(&next) => (next - 1, matches!(items[next - 1], Item::Penalty { .. })),
             None => (n_items, false),
         };
         let mut line = String::new();
@@ -807,11 +1099,11 @@ pub fn break_runs_shrinkable(
                     }
                     line.push_str(t);
                 }
-                Item::Glue => {
+                Item::Glue { .. } => {
                     line.push(' ');
                     push(&mut spans, last, 1);
                 }
-                Item::Penalty => {}
+                Item::Penalty { .. } => {}
             }
         }
         if ends_at_penalty {
@@ -1009,6 +1301,7 @@ pub fn justify_paragraph_indented(
 ) -> Vec<Line> {
     justify_runs_indented(
         &[text],
+        &[],
         max_width_pt,
         indent,
         size_pt,
@@ -1025,8 +1318,10 @@ pub fn justify_paragraph_indented(
 /// whole design: a run must not be able to change where a line breaks, or the run model would be a
 /// layout change rather than a generalization, and "one run lays out identically to a string" would
 /// stop being provable.
+#[allow(clippy::too_many_arguments)]
 pub fn justify_runs_indented(
     runs: &[&str],
+    formats: &[RunFormat],
     max_width_pt: f32,
     indent: Indent,
     size_pt: f32,
@@ -1054,11 +1349,16 @@ pub fn justify_runs_indented(
     // ragged, and telling the breaker so is what makes it look for a breaking where every line
     // fits — through hyphenation, where hyphenation can reach it — instead of one that relies on
     // shrink nobody applies.
+    //
+    // A word is measured at its own run's format (spec 0064): the word that overflows a narrow
+    // measure is the one set in 18 pt bold, and asking the paragraph's size about it would answer
+    // for a word nobody set.
+    let fmts = FormatMap::new(runs, formats, RunFormat::plain(size_pt));
     let ragged = align == Alignment::Left
-        || text
-            .split_whitespace()
-            .any(|w| metrics.measure_run(w, size_pt) > first_w.min(rest_w));
-    let lines = break_runs_shrinkable(runs, first_w, rest_w, size_pt, metrics, hyphenator, !ragged);
+        || word_offsets(text).any(|(w, at)| fmts.measure(w, at, metrics) > first_w.min(rest_w));
+    let lines = break_runs_shrinkable(
+        runs, formats, first_w, rest_w, size_pt, metrics, hyphenator, !ragged,
+    );
 
     // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
     // would need to shrink past its glue, so justifying it would push spaces negative).
@@ -1099,7 +1399,13 @@ pub fn justify_runs_indented(
                 // `measure_run` counts a trailing hyphen, so a hyphenated line fills the frame too.
                 // The width to fill is this line's own measure: filling the *frame* would overrun it
                 // by exactly the indent, invisibly, since ragged text has no fill to be wrong about.
-                let natural = metrics.measure_run(&text, size_pt);
+                let natural = natural_width(
+                    &text,
+                    &broken.spans,
+                    formats,
+                    RunFormat::plain(size_pt),
+                    metrics,
+                );
                 (measure(idx) - natural) / spaces as f32
             };
             Line {
@@ -1624,6 +1930,7 @@ mod tests {
             );
             let as_runs = justify_runs_indented(
                 &[text],
+                &[],
                 width,
                 Indent::default(),
                 SIZE,
@@ -1644,6 +1951,7 @@ mod tests {
         for width in [40.0, 60.0, 97.5, 130.0] {
             let one = justify_runs_indented(
                 &[whole],
+                &[],
                 width,
                 Indent::default(),
                 SIZE,
@@ -1653,6 +1961,7 @@ mod tests {
             );
             let many = justify_runs_indented(
                 &split,
+                &[],
                 width,
                 Indent::default(),
                 SIZE,
@@ -1680,6 +1989,7 @@ mod tests {
         ];
         let lines = justify_runs_indented(
             &runs,
+            &[],
             60.0,
             Indent::default(),
             SIZE,
@@ -1721,6 +2031,7 @@ mod tests {
         // boundary is a change of treatment, not of text.
         let lines = justify_runs_indented(
             &["a bold", "face word"],
+            &[],
             1000.0,
             Indent::default(),
             SIZE,
@@ -1970,5 +2281,326 @@ mod tests {
             lines.iter().all(|l| !l.contains('\u{a0}')),
             "no line may carry U+00A0: {lines:?}"
         );
+    }
+}
+
+/// Spec 0064: what changes when the runs of a paragraph are not all set the same way.
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    const MONO: MonospaceRunMetrics = MonospaceRunMetrics { em_ratio: 0.6 };
+
+    fn at(size_pt: f32) -> RunFormat {
+        RunFormat::plain(size_pt)
+    }
+
+    #[test]
+    fn uniform_formats_break_exactly_as_no_formats_do() {
+        // The criterion the whole increment stands on, at this layer: spelling out the format every
+        // run already had must not be a layout change.
+        let runs = [
+            "the quick brown fox ",
+            "jumps over the lazy dog ",
+            "again and again",
+        ];
+        let formats = vec![at(10.0); runs.len()];
+        for width in [60.0, 90.0, 140.0, 220.0] {
+            let bare = justify_runs_indented(
+                &runs,
+                &[],
+                width,
+                Indent::default(),
+                10.0,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            );
+            let spelled = justify_runs_indented(
+                &runs,
+                &formats,
+                width,
+                Indent::default(),
+                10.0,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            );
+            assert_eq!(bare, spelled, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn a_box_measures_at_its_own_runs_size() {
+        // "aaaa" at 10 pt and "bbbb" at 20 pt under a 0.6 em ratio: 4×6 + 4×12 = 72 pt, not 8×6 or
+        // 8×12. Hand-computed, because the point is that neither run's size answers for the other.
+        let runs = ["aaaa", "bbbb"];
+        let formats = [at(10.0), at(20.0)];
+        let lines = justify_runs_indented(
+            &runs,
+            &formats,
+            1000.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(lines.len(), 1);
+        let offsets = span_offsets(&lines[0], &formats, at(10.0), &MONO);
+        assert_eq!(offsets.len(), 2);
+        assert!((offsets[0] - 0.0).abs() < 0.001);
+        assert!(
+            (offsets[1] - 24.0).abs() < 0.001,
+            "the second run starts after four 6 pt characters, got {}",
+            offsets[1]
+        );
+    }
+
+    #[test]
+    fn glue_measures_at_the_size_of_the_run_it_sits_in() {
+        // One space, in a 20 pt run, is 12 pt wide — not the paragraph's 6.
+        let big = ["aa bb"];
+        let wide = justify_runs_indented(
+            &big,
+            &[at(20.0)],
+            1000.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        let offsets = span_offsets(&wide[0], &[at(20.0)], at(10.0), &MONO);
+        assert_eq!(offsets, vec![0.0]);
+        // Measured directly: five characters at 12 pt each.
+        assert!((MONO.measure_format("aa bb", at(20.0)) - 60.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_measure_is_judged_at_its_own_size() {
+        // Spec 0060's ragged predicate. "aaaaaa" is 36 pt at 10 pt and 72 pt at 20 pt, so at a
+        // 50 pt measure the same word overflows in one run's format and fits in the other's. Asking
+        // the paragraph's size about it would answer for a word nobody set.
+        let fits = justify_runs_indented(
+            &["aaaaaa"],
+            &[at(10.0)],
+            50.0,
+            Indent::default(),
+            10.0,
+            Alignment::Justified,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(fits.len(), 1);
+        let over = justify_runs_indented(
+            &["aaaaaa"],
+            &[at(20.0)],
+            50.0,
+            Indent::default(),
+            10.0,
+            Alignment::Justified,
+            &MONO,
+            &NoHyphenator,
+        );
+        // Set ragged, so no line is drawn past its measure on the strength of shrink nobody spends.
+        assert!(over.iter().all(|l| l.space_adjust_pt == 0.0));
+    }
+
+    #[test]
+    fn a_face_change_splits_the_measurement_and_a_colour_change_does_not() {
+        // Two runs of the same format measure as one string; two runs of different formats measure
+        // either side of the boundary. Under a monospace stub the two agree numerically — what is
+        // asserted is that the *segmentation* follows the format and not the run.
+        let runs = ["Wa", "Va"];
+        let same = [at(10.0), at(10.0)];
+        let differs = [
+            at(10.0),
+            RunFormat {
+                weight: 700,
+                ..at(10.0)
+            },
+        ];
+        let one = justify_runs_indented(
+            &runs,
+            &same,
+            1000.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        let two = justify_runs_indented(
+            &runs,
+            &differs,
+            1000.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(one[0].text, two[0].text, "the text is the same either way");
+        assert_eq!(
+            one[0].spans.len(),
+            2,
+            "the span map is per run, not per format"
+        );
+        assert_eq!(two[0].spans.len(), 2);
+    }
+
+    #[test]
+    fn tracking_widens_a_run_and_reaches_the_breaker() {
+        let plain = MONO.measure_format("abcd", at(10.0));
+        let tracked = MONO.measure_format(
+            "abcd",
+            RunFormat {
+                tracking_pt: 2.0,
+                ..at(10.0)
+            },
+        );
+        assert!((tracked - plain - 8.0).abs() < 0.001);
+
+        // And it moves a break: four 6 pt characters fit a 25 pt measure; tracked at 2 pt each they
+        // do not.
+        let loose = [RunFormat {
+            tracking_pt: 2.0,
+            ..at(10.0)
+        }];
+        let lines = justify_runs_indented(
+            &["abcd abcd"],
+            &loose,
+            25.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(lines.len(), 2, "tracking should force the second word down");
+    }
+
+    /// The drawn width of a line: its natural width plus every justification adjustment spent
+    /// inside it — the same sum the writer's `TJ` array and the screen painter's pen produce.
+    fn line_width(line: &Line, formats: &[RunFormat], default: RunFormat) -> f32 {
+        let spaces = line.text.matches(' ').count() as f32;
+        natural_width(&line.text, &line.spans, formats, default, &MONO)
+            + spaces * line.space_adjust_pt
+    }
+
+    #[test]
+    fn no_line_of_a_mixed_format_paragraph_is_drawn_past_its_measure() {
+        // Spec 0060 under spec 0064's per-box sizes, and the check spec 0051's pruning has to stay
+        // sound for: a retired start must never have been one that could have produced a fitting
+        // line. A line wider than its measure would be the visible symptom of either being wrong.
+        let runs = [
+            "the quick brown ",
+            "fox jumps ",
+            "over the lazy dog and runs ",
+            "on and on",
+        ];
+        let formats = [
+            at(10.0),
+            RunFormat {
+                size_pt: 14.0,
+                weight: 700,
+                ..at(14.0)
+            },
+            at(10.0),
+            RunFormat {
+                tracking_pt: 0.5,
+                ..at(10.0)
+            },
+        ];
+        for measure in [70.0, 110.0, 160.0, 240.0] {
+            for align in [Alignment::Left, Alignment::Justified] {
+                let lines = justify_runs_indented(
+                    &runs,
+                    &formats,
+                    measure,
+                    Indent::default(),
+                    10.0,
+                    align,
+                    &MONO,
+                    &NoHyphenator,
+                );
+                assert!(!lines.is_empty(), "measure {measure} produced nothing");
+                for (i, line) in lines.iter().enumerate() {
+                    let drawn = line_width(line, &formats, at(10.0));
+                    // A justified interior line may legitimately reach its measure; nothing may
+                    // exceed it. The tolerance is one shrink allowance, which is what a justified
+                    // line is permitted to have spent.
+                    assert!(
+                        drawn <= measure + 0.01,
+                        "line {i} of {align:?} at measure {measure} drew to {drawn}: {:?}",
+                        line.text
+                    );
+                }
+                // And the text is all there: no box was lost at a format boundary.
+                let joined: String = lines
+                    .iter()
+                    .map(|l| l.text.replace('-', ""))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                for word in runs.concat().split_whitespace() {
+                    assert!(joined.contains(word), "lost {word:?} at measure {measure}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_space_between_two_faces_is_measured_where_it_is_drawn() {
+        // The breaker measures an inter-word space once; the writer and the painter measure it again
+        // when they place the span after it. Both have to pick the *same* run's format, or a space
+        // at a face change is one width in the line breaker and another on the page — which is a
+        // line drawn past its measure by exactly that difference.
+        let runs = ["Alpha", " beta"];
+        let formats = [at(24.0), at(10.0)];
+        let lines = justify_runs_indented(
+            &runs,
+            &formats,
+            1000.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(lines.len(), 1);
+        let drawn = natural_width(&lines[0].text, &lines[0].spans, &formats, at(10.0), &MONO);
+        // What the breaker put in the item stream: five 14.4 pt boxes, one space in the *first*
+        // run's format, four 6 pt boxes.
+        let measured = 5.0 * 14.4 + 14.4 + 4.0 * 6.0;
+        assert!(
+            (drawn - measured).abs() < 0.001,
+            "breaker measured {measured}, drawn {drawn}"
+        );
+    }
+
+    #[test]
+    fn span_offsets_account_for_the_justification_already_spent() {
+        // A span after an inter-word space starts where that space's stretched width put it — the
+        // same accumulation the writer's `TJ` array performs.
+        let line = Line {
+            text: "aa bb".into(),
+            spans: vec![
+                Span {
+                    run: 0,
+                    len_bytes: 3,
+                },
+                Span {
+                    run: 1,
+                    len_bytes: 2,
+                },
+            ],
+            space_adjust_pt: 4.0,
+            indent_pt: 0.0,
+        };
+        let formats = [at(10.0), at(10.0)];
+        let offsets = span_offsets(&line, &formats, at(10.0), &MONO);
+        // "aa " is three characters at 6 pt, plus one spent adjustment.
+        assert!((offsets[1] - 22.0).abs() < 0.001, "got {}", offsets[1]);
     }
 }

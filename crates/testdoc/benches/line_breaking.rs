@@ -5,7 +5,9 @@
 //! layout with unchanged per-paragraph cost points at the engine, not the breaker.
 
 use quill_testdoc::{document_with_blocks, SynthSpec, HARNESS_METRICS};
-use quill_text_layout::{justify_paragraph_hyphenated, Alignment, NoHyphenator};
+use quill_text_layout::{
+    justify_paragraph_hyphenated, justify_runs_indented, Alignment, Indent, NoHyphenator, RunFormat,
+};
 
 mod budget;
 
@@ -111,6 +113,60 @@ fn main() {
         pathological_ms,
         &mut failures,
     );
+
+    // Spec 0064: the same corpus broken as *mixed-format* runs — every paragraph cut into three
+    // runs, the middle one bold and a point larger. The cost this measures is the one the family
+    // adds: a box that straddles a face change is split and measured twice, and the glue and the
+    // hyphen are measured per boundary instead of once per paragraph.
+    //
+    // Budgeted as a *ratio* against the single-face pass above, not as an absolute: a ratio is
+    // machine-independent, which is the lesson `us_per_paragraph`'s own comment records.
+    let thirds: Vec<[String; 3]> = paragraphs
+        .iter()
+        .map(|p| {
+            let words: Vec<&str> = p.split(' ').collect();
+            let a = words.len() / 3;
+            let b = 2 * words.len() / 3;
+            [
+                words[..a].join(" ") + " ",
+                words[a..b].join(" ") + " ",
+                words[b..].join(" "),
+            ]
+        })
+        .collect();
+    let formats = [
+        RunFormat::plain(quill_text_layout::BODY_FONT_SIZE_PT),
+        RunFormat {
+            size_pt: quill_text_layout::BODY_FONT_SIZE_PT + 1.0,
+            weight: 700,
+            italic: false,
+            tracking_pt: 0.0,
+        },
+        RunFormat::plain(quill_text_layout::BODY_FONT_SIZE_PT),
+    ];
+    let mixed = budget::min_of(3, || {
+        for parts in &thirds {
+            let runs: Vec<&str> = parts.iter().map(String::as_str).collect();
+            std::hint::black_box(justify_runs_indented(
+                &runs,
+                &formats,
+                FRAME_WIDTH_PT,
+                Indent::default(),
+                quill_text_layout::BODY_FONT_SIZE_PT,
+                Alignment::Justified,
+                &HARNESS_METRICS,
+                &NoHyphenator,
+            ));
+        }
+    });
+    let mixed_ratio = mixed.as_secs_f64() / elapsed.as_secs_f64().max(f64::EPSILON);
+    println!(
+        "mixed-face: {} paragraphs of three runs in {:.1} ms  ({:.2}x the single-face pass)",
+        thirds.len(),
+        mixed.as_secs_f64() * 1000.0,
+        mixed_ratio
+    );
+    budgets.check("line_breaking.mixed_face_ratio", mixed_ratio, &mut failures);
 
     budget::report(failures);
 }

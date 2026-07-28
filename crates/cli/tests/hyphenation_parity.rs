@@ -109,7 +109,7 @@ fn line_texts(pages: &[LaidOutPage]) -> Vec<String> {
 
 #[test]
 fn the_screen_and_the_press_break_lines_identically() {
-    let font = quill_fonts::Font::bundled();
+    let font = quill_fonts::FontFamily::bundled();
     let opts = ExportOptions::default();
     for (name, doc) in corpus() {
         let screen = quill_render::lay_out_for_screen(&doc, &font);
@@ -143,7 +143,7 @@ fn the_screen_and_the_press_break_lines_identically() {
 /// the parity assertion has stopped meaning anything.
 #[test]
 fn the_corpus_is_hyphenation_sensitive() {
-    let font = quill_fonts::Font::bundled();
+    let font = quill_fonts::FontFamily::bundled();
     let mut differed = 0;
     for (name, doc) in corpus() {
         let with = quill_render::lay_out_for_screen(&doc, &font);

@@ -372,9 +372,9 @@ impl ProxyCache {
 /// written last.
 pub fn lay_out_for_screen(
     doc: &quill_core_model::Document,
-    font: &quill_fonts::Font,
+    family: &quill_fonts::FontFamily,
 ) -> Vec<quill_layout_engine::LaidOutPage> {
-    quill_layout_engine::lay_out(doc, font, &quill_fonts::HypherHyphenator)
+    quill_layout_engine::lay_out(doc, family, &quill_fonts::HypherHyphenator)
 }
 
 #[cfg(test)]

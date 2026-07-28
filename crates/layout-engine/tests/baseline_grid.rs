@@ -38,6 +38,8 @@ fn gridded_styles() -> StyleSheet {
         style.leading_pt = (style.leading_pt / STEP).ceil() * STEP;
     }
     let on_grid = |size: f32, steps: f32, before: f32, after: f32, indent: Indent| ParagraphStyle {
+        weight: Default::default(),
+        italic: false,
         list: None,
         font_size_pt: size,
         leading_pt: STEP * steps,
@@ -555,5 +557,76 @@ fn each_fragment_of_a_split_component_snaps() {
     assert!(
         off.is_empty(),
         "these (page, block) fragments start off the grid: {off:?}"
+    );
+}
+
+/// Spec 0064: a run set larger does not move the line it sits on, and does not move the lines after
+/// it.
+///
+/// This is the decision spec 0058 requires rather than an omission. A gridded line's position is set
+/// by the paragraph's leading; if it were set by the tallest run on the line, emphasising a word
+/// would move the line — on screen and on the page — and a grid that a run can push off itself is
+/// not a grid.
+#[test]
+fn a_larger_run_does_not_move_the_line_it_sits_on() {
+    use quill_core_model::{InlineStyle, Run, Weight};
+
+    let styles = gridded_styles();
+    let plain = quill_core_model::Block::body_runs(
+        vec![Run::plain(
+            "the vault door had not opened in three hundred years",
+        )],
+        INK,
+    );
+    let mixed = quill_core_model::Block::body_runs(
+        vec![
+            Run::plain("the vault door had "),
+            Run {
+                text: "not".into(),
+                style: InlineStyle {
+                    size_pt: Some(18.0),
+                    weight: Some(Weight::BOLD),
+                    ..InlineStyle::EMPTY
+                },
+            },
+            Run::plain(" opened in three hundred years"),
+        ],
+        INK,
+    );
+
+    let baselines = |block: Block| -> Vec<f32> {
+        let mut doc = gridded_doc(
+            Size {
+                w_pt: 432.0,
+                h_pt: 648.0,
+            },
+            vec![block],
+        );
+        doc.styles = styles.clone();
+        let pages = lay_out(&doc, &METRICS, &NoHyphenator);
+        pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text {
+                    frame,
+                    lines,
+                    font_size_pt,
+                    leading_pt,
+                    ..
+                } => Some((frame.y_pt, lines.len(), *font_size_pt, *leading_pt)),
+                _ => None,
+            })
+            .map(|(y, n, size, leading)| {
+                let ascent = METRICS.ascent_pt(size);
+                (0..n).map(|i| y + ascent + i as f32 * leading).sum::<f32>()
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        baselines(plain),
+        baselines(mixed),
+        "an 18 pt run inside a 10 pt paragraph moved a baseline"
     );
 }

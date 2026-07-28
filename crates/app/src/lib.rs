@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use quill_core_model::{page_geom, Block, BlockId, Document, LoadError, Template, Tpub};
-use quill_fonts::Font;
+use quill_fonts::FontFamily;
 use quill_layout_engine::{LaidOutPage, LayoutSession, LayoutStats};
 use quill_render::{paint_page, PaintOp, PopulateReport, ProxyCache};
 // The real en-US hyphenator, not `NoHyphenator` (spec 0059): the canvas is the screen path, and a
@@ -67,7 +67,7 @@ pub struct EditOutcome {
 pub struct AppState {
     doc: Document,
     asset_root: PathBuf,
-    font: Font,
+    font: FontFamily,
     session: LayoutSession,
     pages: Vec<LaidOutPage>,
     proxies: ProxyCache,
@@ -105,7 +105,7 @@ impl AppState {
         let mut state = AppState {
             doc,
             asset_root,
-            font: Font::bundled(),
+            font: FontFamily::bundled(),
             session: LayoutSession::new(),
             pages: Vec::new(),
             proxies: ProxyCache::new(),

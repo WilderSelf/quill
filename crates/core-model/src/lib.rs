@@ -352,15 +352,38 @@ impl Run {
     }
 }
 
+/// How heavy a face is, on the `OS/2` `usWeightClass` scale the faces themselves are labelled on
+/// (spec 0064).
+///
+/// A number rather than a `Bold` flag, and deliberately: the general mechanism is the one a family
+/// with a Light and a Semibold can also use, and a boolean would have to be replaced rather than
+/// extended the first time one appeared. The bundled family answers 400 and 700; asking for 300 gets
+/// the nearest it has, and is told so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Weight(pub u16);
+
+impl Weight {
+    pub const REGULAR: Weight = Weight(400);
+    pub const BOLD: Weight = Weight(700);
+
+    pub fn is_regular(&self) -> bool {
+        *self == Weight::REGULAR
+    }
+}
+
+impl Default for Weight {
+    fn default() -> Weight {
+        Weight::REGULAR
+    }
+}
+
 /// A run's overrides of the paragraph treatment it sits in.
 ///
 /// Every field is an `Option` *override* rather than a value, so "absent" and "the same as the
 /// paragraph's" stay distinguishable: editing a paragraph style must move a run that did not opt
 /// out, and must not move one that did.
 ///
-/// Weight and italic are deliberately absent — see spec 0064. They are not a model gap: `quill-fonts`
-/// has exactly one face, so bold is a font *family* the workspace does not have rather than an
-/// override this struct is missing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct InlineStyle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -373,6 +396,12 @@ pub struct InlineStyle {
     /// Vertical offset from the baseline. Positive raises — a superscript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_shift_pt: Option<Pt>,
+    /// Which weight of the family to set this run in (spec 0064).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<Weight>,
+    /// Whether to set this run in the family's italic (spec 0064).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
 }
 
 impl InlineStyle {
@@ -381,6 +410,8 @@ impl InlineStyle {
         color: None,
         tracking_pt: None,
         baseline_shift_pt: None,
+        weight: None,
+        italic: None,
     };
 
     pub fn is_empty(&self) -> bool {
@@ -535,6 +566,17 @@ impl Block {
         }
     }
 
+    /// A heading of already-built runs.
+    pub fn heading_runs(level: u8, runs: Vec<Run>, color: Color) -> Block {
+        Block::Heading {
+            id: BlockId::UNASSIGNED,
+            level,
+            runs,
+            color,
+            style: None,
+        }
+    }
+
     /// A heading with no id yet, taking the default `h{level}` style.
     pub fn heading(level: u8, text: impl Into<String>, color: Color) -> Block {
         Block::Heading {
@@ -628,6 +670,14 @@ pub struct ParagraphStyle {
     /// names no list serializes and lays out exactly as it did before lists existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list: Option<ListSpec>,
+    /// Which weight of the family this paragraph is set in (spec 0064).
+    ///
+    /// Here as well as on [`InlineStyle`] so that a run has a face to override rather than a
+    /// constant to contradict — the same reason `font_size_pt` lives here and `size_pt` lives there.
+    #[serde(default, skip_serializing_if = "Weight::is_regular")]
+    pub weight: Weight,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub italic: bool,
 }
 
 /// A paragraph set as a list item: what marks it, and at what depth (spec 0066).
@@ -789,6 +839,8 @@ impl Default for ParagraphStyle {
             space_after_pt: 0.0,
             indent: Indent::ZERO,
             list: None,
+            weight: Weight::REGULAR,
+            italic: false,
         }
     }
 }
@@ -864,6 +916,8 @@ impl Default for StyleSheet {
             paragraph.insert(
                 name.to_string(),
                 ParagraphStyle {
+                    weight: Weight::REGULAR,
+                    italic: false,
                     align: TextAlign::Left,
                     indent: Indent {
                         first_pt: LIST_GUTTER_PT,
@@ -892,6 +946,8 @@ impl Default for StyleSheet {
             paragraph.insert(
                 heading_style_name(level),
                 ParagraphStyle {
+                    weight: Weight::REGULAR,
+                    italic: false,
                     list: None,
                     font_size_pt: size,
                     leading_pt: leading,
@@ -908,6 +964,8 @@ impl Default for StyleSheet {
         paragraph.insert(
             PANEL_TITLE_STYLE.to_string(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 13.0,
                 leading_pt: 16.0,
@@ -920,6 +978,8 @@ impl Default for StyleSheet {
         paragraph.insert(
             PANEL_ATTR_STYLE.to_string(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.0,
@@ -932,6 +992,8 @@ impl Default for StyleSheet {
         paragraph.insert(
             PANEL_BODY_STYLE.to_string(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
@@ -948,6 +1010,8 @@ impl Default for StyleSheet {
         paragraph.insert(
             TABLE_HEADER_STYLE.to_string(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
@@ -960,6 +1024,8 @@ impl Default for StyleSheet {
         paragraph.insert(
             TABLE_CELL_STYLE.to_string(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 9.0,
                 leading_pt: 11.5,
@@ -976,6 +1042,8 @@ impl Default for StyleSheet {
         paragraph.insert(
             TOC_TITLE_STYLE.to_string(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 18.0,
                 leading_pt: 22.0,
@@ -990,6 +1058,8 @@ impl Default for StyleSheet {
             paragraph.insert(
                 toc_entry_style_name(level),
                 ParagraphStyle {
+                    weight: Weight::REGULAR,
+                    italic: false,
                     list: None,
                     font_size_pt: size,
                     leading_pt: size + 4.0,
@@ -1813,6 +1883,8 @@ mod tests {
         sheet.paragraph.insert(
             "sidebar".into(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 8.0,
                 leading_pt: 9.5,
@@ -1849,6 +1921,8 @@ mod tests {
         doc.styles.paragraph.insert(
             "callout".into(),
             ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
                 list: None,
                 font_size_pt: 13.5,
                 leading_pt: 16.0,
