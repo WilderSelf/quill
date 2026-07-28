@@ -820,22 +820,28 @@ pub fn justify_paragraph_indented(
 ) -> Vec<Line> {
     let first_w = max_width_pt - indent.first_pt;
     let rest_w = max_width_pt - indent.rest_pt;
-    // Tell the breaker whether these lines will actually be shrunk (spec 0060). A ragged paragraph
-    // draws every line at its natural width, so the shrink allowance Knuth-Plass grants an over-wide
-    // line is a promise this function never keeps — and the line is drawn past its measure.
+
+    // Whether these lines will be drawn at their natural width. Computed **before** breaking and
+    // used for both decisions, because the two must agree: the breaker is told whether a
+    // shrink allowance will actually be spent, and the renderer below then spends it or does not.
     //
-    // The greedy-fallback case is *not* covered here, and cannot be: it is detected below, after
-    // breaking, and in that case some single word is wider than the measure so no breaking keeps
-    // every line inside it. Laying out visibly beats not laying out (spec 0018).
-    let lines = break_paragraph_shrinkable(
-        text,
-        first_w,
-        rest_w,
-        size_pt,
-        metrics,
-        hyphenator,
-        align == Alignment::Justified,
-    );
+    // Getting this wrong is not hypothetical. The first version of spec 0060 passed
+    // `align == Justified` to the breaker while the `ragged` predicate here *also* fired whenever
+    // any word exceeded the measure — so a justified paragraph containing one long-but-hyphenatable
+    // word was broken as shrinkable and then rendered ragged, and its interior lines were drawn up
+    // to a whole shrink past the measure. Measured: `the extraordinarily grim and dark and cold
+    // corridor runs on and on and on for ever` at a 72 pt measure drew `and on and on` to 78 pt.
+    //
+    // One predicate, one answer. A paragraph containing a word wider than the measure is set
+    // ragged, and telling the breaker so is what makes it look for a breaking where every line
+    // fits — through hyphenation, where hyphenation can reach it — instead of one that relies on
+    // shrink nobody applies.
+    let ragged = align == Alignment::Left
+        || text
+            .split_whitespace()
+            .any(|w| metrics.measure_run(w, size_pt) > first_w.min(rest_w));
+    let lines =
+        break_paragraph_shrinkable(text, first_w, rest_w, size_pt, metrics, hyphenator, !ragged);
 
     // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
     // would need to shrink past its glue, so justifying it would push spaces negative).
@@ -849,10 +855,6 @@ pub fn justify_paragraph_indented(
         }
     };
 
-    let ragged = align == Alignment::Left
-        || text
-            .split_whitespace()
-            .any(|w| metrics.measure_run(w, size_pt) > first_w.min(rest_w));
     if ragged {
         return lines
             .into_iter()

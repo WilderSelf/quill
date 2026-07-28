@@ -257,6 +257,26 @@ pub enum ComponentDefError {
         def: String,
         source: String,
     },
+    /// A `repeat` section that is not part of the definition's leading run of them.
+    ///
+    /// `repeat` means "the prefix every continuation re-states", and the interpreter implements
+    /// that by capturing *everything emitted so far* when it reaches the last repeated section. A
+    /// repeated section with ordinary content above it therefore re-states that content too, and a
+    /// cut component duplicates it on every continuation — silently, with no preflight finding,
+    /// through the one channel a stranger's content arrives by.
+    RepeatNotAPrefix {
+        def: String,
+        index: usize,
+    },
+    /// A measurement that is negative or not finite. Geometry, unlike a style name, has no sane
+    /// fallback: a negative panel padding draws text outside its own panel and off the page, and
+    /// spec 0050's safe-area check exempts anything outward of trim as deliberate bleed — so
+    /// nothing downstream would report it.
+    BadMeasure {
+        def: String,
+        field: String,
+        value: f32,
+    },
     /// A definition filed under one name that calls itself another. `Block::Component { def }`
     /// resolves the key, so a mismatch means the definition that was validated is not the one that
     /// would be laid out.
@@ -297,6 +317,17 @@ impl fmt::Display for ComponentDefError {
                 "component definition `{def}` renders field `{source}` in two sections, which \
                  would set it twice"
             ),
+            ComponentDefError::RepeatNotAPrefix { def, index } => write!(
+                f,
+                "component definition `{def}`, section {index}: a `repeat` section must come \
+                 before every non-repeated one — it is the prefix each continuation re-states, so \
+                 content above it would be re-stated too"
+            ),
+            ComponentDefError::BadMeasure { def, field, value } => write!(
+                f,
+                "component definition `{def}`: `{field}` is {value}, which must be a finite, \
+                 non-negative measurement in points"
+            ),
             ComponentDefError::NameMismatch { key, def } => write!(
                 f,
                 "component definition filed under `{key}` calls itself `{def}`"
@@ -306,6 +337,18 @@ impl fmt::Display for ComponentDefError {
 }
 
 impl std::error::Error for ComponentDefError {}
+
+/// A declared measurement must be finite and non-negative.
+fn check_measure(def: &str, field: &str, value: f32) -> Result<(), ComponentDefError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(ComponentDefError::BadMeasure {
+            def: def.to_string(),
+            field: field.to_string(),
+            value,
+        });
+    }
+    Ok(())
+}
 
 impl ComponentDef {
     /// Refuse a definition this build cannot lay out correctly.
@@ -325,8 +368,43 @@ impl ComponentDef {
                 def: self.name.clone(),
             });
         }
+        // Panel geometry, before anything else reads it.
+        check_measure(&self.name, "panel.padding_pt", self.panel.padding_pt)?;
+        if let Some(stroke) = &self.panel.stroke {
+            check_measure(&self.name, "panel.stroke.width_pt", stroke.width_pt)?;
+        }
+
         let mut seen: Vec<&str> = Vec::with_capacity(self.sections.len());
+        // A `repeat` section must be part of the definition's leading run of them. See
+        // `ComponentDefError::RepeatNotAPrefix`.
+        let mut seen_ordinary = false;
         for (index, s) in self.sections.iter().enumerate() {
+            if s.repeat && seen_ordinary {
+                return Err(ComponentDefError::RepeatNotAPrefix {
+                    def: self.name.clone(),
+                    index,
+                });
+            }
+            if !s.repeat {
+                seen_ordinary = true;
+            }
+            for (field, rule) in [("rule_above", &s.rule_above), ("rule_below", &s.rule_below)] {
+                if let Some(rule) = rule {
+                    for (what, v) in [
+                        ("thickness_pt", rule.thickness_pt),
+                        ("gap_above_pt", rule.gap_above_pt),
+                        ("gap_below_pt", rule.gap_below_pt),
+                    ] {
+                        check_measure(&self.name, &format!("{field}.{what}"), v)?;
+                    }
+                }
+            }
+            if let SectionShape::Rows {
+                cell_padding_pt, ..
+            } = &s.shape
+            {
+                check_measure(&self.name, "cell_padding_pt", *cell_padding_pt)?;
+            }
             if s.source.trim().is_empty() {
                 return Err(ComponentDefError::SectionMissingSource {
                     def: self.name.clone(),
@@ -546,6 +624,106 @@ mod tests {
     /// The strongest form of spec 0054's "a pack may not make output less press-correct": a
     /// definition *cannot express* RGB decoration at all, so there is no path by which a component
     /// from a stranger introduces a colour space PDF/X-1a forbids.
+    /// A `repeat` section with ordinary content above it duplicates that content on every
+    /// continuation, silently and with no preflight finding — through the one channel a stranger's
+    /// content arrives by. Refused at validation, which is where a pack is checked.
+    #[test]
+    fn a_repeat_section_must_come_before_every_ordinary_one() {
+        let section = |source: &str, repeat: bool| SectionDef {
+            source: source.into(),
+            style: "body".into(),
+            shape: SectionShape::Lines,
+            rule_above: None,
+            rule_below: None,
+            repeat,
+        };
+
+        // A header first, then rows: the bundled table's shape, and legal.
+        let mut ok = ok_def();
+        ok.sections = vec![section("header", true), section("rows", false)];
+        assert_eq!(ok.validate(), Ok(()));
+
+        // Two repeated sections, then content: also a prefix, also legal.
+        let mut two = ok_def();
+        two.sections = vec![
+            section("banner", true),
+            section("header", true),
+            section("rows", false),
+        ];
+        assert_eq!(two.validate(), Ok(()));
+
+        // Content, then a repeated section: the duplication case.
+        let mut bad = ok_def();
+        bad.sections = vec![
+            section("intro", false),
+            section("banner", true),
+            section("meat", false),
+        ];
+        let err = bad.validate().unwrap_err();
+        assert!(
+            matches!(err, ComponentDefError::RepeatNotAPrefix { index: 1, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("thing"), "must name it: {err}");
+    }
+
+    /// Geometry has no sane fallback the way a style name does. A negative padding draws text
+    /// outside its own panel and off the page, and spec 0050's safe-area check exempts anything
+    /// outward of trim as deliberate bleed — so nothing downstream reports it.
+    #[test]
+    fn a_negative_or_infinite_measurement_is_refused() {
+        for bad in [-40.0_f32, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let mut d = ok_def();
+            d.panel.padding_pt = bad;
+            assert!(
+                matches!(
+                    d.validate(),
+                    Err(ComponentDefError::BadMeasure { ref field, .. }) if field == "panel.padding_pt"
+                ),
+                "padding {bad} must be refused"
+            );
+
+            let mut stroke = ok_def();
+            stroke.panel.stroke = Some(DefStroke {
+                color: DefColor::Gray { v: 0.5 },
+                width_pt: bad,
+            });
+            assert!(matches!(
+                stroke.validate(),
+                Err(ComponentDefError::BadMeasure { .. })
+            ));
+
+            let mut rule = ok_def();
+            rule.sections[0].rule_above = Some(RuleDef {
+                color: DefColor::Gray { v: 0.5 },
+                thickness_pt: 0.5,
+                gap_above_pt: bad,
+                gap_below_pt: 0.0,
+                full_width: false,
+            });
+            assert!(matches!(
+                rule.validate(),
+                Err(ComponentDefError::BadMeasure { .. })
+            ));
+
+            let mut cell = ok_def();
+            cell.sections[0].shape = SectionShape::Rows {
+                widths: None,
+                cell_padding_pt: bad,
+                zebra: None,
+            };
+            assert!(matches!(
+                cell.validate(),
+                Err(ComponentDefError::BadMeasure { .. })
+            ));
+        }
+
+        // Zero is fine — a table has no panel padding at all.
+        let mut zero = ok_def();
+        zero.panel.padding_pt = 0.0;
+        assert_eq!(zero.validate(), Ok(()));
+    }
+
     #[test]
     fn a_definition_cannot_declare_rgb_decoration() {
         assert!(

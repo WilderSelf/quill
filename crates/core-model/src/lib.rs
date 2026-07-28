@@ -151,7 +151,7 @@ impl BaselineGrid {
         self.step_pt.is_finite() && self.step_pt > 0.0 && self.origin_pt.is_finite()
     }
 
-    /// The smallest grid position at or below `y_pt`, measured in the same page-top-relative space.
+    /// The first grid position at or **after** `y_pt`, in the same page-top-relative space.
     ///
     /// Snaps *down the page* (to a larger y), never up: moving a baseline up could pull it above
     /// the frame it was placed in, or on top of the block before it.

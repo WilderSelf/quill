@@ -124,6 +124,23 @@ impl PackManifest {
                 });
             }
         }
+        // `name` and `version` are not just labels: `install_dir` builds the install path from
+        // them (`<root>/<name>/<version>/`), so a `..` in either escapes the pack root and writes
+        // `pack.json` and every declared asset wherever it likes. Checked here, before a byte is
+        // written anywhere, because a pack is the one artifact in this system that routinely comes
+        // from someone else — which is exactly what spec 0055 claimed and did not do.
+        //
+        // One path component each, not merely a safe relative path: `a/b` would nest the install
+        // silently and make `installed()`'s two-level walk miss it.
+        for value in [&self.name, &self.version] {
+            let ok = safe_relative_path(value).is_some_and(|p| p.components().count() == 1);
+            if !ok {
+                return Err(LoadError::PackUnsafePath {
+                    pack: self.name.clone(),
+                    path: value.clone(),
+                });
+            }
+        }
         for asset in &self.assets {
             if safe_relative_path(&asset.path).is_none() {
                 return Err(LoadError::PackUnsafePath {
@@ -520,6 +537,39 @@ mod tests {
             other => panic!("expected a version refusal, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `install_dir` builds `<root>/<name>/<version>/` from these two strings, so a `..` in either
+    /// escapes the pack root and writes the manifest and every asset outside it. Spec 0055 claimed
+    /// this was checked "before a byte is written anywhere"; until this test it was not.
+    #[test]
+    fn a_traversing_name_or_version_is_refused() {
+        for bad in ["../../../escaped", "..", "/absolute", "a/b", ".", ""] {
+            let mut by_name = sample_pack();
+            by_name.name = bad.into();
+            assert!(
+                by_name.validate().is_err(),
+                "a pack named `{bad}` must not validate"
+            );
+
+            let mut by_version = sample_pack();
+            by_version.version = bad.into();
+            assert!(
+                by_version.validate().is_err(),
+                "a pack at version `{bad}` must not validate"
+            );
+        }
+
+        // And the ordinary case still passes, including a dotted version.
+        let ok = sample_pack();
+        assert_eq!(ok.name, "ashen-vault");
+        assert_eq!(ok.version, "1.2.0");
+        ok.validate().expect("a normal pack validates");
+
+        // The install path stays under the root for anything that validates.
+        let root = Path::new("/packs");
+        let dest = crate::install_dir(root, &ok.name, &ok.version);
+        assert!(dest.starts_with(root), "{dest:?} escaped {root:?}");
     }
 
     #[test]
