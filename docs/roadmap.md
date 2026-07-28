@@ -16,7 +16,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0037 and 0040 shipped |
+| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0038 and 0040 shipped |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
 
@@ -913,7 +913,7 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   already does), not on each template. Not done in 0036 because it changes a serialized 0030 type
   and would have carried a model change inside a templates increment.
 
-- **A block never splits across frames, so a two-column page ends ragged.** The pagination loop
+- **A block never splits across frames — now wanted by three callers.** The pagination loop
   moves a whole block to the next frame when it does not fit, rather than breaking the paragraph
   across the column boundary. On a single-column page this is invisible; on spec 0036's two-column
   `rulebook` template it leaves a visible gap at the foot of a column whenever the next paragraph is
@@ -921,6 +921,24 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   the workspace produced a two-column page as its default before templates existed, which is why it
   had not been seen. This is a real typographic defect for the milestone's flagship template and
   should be sequenced into M2 or M3 explicitly; it is not a template setting that can work around it.
+
+  Spec 0038 raised the stakes and clarified the shape. Its roadmap entry promised stat-block
+  splitting at a section boundary; that was descoped, because splitting is not a stat-block feature
+  — paragraphs, stat blocks and tables all want the same mechanism, and building a stat-block-only
+  splitter would be the second of three implementations and would have to be undone. The real cost
+  is that `measure_block` takes a width and returns a height, with no notion of available height:
+  splitting means "measure this for at most H points, return a fragment and a remainder", which puts
+  height into the measurement-cache key, where the same block against a half-full frame and an empty
+  one becomes two entries — thrashing the hot path spec 0031 exists to keep cold. That design
+  question is what the increment would have to answer, and it deserves its own spec.
+
+- **A stat block's attribute keys wrap mid-key in a narrow measure.** `Armour Class: 15 (leather,
+  shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so
+  the key/value pairing is lost. Proper key/value columns or a hanging indent would fix it and
+  neither exists in the layout engine. Related, and the reason the colon is there at all:
+  `break_by_width` normalizes every run of inter-word whitespace to a single space, so a
+  wider-looking `"{key}  {value}"` separator collapses to an ordinary word space and separates
+  nothing. Found by rendering spec 0038's panel.
 
 ## Open questions
 

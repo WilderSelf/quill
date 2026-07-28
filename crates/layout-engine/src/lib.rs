@@ -14,7 +14,8 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
     Asset, Block, BlockId, Color, Document, Margins, MasterPage, MasterStatic, PageSetup,
-    ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN,
+    ParagraphStyle, Rect, StatBlock, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_ATTR_STYLE,
+    STATBLOCK_BODY_STYLE, STATBLOCK_TITLE_STYLE,
 };
 use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -483,6 +484,34 @@ pub(crate) enum Measured {
         /// The sized placement width (spec 0009), which may be narrower than the frame.
         width: f32,
     },
+    /// A composite: a decorated panel containing several independently-styled text runs
+    /// (spec 0038).
+    ///
+    /// Every offset is **relative to the block's own origin**, so the whole thing can be placed by
+    /// adding the flow cursor once. Measuring it as a unit is what makes it a single block to
+    /// pagination — it moves whole to the next frame when it does not fit, exactly as any other
+    /// block does.
+    Panel {
+        fill: Option<Color>,
+        stroke: Option<Stroke>,
+        parts: Vec<PanelPart>,
+        /// Horizontal rules inside the panel, as offsets from its top. What gives the panel
+        /// internal structure — without them the sections run together and it reads as a tinted
+        /// paragraph rather than as a stat block.
+        rules: Vec<f32>,
+    },
+}
+
+/// One styled run inside a [`Measured::Panel`], positioned relative to the panel's top-left.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PanelPart {
+    pub dx_pt: f32,
+    pub dy_pt: f32,
+    pub w_pt: f32,
+    pub lines: Vec<Line>,
+    pub color: Color,
+    pub font_size_pt: f32,
+    pub leading_pt: f32,
 }
 
 /// Break/size `block` against a frame of `width` points, returning the placement payload and its
@@ -531,6 +560,9 @@ pub(crate) fn measure_block(
                 height,
             ))
         }
+        Block::StatBlock { stat, color, .. } => Some(measure_stat_block(
+            stat, *color, width, styles, metrics, hyphenator,
+        )),
         Block::Image { asset, .. } => {
             // Resolve the asset id. If not found, skip this block (no panic).
             let asset_rec = *assets.get(asset.as_str())?;
@@ -546,6 +578,119 @@ pub(crate) fn measure_block(
             ))
         }
     }
+}
+
+/// Padding between a stat block's panel edge and its text, on all four sides.
+///
+/// A constant rather than an authored field: the panel is a built-in component whose whole value is
+/// that it looks right with no authoring, and a padding a user could set to zero would let text sit
+/// on the rule.
+pub const STATBLOCK_PADDING_PT: f32 = 6.0;
+
+/// The panel's background tint. 8% black — enough to read as a panel on paper, far enough inside
+/// the ink limit that it can never be the thing that fails preflight.
+const STATBLOCK_FILL: Color = Color::Gray { v: 0.92 };
+
+/// The panel's outer rule.
+const STATBLOCK_STROKE: Stroke = Stroke {
+    color: Color::Gray { v: 0.35 },
+    width_pt: 0.75,
+};
+
+/// Thickness of the hairlines that separate a stat block's sections.
+const SECTION_RULE_PT: f32 = 0.5;
+
+/// Space above and below each section rule.
+const SECTION_RULE_GAP_PT: f32 = 2.5;
+
+/// Break a stat block into a padded, tinted, ruled panel of styled runs (spec 0038).
+///
+/// The sections are laid in the order a table reads them — name, attributes, then the prose
+/// sections — each through the same Knuth-Plass path as body text, so a stat block's justification,
+/// hyphenation and metrics are the document's and not a second implementation.
+fn measure_stat_block(
+    stat: &StatBlock,
+    color: Color,
+    width: f32,
+    styles: &StyleSheet,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> (Measured, f32) {
+    let inner_w = (width - STATBLOCK_PADDING_PT * 2.0).max(1.0);
+    let mut parts: Vec<PanelPart> = Vec::new();
+    let mut y = STATBLOCK_PADDING_PT;
+
+    // Name, overview, attributes, details, actions, reactions — the order `StatBlock`'s own doc
+    // comment states, which is the order the compact layout this mirrors reads in. Getting it wrong
+    // puts the creature's type *after* its armour class, which is visibly not a stat block; the
+    // first draft did exactly that and only the render showed it.
+    //
+    // `Section` marks where a rule goes: after the name, and between each group that follows.
+    let mut runs: Vec<(String, &str, bool)> =
+        vec![(stat.name.clone(), STATBLOCK_TITLE_STYLE, true)];
+    let push_group = |runs: &mut Vec<(String, &str, bool)>, lines: Vec<String>| {
+        for (i, line) in lines.into_iter().enumerate() {
+            runs.push((line, STATBLOCK_BODY_STYLE, i == 0));
+        }
+    };
+    push_group(&mut runs, stat.overview.clone());
+    for (i, (k, v)) in stat.attributes.iter().enumerate() {
+        // A colon, not the two spaces this first used: `break_by_width` normalizes every run of
+        // inter-word whitespace to a single U+0020, so the intended visual gap collapsed to an
+        // ordinary word space and "Armour Class 15 (leather, shield)" read as one sentence. With no
+        // bold weight available, punctuation is what distinguishes the key.
+        runs.push((format!("{k}: {v}"), STATBLOCK_ATTR_STYLE, i == 0));
+    }
+    for section in [&stat.details, &stat.actions, &stat.reactions] {
+        push_group(&mut runs, section.clone());
+    }
+
+    let mut rules: Vec<f32> = Vec::new();
+    for (idx, (text, style_name, starts_section)) in runs.into_iter().enumerate() {
+        let style = styles
+            .paragraph
+            .get(style_name)
+            .copied()
+            .unwrap_or_default();
+        let lines = justify_paragraph_hyphenated(
+            &text,
+            inner_w,
+            style.font_size_pt,
+            Alignment::Left,
+            metrics,
+            hyphenator,
+        );
+        y += style.space_before_pt;
+        // A rule separates each section from the one above. Not before the first run, which has
+        // the panel's own edge above it.
+        if starts_section && idx > 0 {
+            y += SECTION_RULE_GAP_PT;
+            rules.push(y);
+            y += SECTION_RULE_GAP_PT;
+        }
+        let n = lines.len();
+        parts.push(PanelPart {
+            dx_pt: STATBLOCK_PADDING_PT,
+            dy_pt: y,
+            w_pt: inner_w,
+            lines,
+            color,
+            font_size_pt: style.font_size_pt,
+            leading_pt: style.leading_pt,
+        });
+        y += n as f32 * style.leading_pt + style.space_after_pt;
+    }
+
+    let height = y + STATBLOCK_PADDING_PT;
+    (
+        Measured::Panel {
+            fill: Some(STATBLOCK_FILL),
+            stroke: Some(STATBLOCK_STROKE),
+            parts,
+            rules,
+        },
+        height,
+    )
 }
 
 /// Flow `content` through a [`Thread`]'s frames, paginating across frames and then pages
@@ -800,12 +945,15 @@ pub(crate) fn flow(
                 continue; // re-measure against the frame it moved into
             }
 
-            let placed = match measured {
+            // A block usually yields one placed item; a composite (spec 0038) yields its panel
+            // plus one text run per section. Pagination still sees a single block — it moved whole
+            // to this frame or not at all.
+            let placed: Vec<PlacedBlock> = match measured {
                 Measured::Text {
                     lines,
                     color,
                     style,
-                } => PlacedBlock::Text {
+                } => vec![PlacedBlock::Text {
                     source: block.id(),
                     // The frame starts *below* the style's space-above: that space belongs to this
                     // block's height (so pagination reserves it) but no text is drawn in it.
@@ -822,8 +970,8 @@ pub(crate) fn flow(
                     // only thing the writer sees and it did not record how the text was measured.
                     font_size_pt: style.font_size_pt,
                     leading_pt: style.leading_pt,
-                },
-                Measured::Image { asset_id, width } => PlacedBlock::Image {
+                }],
+                Measured::Image { asset_id, width } => vec![PlacedBlock::Image {
                     source: block.id(),
                     frame: Rect {
                         x_pt: frame.rect.x_pt,
@@ -832,9 +980,52 @@ pub(crate) fn flow(
                         h_pt: height,
                     },
                     asset_id,
-                },
+                }],
+                Measured::Panel {
+                    fill,
+                    stroke,
+                    parts,
+                    rules,
+                } => {
+                    // The panel first, so it sits behind its own text — the same
+                    // decoration-before-content order the writer and the paint list rely on.
+                    let mut out = vec![PlacedBlock::Rect {
+                        frame: Rect {
+                            x_pt: frame.rect.x_pt,
+                            y_pt: y,
+                            w_pt: frame.rect.w_pt,
+                            h_pt: height,
+                        },
+                        fill,
+                        stroke,
+                    }];
+                    out.extend(rules.into_iter().map(|dy| PlacedBlock::Rect {
+                        frame: Rect {
+                            x_pt: frame.rect.x_pt + STATBLOCK_PADDING_PT,
+                            y_pt: y + dy,
+                            w_pt: (frame.rect.w_pt - STATBLOCK_PADDING_PT * 2.0).max(0.0),
+                            h_pt: SECTION_RULE_PT,
+                        },
+                        fill: Some(STATBLOCK_STROKE.color),
+                        stroke: None,
+                    }));
+                    out.extend(parts.into_iter().map(|p| PlacedBlock::Text {
+                        source: block.id(),
+                        frame: Rect {
+                            x_pt: frame.rect.x_pt + p.dx_pt,
+                            y_pt: y + p.dy_pt,
+                            w_pt: p.w_pt,
+                            h_pt: p.lines.len() as f32 * p.leading_pt,
+                        },
+                        lines: p.lines,
+                        color: p.color,
+                        font_size_pt: p.font_size_pt,
+                        leading_pt: p.leading_pt,
+                    }));
+                    out
+                }
             };
-            page.blocks.push(placed);
+            page.blocks.extend(placed);
             y += height;
             frame_empty = false;
             break;
@@ -2419,6 +2610,254 @@ mod tests {
         assert_eq!(verso.len(), 2);
         assert!((verso[0].rect.x_pt - 40.0).abs() < 0.01);
         assert!((verso[0].rect.w_pt - 162.0).abs() < 0.01);
+    }
+
+    // --- Stat blocks (spec 0038) ----------------------------------------------------------------
+
+    fn goblin() -> quill_core_model::StatBlock {
+        quill_core_model::StatBlock {
+            name: "Goblin".into(),
+            overview: vec!["Small humanoid, chaotic".into()],
+            attributes: vec![("AC".into(), "15".into()), ("HP".into(), "7".into())],
+            details: vec![],
+            actions: vec!["Scimitar. +4 to hit, 5 damage.".into()],
+            reactions: vec![],
+        }
+    }
+
+    fn stat_doc() -> Document {
+        let mut doc = doc_with_blocks(vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: goblin(),
+            color: Color::Gray { v: 0.0 },
+        }]);
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    #[test]
+    fn a_stat_block_places_a_panel_behind_its_own_text() {
+        let doc = stat_doc();
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let blocks = &pages[0].blocks;
+
+        assert!(
+            matches!(blocks[0], PlacedBlock::Rect { .. }),
+            "the panel must be placed first, so it sits behind its text"
+        );
+        // Name + 2 attributes + 1 overview + 1 action = 5 runs.
+        let texts = blocks
+            .iter()
+            .filter(|b| matches!(b, PlacedBlock::Text { .. }))
+            .count();
+        assert_eq!(texts, 5, "one run per section line");
+        let rects = blocks
+            .iter()
+            .filter(|b| matches!(b, PlacedBlock::Rect { .. }))
+            .count();
+        assert_eq!(rects, 4, "the panel plus one rule per section boundary");
+        assert_eq!(blocks.len(), 9, "and nothing else");
+    }
+
+    #[test]
+    fn a_stat_blocks_text_is_inset_by_the_padding_on_every_side() {
+        // The panel spans the frame; every run sits `STATBLOCK_PADDING_PT` inside it, and the last
+        // run's baseline block ends at least a padding above the panel's bottom edge.
+        let doc = stat_doc();
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let PlacedBlock::Rect { frame: panel, .. } = pages[0].blocks[0] else {
+            panic!("expected a panel");
+        };
+
+        let runs: Vec<&PlacedBlock> = pages[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, PlacedBlock::Text { .. }))
+            .collect();
+        for r in &runs {
+            let PlacedBlock::Text { frame, .. } = r else {
+                panic!("expected text")
+            };
+            assert!((frame.x_pt - (panel.x_pt + STATBLOCK_PADDING_PT)).abs() < 0.01);
+            assert!((frame.w_pt - (panel.w_pt - STATBLOCK_PADDING_PT * 2.0)).abs() < 0.01);
+            assert!(frame.y_pt >= panel.y_pt + STATBLOCK_PADDING_PT - 0.01);
+        }
+        let last = match runs.last().unwrap() {
+            PlacedBlock::Text { frame, .. } => frame.y_pt + frame.h_pt,
+            _ => unreachable!(),
+        };
+        assert!(
+            last <= panel.y_pt + panel.h_pt - STATBLOCK_PADDING_PT + 0.01,
+            "the bottom padding must be inside the panel"
+        );
+    }
+
+    #[test]
+    fn a_stat_block_reads_in_the_order_the_component_documents() {
+        // `StatBlock`'s own doc comment states the compact layout as
+        // Overview / Attributes / Details / Actions / Reactions, after the name. The first draft
+        // put the attributes before the overview, which puts a creature's armour class above its
+        // type — visibly not a stat block, and invisible to every assertion until it was rendered.
+        let mut doc = stat_doc();
+        doc.content[0] = Block::StatBlock {
+            id: doc.content[0].id(),
+            stat: quill_core_model::StatBlock {
+                name: "Name".into(),
+                overview: vec!["Overview".into()],
+                attributes: vec![("Attr".into(), "1".into())],
+                details: vec!["Details".into()],
+                actions: vec!["Actions".into()],
+                reactions: vec!["Reactions".into()],
+            },
+            color: Color::Gray { v: 0.0 },
+        };
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let texts: Vec<String> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, .. } => Some(lines[0].text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Name",
+                "Overview",
+                "Attr: 1",
+                "Details",
+                "Actions",
+                "Reactions"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stat_block_rules_between_its_sections() {
+        // Without them the sections run together and the panel reads as a tinted paragraph. Each
+        // rule spans the padded inner width and sits between two runs, never at the very top.
+        let doc = stat_doc();
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let rects: Vec<&PlacedBlock> = pages[0]
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, PlacedBlock::Rect { .. }))
+            .collect();
+
+        // The panel, plus one rule per section boundary. The fixture has name / overview /
+        // attributes / actions ⇒ three boundaries.
+        assert_eq!(rects.len(), 4, "one panel and three section rules");
+        let PlacedBlock::Rect { frame: panel, .. } = rects[0] else {
+            unreachable!()
+        };
+        for rule in &rects[1..] {
+            let PlacedBlock::Rect {
+                frame,
+                fill,
+                stroke,
+            } = rule
+            else {
+                unreachable!()
+            };
+            assert!(fill.is_some() && stroke.is_none(), "a rule is a thin fill");
+            assert!((frame.x_pt - (panel.x_pt + STATBLOCK_PADDING_PT)).abs() < 0.01);
+            assert!((frame.w_pt - (panel.w_pt - STATBLOCK_PADDING_PT * 2.0)).abs() < 0.01);
+            assert!(
+                frame.y_pt > panel.y_pt && frame.y_pt < panel.y_pt + panel.h_pt,
+                "a rule must sit inside its panel"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stat_blocks_title_is_set_larger_than_its_body() {
+        // What "looks like a stat block with zero authoring" means, as a number: the built-in
+        // styles are actually applied, rather than everything coming out at body size.
+        let doc = stat_doc();
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let sizes: Vec<f32> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { font_size_pt, .. } => Some(*font_size_pt),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sizes[0] > sizes[1],
+            "the name must be larger than an attribute line: {sizes:?}"
+        );
+    }
+
+    #[test]
+    fn a_stat_block_moves_whole_to_the_next_frame_rather_than_splitting() {
+        // Keep-together. It is the existing pagination rule — a block moves whole when it does not
+        // fit — and this asserts a stat block really is one block to that rule, rather than a group
+        // of runs that could be torn apart across a page boundary.
+        let mut doc = stat_doc();
+        let stat = doc.content.remove(0);
+        doc.content = many_lines(52);
+        doc.content.push(stat);
+        doc.assign_missing_block_ids().expect("ids");
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 2, "the fixture must actually paginate");
+
+        // Every piece of the stat block landed on the same page as its panel.
+        let panel_page = pages
+            .iter()
+            .position(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, PlacedBlock::Rect { .. }))
+            })
+            .expect("the panel must be placed somewhere");
+        let stat_id = doc.content.last().unwrap().id();
+        for (i, page) in pages.iter().enumerate() {
+            let from_stat = page
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == stat_id))
+                .count();
+            if i == panel_page {
+                assert_eq!(from_stat, 5, "all runs on the panel's page");
+            } else {
+                assert_eq!(from_stat, 0, "no run may be orphaned onto page {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stat_block_wider_than_its_frame_still_wraps_inside_the_padding() {
+        // The padding must come off the measure, not just off the position — otherwise long prose
+        // is broken to the full frame width and then drawn inset, so it overruns the panel.
+        let mut doc = stat_doc();
+        doc.content[0] = Block::StatBlock {
+            id: doc.content[0].id(),
+            stat: quill_core_model::StatBlock {
+                actions: vec![
+                    "A very long action description that will certainly need to wrap \
+                               across more than one line in any reasonable measure at all."
+                        .into(),
+                ],
+                ..goblin()
+            },
+            color: Color::Gray { v: 0.0 },
+        };
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let PlacedBlock::Rect { frame: panel, .. } = pages[0].blocks[0] else {
+            panic!("expected a panel");
+        };
+        for b in &pages[0].blocks {
+            let PlacedBlock::Text { frame, .. } = b else {
+                continue;
+            };
+            assert!(
+                frame.x_pt + frame.w_pt <= panel.x_pt + panel.w_pt - STATBLOCK_PADDING_PT + 0.01,
+                "a run overran the panel's right padding"
+            );
+        }
     }
 
     // --- Heading index (spec 0040) --------------------------------------------------------------

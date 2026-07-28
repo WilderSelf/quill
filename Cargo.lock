@@ -2582,6 +2582,7 @@ name = "quill-core-model"
 version = "0.0.0"
 dependencies = [
  "flate2",
+ "quill-components-ttrpg",
  "serde",
  "serde_json",
  "zip",

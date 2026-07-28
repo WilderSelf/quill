@@ -450,6 +450,32 @@ fn content_fingerprint(block: &Block) -> u64 {
             eat(b"i");
             eat(asset.as_bytes());
         }
+        Block::StatBlock { stat, .. } => {
+            // Every field, not a summary. A key that misses a dimension the measurement depends on
+            // returns a stale layout and the document is silently wrong (spec 0031) — and a stat
+            // block has six independently editable sections, so five of them missing would be five
+            // ways to edit a creature and see nothing change.
+            eat(b"s");
+            eat(stat.name.as_bytes());
+            for (k, v) in &stat.attributes {
+                eat(k.as_bytes());
+                eat(b"\x1f");
+                eat(v.as_bytes());
+                eat(b"\x1e");
+            }
+            for (tag, section) in [
+                (b"ov".as_slice(), &stat.overview),
+                (b"de", &stat.details),
+                (b"ac", &stat.actions),
+                (b"re", &stat.reactions),
+            ] {
+                eat(tag);
+                for line in section {
+                    eat(line.as_bytes());
+                    eat(b"\x1e");
+                }
+            }
+        }
     }
     // Colour does not affect measurement, but it does affect the placed block, so a colour-only
     // edit must still invalidate the cached *result*.
@@ -884,6 +910,76 @@ mod tests {
         assert_eq!(again.stats.blocks_measured, 0, "must be the no-op path");
         assert_eq!(again.headings, first.headings);
         assert_eq!(again.headings.len(), 1);
+    }
+
+    #[test]
+    fn editing_any_stat_block_section_invalidates_its_measurement() {
+        // Spec 0031's rule applied to a composite. A stat block has six independently editable
+        // parts; a fingerprint covering only its name would give five ways to edit a creature and
+        // watch the page not change — a stale document presented as a current one.
+        //
+        // Every section is asserted individually, and the no-edit case is asserted too, so this
+        // cannot pass against a fingerprint that simply invalidates on everything.
+        use quill_core_model::StatBlock;
+
+        /// A named edit to one section of a stat block.
+        type Mutation = (&'static str, fn(&mut StatBlock));
+
+        let base = StatBlock {
+            name: "Goblin".into(),
+            overview: vec!["Small humanoid".into()],
+            attributes: vec![("AC".into(), "15".into())],
+            details: vec!["Nimble".into()],
+            actions: vec!["Scimitar".into()],
+            reactions: vec!["Dodge".into()],
+        };
+
+        let mutations: Vec<Mutation> = vec![
+            ("name", |s| s.name = "Hobgoblin".into()),
+            ("overview", |s| s.overview[0] = "Medium humanoid".into()),
+            ("attributes key", |s| s.attributes[0].0 = "Armour".into()),
+            ("attributes value", |s| s.attributes[0].1 = "17".into()),
+            ("details", |s| s.details[0] = "Sturdy".into()),
+            ("actions", |s| s.actions[0] = "Longsword".into()),
+            ("reactions", |s| s.reactions[0] = "Parry".into()),
+        ];
+
+        for (what, mutate) in mutations {
+            let mut doc = doc_of(20);
+            let id = doc.content[5].id();
+            doc.content[5] = Block::StatBlock {
+                id,
+                stat: base.clone(),
+                color: INK,
+            };
+
+            let mut session = LayoutSession::new();
+            session.relayout(&doc, &MONO, &NoHyphenator);
+
+            // No edit ⇒ no measurement. Without this the assertion below proves nothing.
+            let idle = session.relayout(&doc, &MONO, &NoHyphenator);
+            assert_eq!(
+                idle.stats.blocks_measured, 0,
+                "{what}: an unchanged document must not re-measure"
+            );
+
+            let Block::StatBlock { stat, .. } = &mut doc.content[5] else {
+                unreachable!()
+            };
+            mutate(stat);
+            doc.bump_revision();
+
+            let after = session.relayout(&doc, &MONO, &NoHyphenator);
+            assert!(
+                after.stats.blocks_measured >= 1,
+                "{what}: editing this section must invalidate the measurement"
+            );
+            assert_eq!(
+                after.pages,
+                crate::lay_out(&doc, &MONO, &NoHyphenator),
+                "{what}: and the result must match a full pass"
+            );
+        }
     }
 
     #[test]

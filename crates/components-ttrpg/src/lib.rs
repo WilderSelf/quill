@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// A creature/NPC stat block. Sections mirror the common compact layout
 /// (Overview / Attributes / Details / Actions / Reactions).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatBlock {
     pub name: String,
     #[serde(default)]

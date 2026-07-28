@@ -193,7 +193,9 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     // Colors: no RGB in output; every color within the ink limit.
     for (i, block) in doc.content.iter().enumerate() {
         let color = match block {
-            Block::Heading { color, .. } | Block::Body { color, .. } => Some(color),
+            Block::Heading { color, .. }
+            | Block::Body { color, .. }
+            | Block::StatBlock { color, .. } => Some(color),
             Block::Image { .. } => None,
         };
         let Some(color) = color else { continue };
@@ -404,8 +406,29 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
     set.insert(' ');
     set.insert('-');
     for block in &doc.content {
-        if let Block::Heading { text, .. } | Block::Body { text, .. } = block {
-            set.extend(text.chars());
+        match block {
+            Block::Heading { text, .. } | Block::Body { text, .. } => set.extend(text.chars()),
+            // Spec 0026's silent-failure case, and the reason every variant-adding increment
+            // carries a non-ASCII export test: a character this collector misses is not an error
+            // anywhere, it just renders as `.notdef` in the finished PDF.
+            Block::StatBlock { stat, .. } => {
+                set.extend(stat.name.chars());
+                for (k, v) in &stat.attributes {
+                    set.extend(k.chars());
+                    set.extend(v.chars());
+                }
+                for section in [
+                    &stat.overview,
+                    &stat.details,
+                    &stat.actions,
+                    &stat.reactions,
+                ] {
+                    for line in section {
+                        set.extend(line.chars());
+                    }
+                }
+            }
+            Block::Image { .. } => {}
         }
     }
     set
@@ -667,6 +690,67 @@ mod tests {
     }
 
     #[test]
+    fn a_stat_blocks_glyphs_reach_the_font_subset() {
+        // Spec 0026's silent-failure case, and the reason every variant-adding increment carries
+        // this test: a character `collect_doc_chars` misses is not an error anywhere in the
+        // pipeline — it renders as a `.notdef` box in the finished PDF. Every section of a stat
+        // block is checked, because each is a separate place the collector could have forgotten.
+        let mut doc = Document::sample();
+        doc.content.push(Block::StatBlock {
+            id: quill_core_model::BlockId::UNASSIGNED,
+            stat: quill_core_model::StatBlock {
+                name: "Cráeblóð".into(),
+                overview: vec!["Ǫverview".into()],
+                attributes: vec![("Ǎttr".into(), "Vǻlue".into())],
+                details: vec!["Detaïl".into()],
+                actions: vec!["Actiøn".into()],
+                reactions: vec!["Reactiœn".into()],
+            },
+            color: Color::Gray { v: 0.0 },
+        });
+        doc.assign_missing_block_ids().expect("ids");
+
+        let chars = collect_doc_chars(&doc);
+        for c in ['á', 'ó', 'Ǫ', 'Ǎ', 'ǻ', 'ï', 'ø', 'œ'] {
+            assert!(chars.contains(&c), "{c:?} must reach the font subset");
+        }
+
+        // And it must actually export with them.
+        let (opts, icc) = opts_with_real_icc("statblock_glyphs");
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("export");
+        assert!(bytes.starts_with(b"%PDF-1.3"));
+        let _ = std::fs::remove_file(icc);
+    }
+
+    #[test]
+    fn a_stat_block_in_rgb_fails_preflight_like_any_other_block() {
+        // The colour check walks `Block` variants, so a new variant it does not mention is a new
+        // way for RGB to reach a press file.
+        let mut doc = Document::sample();
+        doc.content.push(Block::StatBlock {
+            id: quill_core_model::BlockId::UNASSIGNED,
+            stat: quill_core_model::StatBlock {
+                name: "Goblin".into(),
+                ..Default::default()
+            },
+            color: Color::Rgb {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+            },
+        });
+        doc.assign_missing_block_ids().expect("ids");
+        let (opts, icc) = opts_with_real_icc("statblock_rgb");
+        let report = preflight(&doc, &opts);
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.check == CheckId::ColorSpace && f.severity == Severity::Error));
+        let _ = std::fs::remove_file(icc);
+    }
+
+    #[test]
     fn a_decoration_over_the_ink_limit_is_an_error() {
         // The reason spec 0037 lands the primitive and the check together. Both existing colour
         // checks walk `doc.content`, so a rectangle the layout engine synthesized is invisible to
@@ -824,7 +908,14 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    /// Changed by spec 0030: `format_version` became 2 and the manifest gained `master_pages`, so
+    /// Changed by spec 0038: `StyleSheet::default()` gained the three built-in `statblock-*`
+    /// styles, so `doc.to_json()` changed and with it the document identifier. Verified as
+    /// identifier-only rather than accepted: exporting the sample against the committed parity ICC
+    /// before and after gives files of identical length (8559 bytes) differing in exactly 108
+    /// bytes, every one inside the XMP `DocumentID`/`InstanceID` or the trailer `/ID`. No content
+    /// stream moved.
+    ///
+    /// Previously changed by spec 0030: `format_version` became 2 and the manifest gained `master_pages`, so
     /// `doc.to_json()` changed and with it the document identifier. Verified as identifier-only:
     /// 124 bytes differ across 8 runs, every one inside the XMP `DocumentID`/`InstanceID` or the
     /// trailer `/ID`; length is unchanged and no content stream moved.
@@ -836,7 +927,7 @@ mod tests {
     /// Verified by inspecting the emitted text operators rather than by accepting the new number:
     /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
     /// only by being ragged-left.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x593b_e732_ff79_4440;
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x228f_8f78_c1fc_fd8e;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
