@@ -81,6 +81,9 @@ impl Budgets {
 
     /// Record a *deterministic counter* against its ceiling, with no tolerance applied.
     ///
+    /// `#[allow(dead_code)]` because this module is `mod budget;`-included by *each* bench target
+    /// separately, so a helper only one target needs reads as dead in the others.
+    ///
     /// The tolerance factor exists for one reason, stated at the top of `benches/budgets.toml`:
     /// shared runners vary by 10-30% between runs. A work counter does not vary at all — the same
     /// document and the same edit produce the same number on every machine — so doubling its
@@ -89,6 +92,7 @@ impl Budgets {
     /// of 520 sat above every value the counter can physically take and the gate could no longer
     /// fail. A budget whose limit is unreachable is not a budget, which is the same lesson this
     /// repo already paid for with CI jobs that were not required contexts.
+    #[allow(dead_code)]
     pub fn check_exact(&self, key: &str, measured: f64, failures: &mut Vec<String>) {
         let Some((_, ceiling)) = self.entries.iter().find(|(k, _)| k == key) else {
             println!("  ! no budget for '{key}' (measured {measured:.3}) — add one");
