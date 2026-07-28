@@ -61,6 +61,28 @@ pub enum LoadError {
     /// A pack carries a path that is absolute or escapes its root, in its manifest or as a zip
     /// entry. A pack is the one artifact here that routinely comes from someone else.
     PackUnsafePath { pack: String, path: String },
+    /// A document requires a pack that is not installed (spec 0056). Names what is installed too:
+    /// a reader who has just been refused needs to know what they *do* have.
+    PackNotInstalled {
+        pack: String,
+        version: String,
+        installed: Vec<String>,
+        root: String,
+    },
+    /// Two resolved packs both define the same component or template. Refused rather than
+    /// resolved last-one-wins, which would make the winner depend on iteration order.
+    PackConflict {
+        what: String,
+        item: String,
+        first: String,
+        second: String,
+    },
+    /// A different pack is already installed at this name and version.
+    PackAlreadyInstalled {
+        pack: String,
+        version: String,
+        path: String,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -101,6 +123,47 @@ impl fmt::Display for LoadError {
                 f,
                 "pack `{pack}` carries the path '{path}', which is absolute or escapes the \
                  pack root"
+            ),
+            LoadError::PackNotInstalled {
+                pack,
+                version,
+                installed,
+                root,
+            } => {
+                let want = if version.trim().is_empty() {
+                    "any version".to_string()
+                } else {
+                    format!("version {version}")
+                };
+                let have = if installed.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    installed.join(", ")
+                };
+                write!(
+                    f,
+                    "this document requires pack `{pack}` ({want}), which is not installed in \
+                     '{root}' — installed there: {have}. Install it with `quill pack install`."
+                )
+            }
+            LoadError::PackConflict {
+                what,
+                item,
+                first,
+                second,
+            } => write!(
+                f,
+                "packs `{first}` and `{second}` both define the {what} `{item}`; \
+                 uninstall one or use a document-level definition"
+            ),
+            LoadError::PackAlreadyInstalled {
+                pack,
+                version,
+                path,
+            } => write!(
+                f,
+                "a different pack `{pack}` {version} is already installed at '{path}'; \
+                 pass --force to replace it"
             ),
         }
     }

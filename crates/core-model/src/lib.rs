@@ -20,6 +20,7 @@ mod container;
 mod geom;
 mod import;
 mod pack;
+mod resolve;
 mod template;
 mod version;
 
@@ -31,6 +32,10 @@ pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
 pub use geom::{page_geom, PageGeom};
 pub use import::{import, Diagnostic, ImportError, Imported};
 pub use pack::{OpenedPack, PackManifest, Qpack, PACK_MANIFEST_NAME, PACK_VERSION};
+pub use resolve::{
+    install, install_dir, installed, pack_root, resolve, version_matches, InstalledPack,
+    PackRequirement, ResolvedPacks,
+};
 pub use template::{
     PageGeometrySeed, Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER, TEMPLATE_VERSION,
 };
@@ -921,6 +926,12 @@ pub struct Document {
     /// stays 3. Spec 0056 adds the other source: definitions resolved from installed packs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, ComponentDef>,
+    /// The content packs this document needs (spec 0056).
+    ///
+    /// A requirement that does not resolve is a refusal, not a fallback: a book set in the default
+    /// face because its pack was missing looks *subtly* wrong, and is discovered at the print shop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<PackRequirement>,
 }
 
 impl Document {
@@ -968,6 +979,7 @@ impl Document {
             default_master: None,
             pages: Vec::new(),
             components: Default::default(),
+            requires: Vec::new(),
         };
         // The sample is a *loaded* document as far as everything downstream is concerned, so it
         // carries real ids like one — otherwise every consumer would have to special-case it.
@@ -1106,6 +1118,37 @@ impl Document {
         let mut lib = builtin_components();
         lib.extend(self.components.iter().map(|(k, v)| (k.clone(), v.clone())));
         lib
+    }
+
+    /// Resolve this document's [`Document::requires`] against the packs installed under `root`
+    /// (spec 0056).
+    pub fn resolve_packs(&self, root: &std::path::Path) -> Result<ResolvedPacks, LoadError> {
+        resolve(&self.requires, root)
+    }
+
+    /// Fold resolved packs into this document, and clear the requirements they satisfied.
+    ///
+    /// Resolution is a *document transformation* rather than an argument threaded into layout, and
+    /// that is the load-bearing choice here. If layout took an optional pack set, the default would
+    /// be "no packs", and a caller who forgot would lay a book out in the default face — the silent
+    /// fallback this spec exists to prevent. Instead a document either has been resolved (its
+    /// `requires` is empty) or has not, and [`quill_layout_engine::lay_out`] refuses the latter.
+    ///
+    /// Precedence, least to most specific: **bundled < packs < the document's own.** A pack
+    /// defining `statblock` is a legitimate restyle of the bundled one; the document's own beats
+    /// both, because the document is the thing being edited.
+    pub fn apply_packs(&mut self, packs: &ResolvedPacks) -> Result<(), LoadError> {
+        let pack_components = packs.components()?;
+        // Merged under the document's own, not over: `extend` would let a pack silently replace a
+        // definition the author wrote in this very file.
+        for (name, def) in pack_components {
+            self.components.entry(name).or_insert(def);
+        }
+        for (name, style) in packs.styles().paragraph {
+            self.styles.paragraph.entry(name).or_insert(style);
+        }
+        self.requires.clear();
+        Ok(())
     }
 }
 

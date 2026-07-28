@@ -207,6 +207,7 @@ pub fn document_with_blocks(spec: &SynthSpec, block_count: usize) -> Document {
         // budget in `benches/budgets.toml` keeps measuring the same thing across spec 0035.
         pages: Vec::new(),
         components: Default::default(),
+        requires: Vec::new(),
     };
     doc.assign_missing_block_ids()
         .expect("generated blocks are unassigned, so cannot collide");

@@ -480,6 +480,18 @@ pub fn lay_out(
     // Authored layout reaches the engine here (spec 0030): margins, columns and master furniture
     // come from the document. With no master and zero margins this is exactly `Frame::full_page`,
     // so a document declaring neither lays out as it always did.
+    assert!(
+        doc.requires.is_empty(),
+        "this document requires content packs that have not been resolved: {}. Call \
+         `Document::apply_packs` with the result of `Document::resolve_packs` before laying it \
+         out — laying it out anyway would set the book in the default face, which is the silent \
+         fallback spec 0056 exists to prevent.",
+        doc.requires
+            .iter()
+            .map(|r| format!("`{}` {}", r.name, r.version))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     lay_out_with_library(
         &doc.content,
         &doc.assets,
@@ -2439,6 +2451,7 @@ mod tests {
             fonts_embeddable: false,
             revision: 0,
             components: Default::default(),
+            requires: Vec::new(),
             next_block_id: 0,
             styles: StyleSheet::default(),
             master_pages: Vec::new(),
@@ -2526,6 +2539,7 @@ mod tests {
                 has_alpha: false,
             }],
             components: Default::default(),
+            requires: Vec::new(),
             fonts_embeddable: false,
             revision: 0,
             next_block_id: 0,

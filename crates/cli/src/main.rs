@@ -119,6 +119,23 @@ enum PackCommand {
         /// Path to the `.qpack` file.
         input: String,
     },
+    /// Install a `.qpack` so documents that require it can resolve it (spec 0056).
+    Install {
+        /// Path to the `.qpack` file.
+        input: String,
+        /// Pack root. Defaults to `$QUILL_PACKS`, then the platform data directory.
+        #[arg(long)]
+        packs: Option<String>,
+        /// Replace a different pack already installed at this name and version.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List installed packs with their provenance.
+    List {
+        /// Pack root. Defaults to `$QUILL_PACKS`, then the platform data directory.
+        #[arg(long)]
+        packs: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -209,6 +226,18 @@ struct Loaded {
 /// nothing owns. A bare `document.json` resolves its assets against its own directory — not the
 /// process working directory, which is what the writer used to assume.
 fn load_doc(input: &Option<String>) -> Result<Loaded, String> {
+    let mut loaded = load_doc_unresolved(input)?;
+    // Content packs are resolved at load, before anything can lay the document out (spec 0056).
+    // A requirement that does not resolve stops here with a typed error naming the pack: falling
+    // back to the default face would produce a book that looks subtly wrong and is discovered at
+    // the print shop.
+    let root = quill_core_model::pack_root(None);
+    let packs = loaded.doc.resolve_packs(&root).map_err(|e| e.to_string())?;
+    loaded.doc.apply_packs(&packs).map_err(|e| e.to_string())?;
+    Ok(loaded)
+}
+
+fn load_doc_unresolved(input: &Option<String>) -> Result<Loaded, String> {
     let Some(path) = input else {
         return Ok(Loaded {
             doc: Document::sample(),
@@ -483,6 +512,64 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+
+        Command::Pack(PackCommand::Install {
+            input,
+            packs,
+            force,
+        }) => {
+            let root = quill_core_model::pack_root(packs.as_deref().map(Path::new));
+            // Extract beside the destination, then install what the manifest declares. The two
+            // steps are separate because the container is validated *before* anything is written
+            // to the pack root — a pack this build refuses must not half-install.
+            let staging = root.join(".staging");
+            let opened = match quill_core_model::Qpack::open_into(Path::new(&input), &staging) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("error: {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result =
+                quill_core_model::install(&opened.manifest, &opened.asset_root, &root, force);
+            let _ = std::fs::remove_dir_all(&staging);
+            match result {
+                Ok(dest) => {
+                    println!(
+                        "installed {} {} to {}",
+                        opened.manifest.name,
+                        opened.manifest.version,
+                        dest.display()
+                    );
+                    println!("  source:  {}", opened.manifest.source);
+                    println!("  licence: {}", opened.manifest.license);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(PackCommand::List { packs }) => {
+            let root = quill_core_model::pack_root(packs.as_deref().map(Path::new));
+            let found = quill_core_model::installed(&root);
+            if found.is_empty() {
+                println!("no packs installed in {}", root.display());
+                return ExitCode::SUCCESS;
+            }
+            println!("{} pack(s) in {}", found.len(), root.display());
+            for p in &found {
+                println!(
+                    "  {} {} — {}",
+                    p.manifest.name, p.manifest.version, p.manifest.title
+                );
+                println!("    source:  {}", p.manifest.source);
+                println!("    licence: {}", p.manifest.license);
+            }
+            ExitCode::SUCCESS
         }
 
         Command::Render(args) => {
