@@ -167,7 +167,11 @@ fixture in-memory in the test instead.
   one invocation instead of four, loading shared config once instead of per-phase. Keeps each
   phase's own approval gates. User-scoped: `~/.claude/skills/wrap/`.
 - **Merge behavior — any PR in this repo, not just `/ship`'s**: the branch-protection gate on
-  `main` is confirmed live (3 required CI contexts, `allow_auto_merge`, admin token — see PR #4).
-  Every PR opened here auto-enables `gh pr merge --auto --squash --delete-branch` once that gate
-  is verified — no confirmation asked per PR. Re-verify the gate rather than assuming it's still
-  live if branch protection could plausibly have changed.
+  `main` is confirmed live (**4** required CI contexts — all of CI's emitted check-runs, i.e. the
+  three `fmt + clippy + test (<os>)` legs plus `PDF preflight (Ghostscript)` — `allow_auto_merge`,
+  admin token; see PR #4, 4th context added 2026-07-27). Every PR opened here auto-enables
+  `gh pr merge --auto --squash --delete-branch` once that gate is verified — no confirmation asked
+  per PR. Re-verify the gate rather than assuming it's still live if branch protection could
+  plausibly have changed. **Adding a CI job does not make it a required context** — a new job gates
+  nothing until it is added to the required set via
+  `gh api -X PATCH repos/:owner/:repo/branches/main/protection/required_status_checks`.
