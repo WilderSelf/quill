@@ -263,10 +263,18 @@ impl LayoutSession {
         };
 
         // Resume from the last page that began at or before the edit.
+        //
+        // A checkpoint *inside* the edited block is not a legal resume point (spec 0044): its
+        // `split_at` counts items of the block's previous measurement, and the pages before it hold
+        // the fragment that measurement produced. Resuming there would keep stale text and cut the
+        // new text at an offset that means nothing. Backing up one page costs a page of relayout
+        // and is the only correct choice.
         let resume_page = self
             .checkpoints
             .iter()
-            .rposition(|c| c.block_idx <= dirty_from)
+            .rposition(|c| {
+                c.block_idx < dirty_from || (c.block_idx == dirty_from && c.split_at == 0)
+            })
             .unwrap_or(0);
         let start = self
             .checkpoints
@@ -274,6 +282,7 @@ impl LayoutSession {
             .copied()
             .unwrap_or(FlowState {
                 block_idx: 0,
+                split_at: 0,
                 page_index: 0,
                 frame_idx: 0,
                 y: crate::frames_for(template, 0)[0].rect.y_pt,
@@ -652,6 +661,176 @@ mod tests {
         doc.content[index] = Block::body(text, INK);
         doc.content[index].set_id(id);
         doc.bump_revision();
+    }
+
+    // ----- spec 0044: fragmentation on the incremental path -------------------------------------
+
+    /// A document of `n` paragraphs long enough to split, plus a template of two 120 pt columns.
+    ///
+    /// Splitting only happens in a partly-full frame, and short paragraphs in a full-page frame
+    /// rarely produce one — narrow columns make it the common case, which is exactly the situation
+    /// spec 0036's `rulebook` template put the engine in.
+    fn splitting_doc(n: usize) -> (Document, crate::UniformTemplate) {
+        let mut doc = Document::sample();
+        doc.content = (0..n)
+            .map(|i| {
+                Block::body(
+                    format!(
+                        "paragraph {i} with a good many words in it, enough that it runs to \
+                         several lines in a narrow column and therefore has somewhere to break"
+                    ),
+                    INK,
+                )
+            })
+            .collect();
+        doc.assets.clear();
+        doc.assign_missing_block_ids().expect("ids");
+        let template = crate::UniformTemplate::new(crate::Thread {
+            frames: (0..2)
+                .map(|i| crate::Frame {
+                    rect: crate::Rect {
+                        x_pt: i as f32 * 144.0,
+                        y_pt: 0.0,
+                        w_pt: 120.0,
+                        h_pt: 144.0,
+                    },
+                })
+                .collect(),
+        });
+        (doc, template)
+    }
+
+    /// The same document against a template of one 120 pt column per page, so that *every* split
+    /// falls on a page boundary and therefore leaves a mid-block checkpoint.
+    fn splitting_doc_single_column(n: usize) -> (Document, crate::UniformTemplate) {
+        let (doc, _) = splitting_doc(n);
+        let template = crate::UniformTemplate::new(crate::Thread {
+            frames: vec![crate::Frame {
+                rect: crate::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 120.0,
+                    h_pt: 144.0,
+                },
+            }],
+        });
+        (doc, template)
+    }
+
+    /// How many blocks were placed in more than one piece.
+    fn split_count(pages: &[LaidOutPage]) -> usize {
+        let mut per_source: std::collections::BTreeMap<BlockId, usize> = Default::default();
+        for page in pages {
+            for b in &page.blocks {
+                if let crate::PlacedBlock::Text { source, .. } = b {
+                    *per_source.entry(*source).or_default() += 1;
+                }
+            }
+        }
+        per_source.values().filter(|c| **c > 1).count()
+    }
+
+    #[test]
+    fn a_split_costs_no_extra_measurement() {
+        // Spec 0044's central design claim, as a number. Splitting is a derivation over the
+        // measurement already cached, not a second measurement — so a document whose blocks are cut
+        // across many frames must measure each block once per distinct width and no more. If this
+        // fails, available height has leaked into `MeasureKey` and the hot path spec 0031 exists to
+        // keep cold is being thrashed.
+        let (doc, template) = splitting_doc(120);
+        let mut session = LayoutSession::new();
+        let result = session.relayout_with_template(&doc, &template, &MONO, &NoHyphenator);
+
+        assert!(
+            split_count(&result.pages) >= 10,
+            "fixture must split many blocks, got {}",
+            split_count(&result.pages)
+        );
+        // Every frame is 120 pt wide, so one measurement per block is the whole budget.
+        assert_eq!(
+            session.cached_measurements(),
+            doc.content.len(),
+            "one cache entry per block at one width, not one per placement"
+        );
+        assert_eq!(
+            result.stats.blocks_measured,
+            doc.content.len(),
+            "a split must not cause a re-measure"
+        );
+    }
+
+    #[test]
+    fn incremental_matches_a_full_relayout_around_a_split() {
+        // The hazard spec 0044 names: `FlowState` is the resume contract, and a mid-block
+        // checkpoint that is not correctly restored produces a document subtly different after an
+        // edit than after a full pass — silently, and only in the direction users experience.
+        //
+        // Three edits, one per position relative to a split block. The middle one is the case that
+        // would not be written by accident and is the one that matters: the checkpoint inside the
+        // edited block counts items of its *previous* measurement, so resuming there would keep
+        // stale text and cut the new text at an offset that means nothing.
+        let (doc, template) = splitting_doc_single_column(60);
+        let mut probe = LayoutSession::new();
+        let first = probe.relayout_with_template(&doc, &template, &MONO, &NoHyphenator);
+        assert!(split_count(&first.pages) >= 5, "fixture must split");
+
+        // The block must split across a *page* boundary, not merely a column boundary. Checkpoints
+        // are recorded per page, so only a page-straddling block leaves a checkpoint with
+        // `split_at > 0` — which is the state this test exists to exercise. A block that splits
+        // between two columns of one page leaves no such checkpoint and would prove nothing.
+        let split_block = {
+            let mut pages_of: std::collections::BTreeMap<
+                BlockId,
+                std::collections::BTreeSet<usize>,
+            > = Default::default();
+            for page in &first.pages {
+                for b in &page.blocks {
+                    if let crate::PlacedBlock::Text { source, .. } = b {
+                        pages_of.entry(*source).or_default().insert(page.index);
+                    }
+                }
+            }
+            let id = *pages_of
+                .iter()
+                .find(|(_, pages)| pages.len() > 1)
+                .expect("a block straddling a page boundary")
+                .0;
+            doc.content
+                .iter()
+                .position(|b| b.id() == id)
+                .expect("index")
+        };
+        assert!(split_block > 0, "need a block before the split one");
+
+        for (label, index) in [
+            ("before", split_block - 1),
+            ("inside", split_block),
+            ("after", split_block + 1),
+        ] {
+            let mut edited = doc.clone();
+            edit(
+                &mut edited,
+                index,
+                "a replacement paragraph of a quite different length, long enough that it too \
+                 runs over several lines and rebreaks everything after it",
+            );
+            let mut session = LayoutSession::new();
+            session.relayout_with_template(&doc, &template, &MONO, &NoHyphenator);
+            let incremental =
+                session.relayout_with_template(&edited, &template, &MONO, &NoHyphenator);
+            let full = crate::lay_out_with_template(
+                &edited.content,
+                &edited.assets,
+                &edited.styles,
+                &template,
+                &MONO,
+                &NoHyphenator,
+            );
+            assert_eq!(
+                incremental.pages, full,
+                "incremental diverged from full layout for an edit {label} a split block"
+            );
+        }
     }
 
     #[test]

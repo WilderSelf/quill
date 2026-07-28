@@ -13,7 +13,11 @@
 # Ceilings are recorded from a release build on the reference machine. If a change legitimately
 # makes something slower, update the number in the same commit and say why in the message.
 
-# How far past a ceiling a measurement may go before it fails. 2.0 = "twice the budget".
+# How far past a ceiling a *timing* may go before it fails. 2.0 = "twice the budget".
+#
+# Work counters are checked exactly, with no tolerance: they are deterministic, so the noise this
+# factor exists for does not apply to them, and doubling a counter's ceiling can lift it above every
+# value the counter can physically take — a budget that cannot fail. See `Budgets::check_exact`.
 tolerance_factor = 2.0
 
 [layout]
@@ -23,10 +27,34 @@ ms_per_page = 0.5
 # value is ~2.0, and it measures 2.08. This is the single most valuable line in the file: it is what
 # would catch a quadratic scan being reintroduced into the engine.
 scaling_ratio = 2.2
-# Pages re-flowed after editing one paragraph in the middle of a 500-page document. This is the M1
-# claim — "re-flow only affected pages" — stated as a number. A regression that broke checkpoint
-# resume or flow re-convergence would send this to ~250 or ~500.
-incremental_pages_reflowed = 3.0
+# Pages re-flowed after editing one paragraph in the middle of a 500-page document.
+#
+# Re-baselined from 3 to 260 by spec 0044, and the reason matters more than the number.
+#
+# Before fragmentation a block that did not fit moved whole to the next page, so every page foot
+# carried a few lines of slack. A one-line change to a paragraph was absorbed by that slack, the
+# next page began with the same block at the same y, the flow re-converged, and this measured 1.
+# Fragmentation fills each column to within two lines of its foot — that is the defect it fixes —
+# so there is no slack left to absorb anything: a paragraph that gains a line shifts every
+# subsequent page boundary by a line, permanently. Re-convergence stops firing for continuously
+# flowed text, and 248 of 499 pages (everything after the edit) genuinely change.
+#
+# The old number therefore measured looseness, not efficiency, and re-baselining it is not a
+# concession. What it still usefully catches is checkpoint resume breaking: pages *before* the edit
+# must be reused, so a measurement near 500 means resume is broken and is a real regression. 260 is
+# "everything after a mid-document edit, and not one page more".
+#
+# What the constraint actually cares about — not redoing the expensive work — moved to
+# `incremental_blocks_measured` below. Wall-clock confirms the split is the right one: the same edit
+# went from 6.3% to 8.8% of a full pass while pages_reflowed went from 1 to 248, because the 247
+# extra pages are placement over a warm measurement cache and not re-breaking.
+incremental_pages_reflowed = 260.0
+# Blocks re-broken after that same edit. Measures 1 — the edited paragraph and nothing else — both
+# before and after spec 0044. This is the deterministic statement of "editing one paragraph must not
+# re-break the document", and it is the line that would catch the measurement cache being
+# invalidated wholesale, a height dimension leaking into `MeasureKey`, or fragmentation
+# re-measuring a block once per fragment.
+incremental_blocks_measured = 2.0
 # The same edit as a fraction of a full layout pass. Stated as a ratio against a pass measured in
 # the same run, so it does not drift with runner speed.
 # There is deliberately no wall-clock budget for the incremental edit. Isolating it means

@@ -214,10 +214,9 @@ pub struct HeadingEntry {
 /// is always. Deriving it from the final page vector makes it correct by construction for the
 /// incremental path and the cold path alike, at the cost of one walk over the pages.
 ///
-/// A heading appearing more than once in the page vector reports its **first** page. That cannot
-/// happen today, because a block is placed whole into one frame and never split (see the roadmap's
-/// known issues) — but a TOC entry and a bookmark both mean "where does this start", so the rule is
-/// stated here rather than left to depend on an invariant that is expected to change.
+/// A heading appearing more than once in the page vector reports its **first** page. Since spec
+/// 0044 a long heading really can split across a frame boundary and appear twice, so this is a live
+/// rule rather than a precaution: a TOC entry and a bookmark both mean "where does this start".
 ///
 /// Master furniture is skipped: it carries [`BlockId::UNASSIGNED`] and is not content.
 pub fn heading_index(doc: &Document, pages: &[LaidOutPage]) -> Vec<HeadingEntry> {
@@ -512,6 +511,111 @@ pub(crate) enum Measured {
         /// paint order is decided in one place rather than two.
         decorations: Vec<PanelRect>,
     },
+}
+
+/// The fewest items a fragment or a remainder may contain (spec 0044).
+///
+/// Two lines: a paragraph may not leave a widow behind at the foot of a column or carry an orphan
+/// forward to the top of the next. This is a typographic rule and not a nicety — a lone stranded
+/// line is the defect a reader notices first, and a splitter without it would fix the ragged-foot
+/// defect by introducing a worse one.
+pub(crate) const MIN_ITEMS_PER_FRAGMENT: usize = 2;
+
+impl Measured {
+    /// The heights of the items this measurement may be cut between, in order. `None` means
+    /// indivisible.
+    ///
+    /// **A variant whose measurement depends on the available height must return `None`.** Spec
+    /// 0044's whole design rests on splitting being a *derivation over an already-cached
+    /// measurement* rather than a second measurement: a paragraph's optimal break at a given width
+    /// does not depend on the space left in the column, so cutting its line list needs no cache
+    /// entry of its own and `MeasureKey` gains no height dimension. A height-dependent measurement
+    /// that offered break opportunities anyway would not merely split badly — it would make the
+    /// measurement cache wrong.
+    fn break_items(&self) -> Option<Vec<f32>> {
+        match self {
+            Measured::Text { lines, style, .. } => Some(vec![style.leading_pt; lines.len()]),
+            // A panel learns its rows in spec 0045 and its sections in 0046; an image never splits.
+            Measured::Image { .. } | Measured::Panel { .. } => None,
+        }
+    }
+
+    /// The height charged to a fragment before its first item — the space *above* a paragraph,
+    /// which belongs to the piece that starts it and to no other.
+    fn fragment_lead_pt(&self) -> f32 {
+        match self {
+            Measured::Text { style, .. } => style.space_before_pt,
+            Measured::Image { .. } | Measured::Panel { .. } => 0.0,
+        }
+    }
+
+    /// The largest legal cut whose fragment fits within `avail_pt`, or `None` when no cut is legal.
+    ///
+    /// Legal means both sides keep [`MIN_ITEMS_PER_FRAGMENT`] items, so a paragraph of three lines
+    /// or fewer never splits at all.
+    fn cut_fitting(&self, avail_pt: f32) -> Option<usize> {
+        let items = self.break_items()?;
+        let n = items.len();
+        if n < 2 * MIN_ITEMS_PER_FRAGMENT {
+            return None;
+        }
+        let last_legal = n - MIN_ITEMS_PER_FRAGMENT;
+        let mut used = self.fragment_lead_pt();
+        let mut best = None;
+        for (i, h) in items.iter().enumerate() {
+            used += h;
+            if used > avail_pt {
+                break;
+            }
+            let k = i + 1;
+            if k >= MIN_ITEMS_PER_FRAGMENT && k <= last_legal {
+                best = Some(k);
+            }
+        }
+        best
+    }
+
+    /// Cut into a fragment of the first `at` items and a remainder of the rest, both fully measured
+    /// at the same width, with their heights. `None` when `at` is not a cut this value admits.
+    ///
+    /// The two heights are deliberately **not** a partition of the whole: vertical space belongs to
+    /// the ends of a paragraph and not to its middle. The fragment starts the paragraph so it is
+    /// charged the space above; the remainder ends it so it is charged the space below. Returning
+    /// both rather than letting a caller subtract is what stops the natural, wrong implementation.
+    fn split_at(&self, at: usize) -> Option<(Measured, f32, Measured, f32)> {
+        match self {
+            Measured::Text {
+                lines,
+                color,
+                style,
+            } => {
+                if at == 0 || at >= lines.len() {
+                    return None;
+                }
+                let head_h = style.space_before_pt + at as f32 * style.leading_pt;
+                let head = Measured::Text {
+                    lines: lines[..at].to_vec(),
+                    color: *color,
+                    style: *style,
+                };
+                // The continuation carries no space-above: it does not start the paragraph. The
+                // style is edited rather than the height alone, because placement reads
+                // `space_before_pt` to inset the text within the block's box and the two must agree.
+                let tail_lines = lines[at..].to_vec();
+                let tail_h = tail_lines.len() as f32 * style.leading_pt + style.space_after_pt;
+                let tail = Measured::Text {
+                    lines: tail_lines,
+                    color: *color,
+                    style: ParagraphStyle {
+                        space_before_pt: 0.0,
+                        ..*style
+                    },
+                };
+                Some((head, head_h, tail, tail_h))
+            }
+            Measured::Image { .. } | Measured::Panel { .. } => None,
+        }
+    }
 }
 
 /// One decorative rectangle inside a [`Measured::Panel`], relative to the panel's top-left.
@@ -1175,6 +1279,13 @@ pub fn lay_out_with_toc_status(
 pub(crate) struct FlowState {
     /// Index into `content` of the next block to place.
     pub block_idx: usize,
+    /// How many of that block's items earlier frames already took (spec 0044): 0 at a block's
+    /// start, non-zero when the flow was cut mid-block and this page continues it.
+    ///
+    /// This is what makes a checkpoint able to sit *inside* a block. It is an absolute item offset,
+    /// interpreted against a fresh measurement at the resumed frame's width — sound because the
+    /// loop only cuts when the continuation frame has that same width.
+    pub split_at: usize,
     pub page_index: usize,
     pub frame_idx: usize,
     pub y: f32,
@@ -1185,11 +1296,32 @@ impl FlowState {
     fn start(template: &impl PageTemplate) -> FlowState {
         FlowState {
             block_idx: 0,
+            split_at: 0,
             page_index: 0,
             frame_idx: 0,
             y: frames_for(template, 0)[0].rect.y_pt,
             frame_empty: true,
         }
+    }
+}
+
+/// Two frame widths are the same measure when they agree to within a hundredth of a point — the
+/// tolerance the repo's geometry assertions already use.
+fn same_width(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 0.01
+}
+
+/// The width of the frame a block's continuation would land in: the next frame on this page, or the
+/// first frame of the next page when this one is exhausted.
+fn continuation_width(
+    frames: &[Frame],
+    frame_idx: usize,
+    template: &impl PageTemplate,
+    page_index: usize,
+) -> f32 {
+    match frames.get(frame_idx + 1) {
+        Some(next) => next.rect.w_pt,
+        None => frames_for(template, page_index + 1)[0].rect.w_pt,
     }
 }
 
@@ -1302,22 +1434,53 @@ pub(crate) fn flow(
 
     for (offset, block) in content[start.block_idx..].iter().enumerate() {
         let block_idx = start.block_idx + offset;
+        // How much of this block earlier frames already took (spec 0044). Non-zero only for the
+        // block a resumed flow was in the middle of.
+        let mut split_at = if offset == 0 { start.split_at } else { 0 };
         // Advance frames / pages until the block fits, then place it. The block is re-measured
         // against each candidate frame's width (wrapping/sizing depend on it), so a block that
         // advances into a narrower frame re-wraps to that width rather than keeping a stale
-        // measurement. Bounded to <= 2 iterations: after one advance the new frame is empty, so the
-        // next iteration places (the `frame_empty` guard also places an oversized block rather than
-        // looping past every frame).
+        // measurement. Since spec 0044 a block that does not fit may leave a fragment behind before
+        // advancing, so the loop can now run once per frame the block spans; `split_at` strictly
+        // increases each time, which is what bounds it.
         loop {
             let frame = frames[frame_idx];
-            let Some((measured, height)) =
+            let Some((whole, whole_height)) =
                 measurer.measure(block, frame.rect.w_pt, &ctx, metrics, hyphenator)
             else {
                 break; // unresolved image asset → skip this block (no panic)
             };
+            // Take the part earlier frames have not had. Re-measuring and re-cutting, rather than
+            // carrying the remainder along, is what keeps the re-measure-per-frame invariant and
+            // what lets a checkpoint be five `Copy` fields instead of a measured payload.
+            let (measured, height) = match whole.split_at(split_at) {
+                Some((_, _, remainder, remainder_h)) => (remainder, remainder_h),
+                None => (whole, whole_height),
+            };
             let bottom = frame.rect.y_pt + frame.rect.h_pt;
 
             if y + height > bottom && !frame_empty {
+                // Fill this frame with as much of the block as legally fits before moving on
+                // (spec 0044) — but only when the continuation lands in a frame of the same width.
+                // The cut is an index into the line list *at this width*, and a frame of another
+                // width re-wraps to a different list against which that index means something else.
+                if same_width(
+                    frame.rect.w_pt,
+                    continuation_width(&frames, frame_idx, template, page_index),
+                ) {
+                    if let Some(k) = measured.cut_fitting(bottom - y) {
+                        if let Some((fragment, fragment_h, _, _)) = measured.split_at(k) {
+                            page.blocks.extend(place_measured(
+                                fragment,
+                                fragment_h,
+                                &frame,
+                                y,
+                                block.id(),
+                            ));
+                            split_at += k;
+                        }
+                    }
+                }
                 // Doesn't fit and the current frame has content → move on before placing.
                 if frame_idx + 1 < frames.len() {
                     frame_idx += 1; // next frame on this page
@@ -1336,6 +1499,7 @@ pub(crate) fn flow(
                     // Record where the new page begins, so a later edit can resume from here.
                     let at_boundary = FlowState {
                         block_idx,
+                        split_at,
                         page_index,
                         frame_idx: 0,
                         y: frames[0].rect.y_pt,
@@ -1364,95 +1528,8 @@ pub(crate) fn flow(
                 continue; // re-measure against the frame it moved into
             }
 
-            // A block usually yields one placed item; a composite (spec 0038) yields its panel
-            // plus one text run per section. Pagination still sees a single block — it moved whole
-            // to this frame or not at all.
-            let placed: Vec<PlacedBlock> = match measured {
-                Measured::Text {
-                    lines,
-                    color,
-                    style,
-                } => vec![PlacedBlock::Text {
-                    source: block.id(),
-                    // The frame starts *below* the style's space-above: that space belongs to this
-                    // block's height (so pagination reserves it) but no text is drawn in it.
-                    frame: Rect {
-                        x_pt: frame.rect.x_pt,
-                        y_pt: y + style.space_before_pt,
-                        w_pt: frame.rect.w_pt,
-                        h_pt: height - style.space_before_pt,
-                    },
-                    lines,
-                    color,
-                    // Carried through to the writer. Without this the exported PDF would set every
-                    // paragraph at body size regardless of its style, because `PlacedBlock` was the
-                    // only thing the writer sees and it did not record how the text was measured.
-                    font_size_pt: style.font_size_pt,
-                    leading_pt: style.leading_pt,
-                }],
-                Measured::Image { asset_id, width } => vec![PlacedBlock::Image {
-                    source: block.id(),
-                    frame: Rect {
-                        x_pt: frame.rect.x_pt,
-                        y_pt: y,
-                        w_pt: width,
-                        h_pt: height,
-                    },
-                    asset_id,
-                }],
-                Measured::Panel {
-                    fill,
-                    stroke,
-                    parts,
-                    decorations,
-                } => {
-                    // The panel first, so it sits behind its own text — the same
-                    // decoration-before-content order the writer and the paint list rely on.
-                    //
-                    // Omitted entirely when it has neither fill nor stroke. A table has no outer
-                    // panel, only bands and a rule, and spec 0037's rule is that a rectangle
-                    // drawing nothing emits nothing — it belongs here as much as in the writer, or
-                    // every table carries an invisible rect through the whole pipeline.
-                    let mut out = Vec::new();
-                    if fill.is_some() || stroke.is_some() {
-                        out.push(PlacedBlock::Rect {
-                            frame: Rect {
-                                x_pt: frame.rect.x_pt,
-                                y_pt: y,
-                                w_pt: frame.rect.w_pt,
-                                h_pt: height,
-                            },
-                            fill,
-                            stroke,
-                        });
-                    }
-                    out.extend(decorations.into_iter().map(|d| PlacedBlock::Rect {
-                        frame: Rect {
-                            x_pt: frame.rect.x_pt + d.dx_pt,
-                            y_pt: y + d.dy_pt,
-                            w_pt: d.w_pt,
-                            h_pt: d.h_pt,
-                        },
-                        fill: d.fill,
-                        stroke: d.stroke,
-                    }));
-                    out.extend(parts.into_iter().map(|p| PlacedBlock::Text {
-                        source: block.id(),
-                        frame: Rect {
-                            x_pt: frame.rect.x_pt + p.dx_pt,
-                            y_pt: y + p.dy_pt,
-                            w_pt: p.w_pt,
-                            h_pt: p.lines.len() as f32 * p.leading_pt,
-                        },
-                        lines: p.lines,
-                        color: p.color,
-                        font_size_pt: p.font_size_pt,
-                        leading_pt: p.leading_pt,
-                    }));
-                    out
-                }
-            };
-            page.blocks.extend(placed);
+            page.blocks
+                .extend(place_measured(measured, height, &frame, y, block.id()));
             y += height;
             frame_empty = false;
             break;
@@ -1468,11 +1545,112 @@ pub(crate) fn flow(
     }
 }
 
+/// Turn a measurement into placed geometry at the flow cursor.
+///
+/// A block usually yields one placed item; a composite (spec 0038) yields its panel plus one text
+/// run per section. Since spec 0044 a `measured` may be a *fragment* of a block rather than the
+/// whole of it — placement does not care, and deliberately: every fragment carries the same
+/// `source`, which is what lets the heading index and the conservation invariant treat the pieces
+/// as one block.
+fn place_measured(
+    measured: Measured,
+    height: f32,
+    frame: &Frame,
+    y: f32,
+    source: BlockId,
+) -> Vec<PlacedBlock> {
+    match measured {
+        Measured::Text {
+            lines,
+            color,
+            style,
+        } => vec![PlacedBlock::Text {
+            source,
+            // The frame starts *below* the style's space-above: that space belongs to this
+            // block's height (so pagination reserves it) but no text is drawn in it.
+            frame: Rect {
+                x_pt: frame.rect.x_pt,
+                y_pt: y + style.space_before_pt,
+                w_pt: frame.rect.w_pt,
+                h_pt: height - style.space_before_pt,
+            },
+            lines,
+            color,
+            // Carried through to the writer. Without this the exported PDF would set every
+            // paragraph at body size regardless of its style, because `PlacedBlock` was the
+            // only thing the writer sees and it did not record how the text was measured.
+            font_size_pt: style.font_size_pt,
+            leading_pt: style.leading_pt,
+        }],
+        Measured::Image { asset_id, width } => vec![PlacedBlock::Image {
+            source,
+            frame: Rect {
+                x_pt: frame.rect.x_pt,
+                y_pt: y,
+                w_pt: width,
+                h_pt: height,
+            },
+            asset_id,
+        }],
+        Measured::Panel {
+            fill,
+            stroke,
+            parts,
+            decorations,
+        } => {
+            // The panel first, so it sits behind its own text — the same
+            // decoration-before-content order the writer and the paint list rely on.
+            //
+            // Omitted entirely when it has neither fill nor stroke. A table has no outer
+            // panel, only bands and a rule, and spec 0037's rule is that a rectangle
+            // drawing nothing emits nothing — it belongs here as much as in the writer, or
+            // every table carries an invisible rect through the whole pipeline.
+            let mut out = Vec::new();
+            if fill.is_some() || stroke.is_some() {
+                out.push(PlacedBlock::Rect {
+                    frame: Rect {
+                        x_pt: frame.rect.x_pt,
+                        y_pt: y,
+                        w_pt: frame.rect.w_pt,
+                        h_pt: height,
+                    },
+                    fill,
+                    stroke,
+                });
+            }
+            out.extend(decorations.into_iter().map(|d| PlacedBlock::Rect {
+                frame: Rect {
+                    x_pt: frame.rect.x_pt + d.dx_pt,
+                    y_pt: y + d.dy_pt,
+                    w_pt: d.w_pt,
+                    h_pt: d.h_pt,
+                },
+                fill: d.fill,
+                stroke: d.stroke,
+            }));
+            out.extend(parts.into_iter().map(|p| PlacedBlock::Text {
+                source,
+                frame: Rect {
+                    x_pt: frame.rect.x_pt + p.dx_pt,
+                    y_pt: y + p.dy_pt,
+                    w_pt: p.w_pt,
+                    h_pt: p.lines.len() as f32 * p.leading_pt,
+                },
+                lines: p.lines,
+                color: p.color,
+                font_size_pt: p.font_size_pt,
+                leading_pt: p.leading_pt,
+            }));
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use quill_core_model::{
-        Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size,
+        Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size, BODY_STYLE,
     };
     use quill_text_layout::{Hyphenator, MonospaceRunMetrics, NoHyphenator};
     use quill_text_layout::{BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
@@ -3039,6 +3217,86 @@ mod tests {
         assert!((verso[0].rect.w_pt - 162.0).abs() < 0.01);
     }
 
+    #[test]
+    fn the_rulebook_template_no_longer_ends_its_columns_ragged() {
+        // The defect spec 0044 exists to fix, in the template it was found in, measured rather than
+        // asserted by construction. Before fragmentation a column ended wherever the next paragraph
+        // happened not to fit; on the rulebook's 162 pt measure that is most paragraphs.
+        //
+        // Measured on this fixture with splitting suppressed and then enabled:
+        //
+        //             pages   total unset   worst column
+        //   before      30       6333.5 pt     327.5 pt   (26 lines of white at a column foot)
+        //   after       24        166.0 pt      15.0 pt   (1.2 lines)
+        //
+        // Paragraph lengths must *vary* for this to measure anything: a fixture of equal-length
+        // paragraphs tiles a column identically with and without splitting, reports no change, and
+        // would pass while proving nothing. The first attempt at this test did exactly that.
+        //
+        // The residual 15 pt is the widow rule's floor and not a miss: a legal fragment needs two
+        // lines (25 pt), so a gap smaller than that is one the engine is right to leave.
+        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let mut doc = Document::from_template(t);
+        doc.content = (0..120)
+            .map(|i| {
+                let words = 20 + (i * 37) % 90;
+                let body: String = (0..words)
+                    .map(|w| format!("word{w}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Block::body(format!("Paragraph {i}. {body}."), Color::Gray { v: 0.0 })
+            })
+            .collect();
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+        let leading = doc.styles.resolve(&doc.content[0]).leading_pt;
+
+        let mut slacks = Vec::new();
+        for page in &pages {
+            // The last page is where the text ran out; its short columns are not a defect.
+            if page.index + 1 == pages.len() {
+                continue;
+            }
+            for frame in template.frames(page.index) {
+                if let Some(bottom) = column_bottom(page, &frame) {
+                    slacks.push(frame.rect.y_pt + frame.rect.h_pt - bottom);
+                }
+            }
+        }
+        assert!(
+            slacks.len() >= 20,
+            "need a document of full columns, got {}",
+            slacks.len()
+        );
+
+        let worst = slacks.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            worst < 2.0 * leading,
+            "a full column left {worst:.1} pt unset, more than the two-line minimum fragment"
+        );
+        assert!(
+            pages.len() <= 25,
+            "the same copy took 30 pages before fragmentation; got {}",
+            pages.len()
+        );
+    }
+
+    /// The y at which a column's content ends, or `None` if nothing was placed in it.
+    fn column_bottom(page: &LaidOutPage, frame: &Frame) -> Option<f32> {
+        page.blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { frame: f, .. } | PlacedBlock::Image { frame: f, .. } => {
+                    same_width(f.x_pt, frame.rect.x_pt).then_some(f.y_pt + f.h_pt)
+                }
+                PlacedBlock::Rect { .. } => None,
+            })
+            .fold(None, |acc: Option<f32>, y| {
+                Some(acc.map_or(y, |a: f32| a.max(y)))
+            })
+    }
+
     // --- Stat blocks (spec 0038) ----------------------------------------------------------------
 
     fn goblin() -> quill_core_model::StatBlock {
@@ -3864,5 +4122,404 @@ mod tests {
             .filter(|b| matches!(b, PlacedBlock::Text { .. }))
             .count();
         assert_eq!(texts, 1, "the block after a skipped image must still place");
+    }
+
+    // ----- spec 0044: block fragmentation -----------------------------------------------------
+
+    /// A paragraph of `n` distinct 12-character words.
+    ///
+    /// In a 120 pt measure under `MONO` (6 pt/char, so 20 characters) two such words plus a space
+    /// need 25 characters and do not fit, so exactly one lands per line and the paragraph breaks
+    /// into exactly `n` lines whose text is predictable word by word.
+    fn n_line_paragraph(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("w{i:02}aaaaaaaaa"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// `count` equal columns, 120 pt wide and `h` tall, 24 pt apart.
+    fn split_columns(count: usize, h: f32) -> Thread {
+        Thread {
+            frames: (0..count)
+                .map(|i| Frame {
+                    rect: Rect {
+                        x_pt: i as f32 * 144.0,
+                        y_pt: 0.0,
+                        w_pt: 120.0,
+                        h_pt: h,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// Every line placed for `source`, in reading order — the block as the reader receives it.
+    ///
+    /// Reading order through a threaded page is column then y, *not* y across the page: the left
+    /// column is read to its foot before the right column starts. Sorting by y alone interleaves
+    /// the two and would make a correctly conserved block look scrambled.
+    fn lines_of(pages: &[LaidOutPage], source: BlockId) -> Vec<String> {
+        let mut out = Vec::new();
+        for page in pages {
+            let mut placed: Vec<(f32, f32, &Vec<Line>)> = page
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    PlacedBlock::Text {
+                        source: s,
+                        frame,
+                        lines,
+                        ..
+                    } if *s == source => Some((frame.x_pt, frame.y_pt, lines)),
+                    _ => None,
+                })
+                .collect();
+            placed.sort_by(|a, b| (a.0, a.1).partial_cmp(&(b.0, b.1)).unwrap());
+            out.extend(
+                placed
+                    .into_iter()
+                    .flat_map(|(_, _, l)| l.iter().map(|l| l.text.clone())),
+            );
+        }
+        out
+    }
+
+    /// Lay `content` out through `thread`, with ids assigned.
+    fn flow_columns(content: Vec<Block>, thread: &Thread) -> (Vec<Block>, Vec<LaidOutPage>) {
+        let mut content = content;
+        for (i, b) in content.iter_mut().enumerate() {
+            b.set_id(BlockId(i as u64 + 1));
+        }
+        let pages = lay_out_in_thread(
+            &content,
+            &[],
+            &StyleSheet::default(),
+            thread,
+            &MONO,
+            &NoHyphenator,
+        );
+        (content, pages)
+    }
+
+    #[test]
+    fn a_paragraph_fills_the_column_then_continues_in_the_next() {
+        // A 12-line-tall column already holding one line has room for 11 more, so a 20-line
+        // paragraph leaves 11 behind and carries 9 forward. Asserted by line *text*: a count would
+        // pass just as happily if the continuation repeated the fragment.
+        let thread = split_columns(2, 144.0);
+        let (content, pages) = flow_columns(
+            vec![
+                Block::body("intro", Color::Gray { v: 0.0 }),
+                Block::body(n_line_paragraph(20), Color::Gray { v: 0.0 }),
+            ],
+            &thread,
+        );
+        let para = content[1].id();
+
+        let first: Vec<_> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text {
+                    source,
+                    frame,
+                    lines,
+                    ..
+                } if *source == para => Some((frame.x_pt, lines.len(), lines[0].text.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            first.len(),
+            2,
+            "the paragraph must be placed in two pieces, got {first:?}"
+        );
+        assert_eq!(first[0], (0.0, 11, "w00aaaaaaaaa".to_string()));
+        assert_eq!(first[1], (144.0, 9, "w11aaaaaaaaa".to_string()));
+    }
+
+    #[test]
+    fn every_line_of_every_split_block_survives_exactly_once() {
+        // The conservation invariant, and the only test here that catches the failure that matters:
+        // a fragment whose remainder is dropped produces a book missing a paragraph, and no
+        // geometric assertion notices. Asserted against the unsplit break of each paragraph, over a
+        // document that splits many times across many pages.
+        let thread = split_columns(2, 144.0);
+        let paragraphs: Vec<String> = (0..12).map(|i| n_line_paragraph(9 + i)).collect();
+        let content: Vec<Block> = std::iter::once(Block::body("intro", Color::Gray { v: 0.0 }))
+            .chain(
+                paragraphs
+                    .iter()
+                    .map(|t| Block::body(t.clone(), Color::Gray { v: 0.0 })),
+            )
+            .collect();
+        let (content, pages) = flow_columns(content, &thread);
+
+        assert!(
+            pages.len() > 1,
+            "the fixture must span pages, got {}",
+            pages.len()
+        );
+
+        let mut split_blocks = 0;
+        for (i, text) in paragraphs.iter().enumerate() {
+            let id = content[i + 1].id();
+            let expected: Vec<String> = justify_paragraph_hyphenated(
+                text,
+                120.0,
+                BODY_FONT_SIZE_PT,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            )
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+            let got = lines_of(&pages, id);
+            assert_eq!(got, expected, "paragraph {i} was not conserved");
+
+            let pieces = pages
+                .iter()
+                .flat_map(|p| p.blocks.iter())
+                .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == id))
+                .count();
+            if pieces > 1 {
+                split_blocks += 1;
+            }
+        }
+        assert!(
+            split_blocks >= 4,
+            "the fixture must exercise splitting, only {split_blocks} blocks split"
+        );
+    }
+
+    #[test]
+    fn a_paragraph_never_strands_a_single_line() {
+        // Three assertions of one rule. A widow left behind and an orphan carried forward are the
+        // same defect seen from two sides, and a splitter that fixes ragged column feet by
+        // producing them has made the page worse.
+        let ink = Color::Gray { v: 0.0 };
+
+        // Room for exactly one more line at the foot: move whole rather than strand it.
+        let thread = split_columns(2, 24.0);
+        let (content, pages) = flow_columns(
+            vec![
+                Block::body("intro", ink),
+                Block::body(n_line_paragraph(8), ink),
+            ],
+            &thread,
+        );
+        let pieces = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == content[1].id()))
+            .count();
+        assert_eq!(
+            pieces, 1,
+            "one line of room must not produce a one-line fragment"
+        );
+
+        // Room for 7 of an 8-line paragraph: cut at 6 so the remainder keeps two, not one.
+        let thread = split_columns(2, 96.0);
+        let (content, pages) = flow_columns(
+            vec![
+                Block::body("intro", ink),
+                Block::body(n_line_paragraph(8), ink),
+            ],
+            &thread,
+        );
+        let counts: Vec<usize> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text { source, lines, .. } if *source == content[1].id() => {
+                    Some(lines.len())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![6, 2],
+            "the cut must back off to leave two lines"
+        );
+
+        // Three lines or fewer never split at all, whatever the room.
+        let thread = split_columns(2, 48.0);
+        let (content, pages) = flow_columns(
+            vec![
+                Block::body("intro", ink),
+                Block::body(n_line_paragraph(3), ink),
+            ],
+            &thread,
+        );
+        let pieces = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == content[1].id()))
+            .count();
+        assert_eq!(pieces, 1, "a three-line paragraph must never split");
+    }
+
+    #[test]
+    fn space_above_is_charged_to_the_fragment_and_space_below_to_the_remainder() {
+        // Not a partition: the natural implementation subtracts, and is wrong in a way that makes
+        // every continuation one space-after too tall and shows up only as slow page drift.
+        let mut styles = StyleSheet::default();
+        styles.paragraph.insert(
+            BODY_STYLE.to_string(),
+            ParagraphStyle {
+                font_size_pt: BODY_FONT_SIZE_PT,
+                leading_pt: BODY_LINE_HEIGHT_PT,
+                align: TextAlign::Justified,
+                space_before_pt: 9.0,
+                space_after_pt: 5.0,
+            },
+        );
+        let mut content = vec![
+            Block::body("intro", Color::Gray { v: 0.0 }),
+            Block::body(n_line_paragraph(12), Color::Gray { v: 0.0 }),
+        ];
+        for (i, b) in content.iter_mut().enumerate() {
+            b.set_id(BlockId(i as u64 + 1));
+        }
+        let thread = split_columns(2, 144.0);
+        let pages = lay_out_in_thread(&content, &[], &styles, &thread, &MONO, &NoHyphenator);
+        let para = content[1].id();
+
+        let boxes: Vec<(f32, f32, usize)> = pages[0]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                PlacedBlock::Text {
+                    source,
+                    frame,
+                    lines,
+                    ..
+                } if *source == para => Some((frame.y_pt, frame.h_pt, lines.len())),
+                _ => None,
+            })
+            .collect();
+
+        // The intro occupies 9 + 12 + 5 = 26 pt, leaving 118 pt of the 144 pt column. The fragment
+        // is charged the 9 pt of space *above*, so nine of its twelve lines fit (9 + 108 = 117 pt)
+        // and three carry forward. Twelve lines rather than ten so the cut is bounded by the height
+        // and not by the two-line minimum — otherwise this asserts the widow rule a second time
+        // instead of asserting the space arithmetic.
+        assert_eq!(
+            boxes.len(),
+            2,
+            "expected a fragment and a remainder, got {boxes:?}"
+        );
+        assert!(
+            (boxes[0].0 - (26.0 + 9.0)).abs() < 0.01,
+            "fragment y {}",
+            boxes[0].0
+        );
+        assert_eq!(boxes[0].2, 9);
+        assert!(
+            (boxes[0].1 - 108.0).abs() < 0.01,
+            "fragment height {}",
+            boxes[0].1
+        );
+        // The fragment's box is its lines and nothing else — 9 x 12 pt — because it does not end
+        // the paragraph and so is charged no space below. The remainder starts flush at the next
+        // column's top, carries no space above, and its box is 3 x 12 + the 5 pt below: the two
+        // halves each carry exactly one of the paragraph's two vertical spaces, which is the whole
+        // point. (The placed box including the space below is the engine's existing convention,
+        // matching an unsplit paragraph.)
+        assert!(
+            (boxes[1].0 - 0.0).abs() < 0.01,
+            "remainder y {}",
+            boxes[1].0
+        );
+        assert_eq!(boxes[1].2, 3);
+        assert!(
+            (boxes[1].1 - 41.0).abs() < 0.01,
+            "remainder height {}",
+            boxes[1].1
+        );
+    }
+
+    #[test]
+    fn a_block_facing_a_narrower_continuation_moves_whole() {
+        // The cut is an index into the line list at *this* width; another width re-wraps to a
+        // different list against which that index means something else. The guard is the reason
+        // splitting is correct rather than approximately correct, so it gets its own test.
+        let thread = Thread {
+            frames: vec![
+                Frame {
+                    rect: Rect {
+                        x_pt: 0.0,
+                        y_pt: 0.0,
+                        w_pt: 120.0,
+                        h_pt: 144.0,
+                    },
+                },
+                Frame {
+                    rect: Rect {
+                        x_pt: 144.0,
+                        y_pt: 0.0,
+                        w_pt: 90.0,
+                        h_pt: 144.0,
+                    },
+                },
+            ],
+        };
+        let (content, pages) = flow_columns(
+            vec![
+                Block::body("intro", Color::Gray { v: 0.0 }),
+                Block::body(n_line_paragraph(20), Color::Gray { v: 0.0 }),
+            ],
+            &thread,
+        );
+        let pieces = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == content[1].id()))
+            .count();
+        assert_eq!(
+            pieces, 1,
+            "a differing continuation width must fall back to moving whole"
+        );
+    }
+
+    #[test]
+    fn an_image_yields_no_break_opportunities() {
+        // "Everything is splittable" must never become an assumption. An oversized image still
+        // moves whole and, in an empty frame, still overflows rather than looping.
+        let assets = vec![Asset {
+            id: "big".into(),
+            path: "big.png".into(),
+            px_w: 400,
+            px_h: 1200,
+            dpi: 300.0,
+            has_alpha: false,
+            line_art: false,
+        }];
+        let mut content = vec![
+            Block::body("intro", Color::Gray { v: 0.0 }),
+            Block::image("big"),
+        ];
+        for (i, b) in content.iter_mut().enumerate() {
+            b.set_id(BlockId(i as u64 + 1));
+        }
+        let thread = split_columns(2, 144.0);
+        let pages = lay_out_in_thread(
+            &content,
+            &assets,
+            &StyleSheet::default(),
+            &thread,
+            &MONO,
+            &NoHyphenator,
+        );
+        let images = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(|b| matches!(b, PlacedBlock::Image { .. }))
+            .count();
+        assert_eq!(images, 1, "an image must be placed once, whole");
     }
 }
