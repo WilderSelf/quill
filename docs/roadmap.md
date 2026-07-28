@@ -42,6 +42,17 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   "re-flow only affected pages" — far more precisely than a timer. Spec 0027.
 - **The bench step folds into an existing CI job rather than adding a new one.** A new job is not
   automatically a required branch-protection context, so a new job would gate nothing. Spec 0027.
+- **All 4 of CI's emitted check-runs are required contexts.** This resolves an open question that
+  spec 0027 reasoned from and got wrong. CI emits `fmt + clippy + test` on ubuntu/macos/windows plus
+  `PDF preflight (Ghostscript)`; until 2026-07-27 only the first three were required, so the
+  Ghostscript PDF/X parse check, the `.tpub` export check, the screen-render check, the per-crate
+  feature-unification guard and spec 0027's own performance-budget gate were all advisory — a PR
+  that broke PDF/X conformance or blew a budget could still auto-merge. 0027 folded the bench step
+  into that job *believing it was one of the required three*. `PDF preflight (Ghostscript)` is now
+  the 4th required context. It costs no merge latency: it runs 55–109 s while the Windows leg runs
+  68–250 s, so it is never the critical path, and the repo is public so Actions minutes are free.
+  If the bench step ever flakes on runner noise, split it into its own advisory job rather than
+  dropping the whole context — the other four checks in that job are deterministic.
 
 ## M1 increments (all shipped)
 
@@ -306,7 +317,6 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
 Deliberately unresolved; each would change work if answered differently. Recorded so they are
 decided explicitly rather than by accident.
 
-- Which 3 of CI's 4 emitted check-runs does branch protection actually require? CI emits `fmt + clippy + test (ubuntu-latest)`, `(macos-latest)`, `(windows-latest)` and `PDF preflight (Ghostscript)`, but CLAUDE.md:159 says 3 contexts are required — so the required set is already a strict subset and a *new* job would not gate merges. Spec 0027 folds the bench step into the existing Linux-only job to avoid an out-of-band admin change, but that only works if that job is one of the required three. Needs `gh api repos/.../branches/main/protection` (gh CLI is not installed in this sandbox).
 - Canvas backend: `tiny-skia` (MIT/Apache, pure Rust, CPU, zero native build across the three-OS matrix) vs `skia-safe` (what CLAUDE.md names; GPU, but a heavy bundled-native build on ubuntu/macos/windows) vs `vello`/`wgpu`. render/Cargo.toml:9 still says "evaluating vello", so this is genuinely undecided. The plan proposes tiny-skia behind the paint-list seam so a GPU backend can swap in later — but CLAUDE.md explicitly says screen rendering uses Skia, so this needs a human ruling.
 - `BlockId` representation: a `u64` newtype (compact, cheap `Hash`, ideal cache key) or a stable string id (human-readable in the JSON manifest, better for the stated git-diffability goal of the text manifest). This choice is baked into every cache key and every frame→content reference from spec 0026 onward.
 - Should `.tpub` be read in place (streaming out of the zip) or extracted to a working directory on open? This determines what `asset_root` actually is, whether edits are staged in a temp tree, and what "save" means (rewrite the zip vs. incremental update). It also decides whether the proxy cache can be persisted alongside the extracted assets.
