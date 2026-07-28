@@ -19,7 +19,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
-| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | complete — specs 0062–0067 shipped; the contents-list re-expression of 0067 is carried as a known issue |
+| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | specs 0062–0067 shipped; **closing out via 0068–0070**, the increments its two known issues turned into once they were measured |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
@@ -104,6 +104,71 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   text of an existing `Heading`/`Body` block (crates/app/src/lib.rs:212-247), and nothing else — no
   block creation, no save, and `document_mut()` (crates/app/src/lib.rs:260-262) is an escape hatch
   called only from tests. A stat block nobody can insert is not an on-ramp.
+
+- **The writer draws the shaped glyph run, not the characters it was given.** Spec 0068. Measurement
+  has shaped since 0016 and the screen has drawn shaped glyphs since 0033; only the PDF writer still
+  encodes character by character, so the press file is the one surface in the workspace that
+  disagrees with the other two. Correcting it converges all three on one shaper, which is what
+  `CLAUDE.md` claims the `fonts` crate is for ("One shaper for screen *and* press, so they cannot
+  drift"). It closes spec 0016's named non-goal — carrying shaped glyph ids into the content stream,
+  and the shaping-GID ↔ subset-GID reconciliation that requires — which has now been deferred three
+  times (0016, 0032, and an open question below).
+
+  The alternative was to disable `liga` in measurement, which would make the character-encoded draw
+  correct and reduce the fix to per-pair `TJ` adjustments. **Rejected**: a desktop publishing
+  application whose press output cannot set an `fi` is not one, and the defect would be paid for in
+  typography rather than in code. Ligatures are on by default in every comparable application.
+
+  **`/ToUnicode` ships in the same increment, and this is a coupling argument rather than scope
+  creep.** No `/ToUnicode` CMap is written today for any font, so with `Identity-H` a copy or a
+  search over a quill PDF already yields subset glyph ids instead of text. That is survivable while
+  the encoding is one glyph per character, because the mapping is recoverable in principle. Drawing
+  ligatures makes it unrecoverable from outside the file: nothing downstream can learn that one
+  glyph was three characters. The cluster map that states it exists only at the moment of shaping,
+  so reconstructing it later means shaping the whole document again. Emit it where it is known.
+
+- **`w_pt` on a placed part is ink: the bounding box of what the part actually draws.** Spec 0069.
+  `PlacedBlock` is a record of what was drawn, and the slot it was drawn into is authored geometry
+  that is available from the frame and the stylesheet without going through placed output. Five
+  reasons, in the order they decide it:
+
+  1. **Alignment is not recoverable downstream.** `PlacedBlock` carries no alignment field, so a
+     right-aligned segment in a wide slot is indistinguishable from a left-aligned one. Under slot
+     semantics its reported box is nowhere near its ink. Spec 0067's `lay_tabs` already resolves the
+     stop into `x_pt` for all four alignments (`Right` ⇒ `x_pt = stop - w`), and spec 0047 already
+     does the same for master statics — three producers are ink today and the rule merely stops
+     contradicting itself.
+  2. **This is already the repo's stated intent, unimplemented.** `specs/0047-master-static-alignment.md`
+     says a placed static "reports where the line *actually* sits rather than the box it was aligned
+     in — which is what spec 0050's geometry preflight will need to ask." Body text, table cells,
+     panel sections, list markers and the contents list contradict it.
+  3. **Both of preflight's consumers want ink.** The safe-area check asks whether ink lands in the
+     margin; `under_dpi` divides pixels by the *drawn* width and would silently mis-report
+     resolution against anything else.
+  4. **False positives are the expensive failure mode**, which spec 0050 says in as many words. A
+     short ragged line in a wide column puts no ink near the trim, and reporting it teaches a user
+     to skim the report — and so to skim the real finding.
+  5. It makes spec 0052's `/Link` hot areas correct as a side effect, per the known issue above.
+
+  **`h_pt` moves with it, to the same rule.** A box that is ink horizontally and slot vertically is
+  worse than either, because no reader of the rectangle can know which question it answers.
+
+  **This decision is only honest after 0068, which is why it is sequenced behind it.** Under ink
+  semantics `w_pt` is the *measured* advance; while the PDF draws a different glyph run, the drawn
+  ink is up to 4.90 pt wider than the number preflight reads, and a right-edge safety violation
+  inside that band would go **unreported**. A false negative on a press check is the one outcome
+  `CLAUDE.md`'s "prefer a visible failure over silent press-corruption" rule forbids outright.
+  Shipping 0069 first would trade a class of false positives for a class of false negatives, which
+  is the wrong direction; shipping it after 0068 makes measured and drawn the same number and the
+  trade disappears.
+
+  **What is lost, and how it is paid for.** A containment invariant is currently expressed *through*
+  `w_pt` — `crates/layout-engine/src/lib.rs:4549-4556` asserts no run overruns its panel's right
+  padding, and `table_columns_land_at_exact_fractions_of_the_measure` asserts exact column widths.
+  Under ink semantics both weaken to "the text that happened to be there fits", which cannot catch a
+  cell broken to too wide a measure. These are real checks and 0069 keeps them by re-expressing them
+  against the measure at the producer, where it is known, instead of inferring it from placed
+  output. A test that has to reconstruct its input from the output was asking the wrong object.
 
 ## M1 increments (all shipped)
 
@@ -2183,6 +2248,113 @@ list, a bibliography or a specification sheet — and quill currently draws its 
   than the feature alone.
 - A document with no tab stop exports byte-identically to before this increment.
 
+## M5 closeout increments (0068–0070)
+
+Three increments that finish what M5 opened. They exist because M5 shipped two mechanisms whose
+*consequences* were recorded as known issues rather than built, and because the audit that settled
+those two questions found that one of them had the wrong diagnosis. Sequenced in a hard order: 0069
+is not honest before 0068, and 0070 is not expressible before 0069.
+
+Each closes a known issue, so each deletes that entry in its own PR — the rule this file already
+applies.
+
+### 0068 shaped-glyph-output
+
+**The PDF draws the glyphs that were measured** · size: large · branch: `feat/shaped-glyph-output`
+
+The writer encodes the shaped glyph run rather than the characters, emits the GPOS advance deltas as
+`TJ` adjustments, subsets by glyph id rather than by character, and writes a `/ToUnicode` CMap so the
+result is still text. Closes spec 0016's three-times-deferred non-goal.
+
+**Acceptance criteria**
+
+- For a corpus spanning the five measured cases above, **drawn width equals measured width to
+  0.01 pt** — asserted by summing the `/W` entries of the emitted glyphs and the `TJ` adjustments
+  actually written, not by re-deriving from the shaper. The control case must stay at exactly zero
+  or the instrument is measuring itself.
+- `ffi` in the source draws as one glyph, and the ligature's glyph id is *in* the subset — today it
+  cannot be, because the subset is cut from a set of characters.
+- A `/ToUnicode` CMap maps every emitted glyph back to its characters, with the ligature mapping to
+  the three it came from. Asserted by extracting text from the exported PDF and comparing to the
+  source, which nothing in the workspace can do today.
+- Both show paths carry it — `show_line` **and** `show_line_by_span` — and a kern pair straddling a
+  span boundary is neither lost nor doubled. There is no test for that boundary today; the trap is
+  the one already documented at crates/export-pdf/src/writer.rs:920-924 for justification.
+- `TJ` amounts are rounded to integer thousandths explicitly rather than relying on the bundled
+  face's `upem == 1000`. A face at 2048 would otherwise emit `ryu` shortest-round-trip floats, making
+  both the file size and the digest's cross-platform reproducibility depend on `f32` ordering.
+- **`SAMPLE_EXPORT_DIGEST` is re-derived under the content-stream template**, the third of the three
+  in the ledger at crates/export-pdf/src/lib.rs:1622-1690 and the first content-stream move since
+  spec 0028: the new operators are inspected and stated, not accepted. Exported against the
+  committed parity ICC, and diffed against a build of `main` in a worktree.
+- Content streams are **not** FlateDecode'd, so every added byte lands in the file. The size change
+  for `Document::sample()` and for the 500-page synthetic document is **measured and recorded**, not
+  left to be discovered. No budget guards export size today; if the growth warrants one, that is a
+  finding for the spec, not a silent regression.
+- The Ghostscript CI gate is the real external check here: `-dPDFSTOPONERROR` is what catches a
+  malformed `TJ` array, which is the actual risk. A legal-but-wrong array is caught by the width
+  assertion above.
+- Two tests assert the *current* contract and must be rewritten rather than deleted:
+  `ragged_line_uses_a_single_show` asserts a ragged line contains no `TJ` — exactly what this
+  invalidates — and `every_line_is_shown_in_the_face_it_was_set_in` walks the stream matching
+  `" Tj"`, so it goes structurally blind rather than failing.
+
+**Named non-goals, with the residual measured** — in the style of spec 0016, so the known issue can
+honestly be deleted. The screen renderer splits on `' '` unconditionally and shapes each word
+separately (crates/render/src/raster.rs:221), so a kern pair straddling a space is lost on screen
+while `measure_run` counts it. That is the same class of defect in the opposite direction, it is
+*not* what this increment is about, and it must either ship here as a one-line change with its own
+assertion or be recorded with its measured magnitude. The stale comment at raster.rs:186-191 —
+"the word positions are derived the same way the writer derives its `TJ` offsets" — stops being true
+the moment this lands, and is part of the increment either way.
+
+### 0069 placed-geometry-is-ink
+
+**A placed part reports the ink it draws** · size: medium · branch: `feat/placed-geometry-is-ink`
+
+Applies the decision from the log to every producer: body and heading paragraphs, table cells,
+component text sections, list markers, and the contents list. The three that are already ink
+(master statics, the contents page number, 0067's segments and leaders) stop being exceptions.
+
+**Acceptance criteria**
+
+- One stated rule on `PlacedBlock`, in a doc comment, that every producer is checked against: the
+  frame is the bounding box of the ink, `x_pt` its left edge and `x_pt + w_pt` its right.
+- **A multi-line paragraph is an ink bounding box, not an advance.** `line.indent_pt` is added at
+  draw time and differs per line under a hanging indent (spec 0048), so no single `x_pt` is "the
+  ink start" for a paragraph: it is `frame.x + min(indent)` and the width is
+  `max(indent + advance) - min(indent)`. This is the case the tab-segment definition does not cover,
+  because a segment is one line at zero indent, and it is where a naive reading of the rule breaks.
+- The containment assertions are re-expressed against the measure at the producer, and are shown
+  still to fail against the defect they were written for — a cell broken to too wide a measure.
+  Reintroducing the defect and re-running is the check, per the lesson from spec 0064.
+- `PlacedBlock::Image` keeps drawn-extent semantics exactly, or `under_dpi` silently mis-reports
+  resolution. This is a press-safety regression rather than a cosmetic one, and it is the one place
+  the new rule and the old happen to agree.
+- `component_parity`'s 20 constants move. They are re-derived by the file's own rule — never pasted
+  from a failing run — and the geometry digest's move is stated as intended, per its module docs.
+- The safe-area check gains a test that fails under slot semantics and passes under ink. Note that
+  `generic`'s `safety_pt == 0.0` short-circuits `intrudes`, so a test on the default preset asserts
+  nothing at all: it needs a preset with a real safety margin.
+
+### 0070 contents-list-through-tabs
+
+**The generated contents list is a tabbed paragraph** · size: small · branch: `feat/toc-through-tabs`
+
+Deletes `measure_toc`'s hand-rolled indent/clip/leader arithmetic in favour of one right tab stop
+with a dot leader. The pattern spec 0054 used to retire the hand-written component measurement.
+
+**Acceptance criteria**
+
+- Every **x position** and the leader's **dot count** are byte-identical to 0041's output. That is
+  the equivalence claim, and it is what makes this a generalization rather than a rewrite.
+- The three **widths** move, deliberately and individually justified: the entry title from its clip
+  column to its measured advance, the leader from its gap to its drawn dots, and the list's own
+  title from the whole frame measure to its measured advance.
+- The `/Link` hot area is asserted to cover the title text and **not** the dot leader — the defect
+  named in the known issue, which no test covers today.
+- The ellipsis clipping stays in the contents list. It is not a tab rule.
+
 ## Known issues
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
@@ -2208,28 +2380,67 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
   it says in as many words that it inverts when the fix ships.
 
-- **Line breaking measures kerned advances; the PDF draws unkerned ones.** Since spec 0016,
-  measurement goes through `rustybuzz`, which applies `kern`/`GPOS`. The content stream shows a
-  string of CIDs and the viewer advances by the `/W` array, which holds `hmtx` advances — no kern
-  pair is applied by any consumer. So a line is drawn slightly *wider* than it was broken to.
-  Measured on the bundled face at 10 pt: a 61-character line of ordinary prose draws 1.36 pt wider
-  than it measured (0.3% of a 432 pt measure); a kern-heavy `AV Wa To Yo, Pa.` draws 4.53 pt wider
-  over 16 characters. Small, but it is spec 0060's rule leaking: a last line proven to fit its
-  measure can still be drawn past it. The fix is to emit the kerning as `TJ` adjustments — the same
-  array justification already uses — which moves every export byte-hash in the workspace and so is
-  an increment with a re-derivation, not a patch.
+- **The PDF does not draw the glyphs that were measured.** Sequenced as spec 0068; the entry is
+  kept until it ships, with its diagnosis corrected. Since spec 0016 measurement goes through
+  `rustybuzz` with HarfBuzz's default feature set for horizontal LTR, which is **both `kern`/`GPOS`
+  and `liga`/`GSUB`**. The content stream is encoded character by character
+  (`EmbeddedFont::encode_line`, crates/export-pdf/src/fonts.rs:80-87), the subset is cut from a
+  `BTreeSet<char>`, and the viewer advances by the `/W` array, which holds raw `hmtx` advances. So
+  the drawn run is a different glyph sequence from the measured one, and it is always the wider.
 
-- **The generated contents list is not yet re-expressed through spec 0067's tab mechanism.** 0067
-  ships the mechanism and 0041's hand-rolled version still stands beside it. The analysis is done:
-  laying `"{clipped title}\t{number}"` against one right stop at `width - indent`, with a `.` leader
-  of `gap_pt: TOC_LEADER_GAP_PT`, reproduces every **x position** and the leader's dot count exactly.
-  Two **widths** do not. `measure_toc` gives the title part `w_pt: title_max` — the column it was
-  clipped to, not the text's width — and the leader part `w_pt: leader_end - leader_x`, the gap
-  rather than the drawn dots; the mechanism reports each segment's measured width. Those fields are
-  placed geometry that spec 0050's preflight reads, so the choice is a real one about what `w_pt` on
-  a placed part *means*, and it should be made with the preflight consequences looked at rather than
-  settled by whichever value keeps a digest green. The ellipsis clipping stays contents-specific
-  either way: it is not a tab rule, it is "an entry does not wrap".
+  **This entry previously recorded the kerning half only, and named a fix that cannot work.**
+  Measured on the bundled face at 10 pt, printing character count beside glyph count:
+
+  | case | chars | glyphs | measured | drawn | gap |
+  |---|---|---|---|---|---|
+  | ordinary prose | 59 | 59 | 285.22 | 286.38 | +1.16 pt |
+  | kern-heavy `AV Wa To Yo, Pa.` | 16 | 16 | 76.85 | 81.38 | +4.53 pt |
+  | `office` | 6 | **4** | 26.10 | 26.99 | +0.89 pt |
+  | ligature-rich prose | 62 | **52** | 260.93 | 265.83 | +4.90 pt |
+  | control — neither feature fires | 17 | 17 | 113.59 | 113.59 | 0.0000 |
+
+  The control row is what makes the rest attributable rather than noise. The fourth row is the
+  finding: an ordinary sentence loses ten glyphs to ligatures and draws 4.90 pt wider — a larger
+  error than the kern-heavy display string, and four times the figure this entry used to carry. The
+  repo already asserts the mechanism from the other side
+  (`tracking_is_spent_per_shaped_glyph_not_per_character`, crates/fonts/src/lib.rs:744-763, whose
+  comment says in as many words that `office` shapes its `ffi` to one glyph).
+
+  **The recorded fix — "emit the kerning as `TJ` adjustments" — is not implementable as stated**,
+  and that is why 0068 is scoped the way it is rather than as the patch this entry once implied. A
+  `TJ` array interleaves numbers between pieces of *one* encoded string, so it can only express a
+  correction that is positional. When the shaped sequence has 52 glyphs and the encoded sequence has
+  62, there is no per-piece correspondence to hang the adjustments on. Either measurement stops
+  applying `liga` — rejected: a publishing application that never sets a ligature is not one — or
+  the writer draws the shaped glyph run. The second is the fix, and the kern adjustments then fall
+  out of it, because shaping yields the GPOS deltas at the same moment it yields the glyph ids.
+
+  It is spec 0060's rule leaking: a last line proven to fit its measure can still be drawn past it.
+  It is also **a prerequisite for the placed-geometry decision below**, not merely adjacent to it —
+  see the decisions log.
+
+- **The generated contents list is not yet re-expressed through spec 0067's tab mechanism.**
+  Sequenced as spec 0070, behind 0068 and 0069. 0067 ships the mechanism and 0041's hand-rolled
+  version still stands beside it. Laying `"{clipped title}\t{number}"` against one right stop at
+  `width - indent`, with a `.` leader of `gap_pt: TOC_LEADER_GAP_PT`, reproduces every **x
+  position** and the leader's dot count exactly. Two **widths** do not: `measure_toc` gives the
+  title part `w_pt: title_max` — the column it was clipped to — and the leader part
+  `w_pt: leader_end - leader_x`, the gap rather than the drawn dots.
+
+  **The question that blocked it is answered in the decisions log: `w_pt` is ink.** So the
+  mechanism's values are the correct ones and `measure_toc`'s are the defect, which inverts this
+  increment's acceptance criterion — every x position and dot count is byte-identical, and the two
+  widths deliberately move. A third width moves with them, unlisted until the audit that settled
+  this: the contents list's *own* title part carries `w_pt: width`, the whole frame measure
+  (crates/layout-engine/src/lib.rs:1379-1389). The ellipsis clipping stays contents-specific either
+  way — it is not a tab rule, it is "an entry does not wrap".
+
+  It also fixes a defect nobody had filed. The entry title is the only part in the workspace
+  carrying `link_page`, so spec 0052's `/Link` hot area is emitted from `title_max`: in a screen
+  export the clickable region spans the whole clip column, running past the end of the title and
+  across the dot leader. The comment at crates/layout-engine/src/lib.rs:2110-2112 claims a link
+  whose hot area has drifted off its own text is "structurally impossible"; today that is true
+  vertically and false horizontally.
 
 ## Open questions
 
@@ -2238,7 +2449,7 @@ decided explicitly rather than by accident.
 
 - Should the 500-page synthetic document target page count by measurement (robust: stays ~500 when leading, margins or hyphenation change, but the workload silently changes size) or fix the block count (stable workload, drifting page count)? Spec 0027 assumes measure-to-target and the *benches* still do. **Answered for the line-breaking equivalence corpus by spec 0060**, which had to pin it by block count before it could prove anything: a corpus sized by laying a document out moves whenever the thing it is testing moves, and the two are then indistinguishable. Whether the benches should follow is still open — they measure throughput, where a workload that tracks a page target is arguably the point.
 - Does the CI perf gate assert any wall-clock at all, or only work counters plus same-run ratios? The plan uses ratios and a 2x blowup ceiling; a stricter gate would need self-hosted or pinned runners.
-- Deferred by design: `text-layout::Line` still carries no glyph ids or positions, so spec 0033's renderer re-shapes each line through the shared `quill-fonts` shaper and derives word positions from `space_adjust_pt`, exactly as `writer::render_page` does for `TJ`. That keeps one shaper but two derivation sites. Is that acceptable through M1, or should `text-layout` emit positioned glyph runs (spec 0016's still-open named non-goal, including shaping-GID ↔ subset-GID reconciliation) before the app shell ships?
+- ~~Deferred by design: `text-layout::Line` still carries no glyph ids or positions…~~ **Answered by spec 0068, three milestones after it was asked, and answered by necessity rather than by preference.** The question was whether the shaping-GID ↔ subset-GID reconciliation could keep being deferred; the answer is that it could, right up until someone measured what the deferral cost — the press file draws a different glyph sequence from the one that was measured, by up to 4.90 pt on an ordinary sentence. What the question got wrong was framing it as a tidiness concern about "one shaper but two derivation sites". Two derivation sites are fine when they agree. These did not, and nothing in the question would have revealed that, because it asked about the shape of the code rather than about whether the two sites produced the same number. **The general form is worth keeping: when a duplicated derivation is deferred, the thing to record is not that it is duplicated but what it measures differently, and if that has never been measured, that is the finding.**
 - Is per-page master assignment by **index** (spec 0035) the right anchor, or should a master be attached to the chapter it opens? Index-based assignment means a TOC that grows by a page slides every chapter opener by one (spec 0041 names this). Anchoring to a heading's `BlockId` would survive repagination but needs a notion of "section" the model does not have. M2 ships index-based; M3 should decide whether that survives contact with a real book.
 - Should a `PodPreset` ever be recorded *in* a `.tpub`? Spec 0049 says no — a document is not bound
   to one printer, and a persisted preset would go stale inside a file nobody re-opens. The cost is
