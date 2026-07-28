@@ -417,14 +417,18 @@ max_level: 3
         assert_eq!(c.len(), 6);
 
         match &c[0] {
-            Block::Heading { level, text, .. } => {
-                assert_eq!((*level, text.as_str()), (1, "The Ruined Keep"))
+            b @ Block::Heading { level, .. } => {
+                assert_eq!(
+                    (*level, b.plain_text().unwrap()),
+                    (1, "The Ruined Keep".to_string())
+                )
             }
             other => panic!("{other:?}"),
         }
         match &c[1] {
             // Soft newlines inside a paragraph become spaces.
-            Block::Body { text, .. } => {
+            b @ Block::Body { .. } => {
+                let text = b.plain_text().unwrap();
                 assert_eq!(text, "A dank corridor stretches into darkness.")
             }
             other => panic!("{other:?}"),
@@ -495,7 +499,7 @@ max_level: 3
             .content
             .iter()
             .filter_map(|b| match b {
-                Block::Body { text, .. } => Some(text.clone()),
+                b @ Block::Body { .. } => b.plain_text(),
                 _ => None,
             })
             .collect();

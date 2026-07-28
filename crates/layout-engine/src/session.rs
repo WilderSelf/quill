@@ -497,6 +497,10 @@ impl Measurer for CachingMeasurer<'_> {
 /// 64-bit collision across one document's blocks is not a realistic risk.
 fn content_fingerprint(block: &Block) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // A run's *text* changes a measurement; its colour does not, and joins the colour tail below so
+    // a colour-only edit invalidates the placed result without forcing a re-measure. Keeping that
+    // two-tier split is the point of spec 0031's key, and spec 0063 must not blunt it.
+
     let mut eat = |bytes: &[u8]| {
         for b in bytes {
             h ^= *b as u64;
@@ -505,16 +509,26 @@ fn content_fingerprint(block: &Block) -> u64 {
     };
     match block {
         Block::Heading {
-            level, text, style, ..
+            level, runs, style, ..
         } => {
             eat(b"h");
             eat(&[*level]);
-            eat(text.as_bytes());
+            for r in runs {
+                eat(r.text.as_bytes());
+                // A boundary byte, so ["ab"] and ["a","b"] cannot collide: same text, different
+                // runs, and one of them can be recoloured mid-word.
+                eat(&[0xff]);
+            }
             eat(style.as_deref().unwrap_or("").as_bytes());
         }
-        Block::Body { text, style, .. } => {
+        Block::Body { runs, style, .. } => {
             eat(b"b");
-            eat(text.as_bytes());
+            for r in runs {
+                eat(r.text.as_bytes());
+                // A boundary byte, so ["ab"] and ["a","b"] cannot collide: same text, different
+                // runs, and one of them can be recoloured mid-word.
+                eat(&[0xff]);
+            }
             eat(style.as_deref().unwrap_or("").as_bytes());
         }
         Block::Image { asset, .. } => {
@@ -593,8 +607,11 @@ fn content_fingerprint(block: &Block) -> u64 {
     }
     // Colour does not affect measurement, but it does affect the placed block, so a colour-only
     // edit must still invalidate the cached *result*.
-    if let Block::Heading { color, .. } | Block::Body { color, .. } = block {
+    if let Block::Heading { color, runs, .. } | Block::Body { color, runs, .. } = block {
         eat(format!("{color:?}").as_bytes());
+        for r in runs {
+            eat(format!("{:?}", r.style.color).as_bytes());
+        }
     }
     h
 }
@@ -871,6 +888,88 @@ mod tests {
         assert_eq!(again.stats.pages_reflowed, 0);
         assert_eq!(again.stats.blocks_measured, 0);
         assert!(again.changed_pages.is_empty());
+    }
+
+    #[test]
+    fn recolouring_a_run_invalidates_the_page_it_is_on() {
+        // A run's colour is ink that reaches the page, so an edit to it has to invalidate the
+        // cached result — exactly as a *block's* colour already does (`content_fingerprint` folds
+        // colour in for this reason, accepting a re-measure to keep one key rather than two).
+        // Without spec 0063 folding the run's own override in, recolouring a word would change
+        // nothing the cache could see and the page would keep its stale ink.
+        let mut doc = doc_of(20);
+        doc.content[3] = Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("A lead-in phrase "),
+                quill_core_model::Run::plain("and the rest of the sentence carries on."),
+            ],
+            Color::Gray { v: 0.0 },
+        );
+        doc.assign_missing_block_ids().expect("ids");
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let Block::Body { runs, .. } = &mut doc.content[3] else {
+            unreachable!()
+        };
+        runs[0].style.color = Some(Color::Cmyk {
+            c: 0.0,
+            m: 1.0,
+            y: 1.0,
+            k: 0.0,
+        });
+        doc.bump_revision();
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            !after.changed_pages.is_empty(),
+            "the page must repaint, or the new ink never reaches it"
+        );
+    }
+
+    #[test]
+    fn editing_a_runs_text_does_re_measure_the_block() {
+        // The other half: the two-tier split is only worth anything if the measurement tier still
+        // fires. Text is metrics.
+        let mut doc = doc_of(20);
+        doc.content[3] = Block::body_runs(
+            vec![quill_core_model::Run::plain("A phrase that will grow.")],
+            Color::Gray { v: 0.0 },
+        );
+        doc.assign_missing_block_ids().expect("ids");
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let Block::Body { runs, .. } = &mut doc.content[3] else {
+            unreachable!()
+        };
+        runs.push(quill_core_model::Run::plain(
+            " And another clause after it.",
+        ));
+        doc.bump_revision();
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            after.stats.blocks_measured > 0,
+            "changing a run's text changes the measurement"
+        );
+    }
+
+    #[test]
+    fn splitting_a_paragraph_into_runs_is_not_the_same_content() {
+        // ["ab"] and ["a","b"] set the same characters but are not the same document: one of them
+        // can be recoloured mid-word. The fingerprint has to be able to tell them apart, or an
+        // edit that only moves a boundary would serve a stale placed result.
+        let one = Block::body_runs(
+            vec![quill_core_model::Run::plain("abcd")],
+            Color::Gray { v: 0.0 },
+        );
+        let two = Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("ab"),
+                quill_core_model::Run::plain("cd"),
+            ],
+            Color::Gray { v: 0.0 },
+        );
+        assert_ne!(content_fingerprint(&one), content_fingerprint(&two));
     }
 
     #[test]
@@ -1380,7 +1479,7 @@ mod tests {
 
         let id = doc.content[10].id();
         let text = match &doc.content[10] {
-            Block::Body { text, .. } => text.clone(),
+            b @ Block::Body { .. } => b.plain_text().unwrap_or_default(),
             _ => unreachable!(),
         };
         doc.content[10] = Block::body(

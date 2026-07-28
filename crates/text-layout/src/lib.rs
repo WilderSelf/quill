@@ -325,24 +325,108 @@ pub fn break_paragraph_shrinkable(
     hyphenator: &impl Hyphenator,
     shrinkable: bool,
 ) -> Vec<String> {
+    break_runs_shrinkable(
+        &[text],
+        first_width_pt,
+        rest_width_pt,
+        size_pt,
+        metrics,
+        hyphenator,
+        shrinkable,
+    )
+    .into_iter()
+    .map(|b| b.text)
+    .collect()
+}
+
+/// One broken line before justification: its text and where each stretch of it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokenLine {
+    pub text: String,
+    pub spans: Vec<Span>,
+}
+
+/// [`break_paragraph_shrinkable`] over an ordered list of authored runs (spec 0063).
+///
+/// The runs are concatenated and broken as one paragraph — a word straddling a run boundary is one
+/// word, and hyphenates as one, because the alternative would hyphenate `bold` and `face` separately
+/// and produce breaks no reader could explain. What the runs buy is the *span map* on each returned
+/// line: which authored run every stretch of it came from, tracked through the item stream rather
+/// than recovered from the output, so it is exact rather than heuristic.
+///
+/// Measurement is uniform across runs at `size_pt`. Per-run size and tracking are spec 0064; this
+/// increment carries the run structure and what varies with it that does not move a glyph.
+pub fn break_runs_shrinkable(
+    runs: &[&str],
+    first_width_pt: f32,
+    rest_width_pt: f32,
+    size_pt: f32,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+    shrinkable: bool,
+) -> Vec<BrokenLine> {
+    // The concatenation the breaker actually works on, plus the byte offset each run starts at, so
+    // any offset into it maps back to the run that authored it.
+    let text: String = runs.concat();
+    let text = text.as_str();
+    let mut run_start: Vec<usize> = Vec::with_capacity(runs.len());
+    let mut acc = 0usize;
+    for r in runs {
+        run_start.push(acc);
+        acc += r.len();
+    }
+    // The run owning byte `off`: the last run that starts at or before it.
+    let run_of = |off: usize| -> usize {
+        match run_start.binary_search(&off) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    };
     // Words break at ordinary whitespace only. U+00A0 NO-BREAK SPACE binds its neighbours into a
     // single unbreakable box and is emitted as an ordinary space (spec 0048), which is how a key
     // like `Armour Class:` survives a narrow measure instead of breaking after `Armour` and losing
     // the key/value pairing. The replacement matters as much as the binding: leaving U+00A0 in the
     // box text would carry it into the PDF, where `collect_doc_chars` never gathered it and it
     // would subset to a `.notdef` box.
-    let bound: Vec<String> = if text.contains('\u{a0}') {
-        text.split(|c: char| c.is_whitespace() && c != '\u{a0}')
-            .filter(|w| !w.is_empty())
-            .map(|w| w.replace('\u{a0}', " "))
-            .collect()
+    //
+    // Each word carries the byte offset it starts at in `text`, so every box built from it can say
+    // which run authored it. The offsets are what make the span map exact rather than recovered.
+    let split_at = |c: char| c.is_whitespace() && c != '\u{a0}';
+    let bound: Vec<(String, usize)> = if text.contains('\u{a0}') {
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        for (i, c) in text.char_indices() {
+            if split_at(c) {
+                if i > start {
+                    out.push((text[start..i].replace('\u{a0}', " "), start));
+                }
+                start = i + c.len_utf8();
+            }
+        }
+        if start < text.len() {
+            out.push((text[start..].replace('\u{a0}', " "), start));
+        }
+        out
     } else {
         Vec::new()
     };
-    let words: Vec<&str> = if bound.is_empty() {
-        text.split_whitespace().collect()
+    let words: Vec<(&str, usize)> = if bound.is_empty() {
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        for (i, c) in text.char_indices() {
+            if c.is_whitespace() {
+                if i > start {
+                    out.push((&text[start..i], start));
+                }
+                start = i + c.len_utf8();
+            }
+        }
+        if start < text.len() {
+            out.push((&text[start..], start));
+        }
+        out
     } else {
-        bound.iter().map(String::as_str).collect()
+        bound.iter().map(|(w, at)| (w.as_str(), *at)).collect()
     };
     if words.is_empty() {
         return Vec::new();
@@ -366,12 +450,18 @@ pub fn break_paragraph_shrinkable(
     // Build the box/glue/penalty item stream. A word splits at its (validated) hyphenation offsets
     // into segment boxes separated by flagged penalties; inter-word glue joins words.
     enum Item<'a> {
-        Boxed { text: &'a str, width: f32 },
+        /// `at` is the box's byte offset in the concatenated paragraph, which is what maps it back
+        /// to the run that authored it (spec 0063).
+        Boxed {
+            text: &'a str,
+            width: f32,
+            at: usize,
+        },
         Glue,
         Penalty,
     }
     let mut items: Vec<Item> = Vec::new();
-    for (wi, &word) in words.iter().enumerate() {
+    for (wi, &(word, word_at)) in words.iter().enumerate() {
         if wi > 0 {
             items.push(Item::Glue);
         }
@@ -385,6 +475,7 @@ pub fn break_paragraph_shrinkable(
             items.push(Item::Boxed {
                 text: seg,
                 width: metrics.measure_run(seg, size_pt),
+                at: word_at + prev,
             });
             items.push(Item::Penalty);
             prev = off;
@@ -393,6 +484,7 @@ pub fn break_paragraph_shrinkable(
         items.push(Item::Boxed {
             text: seg,
             width: metrics.measure_run(seg, size_pt),
+            at: word_at + prev,
         });
     }
 
@@ -650,7 +742,17 @@ pub fn break_paragraph_shrinkable(
 
     // No fully-feasible breaking (an over-wide, unbreakable word) → greedy fallback.
     let Some(solution) = solution else {
-        return break_by_width(text, rest_width_pt.min(first_width_pt), size_pt, metrics);
+        // Greedy fallback (an over-wide, unbreakable word). Its lines are rebuilt from the source
+        // text, so their spans are recovered by walking the same cursor the reconstruction below
+        // uses — the fallback is rare but must not lose the run map.
+        let mut cursor = 0usize;
+        return break_by_width(text, rest_width_pt.min(first_width_pt), size_pt, metrics)
+            .into_iter()
+            .map(|line| {
+                let spans = spans_for_text(text, &mut cursor, &line, &run_of);
+                BrokenLine { text: line, spans }
+            })
+            .collect();
     };
 
     // Materialize the winning start sequence by walking its back-chain to the root, then reversing:
@@ -676,19 +778,88 @@ pub fn break_paragraph_shrinkable(
             None => (n_items, false),
         };
         let mut line = String::new();
+        let mut spans: Vec<Span> = Vec::new();
+        // Attribute each emitted byte to a run as it is emitted. A glue's space and a break's
+        // hyphen belong to the run of the box before them: neither exists in the source, and
+        // splitting a span to hold a character nobody authored would be a distinction with no
+        // consumer. `last` is that run.
+        let mut last = 0usize;
+        let push = |spans: &mut Vec<Span>, run: usize, len: usize| match spans.last_mut() {
+            Some(sp) if sp.run == run => sp.len_bytes += len,
+            _ => spans.push(Span {
+                run,
+                len_bytes: len,
+            }),
+        };
         for it in &items[from..content_end] {
             match it {
-                Item::Boxed { text, .. } => line.push_str(text),
-                Item::Glue => line.push(' '),
+                Item::Boxed { text: t, at, .. } => {
+                    // A box may straddle a run boundary; emit one span per run it covers.
+                    let mut off = *at;
+                    let end = at + t.len();
+                    while off < end {
+                        let run = run_of(off);
+                        let run_end = run_start.get(run + 1).copied().unwrap_or(usize::MAX);
+                        let chunk = end.min(run_end) - off;
+                        push(&mut spans, run, chunk);
+                        last = run;
+                        off += chunk;
+                    }
+                    line.push_str(t);
+                }
+                Item::Glue => {
+                    line.push(' ');
+                    push(&mut spans, last, 1);
+                }
                 Item::Penalty => {}
             }
         }
         if ends_at_penalty {
             line.push('-');
+            push(&mut spans, last, 1);
         }
-        lines.push(line);
+        debug_assert_eq!(
+            spans.iter().map(|sp| sp.len_bytes).sum::<usize>(),
+            line.len(),
+            "the spans must partition the line exactly"
+        );
+        lines.push(BrokenLine { text: line, spans });
     }
     lines
+}
+
+/// Recover a line's span map by consuming the source text in order.
+///
+/// Only the greedy fallback needs this: it rebuilds lines from `text` rather than from the item
+/// stream, so there are no box offsets to read. Whitespace between words is collapsed, so the
+/// cursor skips it; every other byte of the line came from the source in order.
+fn spans_for_text(
+    source: &str,
+    cursor: &mut usize,
+    line: &str,
+    run_of: &impl Fn(usize) -> usize,
+) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    let bytes = source.as_bytes();
+    for ch in line.chars() {
+        // Skip source whitespace the breaker collapsed away.
+        while *cursor < bytes.len() && (bytes[*cursor] as char).is_whitespace() && ch != ' ' {
+            *cursor += 1;
+        }
+        let run = run_of((*cursor).min(source.len().saturating_sub(1)));
+        let len = ch.len_utf8();
+        match spans.last_mut() {
+            Some(sp) if sp.run == run => sp.len_bytes += len,
+            _ => spans.push(Span {
+                run,
+                len_bytes: len,
+            }),
+        }
+        if *cursor < bytes.len() {
+            *cursor += len.min(bytes.len() - *cursor);
+        }
+    }
+    spans
 }
 
 /// Paragraph alignment (spec 0017, increment 2). Only the two modes this increment renders are
@@ -699,6 +870,18 @@ pub enum Alignment {
     Justified,
     /// Ragged-right: words sit at their natural advances, no inter-word adjustment.
     Left,
+}
+
+/// A stretch of one line's text that came from a single authored run (spec 0063).
+///
+/// Byte lengths rather than ranges: spans are consumed in order and a length composes under the
+/// splitting a fragment does, where an absolute offset would have to be rebased.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    /// Index into the paragraph's runs.
+    pub run: usize,
+    /// Length of this stretch, in bytes of the line's `text`.
+    pub len_bytes: usize,
 }
 
 /// One laid-out line: its text plus the per-gap inter-word adjustment needed to justify it.
@@ -712,6 +895,12 @@ pub enum Alignment {
 pub struct Line {
     /// The line's words joined by single spaces (identical to what [`break_paragraph`] returns).
     pub text: String,
+    /// Which authored run each stretch of `text` came from, in order (spec 0063).
+    ///
+    /// The spans partition `text` exactly, so a run boundary may fall mid-line — which is the case
+    /// inline runs exist for. A paragraph authored as one run yields one span covering the whole
+    /// line, and every consumer then takes the same path it took before runs existed.
+    pub spans: Vec<Span>,
     /// Points to add to each inter-word gap to justify the line (see the struct docs).
     pub space_adjust_pt: f32,
     /// Points to inset this line's left edge from its frame (spec 0048): a first-line indent on the
@@ -818,6 +1007,35 @@ pub fn justify_paragraph_indented(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<Line> {
+    justify_runs_indented(
+        &[text],
+        max_width_pt,
+        indent,
+        size_pt,
+        align,
+        metrics,
+        hyphenator,
+    )
+}
+
+/// [`justify_paragraph_indented`] over an ordered list of authored runs (spec 0063).
+///
+/// The runs are one paragraph for every purpose that moves a glyph — breaking, hyphenation,
+/// justification — and are distinguishable only through each returned line's `spans`. That is the
+/// whole design: a run must not be able to change where a line breaks, or the run model would be a
+/// layout change rather than a generalization, and "one run lays out identically to a string" would
+/// stop being provable.
+pub fn justify_runs_indented(
+    runs: &[&str],
+    max_width_pt: f32,
+    indent: Indent,
+    size_pt: f32,
+    align: Alignment,
+    metrics: &impl RunMetrics,
+    hyphenator: &impl Hyphenator,
+) -> Vec<Line> {
+    let joined: String = runs.concat();
+    let text = joined.as_str();
     let first_w = max_width_pt - indent.first_pt;
     let rest_w = max_width_pt - indent.rest_pt;
 
@@ -840,8 +1058,7 @@ pub fn justify_paragraph_indented(
         || text
             .split_whitespace()
             .any(|w| metrics.measure_run(w, size_pt) > first_w.min(rest_w));
-    let lines =
-        break_paragraph_shrinkable(text, first_w, rest_w, size_pt, metrics, hyphenator, !ragged);
+    let lines = break_runs_shrinkable(runs, first_w, rest_w, size_pt, metrics, hyphenator, !ragged);
 
     // Ragged: Left alignment, or the greedy fallback (some word overflows the frame — its line
     // would need to shrink past its glue, so justifying it would push spaces negative).
@@ -859,8 +1076,9 @@ pub fn justify_paragraph_indented(
         return lines
             .into_iter()
             .enumerate()
-            .map(|(idx, text)| Line {
-                text,
+            .map(|(idx, broken)| Line {
+                text: broken.text,
+                spans: broken.spans,
                 space_adjust_pt: 0.0,
                 indent_pt: inset(idx),
             })
@@ -871,7 +1089,8 @@ pub fn justify_paragraph_indented(
     lines
         .into_iter()
         .enumerate()
-        .map(|(idx, text)| {
+        .map(|(idx, broken)| {
+            let text = broken.text;
             let spaces = text.split_whitespace().count().saturating_sub(1);
             // Last line stays ragged; a single-word line has no gap to adjust.
             let space_adjust_pt = if idx == last || spaces == 0 {
@@ -885,11 +1104,31 @@ pub fn justify_paragraph_indented(
             };
             Line {
                 text,
+                spans: broken.spans,
                 space_adjust_pt,
                 indent_pt: inset(idx),
             }
         })
         .collect()
+}
+
+impl Line {
+    /// A line whose text is all one run — furniture, a contents entry, a table cell.
+    ///
+    /// Most lines in the workspace are built rather than broken, and every one of them is a single
+    /// run by construction; this keeps them from having to spell that out.
+    pub fn single_run(text: impl Into<String>, space_adjust_pt: f32, indent_pt: f32) -> Line {
+        let text = text.into();
+        Line {
+            spans: vec![Span {
+                run: 0,
+                len_bytes: text.len(),
+            }],
+            text,
+            space_adjust_pt,
+            indent_pt,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1369,6 +1608,135 @@ mod tests {
     }
 
     #[test]
+    fn one_run_breaks_exactly_as_a_string_does() {
+        // The criterion the whole run model stands on: a run must not be able to move a break, or
+        // this is a layout change rather than a generalization.
+        let text = "the quick brown fox jumps over the lazy dog and keeps on running for a while";
+        for width in [40.0, 60.0, 97.5, 130.0] {
+            let as_string = justify_paragraph_indented(
+                text,
+                width,
+                Indent::default(),
+                SIZE,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            );
+            let as_runs = justify_runs_indented(
+                &[text],
+                width,
+                Indent::default(),
+                SIZE,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            );
+            assert_eq!(as_string, as_runs, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn splitting_a_paragraph_into_runs_does_not_move_a_break() {
+        let whole = "the quick brown fox jumps over the lazy dog and keeps on running for a while";
+        // Three arbitrary cut points, including one mid-word.
+        let split: Vec<&str> = vec![&whole[..14], &whole[14..37], &whole[37..]];
+        assert_eq!(split.concat(), whole);
+        for width in [40.0, 60.0, 97.5, 130.0] {
+            let one = justify_runs_indented(
+                &[whole],
+                width,
+                Indent::default(),
+                SIZE,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            );
+            let many = justify_runs_indented(
+                &split,
+                width,
+                Indent::default(),
+                SIZE,
+                Alignment::Justified,
+                &MONO,
+                &NoHyphenator,
+            );
+            let texts = |ls: &[Line]| ls.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+            assert_eq!(texts(&one), texts(&many), "breaks moved at width {width}");
+            for (a, b) in one.iter().zip(&many) {
+                assert!(
+                    (a.space_adjust_pt - b.space_adjust_pt).abs() < 0.01,
+                    "justification moved at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spans_partition_every_line_and_name_the_right_run() {
+        let runs = [
+            "Armour Class",
+            " is ",
+            "15 and the shield helps a great deal indeed",
+        ];
+        let lines = justify_runs_indented(
+            &runs,
+            60.0,
+            Indent::default(),
+            SIZE,
+            Alignment::Justified,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(lines.len() > 1, "want a multi-line case");
+        // Every line's spans partition its text exactly...
+        for line in &lines {
+            let covered: usize = line.spans.iter().map(|s| s.len_bytes).sum();
+            assert_eq!(covered, line.text.len(), "spans must cover {:?}", line.text);
+            assert!(line.spans.iter().all(|s| s.run < runs.len()));
+        }
+        // ...and reading the spans back in order reproduces the runs' own text. Whitespace is
+        // compared out: a break consumes the glue it breaks at, so a space that fell between two
+        // lines is in neither. That is the property every consumer downstream relies on.
+        let mut per_run = vec![String::new(); runs.len()];
+        for line in &lines {
+            let mut at = 0usize;
+            for sp in &line.spans {
+                per_run[sp.run].push_str(&line.text[at..at + sp.len_bytes]);
+                at += sp.len_bytes;
+            }
+        }
+        let squash = |s: &str| s.replace(' ', "");
+        assert_eq!(squash(&per_run[0]), squash("Armour Class"), "run 0");
+        assert_eq!(squash(&per_run[1]), squash(" is "), "run 1");
+        assert_eq!(
+            squash(&per_run[2]),
+            squash("15 and the shield helps a great deal indeed"),
+            "run 2"
+        );
+    }
+
+    #[test]
+    fn a_word_straddling_a_run_boundary_is_one_word() {
+        // `bold` + `face` is the word `boldface`, and it must never break at the boundary — the
+        // boundary is a change of treatment, not of text.
+        let lines = justify_runs_indented(
+            &["a bold", "face word"],
+            1000.0,
+            Indent::default(),
+            SIZE,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "a boldface word");
+        // And the boundary shows up as a span change inside that word.
+        let runs: Vec<usize> = lines[0].spans.iter().map(|s| s.run).collect();
+        assert_eq!(runs, vec![0, 1], "the split falls inside `boldface`");
+        assert_eq!(lines[0].spans[0].len_bytes, "a bold".len());
+    }
+
+    #[test]
     fn single_word_line_is_not_justified() {
         // One word wider than a narrow frame's other content still can't be justified (no gap).
         let lines = justify_paragraph("hello", 1000.0, SIZE, Alignment::Justified, &MONO);
@@ -1376,6 +1744,10 @@ mod tests {
             lines,
             vec![Line {
                 text: "hello".to_string(),
+                spans: vec![Span {
+                    run: 0,
+                    len_bytes: 5
+                }],
                 space_adjust_pt: 0.0,
                 indent_pt: 0.0,
             }]

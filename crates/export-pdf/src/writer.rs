@@ -485,6 +485,7 @@ fn render_page(
                 frame,
                 lines,
                 color,
+                run_colors,
                 font_size_pt,
                 leading_pt,
                 ..
@@ -511,7 +512,20 @@ fn render_page(
                     let (x, y) = geom::flip(g, frame.x_pt + line.indent_pt, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
-                    show_line(&mut content, font, line, *font_size_pt);
+                    // One colour for the whole line is the overwhelmingly common case and the
+                    // one that must stay byte-identical: it takes the path it took before runs
+                    // existed. Only a line whose spans really do disagree pays for the split.
+                    match single_ink(line, run_colors) {
+                        Some(_) => show_line(&mut content, font, line, *font_size_pt),
+                        None => show_line_by_span(
+                            &mut content,
+                            font,
+                            line,
+                            *font_size_pt,
+                            run_colors,
+                            *color,
+                        ),
+                    }
                 }
                 content.end_text();
             }
@@ -731,6 +745,81 @@ fn set_stroke(content: &mut Content, color: &Color) {
 /// at `font_size_pt` is `-1000 · space_adjust_pt / font_size_pt`. The size is the block's own
 /// (spec 0028), not a global constant: the adjustment is in thousandths of an *em*, so using the
 /// wrong size would misplace every word on a justified line set at anything but body size.
+/// The one ink this line is set in, or `None` if its spans disagree (spec 0063).
+///
+/// `None` is the only case that costs anything: a block with no run colours, or one whose runs all
+/// resolved to the same ink, is emitted exactly as it was before runs existed — which is what makes
+/// "one run is byte-identical to a string" hold at the byte level and not merely at the geometry.
+fn single_ink(line: &Line, run_colors: &[Color]) -> Option<()> {
+    if run_colors.is_empty() {
+        return Some(());
+    }
+    let mut inks = line.spans.iter().map(|sp| run_colors.get(sp.run));
+    let first = inks.next().flatten();
+    inks.all(|c| c.map(fmt_ink) == first.map(fmt_ink))
+        .then_some(())
+}
+
+/// Colours are `f32` and so not `Eq`; compare them by their debug form, which is what the rest of
+/// the workspace already does when it needs colour identity rather than colour arithmetic.
+fn fmt_ink(c: &Color) -> String {
+    format!("{c:?}")
+}
+
+/// Show one line, changing fill colour at each span boundary (spec 0063).
+///
+/// Colour operators are ordinary graphics state and are legal inside a text object, so this needs no
+/// `ET`/`BT` pair — the text matrix set for the line stays current across the whole line.
+///
+/// Justification is unchanged in meaning: the adjustment goes after every inter-word space, exactly
+/// as [`show_line`] places it. It is emitted in whichever span's array the space falls, so a span
+/// boundary inside a word cannot lose or double an adjustment.
+fn show_line_by_span(
+    content: &mut Content,
+    font: &fonts::EmbeddedFont,
+    line: &Line,
+    font_size_pt: f32,
+    run_colors: &[Color],
+    fallback: Color,
+) {
+    let adjust = if line.space_adjust_pt == 0.0 {
+        0.0
+    } else {
+        -1000.0 * line.space_adjust_pt / font_size_pt
+    };
+    let mut at = 0usize;
+    let mut current: Option<String> = None;
+    for sp in &line.spans {
+        let end = (at + sp.len_bytes).min(line.text.len());
+        let piece = &line.text[at..end];
+        at = end;
+        let ink = run_colors.get(sp.run).copied().unwrap_or(fallback);
+        if current.as_deref() != Some(fmt_ink(&ink).as_str()) {
+            set_fill(content, &ink);
+            current = Some(fmt_ink(&ink));
+        }
+        if piece.is_empty() {
+            continue;
+        }
+        if adjust == 0.0 {
+            content.show(Str(&font.encode_line(piece)));
+            continue;
+        }
+        let mut tj = content.show_positioned();
+        let mut items = tj.items();
+        let mut rest = piece;
+        while let Some(idx) = rest.find(' ') {
+            let (head, tail) = rest.split_at(idx + 1);
+            items.show(Str(&font.encode_line(head)));
+            items.adjust(adjust);
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            items.show(Str(&font.encode_line(rest)));
+        }
+    }
+}
+
 fn show_line(content: &mut Content, font: &fonts::EmbeddedFont, line: &Line, font_size_pt: f32) {
     if line.space_adjust_pt == 0.0 {
         content.show(Str(&font.encode_line(&line.text)));
@@ -807,6 +896,7 @@ mod tests {
             index: 0,
             statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
+                run_colors: Vec::new(),
                 source: quill_core_model::BlockId::UNASSIGNED,
                 frame: quill_core_model::Rect {
                     x_pt: 0.0,
@@ -816,11 +906,7 @@ mod tests {
                 },
                 font_size_pt: FONT_SIZE_PT,
                 leading_pt: LINE_HEIGHT_PT,
-                lines: vec![Line {
-                    text: "Hi".to_string(),
-                    space_adjust_pt: 0.0,
-                    indent_pt: 0.0,
-                }],
+                lines: vec![Line::single_run("Hi".to_string(), 0.0, 0.0)],
                 color,
             }],
         };
@@ -944,6 +1030,7 @@ mod tests {
             index: 0,
             statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
+                run_colors: Vec::new(),
                 source: quill_core_model::BlockId::UNASSIGNED,
                 frame: quill_core_model::Rect {
                     x_pt: 0.0,
@@ -953,11 +1040,7 @@ mod tests {
                 },
                 font_size_pt: FONT_SIZE_PT,
                 leading_pt: LINE_HEIGHT_PT,
-                lines: vec![Line {
-                    text: text.to_string(),
-                    space_adjust_pt,
-                    indent_pt: 0.0,
-                }],
+                lines: vec![Line::single_run(text, space_adjust_pt, 0.0)],
                 color: Color::Gray { v: 0.0 },
             }],
         };

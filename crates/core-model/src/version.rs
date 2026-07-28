@@ -204,6 +204,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 3 {
         migrate_2_to_3(obj);
     }
+    if found < 4 {
+        migrate_3_to_4(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -237,6 +240,38 @@ fn migrate_1_to_2(obj: &mut serde_json::Map<String, serde_json::Value>) {
 /// The written-out defaults do not survive back into the manifest: both fields are
 /// `skip_serializing_if`-defaulted, so a migrated document re-serializes without them and its
 /// exported `/ID` does not move. That is deliberate — see spec 0047's risks.
+/// v3 → v4 (spec 0063): a paragraph's single `text` becomes an ordered list of styled `runs`.
+///
+/// Unlike the two before it this is a real rewrite rather than a defaulted field — the old key is
+/// removed and a new one takes its place — because the run model is what `text` should have been,
+/// and carrying both would leave two sources of truth for the same characters.
+///
+/// The result is still a *serialization* no-op in effect: one plain run serializes to
+/// `{"text": "…"}` inside `runs`, with no style object, so a migrated v3 document lays out and
+/// exports byte-for-byte as it did. That is asserted rather than asserted-of.
+fn migrate_3_to_4(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(content) = obj.get_mut("content").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for block in content.iter_mut() {
+        let Some(block) = block.as_object_mut() else {
+            continue;
+        };
+        // Only the two flowed-text blocks carried a bare `text`. A `toc`'s `title` and a panel's
+        // fields are not paragraphs and keep their strings.
+        match block.get("kind").and_then(|k| k.as_str()) {
+            Some("heading") | Some("body") => {}
+            _ => continue,
+        }
+        let Some(text) = block.remove("text") else {
+            continue;
+        };
+        let mut run = serde_json::Map::new();
+        run.insert("text".into(), text);
+        block.insert("runs".into(), serde_json::Value::Array(vec![run.into()]));
+    }
+}
+
 fn migrate_2_to_3(obj: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(masters) = obj.get_mut("master_pages").and_then(|v| v.as_array_mut()) else {
         return;
@@ -320,6 +355,72 @@ pub fn migrate_pack(value: &mut serde_json::Value) -> Result<(), LoadError> {
 
     obj.insert("pack_version".into(), PACK_VERSION.into());
     Ok(())
+}
+
+#[cfg(test)]
+mod runs_migration_tests {
+    use crate::{Block, Document, FORMAT_VERSION};
+
+    /// A v3 document — a paragraph as a bare `text` string — becomes one plain run.
+    #[test]
+    fn a_v3_paragraph_migrates_to_one_plain_run() {
+        let v3 = serde_json::json!({
+            "format_version": 3,
+            "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                           "facing_pages": true},
+            "content": [
+                { "kind": "heading", "id": 1, "level": 1, "text": "A title",
+                  "color": { "space": "gray", "v": 0.0 } },
+                { "kind": "body", "id": 2, "text": "Some prose.",
+                  "color": { "space": "gray", "v": 0.0 } }
+            ]
+        });
+        let doc = Document::from_json(&v3.to_string()).expect("a v3 document must load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+        let Block::Heading { runs, .. } = &doc.content[0] else {
+            panic!("expected a heading")
+        };
+        assert_eq!(runs.len(), 1, "one string is one run");
+        assert_eq!(runs[0].text, "A title");
+        assert!(runs[0].style.is_empty(), "and it overrides nothing");
+        assert_eq!(doc.content[1].plain_text().as_deref(), Some("Some prose."));
+    }
+
+    /// The migration must not reach blocks whose strings are not paragraphs.
+    #[test]
+    fn a_toc_title_is_not_a_paragraph_and_keeps_its_string() {
+        let v3 = serde_json::json!({
+            "format_version": 3,
+            "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                           "facing_pages": true},
+            "content": [
+                { "kind": "toc", "id": 1, "title": "Contents", "max_level": 2,
+                  "color": { "space": "gray", "v": 0.0 } }
+            ]
+        });
+        let doc = Document::from_json(&v3.to_string()).expect("load");
+        let Block::Toc { title, .. } = &doc.content[0] else {
+            panic!("expected a toc")
+        };
+        assert_eq!(title, "Contents");
+    }
+
+    /// A v4 file must not be silently accepted by a build that predates it — the contract spec 0025
+    /// set, asserted here for the version this increment introduces.
+    #[test]
+    fn a_newer_version_is_refused_by_name() {
+        let newer = serde_json::json!({
+            "format_version": FORMAT_VERSION + 1,
+            "page_setup": {"trim": {"w_pt": 432.0, "h_pt": 648.0}, "bleed_pt": 9.0,
+                           "facing_pages": true},
+            "content": []
+        });
+        let err = Document::from_json(&newer.to_string()).expect_err("must refuse");
+        assert!(
+            format!("{err:?}").contains("UnsupportedVersion"),
+            "got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
