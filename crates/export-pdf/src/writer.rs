@@ -583,11 +583,14 @@ fn render_page(
                 // Ascent is the family's, and the four bundled faces share one set of vertical
                 // metrics, so it is the same wherever a run sits (spec 0064).
                 let ascent = family.font(base_slot).ascent_pt(*font_size_pt);
+                // The frame's left edge is the leftmost line's, not the measure's (spec 0069).
+                let indent_base = quill_text_layout::indent_base(lines);
                 for (li, line) in lines.iter().enumerate() {
                     let top_y = frame.y_pt + ascent + li as f32 * leading_pt;
-                    // The line's own left inset (spec 0048) — the same field the screen painter
-                    // adds, so press and screen cannot disagree about an indent.
-                    let (x, y) = geom::flip(g, frame.x_pt + line.indent_pt, top_y);
+                    // The line's own left inset (spec 0048), relative to the block's ink box — the
+                    // same field and the same shared base the screen painter uses, so press and
+                    // screen cannot disagree about an indent.
+                    let (x, y) = geom::flip(g, frame.x_pt + line.indent_pt - indent_base, top_y);
                     // Absolute text matrix per line (avoids relative-Td bookkeeping).
                     content.set_text_matrix([1.0, 0.0, 0.0, 1.0, x, y]);
                     // One colour *and* one format for the whole line is the overwhelmingly common

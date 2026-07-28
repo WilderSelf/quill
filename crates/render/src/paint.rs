@@ -182,8 +182,13 @@ pub fn paint_page(
                 // The baseline comes from the shared font crate, which is also where the PDF writer
                 // gets it (spec 0032). One source, so screen and page agree about where a line sits.
                 let ascent = quill_text_layout::RunMetrics::ascent_pt(family, *font_size_pt);
+                // The frame's left edge is the *leftmost* line's, not the measure's (spec 0069), so
+                // each line is drawn from it by however much its own inset exceeds that. The same
+                // subtraction the PDF writer makes, from the same shared helper: the frame gained
+                // exactly what each line's inset gives back, so no glyph moved.
+                let indent_base = quill_text_layout::indent_base(lines);
                 for (i, line) in lines.iter().enumerate() {
-                    let x0 = geom.off_x + frame.x_pt + line.indent_pt;
+                    let x0 = geom.off_x + frame.x_pt + line.indent_pt - indent_base;
                     let baseline_pt = geom.off_y + frame.y_pt + ascent + i as f32 * leading_pt;
                     // One op per line unless the line's runs really are set in different inks
                     // (spec 0063). The single-ink path is the one every existing document takes,

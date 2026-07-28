@@ -516,6 +516,70 @@ pub fn natural_width(
     total
 }
 
+/// One line's **drawn advance**: its natural width plus the justification it spends on its spaces
+/// (spec 0069).
+///
+/// [`natural_width`] answers "how wide is this text"; this answers "how far does this line reach",
+/// which is the question an ink box asks. The two differ by exactly the stretch a justified line
+/// puts into its gaps, and the writer's `TJ` array and the painter's `space_adjust_pt` both spend it
+/// per space — so it is counted per space here too.
+pub fn line_advance(
+    line: &Line,
+    formats: &[RunFormat],
+    default: RunFormat,
+    metrics: &impl RunMetrics,
+) -> f32 {
+    natural_width(&line.text, &line.spans, formats, default, metrics)
+        + line.text.matches(' ').count() as f32 * line.space_adjust_pt
+}
+
+/// The leftmost inset of any of `lines` — the origin a placed frame's left edge sits at (spec 0069).
+///
+/// [`Line::indent_pt`] is added at *draw* time and differs per line under a hanging indent
+/// (spec 0048), so a paragraph has no single "ink start" among its lines; it has a **leftmost** one.
+/// Both painters subtract this from every line's own indent, so the placed frame's left edge and the
+/// leftmost glyph are the same point. That is what makes the frame an ink box rather than an
+/// advance, and it moves no glyph: the frame's `x_pt` gained exactly what each line's inset lost.
+pub fn indent_base(lines: &[Line]) -> f32 {
+    // No lines means no ink and no origin to shift: `0.0`, so an empty block is placed exactly
+    // where it was rather than at infinity.
+    let mut base = f32::INFINITY;
+    for line in lines {
+        base = base.min(line.indent_pt);
+    }
+    if base.is_finite() {
+        base
+    } else {
+        0.0
+    }
+}
+
+/// The **ink bounding box** of a broken paragraph, relative to the left edge of the measure it was
+/// broken to: `(dx, w)` (spec 0069).
+///
+/// `dx` is [`indent_base`] and `w` is `max(indent + advance) - dx`. A single line at zero indent —
+/// a tab segment, a master static, a list marker — is the degenerate case where this is just the
+/// line's advance, which is why the general rule has to be stated rather than assumed: a multi-line
+/// paragraph under a hanging indent has no line whose box is the paragraph's.
+///
+/// Empty input is an empty box at the measure's left edge, not a negative one.
+pub fn ink_box(
+    lines: &[Line],
+    formats: &[RunFormat],
+    default: RunFormat,
+    metrics: &impl RunMetrics,
+) -> (f32, f32) {
+    if lines.is_empty() {
+        return (0.0, 0.0);
+    }
+    let dx = indent_base(lines);
+    let right = lines
+        .iter()
+        .map(|l| l.indent_pt + line_advance(l, formats, default, metrics))
+        .fold(f32::NEG_INFINITY, f32::max);
+    (dx, (right - dx).max(0.0))
+}
+
 /// Where each of a line's spans starts, in points from the line's own origin (spec 0064).
 ///
 /// The PDF writer and the screen painter both need this, and they must not derive it separately: a
@@ -1440,6 +1504,63 @@ impl Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- spec 0069: the ink box of a broken paragraph ---------------------------------------------
+
+    /// One line at `indent_pt`, with `text` and a single span covering it.
+    fn indented_line(text: &str, indent_pt: f32, space_adjust_pt: f32) -> Line {
+        Line {
+            spans: vec![Span {
+                run: 0,
+                len_bytes: text.len(),
+            }],
+            text: text.to_string(),
+            space_adjust_pt,
+            indent_pt,
+        }
+    }
+
+    #[test]
+    fn an_ink_box_spans_the_lines_rather_than_following_any_one_of_them() {
+        // The hard case spec 0069 exists to state: under a hanging indent the leftmost line and the
+        // rightmost reach are different lines, so neither line's own box is the paragraph's.
+        let m = MonospaceRunMetrics { em_ratio: 0.5 };
+        let plain = RunFormat::plain(10.0);
+        // "aaaaaaaa" is 40 pt at 0 indent (reaches 40); "bbb" is 15 pt at 12 (reaches 27);
+        // "cccccccccc" is 50 pt at 12 (reaches 62).
+        let lines = vec![
+            indented_line("aaaaaaaa", 0.0, 0.0),
+            indented_line("bbb", 12.0, 0.0),
+            indented_line("cccccccccc", 12.0, 0.0),
+        ];
+        assert_eq!(indent_base(&lines), 0.0);
+        assert_eq!(ink_box(&lines, &[], plain, &m), (0.0, 62.0));
+
+        // Drop the flush line and the whole box shifts right, rather than merely narrowing: the
+        // origin is the leftmost line's, which is now the indented one.
+        assert_eq!(ink_box(&lines[1..], &[], plain, &m), (12.0, 50.0));
+    }
+
+    #[test]
+    fn a_justified_lines_advance_includes_the_space_it_spends() {
+        // `natural_width` answers "how wide is this text"; a line's advance answers "how far does it
+        // reach", and a justified line reaches its measure exactly. An ink box built on the first
+        // would report every interior line of a justified paragraph short by the stretch.
+        let m = MonospaceRunMetrics { em_ratio: 0.5 };
+        let plain = RunFormat::plain(10.0);
+        let line = indented_line("aa bb cc", 0.0, 3.0);
+        // 8 chars x 5 pt = 40, plus 2 spaces x 3 pt of justification.
+        assert_eq!(line_advance(&line, &[], plain, &m), 46.0);
+        assert_eq!(ink_box(&[line], &[], plain, &m), (0.0, 46.0));
+    }
+
+    #[test]
+    fn an_empty_line_list_is_an_empty_box_at_the_origin() {
+        // A block with nothing in it must be placed where it was, not at infinity.
+        let m = MonospaceRunMetrics { em_ratio: 0.5 };
+        assert_eq!(indent_base(&[]), 0.0);
+        assert_eq!(ink_box(&[], &[], RunFormat::plain(10.0), &m), (0.0, 0.0));
+    }
 
     // --- spec 0018 increment 1: penalty item stream + Hyphenator seam ------------------------------
 
