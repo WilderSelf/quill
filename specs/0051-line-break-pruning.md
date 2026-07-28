@@ -148,6 +148,19 @@ case. The pathological case is timed once rather than through `min_of`: the budg
 detector with three orders of magnitude of headroom, so noise is irrelevant and repeats would only
 make the bench slower.
 
+### Re-deriving the digest when the corpus moves
+
+The digest is not a magic number and may not be pasted from a failing run. It is re-derived by
+checking out `text-layout`'s **pre-pruning** source, running the test, taking the value it reports,
+then restoring pruning and confirming the value is unchanged. Only that sequence proves anything.
+
+It has been re-derived once. Specs 0044-0046 pack columns tighter, and `quill-testdoc` sizes its
+document by *measuring* to ~500 pages, so reaching that target now takes more blocks: 3,078
+paragraphs / 690,915 lines became 3,251 / 730,328. The corpus changed; line breaking did not. The
+guard assertions on paragraph and line count are what made that distinction visible instead of
+letting a digest mismatch read as "pruning broke something" — or worse, letting someone re-record
+the digest from the post-pruning build and prove nothing at all.
+
 ## Risks
 
 - **Pruning that is a hair too aggressive changes line breaks in rare paragraphs**, which changes

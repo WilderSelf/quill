@@ -29,14 +29,23 @@ const MEASURES_PT: &[f32] = &[432.0, 198.0, 96.0, 54.0];
 
 /// Digest of every line of the corpus at every measure, with and without hyphenation.
 ///
-/// Recorded from the pre-0051 breaker on `main` (commit `ec7d79e`) before any pruning existed.
-const CORPUS_DIGEST: u64 = 0xa013_fe79_a5d8_e97e;
+/// Recorded from the **pre-0051 breaker**, by checking out `text-layout`'s pre-pruning source,
+/// running this test, and taking the value it reported — then restoring pruning and confirming it
+/// reports the same. That is the whole proof, and it is why the digest may only ever be re-derived
+/// that way and never simply pasted from a failing run.
+///
+/// Re-derived once, against a corpus that legitimately moved. Specs 0044-0046 pack columns tighter,
+/// and `quill-testdoc` sizes its document by *measuring* to ~500 pages, so more blocks are now
+/// needed to reach that target: 3,078 paragraphs / 690,915 lines became 3,251 / 730,328. The guard
+/// assertions below are what caught it — they refuse to compare a digest against a corpus that is
+/// not the one it was recorded from, which is exactly the failure a bare digest would have hidden.
+const CORPUS_DIGEST: u64 = 0x9ff1_d046_5473_aa9c;
 /// Total number of lines the corpus produces, digested alongside as a human-legible cross-check —
 /// a digest mismatch says "something moved", this says how much text there was.
-const CORPUS_LINES: usize = 690_915;
+const CORPUS_LINES: usize = 730_328;
 /// Paragraph count actually exercised, so a corpus that quietly shrank cannot pass by breaking
 /// nothing.
-const CORPUS_PARAGRAPHS: usize = 3_078;
+const CORPUS_PARAGRAPHS: usize = 3_251;
 
 /// A deterministic, font-free hyphenator: every word longer than four characters may break after
 /// each third character.
