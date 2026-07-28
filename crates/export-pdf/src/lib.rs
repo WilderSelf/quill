@@ -577,6 +577,45 @@ mod tests {
     }
 
     #[test]
+    fn every_bundled_template_is_press_clean_and_exportable() {
+        // Spec 0036's load-bearing criterion. A starter document that fails preflight the moment it
+        // is created teaches a beginner that the error panel is noise — which is the one lesson
+        // this product cannot afford to teach, because the panel is what stands between them and a
+        // mis-coloured file at a print shop.
+        //
+        // This lives in export-pdf rather than core-model deliberately: it must run the real
+        // checker, not a re-implementation of what we believe the checker does.
+        let (opts, icc) = opts_with_real_icc("template_preflight");
+        for t in quill_core_model::Template::bundled() {
+            let doc = Document::from_template(t);
+
+            let report = preflight(&doc, &opts);
+            let errors: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| f.severity == Severity::Error)
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "template `{}` is not press-clean: {errors:?}",
+                t.name
+            );
+
+            // And it must actually export. An empty content list is a path nothing exercised
+            // before templates existed.
+            let mut bytes = Vec::new();
+            export(&doc, &opts, &mut bytes)
+                .unwrap_or_else(|e| panic!("template `{}` failed to export: {e:?}", t.name));
+            assert!(
+                bytes.starts_with(b"%PDF-1.3"),
+                "template `{}` produced no PDF",
+                t.name
+            );
+        }
+        let _ = std::fs::remove_file(icc);
+    }
+
+    #[test]
     fn export_refuses_when_preflight_fails() {
         let mut sink = Vec::new();
         // Default opts have no ICC -> preflight fails -> export refuses, writes nothing.

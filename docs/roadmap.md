@@ -16,7 +16,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035 shipped |
+| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0036 shipped |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
 
@@ -898,6 +898,26 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
   produce. Deliberately not fixed inside 0027: changing the line breaker and the measurement in one
   commit would leave neither trustworthy. `benches/budgets.toml` pins today's value so a further
   regression is still caught.
+
+- **A master static has no alignment and is not mirrored by page parity.** `MasterStatic::Text`
+  (spec 0030) is drawn as one line starting at its rect's left edge, and the same rect is used on
+  rectos and versos alike. So a running head cannot be centred or set flush to the fore-edge, and a
+  folio cannot sit at the outside corner of a spread — the two most conventional placements in a
+  bound book. Spec 0036's bundled templates work around it by insetting the folio to the fore-edge
+  margin, which is correct but is not the design a publisher would choose. Found by rendering a
+  template page: every numeric test passed while the folio printed hard against the trim.
+  The fix belongs on the static (an `align`, and an `x` that resolves inside/outside like `Margins`
+  already does), not on each template. Not done in 0036 because it changes a serialized 0030 type
+  and would have carried a model change inside a templates increment.
+
+- **A block never splits across frames, so a two-column page ends ragged.** The pagination loop
+  moves a whole block to the next frame when it does not fit, rather than breaking the paragraph
+  across the column boundary. On a single-column page this is invisible; on spec 0036's two-column
+  `rulebook` template it leaves a visible gap at the foot of a column whenever the next paragraph is
+  taller than the space left. Long-standing engine behavior rather than a regression — nothing in
+  the workspace produced a two-column page as its default before templates existed, which is why it
+  had not been seen. This is a real typographic defect for the milestone's flagship template and
+  should be sequenced into M2 or M3 explicitly; it is not a template setting that can work around it.
 
 ## Open questions
 

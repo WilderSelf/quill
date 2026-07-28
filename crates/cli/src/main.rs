@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use quill_core_model::{Document, Tpub};
+use quill_core_model::{Document, Template, Tpub};
 use quill_export_pdf::{
     export, preflight, synth_cmyk_profile, ExportOptions, PdfxVersion, PreflightReport, Severity,
 };
@@ -38,6 +38,21 @@ enum Command {
     Pack(PackArgs),
     /// Render one page to a PNG, as the on-screen canvas would draw it (spec 0033).
     Render(RenderArgs),
+    /// Start a new document from a built-in template (spec 0036).
+    New(NewArgs),
+}
+
+#[derive(Args)]
+struct NewArgs {
+    /// Template slug. See `--list`.
+    #[arg(long)]
+    template: Option<String>,
+    /// Output `.tpub` path.
+    #[arg(short, long)]
+    output: Option<String>,
+    /// List the built-in templates and exit.
+    #[arg(long)]
+    list: bool,
 }
 
 #[derive(Args)]
@@ -346,5 +361,48 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+
+        Command::New(args) => new_document(args),
+    }
+}
+
+/// `quill new` — start a document from a built-in template (spec 0036).
+fn new_document(args: NewArgs) -> ExitCode {
+    if args.list {
+        for t in Template::bundled() {
+            println!("{:<10} {} — {}", t.name, t.title, t.description);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(name) = args.template.as_deref() else {
+        eprintln!("error: --template is required (or pass --list)");
+        return ExitCode::FAILURE;
+    };
+    // A typo must not silently produce a document from the wrong template — or from a default one,
+    // which is the same mistake wearing a friendlier face.
+    let Some(template) = Template::by_name(name) else {
+        eprintln!(
+            "error: unknown template '{name}'; available: {}",
+            Template::names().join(", ")
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(output) = args.output.as_deref() else {
+        eprintln!("error: --output is required");
+        return ExitCode::FAILURE;
+    };
+
+    let doc = Document::from_template(template);
+    // A template links no assets, so the container carries the manifest alone.
+    match Tpub::write(&doc, Path::new(output), &[]) {
+        Ok(()) => {
+            println!("wrote {output} from template '{name}'");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

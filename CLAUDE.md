@@ -122,6 +122,8 @@ cargo test                       # run all tests
 cargo test -p <crate>            # test one crate, e.g. -p export-pdf
 cargo test -p <crate> <name>     # run a single test by name substring
 cargo run -p quill-cli -- <args> # headless render/export (primary M0 entrypoint)
+cargo run -p quill-cli -- new --list          # built-in document templates (spec 0036)
+cargo run -p quill-cli -- new --template rulebook --output book.tpub
 cargo bench -p quill-testdoc     # perf harness vs benches/budgets.toml; non-zero exit on a blowup
 cargo clippy --all-targets       # lint
 cargo fmt                        # format
