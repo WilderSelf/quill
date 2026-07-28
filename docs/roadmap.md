@@ -18,7 +18,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
-| **M4** | Ecosystem — shareable component definitions and content packs | decomposed — specs 0054–0061 sequenced below |
+| **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 
 ## Decisions log
 
@@ -1868,9 +1868,35 @@ M3 closed on 2026-07-28. What it shipped, and what it left:
   the CLI says so out loud. Filling them from the printers' current specifications is the obvious
   next non-code task.
 
-M4 is decomposed above, into specs 0054–0061. Its two deferred M3 items — the baseline grid and the
-two known issues — are sequenced into it rather than left floating, because a milestone that ends
-with its own findings unfixed teaches the wrong thing.
+## Beyond M4
+
+M4 closed on 2026-07-28. What it shipped, and what it left:
+
+- **The generalization held exactly.** 0054's whole risk was subtle geometric drift, and the
+  byte-identical criterion caught nothing because there was nothing to catch: the two bundled
+  components, re-expressed as declarations, produce the same placed geometry over a ten-case corpus.
+  What the criterion *did* buy was the confidence to route both through one interpreter and delete
+  three hundred lines of hand-written measurement.
+- **The corpus assertion found more than the known issue did.** 0060 was scoped to last lines. The
+  test written for it found that every *ragged* line had the same defect, for the same reason — and
+  that is the case that matters, since stat blocks, table cells, headings and contents entries are
+  all ragged. A known issue described the symptom someone happened to hit; the assertion described
+  the rule.
+- **The equivalence corpus was measuring the wrong thing.** It was sized by laying a document out to
+  ~500 pages, so a deliberate line-breaking change moved the corpus and the breaking at once, with no
+  way to tell them apart. Pinned by block count now. This was not visible until a change came along
+  that was *meant* to move the digest.
+- **The baseline grid did not need the blast radius the plan budgeted for.** The roadmap expected
+  0058 to move every fixture in the repo and require 0051's re-derivation discipline. Making the
+  grid opt-in avoided all of it, and cost nothing a publisher wanted — a grid is a design choice, and
+  a document that does not ask for one has no reason to move.
+- **One number was deliberately not invented**: whether the bundled templates should opt in to a
+  baseline grid. That is a decision to make with a designer's eye, not as a side effect of building
+  the mechanism.
+
+M4's two deferred M3 items — the baseline grid and the two known issues — were sequenced into it
+rather than left floating, because a milestone that ends with its own findings unfixed teaches the
+wrong thing. All three shipped. The one known issue now open is one M4 found in their place.
 
 Two things M3 deliberately did *not* attempt, recorded so their absence is a decision:
 

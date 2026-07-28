@@ -530,7 +530,18 @@ fn main() -> ExitCode {
         }
 
         Command::Pack(PackCommand::Info { input }) => {
-            match quill_core_model::Qpack::read_manifest(Path::new(&input)) {
+            let path = Path::new(&input);
+            let read = if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+            {
+                std::fs::read_to_string(path)
+                    .map_err(|e| quill_core_model::LoadError::Container(e.to_string()))
+                    .and_then(|t| quill_core_model::PackManifest::from_json(&t))
+            } else {
+                quill_core_model::Qpack::read_manifest(path)
+            };
+            match read {
                 Ok(m) => {
                     println!("{} {} — {}", m.name, m.version, m.title);
                     if !m.description.is_empty() {
@@ -575,11 +586,40 @@ fn main() -> ExitCode {
             // steps are separate because the container is validated *before* anything is written
             // to the pack root — a pack this build refuses must not half-install.
             let staging = root.join(".staging");
-            let opened = match quill_core_model::Qpack::open_into(Path::new(&input), &staging) {
-                Ok(o) => o,
-                Err(e) => {
-                    eprintln!("error: {input}: {e}");
-                    return ExitCode::FAILURE;
+            let path = Path::new(&input);
+            // A bare `pack.json` installs too, not only a zipped `.qpack`. That is what a pack
+            // *author* has on disk while they are writing one, and making them zip it to try it
+            // would put a build step between an edit and seeing the result (spec 0061).
+            let opened = if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+            {
+                match std::fs::read_to_string(path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| {
+                        quill_core_model::PackManifest::from_json(&t).map_err(|e| e.to_string())
+                    }) {
+                    Ok(manifest) => quill_core_model::OpenedPack {
+                        manifest,
+                        // Assets resolve beside the manifest, exactly as a document's do.
+                        asset_root: path
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .unwrap_or(Path::new("."))
+                            .to_path_buf(),
+                    },
+                    Err(e) => {
+                        eprintln!("error: {input}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                match quill_core_model::Qpack::open_into(path, &staging) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("error: {input}: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             };
             let result =

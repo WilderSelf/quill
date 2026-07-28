@@ -1,0 +1,440 @@
+{
+  "pack_version": 1,
+  "name": "grimdark",
+  "title": "Grimdark House Style",
+  "description": "A tight 6x9 house style with a heavy stat-block panel.",
+  "version": "1.0.0",
+  "source": "https://github.com/WilderSelf/quill/tree/main/examples/packs",
+  "license": "MIT OR Apache-2.0",
+  "templates": [
+    {
+      "template_version": 1,
+      "name": "grimdark",
+      "title": "Grimdark (6x9)",
+      "description": "Tight margins, heavy rules.",
+      "page_setup": {
+        "trim": {
+          "w_pt": 432.0,
+          "h_pt": 648.0
+        },
+        "bleed_pt": 9.0,
+        "facing_pages": true,
+        "margins": {
+          "top_pt": 45.0,
+          "bottom_pt": 45.0,
+          "inside_pt": 54.0,
+          "outside_pt": 36.0
+        },
+        "baseline_grid": {
+          "step_pt": 13.0,
+          "origin_pt": 45.0
+        }
+      },
+      "styles": {
+        "paragraph": {
+          "body": {
+            "font_size_pt": 9.5,
+            "leading_pt": 13.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0,
+            "indent": {
+              "first_pt": 11.0,
+              "rest_pt": 0.0
+            }
+          },
+          "h1": {
+            "font_size_pt": 22.0,
+            "leading_pt": 26.0,
+            "align": "left",
+            "space_before_pt": 26.0,
+            "space_after_pt": 6.5
+          },
+          "h2": {
+            "font_size_pt": 14.0,
+            "leading_pt": 19.5,
+            "align": "left",
+            "space_before_pt": 13.0,
+            "space_after_pt": 0.0
+          },
+          "h3": {
+            "font_size_pt": 14.0,
+            "leading_pt": 18.0,
+            "align": "left",
+            "space_before_pt": 13.5,
+            "space_after_pt": 4.5
+          },
+          "h4": {
+            "font_size_pt": 12.0,
+            "leading_pt": 15.0,
+            "align": "left",
+            "space_before_pt": 11.25,
+            "space_after_pt": 3.75
+          },
+          "h5": {
+            "font_size_pt": 11.0,
+            "leading_pt": 14.0,
+            "align": "left",
+            "space_before_pt": 10.5,
+            "space_after_pt": 3.5
+          },
+          "h6": {
+            "font_size_pt": 10.0,
+            "leading_pt": 13.0,
+            "align": "left",
+            "space_before_pt": 9.75,
+            "space_after_pt": 3.25
+          },
+          "statblock-attr": {
+            "font_size_pt": 8.5,
+            "leading_pt": 11.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0,
+            "indent": {
+              "first_pt": 0.0,
+              "rest_pt": 9.0
+            }
+          },
+          "statblock-body": {
+            "font_size_pt": 8.5,
+            "leading_pt": 11.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 3.0
+          },
+          "statblock-title": {
+            "font_size_pt": 12.0,
+            "leading_pt": 15.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 3.0
+          },
+          "table-cell": {
+            "font_size_pt": 9.0,
+            "leading_pt": 11.5,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "table-header": {
+            "font_size_pt": 9.0,
+            "leading_pt": 11.5,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "toc-1": {
+            "font_size_pt": 12.0,
+            "leading_pt": 16.0,
+            "align": "left",
+            "space_before_pt": 5.0,
+            "space_after_pt": 0.0
+          },
+          "toc-2": {
+            "font_size_pt": 11.5,
+            "leading_pt": 15.5,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "toc-3": {
+            "font_size_pt": 11.0,
+            "leading_pt": 15.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "toc-4": {
+            "font_size_pt": 10.5,
+            "leading_pt": 14.5,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "toc-5": {
+            "font_size_pt": 10.0,
+            "leading_pt": 14.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "toc-6": {
+            "font_size_pt": 9.5,
+            "leading_pt": 13.5,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 0.0
+          },
+          "toc-title": {
+            "font_size_pt": 18.0,
+            "leading_pt": 22.0,
+            "align": "left",
+            "space_before_pt": 0.0,
+            "space_after_pt": 11.0
+          }
+        }
+      },
+      "master_pages": []
+    }
+  ],
+  "styles": {
+    "paragraph": {
+      "body": {
+        "font_size_pt": 9.5,
+        "leading_pt": 13.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0,
+        "indent": {
+          "first_pt": 11.0,
+          "rest_pt": 0.0
+        }
+      },
+      "h1": {
+        "font_size_pt": 22.0,
+        "leading_pt": 26.0,
+        "align": "left",
+        "space_before_pt": 26.0,
+        "space_after_pt": 6.5
+      },
+      "h2": {
+        "font_size_pt": 14.0,
+        "leading_pt": 19.5,
+        "align": "left",
+        "space_before_pt": 13.0,
+        "space_after_pt": 0.0
+      },
+      "h3": {
+        "font_size_pt": 14.0,
+        "leading_pt": 18.0,
+        "align": "left",
+        "space_before_pt": 13.5,
+        "space_after_pt": 4.5
+      },
+      "h4": {
+        "font_size_pt": 12.0,
+        "leading_pt": 15.0,
+        "align": "left",
+        "space_before_pt": 11.25,
+        "space_after_pt": 3.75
+      },
+      "h5": {
+        "font_size_pt": 11.0,
+        "leading_pt": 14.0,
+        "align": "left",
+        "space_before_pt": 10.5,
+        "space_after_pt": 3.5
+      },
+      "h6": {
+        "font_size_pt": 10.0,
+        "leading_pt": 13.0,
+        "align": "left",
+        "space_before_pt": 9.75,
+        "space_after_pt": 3.25
+      },
+      "statblock-attr": {
+        "font_size_pt": 8.5,
+        "leading_pt": 11.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0,
+        "indent": {
+          "first_pt": 0.0,
+          "rest_pt": 9.0
+        }
+      },
+      "statblock-body": {
+        "font_size_pt": 8.5,
+        "leading_pt": 11.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 3.0
+      },
+      "statblock-title": {
+        "font_size_pt": 12.0,
+        "leading_pt": 15.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 3.0
+      },
+      "table-cell": {
+        "font_size_pt": 9.0,
+        "leading_pt": 11.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "table-header": {
+        "font_size_pt": 9.0,
+        "leading_pt": 11.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-1": {
+        "font_size_pt": 12.0,
+        "leading_pt": 16.0,
+        "align": "left",
+        "space_before_pt": 5.0,
+        "space_after_pt": 0.0
+      },
+      "toc-2": {
+        "font_size_pt": 11.5,
+        "leading_pt": 15.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-3": {
+        "font_size_pt": 11.0,
+        "leading_pt": 15.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-4": {
+        "font_size_pt": 10.5,
+        "leading_pt": 14.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-5": {
+        "font_size_pt": 10.0,
+        "leading_pt": 14.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-6": {
+        "font_size_pt": 9.5,
+        "leading_pt": 13.5,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 0.0
+      },
+      "toc-title": {
+        "font_size_pt": 18.0,
+        "leading_pt": 22.0,
+        "align": "left",
+        "space_before_pt": 0.0,
+        "space_after_pt": 11.0
+      }
+    }
+  },
+  "components": {
+    "statblock": {
+      "version": 1,
+      "name": "statblock",
+      "panel": {
+        "fill": {
+          "space": "gray",
+          "v": 0.86
+        },
+        "stroke": {
+          "color": {
+            "space": "gray",
+            "v": 0.15
+          },
+          "width_pt": 1.5
+        },
+        "padding_pt": 9.0
+      },
+      "sections": [
+        {
+          "source": "name",
+          "style": "statblock-title",
+          "shape": "text",
+          "repeat": false
+        },
+        {
+          "source": "overview",
+          "style": "statblock-body",
+          "shape": "lines",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.35
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 2.5,
+            "gap_below_pt": 2.5,
+            "full_width": false
+          },
+          "repeat": false
+        },
+        {
+          "source": "attributes",
+          "style": "statblock-attr",
+          "shape": "pairs",
+          "separator": ": ",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.35
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 2.5,
+            "gap_below_pt": 2.5,
+            "full_width": false
+          },
+          "repeat": false
+        },
+        {
+          "source": "details",
+          "style": "statblock-body",
+          "shape": "lines",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.35
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 2.5,
+            "gap_below_pt": 2.5,
+            "full_width": false
+          },
+          "repeat": false
+        },
+        {
+          "source": "actions",
+          "style": "statblock-body",
+          "shape": "lines",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.35
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 2.5,
+            "gap_below_pt": 2.5,
+            "full_width": false
+          },
+          "repeat": false
+        },
+        {
+          "source": "reactions",
+          "style": "statblock-body",
+          "shape": "lines",
+          "rule_above": {
+            "color": {
+              "space": "gray",
+              "v": 0.35
+            },
+            "thickness_pt": 0.5,
+            "gap_above_pt": 2.5,
+            "gap_below_pt": 2.5,
+            "full_width": false
+          },
+          "repeat": false
+        }
+      ],
+      "split": {
+        "granularity": "sections",
+        "min_items": 1,
+        "keep_together": true
+      }
+    }
+  }
+}

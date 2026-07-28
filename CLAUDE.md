@@ -28,16 +28,22 @@ master-static alignment → hanging indent → POD presets → geometry prefligh
 the screen export profile → user-authored templates. A block now splits across frames, furniture
 sits where a bound book puts it, preflight checks the printer's numbers against placed geometry, and
 a second export profile carries clickable links while the press file stays provably annotation-free.
-`FORMAT_VERSION` is 3. **M4 is decomposed into eight increments, specs 0054–0061**: component
-definitions as data → the `.qpack` container → pack resolution → pack extraction → the baseline grid
-→ screen/press hyphenation parity → the over-long last line → the gallery and authoring guide.
+`FORMAT_VERSION` is 3. **M4 — the ecosystem — is COMPLETE**: specs 0054–0061 shipped. A component is
+now a *declaration* rather than a Rust type, and one interpreter lays any of them out; a `.qpack`
+carries templates, styles, definitions and assets with mandatory provenance; a document names the
+packs it needs and **refuses to lay out** rather than falling back when one is missing; `quill pack
+extract` turns a finished book into a reusable pack. The two defects M3 found are fixed — screen and
+press now share one hyphenator as they share one shaper (0059), and no line, ragged or last, is drawn
+past its measure (0060) — and the baseline grid finally exists (0058), opt-in so no existing book
+moves. `FORMAT_VERSION` stays **3** throughout: every model change is additive.
 
-**M4 deliberately does not build executable plugins**, and that is the decision most worth revisiting
-deliberately rather than by accident. A pack is *declarative* — templates, styles, component
-definitions and assets, no code — because an executable extension that emits geometry can emit
-geometry that is wrong, and every mechanism M3 built to make press errors visible assumes quill
-produced the geometry. The argument is in `docs/roadmap.md`; the sequencing and acceptance criteria
-are there too.
+**M4 deliberately does not build executable plugins**, and that decision is now written where an author
+will find it — `docs/pack-authoring.md` states it and why. A pack is *declarative* — templates, styles,
+component definitions and assets, no code — because an executable extension that emits geometry can emit
+geometry that is wrong, and every mechanism M3 built to make press errors visible assumes quill produced
+the geometry. `DefColor` has no RGB family at all, so a pack cannot even express a colour space PDF/X-1a
+forbids.
+
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
 making architectural decisions. This file holds architecture, constraints and conventions; the
@@ -73,7 +79,7 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 | `color` | `lcms2`: ICC, RGB→CMYK, grayscale, soft-proof, **ink-coverage (240%) enforcement**. |
 | `render` | On-screen viewport (backend-neutral paint list → `tiny-skia` CPU raster) + **linked-image downsampled proxy cache**. |
 | `export-pdf` | **The differentiator.** PDF/X writer on `pdf-writer` + `subsetter`; preflight. |
-| `components-ttrpg` | Stat blocks, random tables, reusable snippets — portable, first-class objects. |
+| `components-ttrpg` | Stat blocks, random tables — and, since spec 0054, `ComponentDef`: a component *declared* as styled sections in a panel, which is what a `.qpack` ships. The two bundled components are themselves definitions. |
 | `app` | `egui` shell + document canvas (paints the `render` crate's op list). |
 | `cli` | Headless render/export; drives M0 and CI. |
 
@@ -107,8 +113,8 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 **M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
 **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and content packs). **M0–M3 done**; M0's sole open
-item is the manual POD upload. **M4** is decomposed and not started.
+TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and content packs).
+**M0–M4 done**; M0's sole open item is the manual POD upload.
 
 ## Planning: spec-driven development
 
@@ -140,6 +146,11 @@ cargo run -p quill-cli -- new --list          # built-in document templates (spe
 cargo run -p quill-cli -- new --template rulebook --output book.tpub
 cargo run -p quill-cli -- new --from my-template.json --output book.tpub  # user-authored (0053)
 cargo run -p quill-cli -- import doc.md --output book.tpub --template rulebook
+cargo run -p quill-cli -- tpub document.json --output book.tpub   # was `pack`, renamed by 0055
+cargo run -p quill-cli -- pack install examples/packs/pbta-moves.json   # content packs (0055-0057)
+cargo run -p quill-cli -- pack list
+cargo run -p quill-cli -- pack extract book.tpub --name house --version 1.0.0 \
+    --source https://example.com --license CC-BY-4.0 --output house.qpack
 cargo bench -p quill-testdoc     # perf harness vs benches/budgets.toml; non-zero exit on a blowup
 cargo clippy --all-targets       # lint
 cargo fmt                        # format

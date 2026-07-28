@@ -69,7 +69,9 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0058 | [The baseline grid](0058-baseline-grid.md) | M4 | implemented |
 | 0059 | [Screen/press hyphenation parity](0059-hyphenation-parity.md) | M4 | implemented |
 | 0060 | [A line may not be drawn past its measure](0060-last-line-measure.md) | M4 | implemented |
+| 0061 | [The gallery and the pack authoring guide](0061-gallery-and-guide.md) | M4 | implemented |
 
-Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
+Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),
+and the content-pack authoring guide in [`../docs/pack-authoring.md`](../docs/pack-authoring.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind
 that order — lives in [`../docs/roadmap.md`](../docs/roadmap.md).
