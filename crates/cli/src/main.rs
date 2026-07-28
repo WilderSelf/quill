@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use quill_core_model::{Document, Template, Tpub};
+use quill_core_model::{import, Document, Template, Tpub};
 use quill_export_pdf::{
     export, preflight, synth_cmyk_profile, ExportOptions, PdfxVersion, PreflightReport, Severity,
 };
@@ -40,6 +40,20 @@ enum Command {
     Render(RenderArgs),
     /// Start a new document from a built-in template (spec 0036).
     New(NewArgs),
+    /// Import the authoring syntax into a `.tpub` (spec 0043).
+    Import(ImportArgs),
+}
+
+#[derive(Args)]
+struct ImportArgs {
+    /// Path to the source file.
+    input: String,
+    /// Output `.tpub` path.
+    #[arg(short, long)]
+    output: String,
+    /// Template slug supplying page setup, styles and masters. See `quill new --list`.
+    #[arg(long, default_value = "adventure")]
+    template: String,
 }
 
 #[derive(Args)]
@@ -363,6 +377,58 @@ fn main() -> ExitCode {
         },
 
         Command::New(args) => new_document(args),
+
+        Command::Import(args) => import_document(args),
+    }
+}
+
+/// `quill import` — a thin caller over `quill_core_model::import` (spec 0043).
+///
+/// Deliberately thin: the importer is a library function so the app can reuse it without going
+/// through a process.
+fn import_document(args: ImportArgs) -> ExitCode {
+    let Some(template) = Template::by_name(&args.template) else {
+        eprintln!(
+            "error: unknown template '{}'; available: {}",
+            args.template,
+            Template::names().join(", ")
+        );
+        return ExitCode::FAILURE;
+    };
+    let source = match std::fs::read_to_string(&args.input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", args.input);
+            return ExitCode::FAILURE;
+        }
+    };
+    let imported = match import(&source, template) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Warnings are printed, never swallowed: every one means something was kept as plain text
+    // rather than laid out the way it was written.
+    for w in &imported.warnings {
+        eprintln!("warning: line {}: {}", w.line, w.message);
+    }
+    match Tpub::write(&imported.document, Path::new(&args.output), &[]) {
+        Ok(()) => {
+            println!(
+                "wrote {} ({} blocks from template '{}', {} warning(s))",
+                args.output,
+                imported.document.content.len(),
+                args.template,
+                imported.warnings.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

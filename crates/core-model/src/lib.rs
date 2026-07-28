@@ -13,11 +13,13 @@ use serde::{Deserialize, Serialize};
 
 mod container;
 mod geom;
+mod import;
 mod template;
 mod version;
 
 pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
 pub use geom::{page_geom, PageGeom};
+pub use import::{import, Diagnostic, ImportError, Imported};
 pub use template::{Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER};
 pub use version::LoadError;
 

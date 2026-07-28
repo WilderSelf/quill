@@ -51,6 +51,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0040 | [Heading index](0040-heading-index.md) | M2 | implemented |
 | 0041 | [`Block::Toc` — generated contents](0041-generated-toc.md) | M2 | implemented |
 | 0042 | [PDF outline + annotation/bleed guard](0042-pdf-outline.md) | M2 | implemented |
+| 0043 | [Authoring on-ramp: `quill import`](0043-markdown-import.md) | M2 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind
