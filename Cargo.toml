@@ -10,9 +10,10 @@ repository = "https://github.com/WilderSelf/quill"
 authors = ["Daniel Foster <danielfoster25@gmail.com>"]
 rust-version = "1.75"
 
-# Shared dependency versions. Remaining heavy native-backed crates (skia-safe, rustybuzz,
-# egui, ...) are intentionally NOT added yet — they arrive in later spec-driven commits so
-# the scaffold stays fast to build. The PDF/X export stack below landed with spec 0002.
+# Shared dependency versions. Every dependency here is permissive (MIT/Apache-2.0 or compatible)
+# and carries an inline note saying which spec brought it in and why. The PDF/X export stack landed
+# with spec 0002, shaping (rustybuzz) with 0016, the screen rasterizer with 0033 and the shell with
+# 0034; `skia-safe` was evaluated and rejected — see the decisions log in docs/roadmap.md.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
