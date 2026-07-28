@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use crate::{FORMAT_VERSION, TEMPLATE_VERSION};
+use crate::{FORMAT_VERSION, PACK_VERSION, TEMPLATE_VERSION};
 
 /// Everything that can go wrong loading a document or a `.tpub` container.
 ///
@@ -48,6 +48,19 @@ pub enum LoadError {
     /// understand. Its own variant, and it names the definition, because a definition is the unit
     /// a pack ships and a reader has to know which one to fix.
     ComponentDef(quill_components_ttrpg::ComponentDefError),
+    /// A `.qpack` manifest (spec 0055) is not well-formed, or does not match the schema.
+    PackParse(String),
+    /// A pack declares a `pack_version` newer than this build supports. A refusal, on the same
+    /// reasoning as [`LoadError::UnsupportedVersion`].
+    UnsupportedPackVersion { found: u32, supported: u32 },
+    /// The container is a readable zip but not a `.qpack` (no `pack.json`).
+    NotAQpack(String),
+    /// A pack omits its `source` or `license`. Content arriving from a stranger with no provenance
+    /// is content nobody should install, so this is a refusal rather than a warning.
+    PackMissingProvenance { pack: String, field: String },
+    /// A pack carries a path that is absolute or escapes its root, in its manifest or as a zip
+    /// entry. A pack is the one artifact here that routinely comes from someone else.
+    PackUnsafePath { pack: String, path: String },
 }
 
 impl fmt::Display for LoadError {
@@ -72,6 +85,23 @@ impl fmt::Display for LoadError {
                  (up to {supported}); upgrade Quill to use it"
             ),
             LoadError::ComponentDef(e) => write!(f, "{e}"),
+            LoadError::PackParse(m) => write!(f, "malformed pack manifest: {m}"),
+            LoadError::UnsupportedPackVersion { found, supported } => write!(
+                f,
+                "pack format version {found} is newer than this build supports \
+                 (up to {supported}); upgrade Quill to install it"
+            ),
+            LoadError::NotAQpack(m) => write!(f, "not a .qpack container: {m}"),
+            LoadError::PackMissingProvenance { pack, field } => write!(
+                f,
+                "pack `{pack}` has no `{field}`; a pack must say where it came from and \
+                 under what licence before it can be installed"
+            ),
+            LoadError::PackUnsafePath { pack, path } => write!(
+                f,
+                "pack `{pack}` carries the path '{path}', which is absolute or escapes the \
+                 pack root"
+            ),
         }
     }
 }
@@ -198,6 +228,34 @@ pub fn migrate_template(value: &mut serde_json::Value) -> Result<(), LoadError> 
     }
 
     obj.insert("template_version".into(), TEMPLATE_VERSION.into());
+    Ok(())
+}
+
+/// Bring a `.qpack` manifest forward to [`PACK_VERSION`], or refuse it (spec 0055).
+///
+/// The same three-step shape as the two above — read the declared version, refuse a newer one,
+/// stamp the current one — because a third differently-shaped version gate would be a third thing
+/// to get wrong.
+pub fn migrate_pack(value: &mut serde_json::Value) -> Result<(), LoadError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| LoadError::PackParse("pack manifest root is not a JSON object".into()))?;
+
+    let found = match obj.get("pack_version") {
+        None => PACK_VERSION,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            LoadError::PackParse("`pack_version` is not a non-negative integer".into())
+        })? as u32,
+    };
+
+    if found > PACK_VERSION {
+        return Err(LoadError::UnsupportedPackVersion {
+            found,
+            supported: PACK_VERSION,
+        });
+    }
+
+    obj.insert("pack_version".into(), PACK_VERSION.into());
     Ok(())
 }
 

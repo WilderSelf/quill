@@ -19,6 +19,7 @@ mod components;
 mod container;
 mod geom;
 mod import;
+mod pack;
 mod template;
 mod version;
 
@@ -29,6 +30,7 @@ pub use components::{
 pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
 pub use geom::{page_geom, PageGeom};
 pub use import::{import, Diagnostic, ImportError, Imported};
+pub use pack::{OpenedPack, PackManifest, Qpack, PACK_MANIFEST_NAME, PACK_VERSION};
 pub use template::{
     PageGeometrySeed, Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER, TEMPLATE_VERSION,
 };

@@ -63,6 +63,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0052 | [The screen export profile — clickable internal links](0052-screen-profile.md) | M3 | implemented |
 | 0053 | [User-authored templates: `quill new --from`](0053-user-authored-templates.md) | M3 | implemented |
 | 0054 | [Component definitions as data](0054-component-definitions.md) | M4 | implemented |
+| 0055 | [The `.qpack` container](0055-pack-container.md) | M4 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md).
 The sequenced plan these specs implement — milestones, increment order, and the reasoning behind

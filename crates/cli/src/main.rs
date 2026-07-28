@@ -35,8 +35,14 @@ enum Command {
         /// Output path for the `.icc` file.
         output: String,
     },
-    /// Pack a `document.json` and its linked assets into a portable `.tpub` container.
-    Pack(PackArgs),
+    /// Bundle a `document.json` and its linked assets into a portable `.tpub` container.
+    ///
+    /// Named for the artifact it makes rather than the verb: `pack` now means the `.qpack` content
+    /// pack (spec 0055), which is a different thing entirely.
+    Tpub(TpubArgs),
+    /// Work with `.qpack` content packs (spec 0055).
+    #[command(subcommand)]
+    Pack(PackCommand),
     /// Render one page to a PNG, as the on-screen canvas would draw it (spec 0033).
     Render(RenderArgs),
     /// Start a new document from a built-in template (spec 0036).
@@ -98,12 +104,21 @@ struct RenderArgs {
 }
 
 #[derive(Args)]
-struct PackArgs {
-    /// Path to the `document.json` to pack. Its linked assets are resolved relative to it.
+struct TpubArgs {
+    /// Path to the `document.json` to bundle. Its linked assets are resolved relative to it.
     input: String,
     /// Output `.tpub` path.
     #[arg(short, long)]
     output: String,
+}
+
+#[derive(Subcommand)]
+enum PackCommand {
+    /// Show a pack's identity, provenance and contents.
+    Info {
+        /// Path to the `.qpack` file.
+        input: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -395,7 +410,7 @@ fn main() -> ExitCode {
             }
         }
 
-        Command::Pack(args) => {
+        Command::Tpub(args) => {
             let loaded = match load_doc(&Some(args.input)) {
                 Ok(d) => d,
                 Err(e) => {
@@ -429,6 +444,42 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+
+        Command::Pack(PackCommand::Info { input }) => {
+            match quill_core_model::Qpack::read_manifest(Path::new(&input)) {
+                Ok(m) => {
+                    println!("{} {} — {}", m.name, m.version, m.title);
+                    if !m.description.is_empty() {
+                        println!("  {}", m.description);
+                    }
+                    // Provenance first and always, not folded in with the counts: a pack is
+                    // content from a stranger, and where it came from is the thing a person needs
+                    // to see before they install it (spec 0055).
+                    println!("  source:   {}", m.source);
+                    println!("  licence:  {}", m.license);
+                    println!("  format:   pack_version {}", m.pack_version);
+                    println!(
+                        "  contents: {} template(s), {} component definition(s), {} style(s), \
+                         {} asset(s)",
+                        m.templates.len(),
+                        m.components.len(),
+                        m.styles.paragraph.len(),
+                        m.assets.len()
+                    );
+                    for t in &m.templates {
+                        println!("    template  {} — {}", t.name, t.title);
+                    }
+                    for name in m.components.keys() {
+                        println!("    component {name}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {}: {e}", input);
                     ExitCode::FAILURE
                 }
             }

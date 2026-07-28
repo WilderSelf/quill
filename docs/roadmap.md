@@ -92,7 +92,7 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   three named features (templates, stat blocks, TOC) are the *content* of that claim, but the claim
   itself is the exit criterion, and it is what forces the last two increments: today the only way to
   produce a document is to author `document.json` by hand against `core-model`'s schema and pack it
-  with `quill pack` (crates/cli/src/main.rs:243-280). The shell can open and scroll it, edit the
+  with `quill tpub` (renamed from `quill pack` by spec 0055, which reserves `pack` for the `.qpack` content pack). The shell can open and scroll it, edit the
   text of an existing `Heading`/`Body` block (crates/app/src/lib.rs:212-247), and nothing else — no
   block creation, no save, and `document_mut()` (crates/app/src/lib.rs:260-262) is an escape hatch
   called only from tests. A stat block nobody can insert is not an on-ramp.
