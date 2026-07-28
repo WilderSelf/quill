@@ -1,7 +1,9 @@
 //! Press-ready PDF/X export and preflight. See `specs/0001-pdf-x-export.md` (preflight) and
 //! `specs/0002-pdf-byte-generation.md` (byte generation).
 //!
-//! [`preflight`] validates a document against the DriveThruRPG/PDF-X requirements. [`export`]
+//! [`preflight`] validates a document against the PDF/X requirements, at the thresholds the
+//! selected [`PodPreset`] states (spec 0049 — the default preset is numerically identical to the
+//! constants those checks used before presets existed). [`export`]
 //! then writes a real **PDF/X-1a:2001** or **PDF/X-3:2002** file (selected via
 //! [`ExportOptions::version`]) through `pdf-writer` (object graph) + `subsetter` (embedded subset
 //! font), with `lcms2` validating the ICC OutputIntent. The writer internals live in the
@@ -14,8 +16,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use quill_color::{within_ink_limit, MAX_INK_COVERAGE_PCT};
-use quill_core_model::{Block, Color, Document, DEFAULT_BLEED_PT};
+use quill_color::within_ink_limit_pct;
+use quill_core_model::{Block, Color, Document};
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 use thiserror::Error;
 
@@ -24,8 +26,12 @@ mod geom;
 mod hyphenate;
 mod icc;
 mod images;
+mod preset;
 mod writer;
 mod xmp;
+
+/// The printer's requirements as data (spec 0049). Every preflight threshold is read from one.
+pub use preset::PodPreset;
 
 /// Synthesize a minimal, structurally valid CMYK output-class ICC profile.
 ///
@@ -119,6 +125,12 @@ pub struct ExportOptions {
     /// process's working directory — and a linked image that fails to resolve is silently dropped
     /// from the export (spec 0025).
     pub asset_root: PathBuf,
+    /// The POD preset every preflight threshold is read from (spec 0049).
+    ///
+    /// Defaults to [`PodPreset::generic`], which is numerically identical to the constants these
+    /// checks used before presets existed — so a caller that never sets this behaves exactly as it
+    /// did. It is an *export-time* choice and is deliberately not part of the document.
+    pub preset: PodPreset,
 }
 
 impl Default for ExportOptions {
@@ -134,6 +146,7 @@ impl Default for ExportOptions {
             // `.` preserves the pre-spec-0025 behavior for callers that never set it, so this
             // change cannot move where an existing caller's images resolve from.
             asset_root: PathBuf::from("."),
+            preset: PodPreset::generic(),
         }
     }
 }
@@ -156,6 +169,11 @@ pub enum CheckId {
     Transparency,
     /// The supplied ICC OutputIntent profile is not a CMYK output-class profile.
     IccProfileInvalid,
+    /// The document's trim is not among the sizes the selected preset lists (spec 0049).
+    ///
+    /// Always a `Warning`: an unusual trim is a conversation with the printer, not a corrupt file,
+    /// and a preflight that blocks a legitimate document teaches its user to reach for `--force`.
+    TrimSize,
 }
 
 impl CheckId {
@@ -264,15 +282,13 @@ fn push_warning(report: &mut PreflightReport, check: CheckId, message: String) {
     });
 }
 
-fn min_dpi(line_art: bool) -> f32 {
-    if line_art {
-        600.0
-    } else {
-        300.0
-    }
-}
-
-/// Validate a document against the PDF/X / DriveThruRPG requirements from spec 0001.
+/// Validate a document against the PDF/X requirements from spec 0001, at the thresholds the
+/// selected POD preset states (spec 0049).
+///
+/// Every number this checks — ink limit, bleed floor, minimum resolution, the trim catalogue — is
+/// read from `opts.preset`, never from a constant. `ExportOptions::default()` selects
+/// [`PodPreset::generic`], whose values are exactly the constants these checks used before presets
+/// existed, so an unchanged caller gets an unchanged report.
 ///
 /// Under [`ExportProfile::Screen`] with no ICC supplied, the two OutputIntent-related checks are
 /// recorded in [`PreflightReport::skipped`] instead of run — see spec 0052. **Everything else still
@@ -282,6 +298,7 @@ fn min_dpi(line_art: bool) -> f32 {
 /// incompatible with, and nothing else.
 pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     let mut report = PreflightReport::default();
+    let preset = &opts.preset;
 
     // Colors: no RGB in output; every color within the ink limit.
     for (i, block) in doc.content.iter().enumerate() {
@@ -300,11 +317,14 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
                 CheckId::ColorSpace,
                 format!("block {i} uses RGB; press output must be CMYK or grayscale"),
             );
-        } else if !within_ink_limit(color) {
+        } else if !within_ink_limit_pct(color, preset.max_ink_pct) {
             push_error(
                 &mut report,
                 CheckId::InkCoverage,
-                format!("block {i} exceeds {MAX_INK_COVERAGE_PCT}% total ink coverage"),
+                format!(
+                    "block {i} exceeds {}% total ink coverage",
+                    preset.max_ink_pct
+                ),
             );
         }
     }
@@ -318,21 +338,38 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
         );
     }
 
-    // Bleed must be at least the required 0.125in on outside edges. Validate the document's own
+    // Bleed must be at least what the preset requires on outside edges. Validate the document's own
     // `page_setup.bleed_pt` — the exact value `geom::page_geom` writes into the BleedBox — so
     // preflight rejects the geometry export actually produces (spec 0013).
     let bleed_pt = doc.page_setup.bleed_pt;
-    if bleed_pt + f32::EPSILON < DEFAULT_BLEED_PT {
+    if bleed_pt + f32::EPSILON < preset.bleed_pt {
         push_error(
             &mut report,
             CheckId::Bleed,
-            format!("bleed {bleed_pt}pt is below the required {DEFAULT_BLEED_PT}pt"),
+            format!(
+                "bleed {bleed_pt}pt is below the required {}pt",
+                preset.bleed_pt
+            ),
+        );
+    }
+
+    // Trim: a size the preset does not list is a *warning* (spec 0049). A preset that states no
+    // catalogue at all — every bundled vendor one — never warns; see `PodPreset::lists_trim`.
+    let trim = doc.page_setup.trim;
+    if !preset.lists_trim(trim) {
+        push_warning(
+            &mut report,
+            CheckId::TrimSize,
+            format!(
+                "trim {}x{}pt is not among preset '{}''s listed sizes; confirm it with the printer",
+                trim.w_pt, trim.h_pt, preset.name
+            ),
         );
     }
 
     // Image resolution.
     for asset in &doc.assets {
-        let needed = min_dpi(asset.line_art);
+        let needed = preset.min_dpi(asset.line_art);
         if asset.dpi + 0.5 < needed {
             push_error(
                 &mut report,
@@ -437,7 +474,7 @@ pub fn export(
     // writer is about to draw, rather than laying the document out a second time inside
     // `preflight`.
     if !opts.force {
-        let findings = preflight_pages(&pages);
+        let findings = preflight_pages(&pages, &opts.preset);
         let errors = findings
             .iter()
             .filter(|f| f.severity == Severity::Error)
@@ -497,7 +534,10 @@ pub fn annotation_finding(
 ///
 /// Kept public so the same checks can be run against a page set the caller already has, and so this
 /// can be tested directly rather than only through a full export.
-pub fn preflight_pages(pages: &[LaidOutPage]) -> Vec<Finding> {
+///
+/// `preset` supplies the ink limit (spec 0049): decoration is checked against the same press the
+/// blocks are, because a panel and a paragraph reach the same printer.
+pub fn preflight_pages(pages: &[LaidOutPage], preset: &PodPreset) -> Vec<Finding> {
     let mut findings = Vec::new();
     for page in pages {
         for block in page.statics.iter().chain(page.blocks.iter()) {
@@ -519,14 +559,14 @@ pub fn preflight_pages(pages: &[LaidOutPage]) -> Vec<Finding> {
                             page.index + 1
                         ),
                     });
-                } else if !within_ink_limit(&color) {
+                } else if !within_ink_limit_pct(&color, preset.max_ink_pct) {
                     findings.push(Finding {
                         check: CheckId::InkCoverage,
                         severity: Severity::Error,
                         message: format!(
-                            "page {}: a decoration {what} exceeds {MAX_INK_COVERAGE_PCT}% total \
-                             ink coverage",
-                            page.index + 1
+                            "page {}: a decoration {what} exceeds {}% total ink coverage",
+                            page.index + 1,
+                            preset.max_ink_pct
                         ),
                     });
                 }
@@ -1052,7 +1092,7 @@ mod tests {
             y: 0.7,
             k: 0.6,
         }; // 280%
-        let findings = preflight_pages(&[page_with_rect(Some(over), None)]);
+        let findings = preflight_pages(&[page_with_rect(Some(over), None)], &PodPreset::generic());
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check, CheckId::InkCoverage);
         assert_eq!(findings[0].severity, Severity::Error);
@@ -1067,17 +1107,20 @@ mod tests {
             g: 0.0,
             b: 0.0,
         };
-        let by_fill = preflight_pages(&[page_with_rect(Some(rgb), None)]);
+        let by_fill = preflight_pages(&[page_with_rect(Some(rgb), None)], &PodPreset::generic());
         assert_eq!(by_fill.len(), 1);
         assert_eq!(by_fill[0].check, CheckId::ColorSpace);
 
-        let by_stroke = preflight_pages(&[page_with_rect(
-            None,
-            Some(quill_layout_engine::Stroke {
-                color: rgb,
-                width_pt: 0.5,
-            }),
-        )]);
+        let by_stroke = preflight_pages(
+            &[page_with_rect(
+                None,
+                Some(quill_layout_engine::Stroke {
+                    color: rgb,
+                    width_pt: 0.5,
+                }),
+            )],
+            &PodPreset::generic(),
+        );
         assert_eq!(by_stroke.len(), 1);
         assert_eq!(by_stroke[0].check, CheckId::ColorSpace);
     }
@@ -1092,8 +1135,10 @@ mod tests {
             y: 0.0,
             k: 0.1,
         };
-        assert!(preflight_pages(&[page_with_rect(Some(tint), None)]).is_empty());
-        assert!(preflight_pages(&[]).is_empty());
+        assert!(
+            preflight_pages(&[page_with_rect(Some(tint), None)], &PodPreset::generic()).is_empty()
+        );
+        assert!(preflight_pages(&[], &PodPreset::generic()).is_empty());
     }
 
     #[test]
@@ -1107,7 +1152,7 @@ mod tests {
             y: 0.7,
             k: 0.6,
         };
-        let findings = preflight_pages(&[page_with_rect(Some(over), None)]);
+        let findings = preflight_pages(&[page_with_rect(Some(over), None)], &PodPreset::generic());
         assert_eq!(findings.len(), 1, "fixture must actually violate the limit");
 
         // A clean document still exports, so the wiring cannot have simply broken export.

@@ -11,7 +11,14 @@
 use lcms2::{Intent, PixelFormat, Profile, Transform};
 use quill_core_model::Color;
 
-/// DriveThruRPG's maximum total ink coverage, in percent (sum of C+M+Y+K).
+/// The conservative maximum total ink coverage, in percent (sum of C+M+Y+K).
+///
+/// Since spec 0049 this is **not** the preflight threshold: that comes from the selected
+/// [`PodPreset`](../quill_export_pdf/struct.PodPreset.html), whose `generic` values are exactly
+/// these numbers. What remains here is the limit the *per-pixel* image clamp
+/// ([`clamp_cmyk_u8`], spec 0006) enforces, which spec 0049 deliberately left preset-independent:
+/// it rewrites pixels, so making it a parameter changes exported image bytes. Threading a preset
+/// through the clamp is a named follow-up of spec 0049, not an oversight.
 pub const MAX_INK_COVERAGE_PCT: f32 = 240.0;
 
 /// Small tolerance so a color intended to sit exactly on the limit isn't rejected by
@@ -36,9 +43,15 @@ pub fn ink_coverage_pct(color: &Color) -> Option<f32> {
     }
 }
 
-/// Whether a color is within the ink limit. `Rgb` is never within limit (must convert first).
-pub fn within_ink_limit(color: &Color) -> bool {
-    matches!(ink_coverage_pct(color), Some(pct) if pct <= MAX_INK_COVERAGE_PCT + INK_EPS_PCT)
+/// Whether a color is within `max_pct` total ink. `Rgb` is never within limit (must convert first).
+///
+/// The limit is a parameter rather than [`MAX_INK_COVERAGE_PCT`] because it is a property of the
+/// press, and since spec 0049 it is carried by the selected POD preset. The un-parameterised
+/// `within_ink_limit` this replaced was deleted rather than kept as a convenience wrapper: leaving
+/// it would leave a way for a preflight path to silently check the wrong vendor's limit, and the
+/// compiler is a better guard than a convention.
+pub fn within_ink_limit_pct(color: &Color, max_pct: f32) -> bool {
+    matches!(ink_coverage_pct(color), Some(pct) if pct <= max_pct + INK_EPS_PCT)
 }
 
 /// Maximum sum of the four 8-bit CMYK samples allowed by [`MAX_INK_COVERAGE_PCT`]. Each sample
@@ -195,7 +208,7 @@ mod tests {
             k: 0.6,
         };
         assert!((ink_coverage_pct(&ok).unwrap() - 240.0).abs() < 0.1);
-        assert!(within_ink_limit(&ok));
+        assert!(within_ink_limit_pct(&ok, MAX_INK_COVERAGE_PCT));
 
         // 0.6025 * 4 = 2.41 -> 241%: over limit.
         let over = Color::Cmyk {
@@ -205,7 +218,12 @@ mod tests {
             k: 0.6025,
         };
         assert!(ink_coverage_pct(&over).unwrap() > MAX_INK_COVERAGE_PCT + INK_EPS_PCT);
-        assert!(!within_ink_limit(&over));
+        assert!(!within_ink_limit_pct(&over, MAX_INK_COVERAGE_PCT));
+
+        // The limit is a parameter, so the same colour flips with the press it is checked against
+        // (spec 0049). Without this direction the function could ignore `max_pct` entirely.
+        assert!(within_ink_limit_pct(&over, 280.0));
+        assert!(!within_ink_limit_pct(&ok, 200.0));
     }
 
     #[test]
@@ -216,7 +234,7 @@ mod tests {
             b: 0.6,
         };
         assert_eq!(ink_coverage_pct(&rgb), None);
-        assert!(!within_ink_limit(&rgb));
+        assert!(!within_ink_limit_pct(&rgb, MAX_INK_COVERAGE_PCT));
     }
 
     #[test]
