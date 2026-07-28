@@ -536,6 +536,22 @@ pub(crate) struct PanelSplit {
     pub repeat_parts: Vec<PanelPart>,
     pub repeat_decorations: Vec<PanelRect>,
     pub repeat_h: f32,
+    /// Space a *fragment* must reserve below its last item — a stat block's bottom padding, so a
+    /// cut panel closes with the same inset it opens with. The mirror of `repeat_h`, which is space
+    /// a *continuation* reserves above its first. Zero for a table, which has no panel edge.
+    pub trailing_pt: f32,
+    /// The fewest items this panel's fragments may contain — a table's rows and a stat block's
+    /// sections want different answers. See [`MIN_ROWS_PER_FRAGMENT`] and
+    /// [`MIN_SECTIONS_PER_FRAGMENT`].
+    pub min_items: usize,
+    /// Prefer moving whole to the next frame over cutting, when the block would fit there entire
+    /// (spec 0046).
+    ///
+    /// This is the difference between a composite and a paragraph. Splitting a paragraph is the
+    /// *point* — moving it whole is what left the hole spec 0044 fixed. Splitting a stat block that
+    /// would have fitted the next column intact is a worse page than moving it, which is what spec
+    /// 0038's keep-together promised. Cutting stays the fallback for one that fits nowhere.
+    pub keep_together: bool,
 }
 
 impl PanelSplit {
@@ -549,13 +565,27 @@ impl PanelSplit {
     }
 }
 
-/// The fewest items a fragment or a remainder may contain (spec 0044).
+/// The fewest *lines* a paragraph fragment or remainder may contain (spec 0044).
 ///
-/// Two lines: a paragraph may not leave a widow behind at the foot of a column or carry an orphan
-/// forward to the top of the next. This is a typographic rule and not a nicety — a lone stranded
-/// line is the defect a reader notices first, and a splitter without it would fix the ragged-foot
-/// defect by introducing a worse one.
-pub(crate) const MIN_ITEMS_PER_FRAGMENT: usize = 2;
+/// Two: a paragraph may not leave a widow behind at the foot of a column or carry an orphan forward
+/// to the top of the next. This is a typographic rule and not a nicety — a lone stranded line is the
+/// defect a reader notices first, and a splitter without it would fix the ragged-foot defect by
+/// introducing a worse one.
+pub(crate) const MIN_LINES_PER_FRAGMENT: usize = 2;
+
+/// The fewest *sections* a stat-block fragment may contain (spec 0046).
+///
+/// One, not two, and the difference matters. A section is coarse — a whole attributes list, a whole
+/// actions list — so demanding two per fragment can make the smallest legal cut larger than a frame,
+/// at which point nothing is cut and the panel runs off the bottom of the page. That is not a
+/// theoretical worry: it is what the first version of this increment rendered. A widow rule protects
+/// against a stranded *line*; a section is never stranded, because it is a unit the reader
+/// recognises.
+pub(crate) const MIN_SECTIONS_PER_FRAGMENT: usize = 1;
+
+/// The fewest *rows* a table fragment may contain (spec 0045). Two, for the same reason as lines:
+/// one row alone under a repeated header reads as a mistake.
+pub(crate) const MIN_ROWS_PER_FRAGMENT: usize = 2;
 
 impl Measured {
     /// The heights of the items this measurement may be cut between, in order. `None` means
@@ -596,23 +626,57 @@ impl Measured {
     fn cut_fitting(&self, avail_pt: f32) -> Option<usize> {
         let items = self.break_items()?;
         let n = items.len();
-        if n < 2 * MIN_ITEMS_PER_FRAGMENT {
+        let min = self.min_items_per_fragment();
+        if n < 2 * min {
             return None;
         }
-        let last_legal = n - MIN_ITEMS_PER_FRAGMENT;
+        let last_legal = n - min;
         let mut used = self.fragment_lead_pt();
+        // Whatever the fragment must reserve *below* its last item is part of what has to fit, or a
+        // cut stat block's panel edge is drawn past the bottom of the frame.
+        let trail = self.fragment_trail_pt();
         let mut best = None;
         for (i, h) in items.iter().enumerate() {
             used += h;
-            if used > avail_pt {
+            if used + trail > avail_pt {
                 break;
             }
             let k = i + 1;
-            if k >= MIN_ITEMS_PER_FRAGMENT && k <= last_legal {
+            if k >= min && k <= last_legal {
                 best = Some(k);
             }
         }
         best
+    }
+
+    /// The fewest items either side of a legal cut, which differs by what an "item" is.
+    fn min_items_per_fragment(&self) -> usize {
+        match self {
+            Measured::Text { .. } => MIN_LINES_PER_FRAGMENT,
+            Measured::Panel {
+                split: Some(split), ..
+            } => split.min_items,
+            Measured::Image { .. } | Measured::Panel { split: None, .. } => usize::MAX,
+        }
+    }
+
+    /// Space a fragment reserves after its last item. See [`PanelSplit::trailing_pt`].
+    fn fragment_trail_pt(&self) -> f32 {
+        match self {
+            Measured::Panel {
+                split: Some(split), ..
+            } => split.trailing_pt,
+            // A paragraph fragment does not end the paragraph, so it is charged no space below.
+            Measured::Text { .. }
+            | Measured::Image { .. }
+            | Measured::Panel { split: None, .. } => 0.0,
+        }
+    }
+
+    /// Whether this block would rather move whole to the next frame than be cut, given that it
+    /// would fit there entire. See [`PanelSplit::keep_together`].
+    fn prefers_keep_together(&self) -> bool {
+        matches!(self, Measured::Panel { split: Some(s), .. } if s.keep_together)
     }
 
     /// Cut into a fragment of the first `at` items and a remainder of the rest, both fully measured
@@ -713,9 +777,12 @@ impl Measured {
                         repeat_parts: split.repeat_parts.clone(),
                         repeat_decorations: split.repeat_decorations.clone(),
                         repeat_h: split.repeat_h,
+                        trailing_pt: split.trailing_pt,
+                        min_items: split.min_items,
+                        keep_together: split.keep_together,
                     }),
                 };
-                Some((head, cut, tail, total - shift))
+                Some((head, cut + split.trailing_pt, tail, total - shift))
             }
             Measured::Image { .. } | Measured::Panel { split: None, .. } => None,
         }
@@ -906,6 +973,10 @@ fn measure_stat_block(
     }
 
     let mut decorations: Vec<PanelRect> = Vec::new();
+    // Where each section begins, in panel-local dy — the only places this block may be cut
+    // (spec 0046). Section 0 is recorded at 0 rather than at the padding, so that the panel's top
+    // inset is charged to the first item and therefore to a continuation's first item too.
+    let mut section_tops: Vec<f32> = vec![0.0];
     for (idx, (text, style_name, starts_section)) in runs.into_iter().enumerate() {
         let style = styles
             .paragraph
@@ -920,6 +991,11 @@ fn measure_stat_block(
             metrics,
             hyphenator,
         );
+        // A cut may fall here and nowhere else: never inside a section, so an attributes list is
+        // never separated from itself and a prose section never breaks mid-run.
+        if starts_section && idx > 0 {
+            section_tops.push(y);
+        }
         y += style.space_before_pt;
         // A rule separates each section from the one above. Not before the first run, which has
         // the panel's own edge above it.
@@ -949,15 +1025,30 @@ fn measure_stat_block(
     }
 
     let height = y + STATBLOCK_PADDING_PT;
+    // Section heights, as gaps between the recorded tops. The last runs to the end of the content;
+    // the panel's bottom padding is `trailing_pt`, charged to whichever fragment ends the block.
+    let mut items: Vec<f32> = Vec::with_capacity(section_tops.len());
+    for i in 0..section_tops.len() {
+        let end = section_tops.get(i + 1).copied().unwrap_or(y);
+        items.push(end - section_tops[i]);
+    }
     (
         Measured::Panel {
             fill: Some(STATBLOCK_FILL),
             stroke: Some(STATBLOCK_STROKE),
             parts,
             decorations,
-            // Spec 0046 teaches a stat block its section boundaries. Until then it keeps together
-            // or moves whole, exactly as spec 0038 shipped it.
-            split: None,
+            split: Some(PanelSplit {
+                items,
+                // Nothing is re-stated at the top of a continuation except the panel's own inset:
+                // a stat block has no header row to repeat, but its text may not sit on the rule.
+                repeat_parts: Vec::new(),
+                repeat_decorations: Vec::new(),
+                repeat_h: STATBLOCK_PADDING_PT,
+                trailing_pt: STATBLOCK_PADDING_PT,
+                min_items: MIN_SECTIONS_PER_FRAGMENT,
+                keep_together: true,
+            }),
         },
         height,
     )
@@ -1115,6 +1206,10 @@ fn measure_table(
                 repeat_parts,
                 repeat_decorations,
                 repeat_h,
+                // A table has no panel edge of its own, so nothing to close below its last row.
+                trailing_pt: 0.0,
+                min_items: MIN_ROWS_PER_FRAGMENT,
+                keep_together: true,
             }),
         },
         y,
@@ -1444,15 +1539,18 @@ fn same_width(a: f32, b: f32) -> bool {
 
 /// The width of the frame a block's continuation would land in: the next frame on this page, or the
 /// first frame of the next page when this one is exhausted.
-fn continuation_width(
+fn continuation_frame(
     frames: &[Frame],
     frame_idx: usize,
     template: &impl PageTemplate,
     page_index: usize,
-) -> f32 {
+) -> (f32, f32) {
     match frames.get(frame_idx + 1) {
-        Some(next) => next.rect.w_pt,
-        None => frames_for(template, page_index + 1)[0].rect.w_pt,
+        Some(next) => (next.rect.w_pt, next.rect.h_pt),
+        None => {
+            let r = frames_for(template, page_index + 1)[0].rect;
+            (r.w_pt, r.h_pt)
+        }
     }
 }
 
@@ -1596,10 +1694,13 @@ pub(crate) fn flow(
                 // The cut is an index into the line list *at this width*, and a frame of another
                 // width re-wraps to a different list against which that index means something else.
                 let mut cut_taken = false;
-                if same_width(
-                    frame.rect.w_pt,
-                    continuation_width(&frames, frame_idx, template, page_index),
-                ) {
+                let (next_w, next_h) = continuation_frame(&frames, frame_idx, template, page_index);
+                // A composite would rather move whole than be cut, when moving whole actually
+                // works (spec 0046). Splitting a stat block that would have fitted the next column
+                // intact is a worse page than moving it — which is the keep-together spec 0038
+                // promised — while a paragraph is the opposite case and must still be cut.
+                let keep_whole = measured.prefers_keep_together() && height <= next_h;
+                if !keep_whole && same_width(frame.rect.w_pt, next_w) {
                     if let Some(k) = measured.cut_fitting(bottom - y) {
                         if let Some((fragment, fragment_h, _, _)) = measured.split_at(k) {
                             page.blocks.extend(place_measured(
@@ -3621,10 +3722,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stat_block_moves_whole_to_the_next_frame_rather_than_splitting() {
-        // Keep-together. It is the existing pagination rule — a block moves whole when it does not
-        // fit — and this asserts a stat block really is one block to that rule, rather than a group
-        // of runs that could be torn apart across a page boundary.
+    fn a_stat_block_that_fits_the_next_frame_still_moves_whole_to_it() {
+        // Keep-together, preserved. Spec 0046 gave a stat block section boundaries it *could* be cut
+        // at; this asserts it is still not cut when moving it whole works, which is what spec 0038
+        // promised. The preference order is the behaviour, and it is asserted before the split is.
         let mut doc = stat_doc();
         let stat = doc.content.remove(0);
         doc.content = many_lines(52);
@@ -3634,7 +3735,6 @@ mod tests {
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
         assert!(pages.len() >= 2, "the fixture must actually paginate");
 
-        // Every piece of the stat block landed on the same page as its panel.
         let panel_page = pages
             .iter()
             .position(|p| {
@@ -3656,6 +3756,272 @@ mod tests {
                 assert_eq!(from_stat, 0, "no run may be orphaned onto page {i}");
             }
         }
+    }
+
+    /// A stat block with `n` action lines — long enough to fit no frame at all.
+    fn big_goblin(n: usize) -> quill_core_model::StatBlock {
+        quill_core_model::StatBlock {
+            actions: (0..n)
+                .map(|i| format!("Action {i}. Does something."))
+                .collect(),
+            details: (0..n)
+                .map(|i| format!("Detail {i} about the creature."))
+                .collect(),
+            reactions: vec!["Parry. Adds 2 to AC.".into()],
+            ..goblin()
+        }
+    }
+
+    /// Every line placed for `source`, in page then y order.
+    fn stat_runs(pages: &[LaidOutPage], source: BlockId) -> Vec<String> {
+        let mut out = Vec::new();
+        for page in pages {
+            let mut placed: Vec<(f32, Vec<String>)> = page
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    PlacedBlock::Text {
+                        source: s,
+                        frame,
+                        lines,
+                        ..
+                    } if *s == source => Some((
+                        frame.y_pt,
+                        lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            placed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            out.extend(placed.into_iter().flat_map(|(_, l)| l));
+        }
+        out
+    }
+
+    #[test]
+    fn a_stat_block_too_tall_for_any_frame_splits_at_a_section() {
+        // Spec 0038's original promise, now buildable. The block fits nowhere, so keep-together has
+        // nothing to prefer and the fallback applies.
+        let mut doc = stat_doc();
+        doc.content = vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: big_goblin(30),
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.assign_missing_block_ids().expect("ids");
+        let id_pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(
+            id_pages.len() >= 2,
+            "a stat block taller than the page must paginate, got {}",
+            id_pages.len()
+        );
+
+        let id = doc.content[0].id();
+        let placed = stat_runs(&id_pages, id);
+
+        // Conservation: every run exactly once, in order.
+        let mut expected = vec!["Goblin".to_string(), "Small humanoid, chaotic".to_string()];
+        expected.push("AC: 15".into());
+        expected.push("HP: 7".into());
+        let big = big_goblin(30);
+        expected.extend(big.details.clone());
+        expected.extend(big.actions.clone());
+        expected.extend(big.reactions.clone());
+        assert_eq!(
+            placed, expected,
+            "every run exactly once, in document order"
+        );
+    }
+
+    #[test]
+    fn a_cut_stat_block_never_separates_an_attributes_list() {
+        // The rule that makes a section the unit: a cut falls *between* sections and never inside
+        // one, so `AC` and `HP` cannot end up on different pages. Attributes are one section by
+        // construction, which is what makes this true rather than lucky.
+        let mut doc = stat_doc();
+        doc.content = vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: quill_core_model::StatBlock {
+                attributes: (0..6)
+                    .map(|i| (format!("Attr{i}"), format!("{i}")))
+                    .collect(),
+                ..big_goblin(30)
+            },
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let id = doc.content[0].id();
+
+        let mut attr_pages = std::collections::BTreeSet::new();
+        for page in &pages {
+            for b in &page.blocks {
+                if let PlacedBlock::Text { source, lines, .. } = b {
+                    if *source == id && lines[0].text.starts_with("Attr") {
+                        attr_pages.insert(page.index);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            attr_pages.len(),
+            1,
+            "the attributes section must not be cut across pages, found on {attr_pages:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_stat_blocks_panel_closes_and_reopens() {
+        // One rect per fragment, each bounded by its own fragment — not one rect spanning a page
+        // break, which is what a naive implementation draws and what no text assertion notices.
+        let mut doc = stat_doc();
+        doc.content = vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: big_goblin(30),
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let bottom = Frame::full_page(&doc.page_setup).rect.h_pt;
+
+        let mut panels = 0;
+        for page in &pages {
+            for b in &page.blocks {
+                if let PlacedBlock::Rect { frame, fill, .. } = b {
+                    if *fill == Some(STATBLOCK_FILL) {
+                        panels += 1;
+                        assert!(
+                            frame.y_pt + frame.h_pt <= bottom + 0.01,
+                            "page {} panel runs {:.1} past the frame bottom",
+                            page.index,
+                            frame.y_pt + frame.h_pt
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            panels >= 2,
+            "each fragment must carry its own panel, got {panels}"
+        );
+    }
+
+    #[test]
+    fn no_stat_block_fragment_overruns_a_narrow_column() {
+        // Asserted over the real two-column template rather than a synthetic frame, because the
+        // narrow 162 pt columns and their 378 pt height are what make a cut hard to find: a
+        // fragment whose smallest legal cut is larger than the column falls back to being placed
+        // whole, and runs off the bottom of the page.
+        let t = quill_core_model::Template::by_name("rulebook").expect("bundled");
+        let mut doc = Document::from_template(t);
+        doc.content = vec![
+            Block::body(
+                "Some introductory prose, so the frame is not empty when the panel arrives and \
+                 the engine has a real decision to make about where it goes.",
+                Color::Gray { v: 0.0 },
+            ),
+            Block::StatBlock {
+                id: BlockId::UNASSIGNED,
+                stat: big_goblin(22),
+                color: Color::Gray { v: 0.0 },
+            },
+        ];
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+
+        for page in &pages {
+            let bottom = template
+                .frames(page.index)
+                .iter()
+                .map(|f| f.rect.y_pt + f.rect.h_pt)
+                .fold(0.0_f32, f32::max);
+            for b in &page.blocks {
+                let (y, h) = match b {
+                    PlacedBlock::Text { frame, .. }
+                    | PlacedBlock::Rect { frame, .. }
+                    | PlacedBlock::Image { frame, .. } => (frame.y_pt, frame.h_pt),
+                };
+                assert!(
+                    y + h <= bottom + 0.01,
+                    "page {} content runs to {:.1}, past the column bottom {bottom:.1}",
+                    page.index,
+                    y + h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_three_section_stat_block_still_splits() {
+        // Why the section minimum is one and not two (spec 0046). With a two-section minimum a
+        // block of three sections could not be cut at all — three is below the four that two-a-side
+        // needs — so a creature with a name, an overview and one long actions list would be placed
+        // whole and overflow. A section is a unit the reader recognises, so a fragment of one is
+        // not a widow the way a single line is.
+        let mut doc = stat_doc();
+        doc.content = vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: quill_core_model::StatBlock {
+                name: "Barrow Wight".into(),
+                overview: vec!["Medium undead, lawful evil".into()],
+                attributes: vec![],
+                details: vec![],
+                actions: (0..70).map(|i| format!("Attack {i}. +5 to hit.")).collect(),
+                reactions: vec![],
+            },
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let panels: usize = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(
+                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL)),
+            )
+            .count();
+        assert!(
+            panels >= 2,
+            "three sections must still admit a cut, got {panels} panel(s)"
+        );
+    }
+
+    #[test]
+    fn a_stat_block_of_one_oversized_section_is_placed_whole() {
+        // The uncuttable fallback, at its real boundary. A section is the unit, so a block with a
+        // single section has no legal cut however tall it is: place it and let it overflow, rather
+        // than emit an empty fragment and loop forever.
+        //
+        // Two sections would *not* be this case — spec 0046 allows a one-section fragment, so a
+        // name and an overview do split. Requiring two sections per fragment instead is what made
+        // the first version of this increment render a panel off the bottom of the page.
+        let mut doc = stat_doc();
+        doc.content = vec![Block::StatBlock {
+            id: BlockId::UNASSIGNED,
+            stat: quill_core_model::StatBlock {
+                name: (0..400)
+                    .map(|i| format!("word{i}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                overview: vec![],
+                attributes: vec![],
+                details: vec![],
+                actions: vec![],
+                reactions: vec![],
+            },
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let panels: usize = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter(
+                |b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(STATBLOCK_FILL)),
+            )
+            .count();
+        assert_eq!(panels, 1, "one section ⇒ no legal cut ⇒ placed whole");
     }
 
     #[test]

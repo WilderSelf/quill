@@ -1521,48 +1521,6 @@ increment's PR, not left here as a fixed-but-still-listed defect.
   already does), not on each template. Not done in 0036 because it changes a serialized 0030 type
   and would have carried a model change inside a templates increment.
 
-- **A block never splits across frames — now wanted by three callers.** *(Paragraphs fixed by spec
-  0044 and tables by 0045; stat blocks remain, scheduled as M3 spec 0046.)* The pagination loop
-  moves a whole block to the next frame when it does not fit, rather than breaking the paragraph
-  across the column boundary. On a single-column page this is invisible; on spec 0036's two-column
-  `rulebook` template it leaves a visible gap at the foot of a column whenever the next paragraph is
-  taller than the space left. Long-standing engine behavior rather than a regression — nothing in
-  the workspace produced a two-column page as its default before templates existed, which is why it
-  had not been seen. This is a real typographic defect for the milestone's flagship template and
-  should be sequenced into M2 or M3 explicitly; it is not a template setting that can work around it.
-
-  Spec 0038 raised the stakes and clarified the shape. Its roadmap entry promised stat-block
-  splitting at a section boundary; that was descoped, because splitting is not a stat-block feature
-  — paragraphs, stat blocks and tables all want the same mechanism, and building a stat-block-only
-  splitter would be the second of three implementations and would have to be undone. The real cost
-  is that `measure_block` takes a width and returns a height, with no notion of available height:
-  splitting means "measure this for at most H points, return a fragment and a remainder", which puts
-  height into the measurement-cache key, where the same block against a half-full frame and an empty
-  one becomes two entries — thrashing the hot path spec 0031 exists to keep cold. That design
-  question is what the increment would have to answer, and it deserves its own spec.
-
-  Spec 0039 then hit it a third time: its roadmap entry promised breaking between rows with the
-  header repeating on the continuation, and both were blocked on exactly this. **Three callers
-  wanted one mechanism** — paragraphs, stat blocks and tables — which was the strongest argument yet
-  that it should be built once, deliberately, rather than three times. Spec 0044 built it and
-  0045 gave tables their rows and header repetition; only stat blocks remain, in spec 0046.
-
-- **The screen render and the press export do not hyphenate the same way.** `quill render` lays out
-  with `NoHyphenator` (crates/cli/src/main.rs:323) while `export` uses the real en-US
-  `HypherHyphenator` (crates/export-pdf/src/lib.rs:323-324). So the two paths break lines
-  differently, and a document can have a different line count — and therefore a different page
-  count — on screen than in the file that goes to the printer. `CLAUDE.md` states the rule this
-  breaks in as many words: *one shaper for screen and press, so they cannot drift.* The shaper is
-  shared; the hyphenator is not, because `hyphenate::HypherHyphenator` is private to `export-pdf`
-  and the CLI cannot reach it. The fix is to promote it to `quill-text-layout` or `quill-fonts`
-  alongside the shaper, which is a small refactor with a large blast radius on rendered output, so
-  it is recorded rather than smuggled into an unrelated increment.
-
-  Found by rendering spec 0044's verification page and noticing single-word lines stranded in a
-  narrow justified measure — the sort of break hyphenation exists to prevent. A justified line
-  holding one word has no inter-word space to stretch and so sets short and flush left, which is
-  what made the discrepancy visible at all.
-
 - **A stat block's attribute keys wrap mid-key in a narrow measure.** *(Scheduled: M3 spec 0048.)* `Armour Class: 15 (leather,
   shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so
   the key/value pairing is lost. Proper key/value columns or a hanging indent would fix it and
