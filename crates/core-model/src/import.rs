@@ -43,8 +43,8 @@
 //!   came out as plain prose is visible and fixable; a paragraph that vanished is not.
 
 use crate::{
-    Block, BlockId, Color, Document, InlineStyle, Panel, Run, Table, Template, Weight,
-    LIST_BULLET_STYLE, LIST_NUMBER_STYLE,
+    Block, BlockId, Color, Document, InlineStyle, Panel, Run, Table, Template, EMPHASIS_STYLE,
+    LIST_BULLET_STYLE, LIST_NUMBER_STYLE, STRONG_EMPHASIS_STYLE, STRONG_STYLE,
 };
 
 /// Something the importer could not honor, with the line it was on.
@@ -340,13 +340,19 @@ fn build_runs(text: &str, delims: &[Delim], pairs: &[Pair]) -> Vec<Run> {
         if buf.is_empty() {
             return;
         }
+        // Imported as the *name* of a treatment, not as its values (spec 0065): a document that
+        // recorded `weight: 700` has forgotten that its author meant emphasis, and a house style
+        // that sets emphasis differently would have nothing to change.
+        let character = match (bold > 0, italic > 0) {
+            (true, true) => Some(STRONG_EMPHASIS_STYLE.to_string()),
+            (true, false) => Some(STRONG_STYLE.to_string()),
+            (false, true) => Some(EMPHASIS_STYLE.to_string()),
+            (false, false) => None,
+        };
         runs.push(Run {
             text: std::mem::take(buf),
-            style: InlineStyle {
-                weight: (bold > 0).then_some(Weight::BOLD),
-                italic: (italic > 0).then_some(true),
-                ..InlineStyle::EMPTY
-            },
+            style: InlineStyle::EMPTY,
+            character,
         });
     };
 
@@ -894,10 +900,14 @@ max_level: 3
         };
         let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, ["a ", "bold", " word and an ", "italic", " one"]);
-        assert_eq!(runs[1].style.weight, Some(Weight::BOLD));
-        assert_eq!(runs[1].style.italic, None);
-        assert_eq!(runs[3].style.italic, Some(true));
-        assert_eq!(runs[3].style.weight, None);
+        // Read as *names*, not as values (spec 0065): the document records that the author meant
+        // strong emphasis, so a house style that sets it differently has something to change.
+        assert_eq!(runs[1].character.as_deref(), Some(STRONG_STYLE));
+        assert_eq!(runs[3].character.as_deref(), Some(EMPHASIS_STYLE));
+        assert!(
+            runs.iter().all(|r| r.style.is_empty()),
+            "no run is overridden"
+        );
     }
 
     #[test]
@@ -910,14 +920,12 @@ max_level: 3
         };
         let both = &runs[0];
         assert_eq!(both.text, "both");
-        assert_eq!(both.style.weight, Some(Weight::BOLD));
-        assert_eq!(both.style.italic, Some(true));
+        assert_eq!(both.character.as_deref(), Some(STRONG_EMPHASIS_STYLE));
         let inner = runs
             .iter()
             .find(|r| r.text == "italic")
             .expect("the nested run survives");
-        assert_eq!(inner.style.weight, Some(Weight::BOLD));
-        assert_eq!(inner.style.italic, Some(true));
+        assert_eq!(inner.character.as_deref(), Some(STRONG_EMPHASIS_STYLE));
     }
 
     #[test]
@@ -939,7 +947,7 @@ max_level: 3
             let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
             assert_eq!(joined, source, "text was altered");
             assert!(
-                runs.iter().all(|r| r.style.is_empty()),
+                runs.iter().all(|r| r.character.is_none()),
                 "{source:?} should carry no emphasis"
             );
         }
@@ -954,7 +962,7 @@ max_level: 3
             panic!("expected a heading")
         };
         assert_eq!(runs.len(), 3);
-        assert_eq!(runs[1].style.italic, Some(true));
+        assert_eq!(runs[1].character.as_deref(), Some(EMPHASIS_STYLE));
     }
 
     #[test]
@@ -968,7 +976,7 @@ max_level: 3
             panic!("expected a body paragraph")
         };
         assert_eq!(runs.len(), 1);
-        assert!(runs[0].style.is_empty());
+        assert!(runs[0].style.is_empty() && runs[0].character.is_none());
     }
 
     /// Every one of these was measured losing *ordinary* characters under the first, one-pass
@@ -1022,7 +1030,7 @@ max_level: 3
         };
         let emphasised: Vec<&str> = runs
             .iter()
-            .filter(|r| r.style.italic == Some(true))
+            .filter(|r| r.character.as_deref() == Some(EMPHASIS_STYLE))
             .map(|r| r.text.as_str())
             .collect();
         assert_eq!(emphasised, ["big"], "the wrong pair was matched");
@@ -1042,7 +1050,7 @@ max_level: 3
         let Block::Body { runs, .. } = &doc.content[0] else {
             panic!("expected a body paragraph")
         };
-        assert!(runs.iter().all(|r| r.style.is_empty()));
+        assert!(runs.iter().all(|r| r.character.is_none()));
         let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(joined, "_a* b");
     }

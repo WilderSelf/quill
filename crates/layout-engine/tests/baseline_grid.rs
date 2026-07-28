@@ -588,6 +588,7 @@ fn a_larger_run_does_not_move_the_line_it_sits_on() {
                     weight: Some(Weight::BOLD),
                     ..InlineStyle::EMPTY
                 },
+                character: None,
             },
             Run::plain(" opened in three hundred years"),
         ],

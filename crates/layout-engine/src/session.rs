@@ -694,18 +694,30 @@ fn marker_fingerprint(marker: Option<&String>) -> u64 {
     h
 }
 
+/// Everything about the *styles* a block resolves against that could move its layout.
+///
+/// `Debug` over the whole resolved `ParagraphStyle` rather than a hand-picked list of fields, for
+/// the reason the ambient fingerprint below gives: a hand-written list silently stops covering a
+/// field the moment the model grows one, and the symptom is a document that refuses to re-flow after
+/// an edit nobody can see. It had already stopped covering three — `indent` (spec 0048), `list`
+/// (0066) and `weight`/`italic` (0064) — each of which moves a glyph.
+///
+/// Plus the character styles this block's runs actually name (spec 0065), resolved, so that editing
+/// one invalidates the blocks that use it and leaves the rest of the document cached.
 fn style_fingerprint(styles: &StyleSheet, block: &Block) -> u64 {
-    let s = styles.resolve(block);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for bits in [
-        s.font_size_pt.to_bits(),
-        s.leading_pt.to_bits(),
-        s.space_before_pt.to_bits(),
-        s.space_after_pt.to_bits(),
-        s.align as u32,
-    ] {
-        h ^= bits as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    eat(format!("{:?}", styles.resolve(block)).as_bytes());
+    if let Block::Heading { runs, .. } | Block::Body { runs, .. } = block {
+        for name in runs.iter().filter_map(|r| r.character.as_deref()) {
+            eat(name.as_bytes());
+            eat(format!("{:?}", styles.character(name)).as_bytes());
+        }
     }
     h
 }
@@ -975,6 +987,7 @@ mod tests {
                     Run {
                         text: "enough".into(),
                         style,
+                        character: None,
                     },
                     Run::plain(" words in it to occupy a line or so of text"),
                 ],
@@ -1664,5 +1677,104 @@ mod tests {
             "pages that no longer exist must be reported so a viewport clears them"
         );
         assert_eq!(after.pages, crate::lay_out(&doc, &MONO, &NoHyphenator));
+    }
+
+    /// Spec 0065's cache claim, and spec 0031's: editing a character style reflows the blocks that
+    /// use it.
+    ///
+    /// Asserted with the work counters rather than a timing, which is the discipline this module's
+    /// own doc comment sets. The invalidation is deliberately coarse — the style fingerprint covers
+    /// the whole `StyleSheet`, as it has since spec 0028's paragraph map — so what is asserted is
+    /// that the blocks that use the style *are* re-measured, and that a document is not re-measured
+    /// when nothing changed at all.
+    #[test]
+    fn editing_a_character_style_reflows_the_blocks_that_use_it() {
+        use quill_core_model::{CharacterStyle, InlineStyle, Run, Weight};
+
+        let mut doc = doc_of(40);
+        for (i, block) in doc.content.iter_mut().enumerate() {
+            if i % 4 != 0 {
+                continue;
+            }
+            let id = block.id();
+            *block = Block::body_runs(
+                vec![
+                    Run {
+                        text: "lead in".into(),
+                        style: InlineStyle::EMPTY,
+                        character: Some("house-lead".into()),
+                    },
+                    Run::plain(" and the rest of a paragraph long enough to occupy a line"),
+                ],
+                INK,
+            );
+            block.set_id(id);
+        }
+        doc.styles.character.insert(
+            "house-lead".into(),
+            CharacterStyle {
+                weight: Some(Weight::BOLD),
+                ..CharacterStyle::EMPTY
+            },
+        );
+        doc.bump_revision();
+
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+        let quiet = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(quiet.stats.blocks_measured, 0, "nothing changed");
+
+        doc.styles.character.insert(
+            "house-lead".into(),
+            CharacterStyle {
+                weight: Some(Weight::BOLD),
+                size_pt: Some(14.0),
+                ..CharacterStyle::EMPTY
+            },
+        );
+        doc.bump_revision();
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            after.stats.blocks_measured > 0,
+            "the blocks naming the style must be re-measured"
+        );
+        assert!(
+            !after.changed_pages.is_empty(),
+            "and what they draw must change"
+        );
+    }
+
+    /// The fingerprint had stopped covering three fields that move a glyph — a hanging indent
+    /// (spec 0048), a list marker (0066) and a paragraph weight (0064) — because it listed the
+    /// fields it hashed by hand. Each of these edits must re-measure.
+    #[test]
+    fn a_paragraph_style_edit_that_moves_a_glyph_re_measures() {
+        use quill_core_model::{Indent, Weight};
+
+        type Edit = fn(&mut quill_core_model::ParagraphStyle);
+        let edits: Vec<(&str, Edit)> = vec![
+            ("size", |s| s.font_size_pt = 14.0),
+            ("indent", |s| s.indent = Indent::hanging(18.0)),
+            ("weight", |s| s.weight = Weight::BOLD),
+            ("italic", |s| s.italic = true),
+            ("align", |s| s.align = quill_core_model::TextAlign::Left),
+        ];
+        for (what, edit) in edits {
+            let mut doc = doc_of(40);
+            let mut session = LayoutSession::new();
+            session.relayout(&doc, &MONO, &NoHyphenator);
+            edit(
+                doc.styles
+                    .paragraph
+                    .get_mut(quill_core_model::BODY_STYLE)
+                    .expect("body style"),
+            );
+            doc.bump_revision();
+            let after = session.relayout(&doc, &MONO, &NoHyphenator);
+            assert!(
+                after.stats.blocks_measured > 0,
+                "editing {what} must re-measure"
+            );
+        }
     }
 }

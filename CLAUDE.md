@@ -129,8 +129,8 @@ content packs) → **M5** the general typographic core (the neutral core, inline
 styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
 an index, a book) → **M7** graphics and colour.
 **M0–M4 done**; M0's sole open item is the manual POD upload. **M5 is decomposed** into specs
-0062–0067, of which 0062 (the neutral core), 0063 (inline runs), 0064 (the font family) and 0066
-(lists) have shipped; 0065 (character styles) and 0067 (tabs and leaders) remain. M6–M7 are named,
+0062–0067, of which 0062 (the neutral core), 0063 (inline runs), 0064 (the font family), 0065
+(character styles) and 0066 (lists) have shipped; 0067 (tabs and leaders) remains. M6–M7 are named,
 not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
