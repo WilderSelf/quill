@@ -20,24 +20,43 @@ image-heavy books. The manifest is JSON (text) so projects are **git-friendly**.
 
 ## Manifest (`document.json`)
 
-Top-level shape (illustrative; the authoritative schema is the `serde` types in
-`quill-core-model`):
+Top-level shape (the authoritative schema is the `serde` types in `quill-core-model`; this example
+is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 ```json
 {
-  "format_version": 2,
-  "metadata": { "title": "...", "authors": ["..."] },
-  "page_setup": { "trim": { "w_pt": 468, "h_pt": 720 }, "bleed_pt": 9.0, "facing_pages": true,
-                  "margins": { "top_pt": 36, "bottom_pt": 36, "inside_pt": 54, "outside_pt": 36 } },
-  "master_pages": [ { "name": "body", "columns": 2, "gutter_pt": 12,
-                      "statics": [ { "kind": "text", "rect": { ... }, "text": "The Dungeon — {page}" } ] } ],
+  "format_version": 3,
+  "metadata": { "title": "The Ruined Keep", "authors": ["Anon"] },
+  "page_setup": { "trim": { "w_pt": 468.0, "h_pt": 720.0 }, "bleed_pt": 9.0, "facing_pages": true,
+                  "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 } },
+  "master_pages": [
+    { "name": "body", "columns": 2, "gutter_pt": 12.0,
+      "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 },
+      "statics": [
+        { "kind": "text", "rect": { "x_pt": 54.0, "y_pt": 18.0, "w_pt": 378.0, "h_pt": 12.0 },
+          "text": "The Dungeon", "color": { "space": "gray", "v": 0.0 },
+          "style": "folio", "align": "center" },
+        { "kind": "text", "rect": { "x_pt": 54.0, "y_pt": 690.0, "w_pt": 378.0, "h_pt": 12.0 },
+          "text": "{page}", "color": { "space": "gray", "v": 0.0 },
+          "style": "folio", "align": "outside", "mirror": true }
+      ] },
+    { "name": "chapter-opener", "columns": 1, "gutter_pt": 0.0, "statics": [] }
+  ],
   "default_master": "body",
   "pages": [ { "master": "chapter-opener" }, {} ],
-  "styles": { "paragraph": { "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" }, "h1": { ... } } },
-  "content": [ /* semantic blocks: headings, body, stat blocks, tables, random tables */ ],
+  "styles": { "paragraph": {
+    "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" },
+    "folio": { "font_size_pt": 9.0, "leading_pt": 12.0, "align": "left" } } },
+  "content": [
+    { "kind": "heading", "id": 1, "level": 1, "text": "The Ruined Keep",
+      "color": { "space": "gray", "v": 0.0 } },
+    { "kind": "body", "id": 2, "text": "A dank corridor stretches into darkness.",
+      "color": { "space": "cmyk", "c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0 } },
+    { "kind": "image", "id": 3, "asset": "map1" }
+  ],
   "revision": 0,
   "next_block_id": 4,
-  "assets": [ { "id": "...", "path": "assets/....png", "px_w": 1500, "px_h": 1200, "dpi": 300 } ]
+  "assets": [ { "id": "map1", "path": "assets/map1.png", "px_w": 1500, "px_h": 1200, "dpi": 300.0 } ]
 }
 ```
 
@@ -62,6 +81,25 @@ Because assignment is positional, content that pushes the book by a page slides 
 assignment. That is the accepted trade for M2; anchoring a master to the chapter it opens is
 recorded as an open question in `docs/roadmap.md`.
 
+## Master statics: alignment and page parity (spec 0047, v3)
+
+A text static carries two optional fields, both defaulting to the pre-v3 behavior and both omitted
+from the manifest when they do:
+
+- `align` — `left` (default), `center`, `right`, `inside`, `outside`. Where the line sits **within
+  its rect**. `inside`/`outside` resolve to left/right by page parity, the same rule the margins
+  use: a recto has the spine on its left, and with `facing_pages` off every page is a recto.
+  A static is one unbroken line, so there is no `justified`.
+- `mirror` — when true, the rect itself is reflected about the page's vertical centre on a verso
+  (`x' = trim.w - (x + w)`). The rect is authored **as it looks on a recto**, exactly as margins are
+  authored inside/outside.
+
+Both are needed to place a folio at the outside corner of a spread, because the band it sits in is
+itself asymmetric whenever the inside and outside margins differ: `mirror` moves the band to the
+right half of the page, `align` puts the number at its fore-edge end. Alignment is resolved at
+layout, against the same font metrics the text is broken with, so a placed static's frame reports
+the measured line rather than the band it was aligned in.
+
 ## Versioning
 
 `format_version` is an integer. Readers reject formats newer than they understand and migrate
@@ -79,6 +117,24 @@ whatever this build did not understand.
 | older | migrated forward, one step per version |
 | current | loaded as-is |
 | newer | refused |
+
+### The migrations
+
+Each step brings a manifest forward exactly one version and falls through to the next, so a
+document written by any released build reaches the current types in one load. Both migrations so far
+are structurally no-ops — every field they add is `serde(default)` and the default is what the older
+version *meant* — and both are written out anyway, so the chain reads as a record of what each
+version changed.
+
+| From → to | Spec | What changed | Migration |
+|---|---|---|---|
+| 1 → 2 | 0030 | `page_setup.margins`, `master_pages`, `default_master` | defaults `margins` to zero on every edge and `master_pages` to empty: a v1 document had no margins and no masters |
+| 2 → 3 | 0047 | `align` and `mirror` on a text master static | defaults `align` to `left` and `mirror` to `false` on every text static: a v2 static was drawn from its rect's left edge in the same rect on both halves of a spread |
+
+A bump is warranted whenever an **older** build would open the document and silently lay it out
+wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
+heads and column geometry; a pre-0047 build would put every verso's folio in the gutter. Refusing to
+open beats either, because a half-understood document can be saved back over the original.
 
 ## Reading a container
 

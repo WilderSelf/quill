@@ -1510,16 +1510,6 @@ increment's PR, not left here as a fixed-but-still-listed defect.
   commit would leave neither trustworthy. `benches/budgets.toml` pins today's value so a further
   regression is still caught.
 
-- **A master static has no alignment and is not mirrored by page parity.** *(Scheduled: M3 spec 0047.)* `MasterStatic::Text`
-  (spec 0030) is drawn as one line starting at its rect's left edge, and the same rect is used on
-  rectos and versos alike. So a running head cannot be centred or set flush to the fore-edge, and a
-  folio cannot sit at the outside corner of a spread — the two most conventional placements in a
-  bound book. Spec 0036's bundled templates work around it by insetting the folio to the fore-edge
-  margin, which is correct but is not the design a publisher would choose. Found by rendering a
-  template page: every numeric test passed while the folio printed hard against the trim.
-  The fix belongs on the static (an `align`, and an `x` that resolves inside/outside like `Margins`
-  already does), not on each template. Not done in 0036 because it changes a serialized 0030 type
-  and would have carried a model change inside a templates increment.
 
 - **A stat block's attribute keys wrap mid-key in a narrow measure.** *(Scheduled: M3 spec 0048.)* `Armour Class: 15 (leather,
   shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so

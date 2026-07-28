@@ -28,14 +28,16 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
-/// **2** since spec 0030 added master pages and margins. The bump is deliberate even though the new
-/// fields are all `serde(default)` and a v1 manifest therefore loads unchanged: the point of a
+/// **3** since spec 0047 gave [`MasterStatic::Text`] an alignment and page-parity mirroring; **2**
+/// since spec 0030 added master pages and margins. Each bump is deliberate even though the new
+/// fields are all `serde(default)` and an older manifest therefore loads unchanged: the point of a
 /// version is to stop an *older* build from opening a document it would silently mis-lay-out. A
 /// build that predates master pages would ignore `master_pages` entirely and produce a document
-/// without its running heads, folios or column geometry — and could then save that back. Refusing
-/// to open is the correct outcome; quietly dropping the layout is exactly the silent corruption
-/// `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 2;
+/// without its running heads, folios or column geometry; a build that predates spec 0047 would draw
+/// every static left-aligned in an unmirrored rect, putting the folio in the gutter on every verso.
+/// Either could then save that back over the original. Refusing to open is the correct outcome;
+/// quietly dropping the layout is exactly the silent corruption `CLAUDE.md` forbids.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -130,13 +132,24 @@ impl Margins {
     /// left. With facing pages off, every page is treated as a recto — a single-sided document has
     /// no spread to mirror across.
     pub fn left_right(&self, page_index: usize, facing_pages: bool) -> (Pt, Pt) {
-        let recto = !facing_pages || page_index.is_multiple_of(2);
-        if recto {
+        if is_recto(page_index, facing_pages) {
             (self.inside_pt, self.outside_pt)
         } else {
             (self.outside_pt, self.inside_pt)
         }
     }
+}
+
+/// Whether `page_index` is a right-hand page — the spine on its left, the fore-edge on its right.
+///
+/// The one place page parity is decided. [`Margins::left_right`] and [`StaticAlign`] (spec 0047)
+/// both call it rather than each re-deriving the rule, so the parity of a margin and the parity of a
+/// folio cannot disagree.
+///
+/// With `facing_pages` off every page is a recto: a single-sided document has no spread to mirror
+/// across.
+pub fn is_recto(page_index: usize, facing_pages: bool) -> bool {
+    !facing_pages || page_index.is_multiple_of(2)
 }
 
 impl Default for PageSetup {
@@ -582,6 +595,56 @@ impl StyleSheet {
     }
 }
 
+/// How a [`MasterStatic::Text`] is set within its rect (spec 0047).
+///
+/// Distinct from [`TextAlign`], which is the treatment of a *flowed* paragraph: a static is one
+/// unbroken line, so there is nothing to justify and no last line to except. `Left` is the default
+/// and is exactly the pre-spec-0047 behaviour — a static that says nothing is drawn where it always
+/// was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaticAlign {
+    /// Flush to the rect's left edge.
+    #[default]
+    Left,
+    /// Centred in the rect.
+    Center,
+    /// Flush to the rect's right edge.
+    Right,
+    /// Flush to the spine side: left on a recto, right on a verso.
+    Inside,
+    /// Flush to the fore-edge side: right on a recto, left on a verso.
+    Outside,
+}
+
+impl StaticAlign {
+    /// The x at which a line of width `line_w_pt` sits inside `rect` on `page_index`.
+    ///
+    /// `Inside`/`Outside` resolve by page parity through [`is_recto`] — the same rule
+    /// [`Margins::left_right`] uses, which is what makes "outside" mean the same thing to a margin
+    /// and to a folio.
+    ///
+    /// A line wider than its rect keeps its aligned edge and overflows *inward* rather than being
+    /// clamped: a too-wide `Outside` running head then runs into the page instead of off the trim.
+    /// Visible and fixable beats silently guillotined (`CLAUDE.md`).
+    pub fn x_for(self, rect: Rect, line_w_pt: Pt, page_index: usize, facing_pages: bool) -> Pt {
+        let recto = is_recto(page_index, facing_pages);
+        let resolved = match self {
+            StaticAlign::Inside if recto => StaticAlign::Left,
+            StaticAlign::Inside => StaticAlign::Right,
+            StaticAlign::Outside if recto => StaticAlign::Right,
+            StaticAlign::Outside => StaticAlign::Left,
+            other => other,
+        };
+        match resolved {
+            StaticAlign::Center => rect.x_pt + (rect.w_pt - line_w_pt) / 2.0,
+            StaticAlign::Right => rect.x_pt + rect.w_pt - line_w_pt,
+            // `Inside`/`Outside` were resolved above; `Left` is the rect's own origin.
+            _ => rect.x_pt,
+        }
+    }
+}
+
 /// A repeating element a master page stamps onto each page it governs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -592,16 +655,74 @@ pub enum MasterStatic {
     /// out. A token rather than a distinct "folio" variant, so a running head can read
     /// "The Dungeon — 42" without needing a second element type.
     Text {
-        /// Where the line sits, relative to the trim box.
+        /// Where the line sits, relative to the trim box — **as it looks on a recto** when
+        /// `mirror` is set.
         rect: Rect,
         text: String,
         color: Color,
         /// Paragraph style name, resolved against the document's stylesheet.
         #[serde(default)]
         style: Option<String>,
+        /// Where the line sits within `rect` (spec 0047).
+        #[serde(default, skip_serializing_if = "is_default_align")]
+        align: StaticAlign,
+        /// Whether `rect` is mirrored across the spine on a verso (spec 0047).
+        ///
+        /// Alignment alone cannot put a folio at the outside corner of both halves of a spread,
+        /// because the band it may sit in is *itself* asymmetric whenever the inside and outside
+        /// margins differ. Set this and the rect flips about the page's vertical centre on a verso,
+        /// exactly as [`Margins`] swap sides. Ignored when `facing_pages` is off.
+        #[serde(default, skip_serializing_if = "is_false")]
+        mirror: bool,
     },
     /// A linked image at a fixed position — background art, a border, a decorative rule.
     Image { rect: Rect, asset: String },
+}
+
+/// Both spec-0047 fields are omitted from the manifest when they hold their defaults, on the
+/// precedent of `pages` (spec 0035). Not cosmetic: the exported PDF's `/ID` is a hash of the
+/// manifest text, so a migration that added two keys to every static would change the identifier —
+/// and therefore every exported byte — of every document that has furniture.
+fn is_default_align(a: &StaticAlign) -> bool {
+    *a == StaticAlign::default()
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl MasterStatic {
+    /// A left-aligned, unmirrored text static — the shape every static had before spec 0047.
+    pub fn text(rect: Rect, text: impl Into<String>, color: Color) -> MasterStatic {
+        MasterStatic::Text {
+            rect,
+            text: text.into(),
+            color,
+            style: None,
+            align: StaticAlign::default(),
+            mirror: false,
+        }
+    }
+
+    /// Where this static's box sits on `page_index`, after parity mirroring.
+    ///
+    /// The authored rect is what the page looks like on a **recto**; on a verso a mirrored rect is
+    /// reflected about the page's vertical centre. An unmirrored static — and every static on a
+    /// single-sided document — gets its authored rect back unchanged, which is the pre-0047
+    /// behaviour.
+    pub fn rect_on(&self, page_index: usize, setup: &PageSetup) -> Rect {
+        let (rect, mirror) = match self {
+            MasterStatic::Text { rect, mirror, .. } => (*rect, *mirror),
+            MasterStatic::Image { rect, .. } => (*rect, false),
+        };
+        if !mirror || is_recto(page_index, setup.facing_pages) {
+            return rect;
+        }
+        Rect {
+            x_pt: setup.trim.w_pt - (rect.x_pt + rect.w_pt),
+            ..rect
+        }
+    }
 }
 
 /// The page-number token replaced in [`MasterStatic::Text`].
@@ -1280,6 +1401,168 @@ mod tests {
                 > sheet.paragraph[STATBLOCK_BODY_STYLE].font_size_pt,
             "the name must be set larger than the prose"
         );
+    }
+
+    // --- Master static alignment and parity (spec 0047) ---------------------------------------
+
+    /// A 100 pt-wide band starting 50 pt in, on a 432 pt page.
+    const BAND: Rect = Rect {
+        x_pt: 50.0,
+        y_pt: 600.0,
+        w_pt: 100.0,
+        h_pt: 12.0,
+    };
+
+    #[test]
+    fn left_alignment_is_exactly_the_pre_0047_placement() {
+        // The default must be the old behaviour to the point: a static that says nothing about
+        // alignment is drawn from its rect's left edge, on every page, as it always was.
+        for page in 0..4 {
+            assert_eq!(StaticAlign::Left.x_for(BAND, 20.0, page, true), 50.0);
+            assert_eq!(StaticAlign::default(), StaticAlign::Left);
+        }
+    }
+
+    #[test]
+    fn a_line_is_centred_and_right_aligned_within_its_rect() {
+        // 100 pt band, 20 pt line: centred at 50 + 40, flush right at 50 + 80.
+        assert!((StaticAlign::Center.x_for(BAND, 20.0, 0, true) - 90.0).abs() < 0.01);
+        assert!((StaticAlign::Right.x_for(BAND, 20.0, 0, true) - 130.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn inside_and_outside_swap_with_page_parity() {
+        // The defect this spec exists to fix, at the arithmetic level: two adjacent pages must not
+        // resolve to the same x.
+        let recto = StaticAlign::Outside.x_for(BAND, 20.0, 0, true);
+        let verso = StaticAlign::Outside.x_for(BAND, 20.0, 1, true);
+        assert!((recto - 130.0).abs() < 0.01, "recto outside is flush right");
+        assert!((verso - 50.0).abs() < 0.01, "verso outside is flush left");
+        assert_ne!(recto, verso);
+        // And `inside` is its mirror image, not a second name for the same edge.
+        assert_eq!(StaticAlign::Inside.x_for(BAND, 20.0, 0, true), 50.0);
+        assert_eq!(StaticAlign::Inside.x_for(BAND, 20.0, 1, true), 130.0);
+    }
+
+    #[test]
+    fn parity_resolution_is_off_when_facing_pages_is() {
+        // Same rule as `Margins::left_right`: a single-sided document has no spread to mirror
+        // across, so every page is a recto.
+        for page in 0..4 {
+            assert_eq!(
+                StaticAlign::Outside.x_for(BAND, 20.0, page, false),
+                StaticAlign::Right.x_for(BAND, 20.0, page, false)
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_long_line_keeps_its_aligned_edge_and_overflows_inward() {
+        // A right-aligned static wider than its rect must run into the page, not off the trim.
+        // Clamping to the rect's left edge would push the overflow the other way — into the
+        // guillotine, silently.
+        let x = StaticAlign::Right.x_for(BAND, 160.0, 0, true);
+        assert!(x < BAND.x_pt, "expected leftward overflow, got {x}");
+        assert!((x + 160.0 - (BAND.x_pt + BAND.w_pt)).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_mirrored_rect_flips_about_the_page_centre_on_a_verso() {
+        let setup = PageSetup::default(); // 432 pt wide, facing pages on
+        let s = MasterStatic::Text {
+            rect: BAND,
+            text: "{page}".into(),
+            color: Color::Gray { v: 0.0 },
+            style: None,
+            align: StaticAlign::Outside,
+            mirror: true,
+        };
+        assert_eq!(
+            s.rect_on(0, &setup),
+            BAND,
+            "a recto keeps the authored rect"
+        );
+        // 432 - (50 + 100) = 282.
+        assert_eq!(s.rect_on(1, &setup).x_pt, 282.0);
+        assert_eq!(s.rect_on(1, &setup).w_pt, BAND.w_pt);
+    }
+
+    #[test]
+    fn an_unmirrored_static_and_a_single_sided_document_keep_the_authored_rect() {
+        let mut setup = PageSetup::default();
+        let plain = MasterStatic::text(BAND, "x", Color::Gray { v: 0.0 });
+        for page in 0..4 {
+            assert_eq!(plain.rect_on(page, &setup), BAND, "unmirrored never moves");
+        }
+        let mirrored = MasterStatic::Text {
+            rect: BAND,
+            text: "x".into(),
+            color: Color::Gray { v: 0.0 },
+            style: None,
+            align: StaticAlign::Outside,
+            mirror: true,
+        };
+        setup.facing_pages = false;
+        for page in 0..4 {
+            assert_eq!(mirrored.rect_on(page, &setup), BAND);
+        }
+        // An image static has no `mirror` field at all and is never moved.
+        let image = MasterStatic::Image {
+            rect: BAND,
+            asset: "bg".into(),
+        };
+        assert_eq!(image.rect_on(1, &PageSetup::default()), BAND);
+    }
+
+    #[test]
+    fn margins_and_statics_agree_about_which_side_is_outside() {
+        // Both call `is_recto`, so this cannot drift — asserted anyway, because the whole point of
+        // the shared helper is that a folio and a margin never disagree about a page.
+        let m = Margins {
+            top_pt: 0.0,
+            bottom_pt: 0.0,
+            inside_pt: 54.0,
+            outside_pt: 40.0,
+        };
+        for page in 0..4 {
+            let (left, _right) = m.left_right(page, true);
+            let inside_is_left = left == m.inside_pt;
+            assert_eq!(inside_is_left, is_recto(page, true));
+            let x = StaticAlign::Inside.x_for(BAND, 20.0, page, true);
+            assert_eq!(
+                x == BAND.x_pt,
+                inside_is_left,
+                "page {page}: the inside edge must be the same side for both"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_static_fields_round_trip_and_default_out_of_the_manifest() {
+        let mut doc = Document::sample();
+        doc.master_pages = vec![MasterPage {
+            statics: vec![
+                MasterStatic::Text {
+                    rect: BAND,
+                    text: PAGE_TOKEN.into(),
+                    color: Color::Gray { v: 0.0 },
+                    style: None,
+                    align: StaticAlign::Outside,
+                    mirror: true,
+                },
+                MasterStatic::text(BAND, "plain", Color::Gray { v: 0.0 }),
+            ],
+            ..MasterPage::plain("body")
+        }];
+        doc.default_master = Some("body".into());
+        let json = doc.to_json().expect("save");
+        assert_eq!(Document::from_json(&json).expect("load"), doc);
+        // A default-aligned, unmirrored static writes neither key. This is what keeps a migrated
+        // v2 document's manifest text — and therefore the `/ID` its export is hashed from —
+        // exactly where it was (spec 0047).
+        let masters = serde_json::to_string(&doc.master_pages).expect("masters");
+        assert_eq!(masters.matches("\"align\"").count(), 1, "{masters}");
+        assert_eq!(masters.matches("\"mirror\"").count(), 1, "{masters}");
     }
 
     #[test]
