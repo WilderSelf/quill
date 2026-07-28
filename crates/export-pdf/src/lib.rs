@@ -1134,7 +1134,16 @@ mod tests {
     /// Verified by inspecting the emitted text operators rather than by accepting the new number:
     /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
     /// only by being ragged-left.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0xa7fb_899f_9cf4_d605;
+    ///
+    /// Changed again by spec 0048, and again only in the document's identity. `StyleSheet::default()`
+    /// now gives `statblock-attr` a 10 pt hanging indent, so `doc.to_json()` differs and the `/ID`
+    /// derived from it moves. Verified rather than accepted: exported against the committed parity
+    /// ICC before and after, **8786 bytes both sides**, 116 differing bytes in 16 runs, and every
+    /// run inside the XMP `DocumentID`/`InstanceID` or one of the two halves of the trailer `/ID`.
+    /// No content, font or metadata stream moved. The sample has no stat block, so nothing it draws
+    /// could have changed — which is what makes an identifier-only diff the expected result here
+    /// rather than a hopeful one.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x6792_4808_db3d_24f5;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;

@@ -10,6 +10,7 @@
 
 use std::sync::OnceLock;
 
+use crate::Indent;
 use crate::{
     heading_style_name, Color, Document, Margins, MasterPage, MasterStatic, PageOverride,
     PageSetup, ParagraphStyle, Rect, Size, StaticAlign, StyleSheet, TextAlign, BODY_STYLE,
@@ -118,6 +119,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
             align: TextAlign::Justified,
             space_before_pt: 0.0,
             space_after_pt: 0.0,
+            indent: Indent::ZERO,
         },
     );
     for &(level, size, leading) in scale {
@@ -131,6 +133,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
                 align: TextAlign::Left,
                 space_before_pt: leading * 0.75,
                 space_after_pt: leading * 0.25,
+                indent: Indent::ZERO,
             },
         );
     }
@@ -142,6 +145,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
             align: TextAlign::Left,
             space_before_pt: 0.0,
             space_after_pt: 0.0,
+            indent: Indent::ZERO,
         },
     );
     styles

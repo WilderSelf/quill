@@ -118,7 +118,10 @@ pub fn paint_page(
                 let ascent = font.ascent_pt(*font_size_pt);
                 for (i, line) in lines.iter().enumerate() {
                     ops.push(PaintOp::Text {
-                        x_pt: geom.off_x + frame.x_pt,
+                        // A line's own left inset (spec 0048), added here and in the PDF writer
+                        // from the same field, so the two derivation sites cannot disagree about
+                        // which lines are indented.
+                        x_pt: geom.off_x + frame.x_pt + line.indent_pt,
                         baseline_pt: geom.off_y + frame.y_pt + ascent + i as f32 * leading_pt,
                         text: line.text.clone(),
                         size_pt: *font_size_pt,
@@ -435,6 +438,7 @@ mod tests {
             lines: vec![quill_text_layout::Line {
                 text: "running head".into(),
                 space_adjust_pt: 0.0,
+                indent_pt: 0.0,
             }],
             color: Color::Gray { v: 0.5 },
             font_size_pt: 9.0,
