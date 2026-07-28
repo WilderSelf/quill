@@ -341,6 +341,42 @@ pub fn export(
     writer::write_pdf(doc, opts, &pages, &font, out)
 }
 
+/// Whether an annotation at `rect` on `page_index` would violate PDF/X (spec 0042).
+///
+/// PDF/X-1a requires annotations to sit **outside the BleedBox**. A clickable table-of-contents
+/// entry sits in the middle of the text block by definition, which is why spec 0042 ships outlines
+/// and destinations — document structure, always legal — and not internal links.
+///
+/// Nothing in the model can express an annotation yet, so this check has nothing to guard today.
+/// That is exactly when it is cheap to add and exactly the spec-0013 lesson: the validator and the
+/// writer must agree on the rule *before* anything relies on it. When links arrive — behind a
+/// non-PDF/X screen profile, most likely — this is the gate they have to pass, rather than a rule
+/// someone has to remember.
+///
+/// `rect` is in the page's own top-left space, the same space `PlacedBlock` uses.
+pub fn annotation_finding(
+    rect: &quill_core_model::Rect,
+    page_setup: &quill_core_model::PageSetup,
+    page_index: usize,
+) -> Option<Finding> {
+    let g = quill_core_model::page_geom(page_setup, page_index);
+    // The BleedBox is the whole media box here (`MediaBox == BleedBox`, spec 0013), so anything
+    // touching the page at all intersects it. Stated as an intersection test rather than as
+    // "always fails" so it stays correct if the two boxes ever diverge.
+    let (bx, by, bw, bh) = (0.0, 0.0, g.media_w, g.media_h);
+    let x = g.off_x + rect.x_pt;
+    let y = g.off_y + rect.y_pt;
+    let intersects = x < bx + bw && x + rect.w_pt > bx && y < by + bh && y + rect.h_pt > by;
+    intersects.then(|| Finding {
+        check: CheckId::Marks,
+        severity: Severity::Error,
+        message: format!(
+            "page {}: an annotation intersects the BleedBox; PDF/X requires annotations outside it",
+            page_index + 1
+        ),
+    })
+}
+
 /// Press checks that can only be made against laid-out geometry (spec 0037).
 ///
 /// [`preflight`] walks the document, which is the right place for everything a *block* declares.
@@ -702,6 +738,129 @@ mod tests {
         }
     }
 
+    // --- PDF outline (spec 0042) ---------------------------------------------------------------
+
+    /// Export a document made of the given headings and return the raw PDF bytes.
+    fn export_with_headings(tag: &str, levels: &[(u8, &str)]) -> Vec<u8> {
+        let (opts, icc) = opts_with_real_icc(tag);
+        let mut doc = Document::sample();
+        doc.content.clear();
+        for (level, text) in levels {
+            doc.content
+                .push(Block::heading(*level, *text, Color::Gray { v: 0.0 }));
+        }
+        doc.assign_missing_block_ids().expect("ids");
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("export");
+        let _ = std::fs::remove_file(icc);
+        bytes
+    }
+
+    #[test]
+    fn a_document_with_no_headings_emits_no_outline_at_all() {
+        // Not an empty one. An empty outline tree renders as an empty, confusing bookmark pane,
+        // which is worse than no pane.
+        let (opts, icc) = opts_with_real_icc("outline_none");
+        let mut doc = Document::sample();
+        doc.content.retain(|b| !matches!(b, Block::Heading { .. }));
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("export");
+        assert!(
+            !bytes.windows(9).any(|w| w == b"/Outlines"),
+            "no headings must mean no /Outlines entry"
+        );
+        let _ = std::fs::remove_file(icc);
+    }
+
+    #[test]
+    fn headings_become_a_nested_outline_tree() {
+        // h1 / h2 / h1 ⇒ two top-level items, the first with one child. Asserted on the emitted
+        // objects rather than by eye: the link fields are the part a parser accepts and a viewer
+        // renders wrongly.
+        let bytes = export_with_headings("outline_tree", &[(1, "One"), (2, "Under"), (1, "Two")]);
+        let text = String::from_utf8_lossy(&bytes);
+
+        assert!(text.contains("/Type /Outlines"), "an outline root: {text}");
+        // The root is open, so its count is every visible item.
+        assert!(text.contains("/Count 3"), "root counts all three: {text}");
+        // The h1 with a child counts its visible descendants — this is the nesting, stated as the
+        // number a viewer reads.
+        assert!(
+            text.contains("/Count 1"),
+            "the h1 with a child counts 1: {text}"
+        );
+        // `/Dest [` appears once per outline item and nowhere else, which makes it the honest way
+        // to count items: `/Title` also appears in the document info dictionary, `/Parent` in every
+        // page object, and a bare `/Dest` also matches the OutputIntent's `/DestOutputProfile`.
+        assert_eq!(text.matches("/Dest [").count(), 3, "one item per heading");
+        assert!(
+            text.contains("/Prev") && text.contains("/Next"),
+            "top-level siblings must be linked: {text}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_heading_level_still_nests_under_its_nearest_ancestor() {
+        // Authoring reality: an h3 directly under an h1, and a document whose first heading is an
+        // h2. Neither is well-formed, and neither may produce a broken tree.
+        let bytes = export_with_headings("outline_skip", &[(1, "One"), (3, "Deep")]);
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("/Dest [").count(), 2);
+        assert!(
+            text.contains("/Count 1"),
+            "the h1 still parents the h3: {text}"
+        );
+
+        // Two h2s and no h1: both are top level, neither parents the other.
+        let bytes = export_with_headings("outline_deep_first", &[(2, "Starts deep"), (2, "Also")]);
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("/Dest [").count(), 2);
+        assert!(text.contains("/Count 2"), "both sit at the root: {text}");
+    }
+
+    #[test]
+    fn an_outline_title_carries_non_ascii_correctly() {
+        // Outline strings are a *different* encoding path from page content (PDF text strings are
+        // UTF-16BE with a BOM), so they get this wrong independently of the font subset.
+        let bytes = export_with_headings("outline_utf16", &[(1, "Cráeblóð")]);
+        let text = String::from_utf8_lossy(&bytes);
+        // Written as a hex string: the BOM `FEFF`, then UTF-16BE code units — `0043` for 'C' and
+        // `00E1` for 'á'. An ASCII title stays a plain literal string, which is why this needs its
+        // own test rather than riding on the tree one.
+        assert!(
+            text.contains("<FEFF0043") && text.contains("00E1"),
+            "the title must be a UTF-16BE hex string with a BOM: {text}"
+        );
+    }
+
+    #[test]
+    fn an_annotation_intersecting_the_bleed_box_is_an_error() {
+        // The rule spec 0042 exists to make enforceable rather than remembered. Nothing emits
+        // annotations yet, so the input is constructed — which is the point (spec 0013: the
+        // validator and the writer must agree before anything relies on it).
+        use quill_core_model::{PageSetup, Rect};
+        let setup = PageSetup::default();
+
+        let on_page = Rect {
+            x_pt: 100.0,
+            y_pt: 100.0,
+            w_pt: 50.0,
+            h_pt: 20.0,
+        };
+        let f = annotation_finding(&on_page, &setup, 0).expect("must be flagged");
+        assert_eq!(f.severity, Severity::Error);
+
+        // Entirely off the media box: no finding. Without this direction the check could simply
+        // flag everything and still pass.
+        let off_page = Rect {
+            x_pt: 10_000.0,
+            y_pt: 10_000.0,
+            w_pt: 5.0,
+            h_pt: 5.0,
+        };
+        assert!(annotation_finding(&off_page, &setup, 0).is_none());
+    }
+
     #[test]
     fn a_stat_blocks_glyphs_reach_the_font_subset() {
         // Spec 0026's silent-failure case, and the reason every variant-adding increment carries
@@ -921,7 +1080,15 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    /// Changed by spec 0039: `StyleSheet::default()` gained the two built-in `table-*` styles, so
+    /// Changed by spec 0042, and this one is **structural rather than identifier-only** — the first
+    /// such move in M2, and expected: the catalog gained `/Outlines` and the document gained an
+    /// outline root plus one item for the sample's single `h1`. 8559 -> 8786 bytes.
+    ///
+    /// Verified that nothing else moved: every `/Length` in the file is unchanged
+    /// (`[1017, 376, 2981, 2017]` before and after), so no content stream, font or metadata stream
+    /// was touched; the object count rose by exactly the two new outline objects.
+    ///
+    /// Previously changed by spec 0039: `StyleSheet::default()` gained the two built-in `table-*` styles, so
     /// `doc.to_json()` changed and with it the document identifier. Verified the same way as spec
     /// 0038's move: both files are 8559 bytes and differ in exactly 120, every one inside the XMP
     /// `DocumentID`/`InstanceID` or the trailer `/ID`. No content stream moved.
@@ -945,7 +1112,7 @@ mod tests {
     /// Verified by inspecting the emitted text operators rather than by accepting the new number:
     /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
     /// only by being ragged-left.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x6169_f912_df20_71ee;
+    const SAMPLE_EXPORT_DIGEST: u64 = 0xaa41_b45e_01d6_c2dd;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;

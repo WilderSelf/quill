@@ -101,6 +101,10 @@ pub fn write_pdf(
     }
     let page_refs: Vec<(Ref, Ref)> = pages.iter().map(|_| (alloc.bump(), alloc.bump())).collect();
 
+    // Bookmarks (spec 0042). A 500-page PDF with no outline is unusable, and until now the writer
+    // emitted a catalog and a page tree and nothing navigational at all.
+    let outline = OutlineTree::build(&quill_layout_engine::heading_index(doc, pages), &mut alloc);
+
     // --- Build the document ---------------------------------------------------------------
     let mut pdf = Pdf::new();
     pdf.set_version(1, 3); // PDF/X-1a:2001 == PDF 1.3
@@ -110,6 +114,11 @@ pub fn write_pdf(
         let mut cat = pdf.catalog(catalog_id);
         cat.pages(page_tree_id);
         cat.metadata(xmp_id);
+        // Only when there is something to show. An empty outline tree renders as an empty,
+        // confusing bookmark pane, which is worse than no pane at all.
+        if let Some(root) = outline.root {
+            cat.outlines(root);
+        }
         let mut intents = cat.output_intents();
         write_output_intent(intents.push(), icc_id);
         intents.finish();
@@ -123,6 +132,8 @@ pub fn write_pdf(
         tree.count(page_refs.len() as i32);
         tree.finish();
     }
+
+    outline.write(&mut pdf, &page_refs);
 
     // Document info (title/creator/producer + PDF/X identification keys, mirrored in XMP).
     {
@@ -418,6 +429,128 @@ fn render_page(
         }
     }
     content.finish().as_slice().to_vec()
+}
+
+/// One node of the PDF outline tree.
+struct OutlineNode {
+    id: Ref,
+    title: String,
+    page_index: usize,
+    children: Vec<usize>,
+    parent: Option<usize>,
+}
+
+/// The `/Outlines` tree, built from spec 0040's heading index.
+///
+/// Nesting follows heading level: an `h2` after an `h1` is its child, an `h1` after an `h2` closes
+/// back to the root. Levels may skip (an `h3` directly under an `h1`) and may start deep (a
+/// document whose first heading is an `h2`) — both are authoring realities, and the stack handles
+/// them by attaching to the nearest shallower ancestor rather than by assuming a well-formed
+/// hierarchy.
+struct OutlineTree {
+    root: Option<Ref>,
+    nodes: Vec<OutlineNode>,
+    top: Vec<usize>,
+}
+
+impl OutlineTree {
+    fn build(headings: &[quill_layout_engine::HeadingEntry], alloc: &mut Alloc) -> OutlineTree {
+        if headings.is_empty() {
+            return OutlineTree {
+                root: None,
+                nodes: Vec::new(),
+                top: Vec::new(),
+            };
+        }
+        let root = alloc.bump();
+        let mut nodes: Vec<OutlineNode> = Vec::with_capacity(headings.len());
+        let mut top: Vec<usize> = Vec::new();
+        // (level, node index) of the open ancestors, shallowest first.
+        let mut stack: Vec<(u8, usize)> = Vec::new();
+
+        for h in headings {
+            while stack.last().is_some_and(|(level, _)| *level >= h.level) {
+                stack.pop();
+            }
+            let parent = stack.last().map(|(_, i)| *i);
+            let index = nodes.len();
+            nodes.push(OutlineNode {
+                id: alloc.bump(),
+                title: h.text.clone(),
+                page_index: h.page_index,
+                children: Vec::new(),
+                parent,
+            });
+            match parent {
+                Some(p) => nodes[p].children.push(index),
+                None => top.push(index),
+            }
+            stack.push((h.level, index));
+        }
+
+        OutlineTree {
+            root: Some(root),
+            nodes,
+            top,
+        }
+    }
+
+    /// Visible descendants of `index`, counting the whole open subtree.
+    ///
+    /// The `/Count` of an open item is its *visible descendants*, not its direct children — an item
+    /// with two children that each have three is 8, not 2. Getting this wrong is the kind of defect
+    /// a parser accepts and a viewer renders wrongly, which is why it is computed rather than
+    /// approximated.
+    fn visible(&self, index: usize) -> i32 {
+        self.nodes[index]
+            .children
+            .iter()
+            .map(|c| 1 + self.visible(*c))
+            .sum()
+    }
+
+    fn write(&self, pdf: &mut Pdf, page_refs: &[(Ref, Ref)]) {
+        let Some(root) = self.root else { return };
+        {
+            let mut o = pdf.outline(root);
+            if let (Some(first), Some(last)) = (self.top.first(), self.top.last()) {
+                o.first(self.nodes[*first].id);
+                o.last(self.nodes[*last].id);
+            }
+            // Every item is open, so the root's count is simply all of them.
+            o.count(self.nodes.len() as i32);
+            o.finish();
+        }
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let siblings = match node.parent {
+                Some(p) => &self.nodes[p].children,
+                None => &self.top,
+            };
+            let at = siblings.iter().position(|i| *i == index).expect("sibling");
+
+            let mut item = pdf.outline_item(node.id);
+            item.title(TextStr(&node.title));
+            item.parent(node.parent.map_or(root, |p| self.nodes[p].id));
+            if at > 0 {
+                item.prev(self.nodes[siblings[at - 1]].id);
+            }
+            if at + 1 < siblings.len() {
+                item.next(self.nodes[siblings[at + 1]].id);
+            }
+            if let (Some(first), Some(last)) = (node.children.first(), node.children.last()) {
+                item.first(self.nodes[*first].id);
+                item.last(self.nodes[*last].id);
+                item.count(self.visible(index));
+            }
+            if let Some((page, _)) = page_refs.get(node.page_index) {
+                // `fit` rather than an explicit position: the whole page is the destination, which
+                // is what a chapter bookmark means and what survives a viewer's own zoom setting.
+                item.dest().page(*page).fit();
+            }
+            item.finish();
+        }
+    }
 }
 
 /// Set the non-stroking colour in the authored space.
