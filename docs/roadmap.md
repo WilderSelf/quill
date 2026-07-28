@@ -20,7 +20,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
-| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
+| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **decomposed** into specs 0072–0079; none built |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
@@ -2480,6 +2480,195 @@ The 500-page file is **9.5% of its pre-0068 size**. Four things worth carrying b
   since an empty page is well-formed. The job gains a step that inflates and asserts both halves:
   no operator text in the stored bytes, and operators present after inflation.
 
+## M6 increments
+
+Decomposed 2026-07-28, off the back of a read-only audit — the method that set M5's contents, and
+for the same reason: the milestone's ordering is decided by what the code already has, and two of the
+six features turned out to be priced wrongly in both directions.
+
+| # | Increment | Size |
+|---|---|---|
+| 0072 | the section — the anchor the model does not have | large |
+| 0073 | folio formats and restart | small |
+| 0074 | running heads derived from content | small |
+| 0075 | a derived or composite block may span frames | medium |
+| 0076 | cross-references | large |
+| 0077 | footnotes | large |
+| 0078 | the index | medium |
+| 0079 | a book | large |
+
+### What the audit found
+
+**The load-bearing gap is the section, and the code has been saying so since M2.**
+`PageOverride`'s doc comment (crates/core-model/src/lib.rs:1482-1487) names it in as many words —
+*"anchoring a master to the chapter it opens needs a notion of 'section' the model does not have"* —
+`specs/0035-per-page-master-assignment.md:63-65` repeats it, and it is the standing open question
+below. Four of M6's six features are downstream of it: a folio format and a restart are *per section*
+by definition, `{section}` in a running head is its name, and a book's chapters are sections with a
+page offset. Footnotes are the one item independent of it. That is the same shape "no styled run" had
+for M5 — one gap, most of the milestone downstream, one independent item.
+
+**A section does not have to replace index-based assignment; it can generate it.**
+`Document::master_for` resolves `self.pages.get(page_index)`, so a section anchored to a `BlockId`
+yields a derived `page_index` from the final page vector — exactly `heading_index_of`'s output — from
+which the same `Vec<PageOverride>` is synthesised each pass. That confines the change to one
+derivation and answers the open question without touching `frames`/`statics`/`master_for`.
+
+**Three things are much cheaper than this roadmap assumed.**
+
+- **Running heads are not a fixpoint at all.** The "After M5" text below groups every M6 item under
+  "every item is a fixpoint over laid-out pages". Furniture consumes no flow space
+  (`LaidOutPage::statics`, crates/layout-engine/src/lib.rs:263-268), so a content-derived running head
+  cannot move a line break: it is one post-pass with zero extra flow iterations. The blanket claim is
+  over-stated and is corrected here.
+- **Roman front matter needs no numeral code.** `NumberFormat::{Decimal, LowerAlpha, UpperAlpha,
+  LowerRoman, UpperRoman}` with `roman()` and `alpha()` already exist and are tested
+  (crates/core-model/src/lib.rs:824-893) — spec 0066 built them for list markers. Folio formats are
+  wiring.
+- **Cross-reference plumbing is built end to end.** `link_page` → `PlacedBlock::Link` → `/Link`
+  already survives fragmentation, is already gated for PDF/X legality, and reports ink-accurate hot
+  areas after 0069/0070. New `PlacedBlock` variants have a two-site blast radius, and
+  `preflight_pages` already walks `statics.chain(blocks)`, so footnote text, index entries and running
+  heads get safe-area, dpi and ink checks for free.
+
+**Two are much more expensive.**
+
+- **"Cross-references are cheap once sections exist" is wrong about the cost.** The dependency shape
+  is the contents list's, but a TOC is *one* block whose derived index can afford to live in
+  `context_fingerprint`; cross-references are hundreds of blocks scattered through a book, and
+  `context_fingerprint` changing sets `dirty_from = Some(0)` — a whole-document reflow on any edit
+  that moves any page. `incremental_blocks_measured = 2.0` would blow immediately. They need
+  per-block resolved-value fingerprints in `MeasureKey`, which is spec 0066's `marker` pattern at
+  scale: a design problem, not a wiring job.
+- **The fixpoint cost multiplies and nothing measures it.** `TOC_MAX_ITERATIONS = 8` bounds *one*
+  derived quantity. Cross-references, an index and a book-level contents list iterate the same loop,
+  and each iteration is a full-document pass. `layout.scaling_ratio` — "the single most valuable line
+  in the file" — would not catch it, because the growth is in pass *count*, not in per-pass shape.
+
+**Footnotes are the only item that changes the flow loop, and the constraint is sharper than it
+looks.** The available height is fixed before any block flows (`let frame = frames[frame_idx]`,
+lib.rs:1923) and `bottom - y` is the only avail value passed anywhere. But `Measured::break_items`'
+doc comment states the rule that guards the whole measurement cache: *"A variant whose measurement
+depends on the available height must return `None`… A height-dependent measurement that offered break
+opportunities anyway would not merely split badly — it would make the measurement cache wrong."* So a
+note band may reduce the `bottom`/avail term and must **not** reach measurement. Accrued note height
+is also new `FlowState`, whose own doc comment says capturing the wrong subset means *"resumed layout
+silently diverges from a full pass"*.
+
+**The index is less new than assumed, and new in a different place.** Its derivation, its marking and
+its rendering all have working analogues — `Block::Toc` carries no entries for the same reason, an
+index mark is a `Run` with a name as a character style is, and `measure_toc`'s tabbed line with a dot
+leader is now the general tab mechanism. What has *no* analogue anywhere in the workspace is
+**collation** (nothing sorts text; `BTreeMap<String, _>` is byte order, which is wrong for case, for
+diacritics and for articles; there is no locale or collator in the dependency graph, and
+`Cargo.toml`'s rule makes adding one a real decision) and **page-range coalescing**. Both are pure
+functions with no engine coupling, which makes them the *safest* new machinery in M6, not the
+riskiest.
+
+### M6 sequencing rationale
+
+**0072 first because four of the six are downstream of it**, and because it is the milestone's one
+likely `FORMAT_VERSION` bump — the M2 rule is that an increment which cannot stay additive says so in
+its spec and bumps on its own rather than smuggling it in. `docs/format-spec.md:137-139` states the
+test: a bump is warranted when an older build would open the document and *silently lay it out
+wrongly*. A pre-M6 build opening a document with roman front matter prints arabic folios on every
+page — the same class as spec 0047's verso gutter, which did bump.
+
+**0073 and 0074 next because they are the cheap ones and they prove 0072.** A section nobody can see
+is not obviously right; a roman folio and a running head that names its chapter are what make it
+visible. 0074 also carries two corrections it must not skip: the font-subset collector hardcodes
+`{page}` as the only layout-time token (see known issues), and tail-page reuse assumes statics are a
+pure function of `page_index`, which a content-derived running head makes false.
+
+**0075 before the index and before footnotes, because both inherit a defect that already ships.** A
+derived block is indivisible today, so a contents list taller than its frame overflows the page — and
+a real 500-page book's contents list is three pages. The index inherits it exactly, and a footnote
+that splits across pages needs the same mechanism. It shares a root cause with the recorded
+stat-block known issue, so one fix may close both.
+
+**0076 before 0077 because it establishes the fingerprint pattern footnotes reuse.** A footnote
+number that restarts per page is the same "derived from position, therefore context not content"
+shape as a cross-reference's page number and spec 0066's list marker. Doing the harder, more general
+case first means the riskiest increment in the milestone inherits a settled answer instead of
+inventing one. 0076 is also where the fixpoint-iteration budget lands, because it is where the second
+derived quantity arrives.
+
+**0077 after the cheap wins and after 0075**, because it is the only increment that touches
+`FlowState` — the incremental contract — and it should not also be the increment discovering what a
+section is.
+
+**0079 last**, because a book is a composition over everything before it, and because it is the one
+item that breaks the one-`Document` assumption in four crates at once (`export`, `AppState`,
+`OpenedTpub`, `LayoutSession`). Its sharing half is already built: `.qpack` carries templates, styles
+and definitions with mandatory provenance and refuses rather than falling back.
+
+### M6 increment detail
+
+Deliberately shorter than M5's. A decomposition eight increments deep is one whose later entries will
+be wrong; what belongs here is the ordering argument, the constraint each increment must respect, and
+the thing it must not forget. Each gets a spec when it is built.
+
+#### 0072 section
+
+Sections anchored to a `BlockId`, generating the per-page assignment rather than replacing it.
+Answers the standing open question about index-based master assignment. **Must state whether it bumps
+`FORMAT_VERSION`, and bump on its own if so** — which also drags `TEMPLATE_VERSION` if `PageOverride`
+or `MasterStatic` change shape. "Start this section on the next recto" is a *forced page break*, which
+the model has no mechanism for and which is not a fixpoint but a forward-only rule; it may be deferred
+but must be named. **`docs/format-spec.md` is stale at v3 and never recorded the `3 → 4` migration —
+the only one so far that is not a structural no-op. This is the increment that fixes it**, because it
+is the increment judged against that document's own bump rule.
+
+#### 0073 folio formats and restart
+
+Per-section folio format and restart value, through the existing `NumberFormat`. Cheap, and the first
+visible proof of 0072.
+
+#### 0074 running heads derived from content
+
+`{section}` and `{heading:1}` beside `{page}`, resolved from spec 0040's heading index. `PAGE_TOKEN`
+becomes a token set and `PageTemplate::statics` needs a content channel. Not a fixpoint. Two things
+it must not skip are recorded as known issues below. Note the heading index's `text` is flattened by
+`Block::plain_text`, so a running head cannot carry a chapter title's inline runs — state that as a
+non-goal with the residual, or fix it.
+
+#### 0075 a derived or composite block may span frames
+
+Spec 0044's `\vsplit` wired through the blocks that currently refuse to cut. Closes the contents-list
+overflow, and should be checked against the recorded stat-block known issue — the two share a root
+cause and the test pinning the stat-block case says in as many words that it inverts when the fix
+ships.
+
+#### 0076 cross-references
+
+"See page 42" that survives repagination. The design problem is the cache: per-block resolved-value
+fingerprints in `MeasureKey`, **not** `context_fingerprint`, for the reason above. Owes a bounded
+fixpoint with a `converged: false` report, following `TOC_MAX_ITERATIONS`'s precedent, and owes
+`benches/budgets.toml` a line that counts fixpoint iterations — the gap the audit found.
+
+#### 0077 footnotes
+
+A second flow with an anchor in the first. The note band reduces the `bottom`/avail term and must not
+reach measurement, or the measurement cache becomes wrong rather than merely slow. `FlowState` grows,
+so every checkpoint and re-convergence path moves with it. Spec 0044's progress invariant is
+structural rather than asserted today, and a note band that grows each time its reference moves is a
+new way for the loop to fail to make progress — this increment owes it a runtime guard.
+
+#### 0078 the index
+
+Marked terms, collated, page-ranged, alphabetised. Built on 0075. The derivation, the marking and the
+rendering are `Block::Toc`, `Run::character` and the tab mechanism respectively. **Collation is the
+real decision**: no dependency in the workspace sorts text, and `Cargo.toml`'s rule is that every
+dependency is permissive with a note saying which spec brought it in.
+
+#### 0079 a book
+
+Multiple documents, shared styles, continuous pagination. Breaks the one-`Document` assumption in four
+crates. A fourth version chain beside `FORMAT_VERSION`/`TEMPLATE_VERSION`/`PACK_VERSION`, for which
+`version.rs` has two deliberately-alike gates as a template. The fixpoint spans documents: a book's
+contents list names headings from chapters it does not contain, so each iteration re-lays every
+chapter — which is why 0076's iteration budget has to exist first.
+
 ## Known issues
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
@@ -2505,6 +2694,33 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
   it says in as many words that it inverts when the fix ships.
 
+- **A generated contents list taller than its frame overflows the page — the same defect, in the
+  feature a long book most needs.** Found by M6's audit, not by a user, and it ships today.
+  `measure_toc` returns `Measured::Panel { split: None, .. }` with the comment "A contents block is
+  deliberately indivisible", so `break_items` yields `None`, `cut_fitting` yields `None`, and the
+  flow reaches the branch that places a block whole and lets it overflow. **A real 500-page book's
+  contents list is three pages.** Every TOC fixture in the workspace uses a handful of chapters, so
+  nothing exercises it.
+
+  Same root cause as the stat-block entry above — an indivisible `Measured::Panel` in a frame it does
+  not fit — which is why one fix should close both, and why spec 0075 is sequenced before the index:
+  the index would inherit it exactly.
+
+- **The font-subset collector hardcodes `{page}` as the only token resolved at layout time.**
+  crates/export-pdf/src/lib.rs:866-875 carries digits into every subset because `{page}` becomes a
+  number after collection has run. Every *new* such token — `{section}`, a footnote number, a
+  cross-reference's page, an index page range — generates characters the collector has not seen, and
+  the failure mode is `.notdef` boxes in a press file with no error anywhere.
+
+  This class has already bitten once here: the same function's comment records that a master's static
+  text was never collected at all until PR #107, and that "digits usually survived by accident,
+  because a contents list contributes `0`–`9`". It is `CLAUDE.md`'s silent-press-corruption class,
+  and M6 introduces four new ways in.
+
+  A smaller defect at the same site, worth fixing with it: the check tests the string literal
+  `"{page}"` rather than importing `quill_core_model::PAGE_TOKEN`, so generalising the constant breaks
+  digit embedding with no compile error.
+
 ## Open questions
 
 Deliberately unresolved; each would change work if answered differently. Recorded so they are
@@ -2513,7 +2729,7 @@ decided explicitly rather than by accident.
 - Should the 500-page synthetic document target page count by measurement (robust: stays ~500 when leading, margins or hyphenation change, but the workload silently changes size) or fix the block count (stable workload, drifting page count)? Spec 0027 assumes measure-to-target and the *benches* still do. **Answered for the line-breaking equivalence corpus by spec 0060**, which had to pin it by block count before it could prove anything: a corpus sized by laying a document out moves whenever the thing it is testing moves, and the two are then indistinguishable. Whether the benches should follow is still open — they measure throughput, where a workload that tracks a page target is arguably the point.
 - Does the CI perf gate assert any wall-clock at all, or only work counters plus same-run ratios? The plan uses ratios and a 2x blowup ceiling; a stricter gate would need self-hosted or pinned runners.
 - ~~Deferred by design: `text-layout::Line` still carries no glyph ids or positions…~~ **Answered by spec 0068, three milestones after it was asked, and answered by necessity rather than by preference.** The question was whether the shaping-GID ↔ subset-GID reconciliation could keep being deferred; the answer is that it could, right up until someone measured what the deferral cost — the press file draws a different glyph sequence from the one that was measured, by up to 4.90 pt on an ordinary sentence. What the question got wrong was framing it as a tidiness concern about "one shaper but two derivation sites". Two derivation sites are fine when they agree. These did not, and nothing in the question would have revealed that, because it asked about the shape of the code rather than about whether the two sites produced the same number. **The general form is worth keeping: when a duplicated derivation is deferred, the thing to record is not that it is duplicated but what it measures differently, and if that has never been measured, that is the finding.**
-- Is per-page master assignment by **index** (spec 0035) the right anchor, or should a master be attached to the chapter it opens? Index-based assignment means a TOC that grows by a page slides every chapter opener by one (spec 0041 names this). Anchoring to a heading's `BlockId` would survive repagination but needs a notion of "section" the model does not have. M2 ships index-based; M3 should decide whether that survives contact with a real book.
+- ~~Is per-page master assignment by **index** (spec 0035) the right anchor…~~ **Answered by M6's decomposition: neither, quite.** Index assignment is the right *representation* and the wrong *authoring surface*. A section anchored to a `BlockId` yields a derived `page_index` from the final page vector, from which the existing `Vec<PageOverride>` is synthesised each pass — so `Document::master_for`, `DocumentTemplate::frames` and `statics` are all unchanged, and the anchor survives repagination. Asked of M3, deferred through M4 and M5, and it turned out not to be a fork at all: the two candidates are the same mechanism at different layers. Worth keeping as a shape — **when a question offers two anchors, check whether one can be derived from the other before choosing between them.** The cost is real and belongs in spec 0072: a section-driven master change alters column count and margins, so master assignment joins the fixpoint rather than being resolved before it.
 - Should a `PodPreset` ever be recorded *in* a `.tpub`? Spec 0049 says no — a document is not bound
   to one printer, and a persisted preset would go stale inside a file nobody re-opens. The cost is
   that the vendor a book was built for is not recoverable from the book. If that turns out to matter
@@ -2609,9 +2825,16 @@ The two milestones after M5 are named here with their contents, and deliberately
 into specs. A decomposition written two milestones ahead is one that will be wrong; what belongs
 here is the ordering argument and the list of things not to forget.
 
-**M6 — the long document.** The apparatus a book needs beyond its typography. Every item is a
-fixpoint over laid-out pages, and spec 0041's rule governs all of them: derive from the final page
-vector, never accumulate during pagination.
+**M6 — the long document.** The apparatus a book needs beyond its typography. **Now decomposed into
+specs 0072–0079 — see "M6 increments" above, which supersedes the sequencing implied here.** The list
+below stands as the statement of contents.
+
+The claim that *"every item is a fixpoint over laid-out pages"* was **wrong for two of the six**, and
+the audit is what showed it. Running heads are furniture, consume no flow space, and so cannot move a
+line break: one post-pass, no iteration. A section's folio format is the same. Footnotes go the other
+way — they are the only item that changes the flow loop rather than reading its output. The rule this
+paragraph reached for is spec 0041's and it is still right where it applies; what was wrong was
+applying it to everything without checking.
 
 - **Sections with independent page numbering and folio formats.** Roman front matter, arabic body,
   restart at a part opener. `PageOverride`'s own doc comment names the gap: the model has no notion
