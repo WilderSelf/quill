@@ -1324,15 +1324,6 @@ const TOC_INDENT_PT: f32 = 12.0;
 /// Gap between the end of an entry's leader and its page number.
 const TOC_LEADER_GAP_PT: f32 = 4.0;
 
-/// Build a table of contents from where the headings actually landed (spec 0041).
-///
-/// The entries are *derived*, never stored: a stored entry is stale the moment anything is edited,
-/// and a contents list whose numbers were right one edit ago is worse than none.
-///
-/// Each entry is two runs — the title, and the page number right-aligned in a reserved column — with
-/// a dot leader between them. Two runs rather than one string of dots because the number has to
-/// land at an exact x, and padding a string with dots would put it wherever the last dot happened
-/// to fall.
 /// A paragraph positioned by its tab stops (spec 0067).
 ///
 /// One line, and deliberately: a tabbed paragraph is a *row* — a contents entry, a price line, a
@@ -1371,28 +1362,16 @@ fn measure_tabbed(
         })
         .collect();
 
-    let size = style.font_size_pt;
-    let segments = quill_text_layout::lay_tabs(&joined, &stops, &|s| metrics.measure_run(s, size));
-    let parts: Vec<PanelPart> = segments
-        .into_iter()
-        .map(|seg| PanelPart {
-            dx_pt: seg.x_pt,
-            dy_pt: style.space_before_pt,
-            // `lay_tabs` already resolved the stop into the segment's own extent for all four
-            // alignments, so a segment's measure and its ink are the same rectangle — the
-            // degenerate case of spec 0069's rule, one line at zero indent.
-            w_pt: seg.w_pt,
-            ink_dx_pt: 0.0,
-            ink_w_pt: seg.w_pt,
-            // Each segment is drawn where the stops put it, so it carries no justification: a tab is
-            // a hard position, and stretching the gap in front of one would move the stop.
-            lines: vec![Line::single_run(seg.text, 0.0, 0.0)],
-            color,
-            font_size_pt: size,
-            leading_pt: style.leading_pt,
-            link_page: None,
-        })
-        .collect();
+    let parts = tab_parts(
+        &joined,
+        &stops,
+        0.0,
+        style.space_before_pt,
+        style.font_size_pt,
+        style.leading_pt,
+        color,
+        metrics,
+    );
 
     let height = style.space_before_pt + style.leading_pt + style.space_after_pt;
     (
@@ -1408,6 +1387,63 @@ fn measure_tabbed(
     )
 }
 
+/// One tabbed line, laid against `stops` and returned as panel parts (spec 0067).
+///
+/// The one place a tabbed line becomes placed geometry. Both callers go through it: an authored
+/// paragraph whose style names stops ([`measure_tabbed`]), and the generated contents list, whose
+/// entries are a tabbed line that spec 0041 used to write out longhand (spec 0070).
+///
+/// `origin_dx_pt` shifts the whole line right — a contents entry's per-level indent — and is added
+/// to each segment's resolved `x_pt` rather than being folded into the stops, so a stop stays the
+/// column it names.
+#[allow(clippy::too_many_arguments)]
+fn tab_parts(
+    text: &str,
+    stops: &[quill_text_layout::TabStop],
+    origin_dx_pt: f32,
+    dy_pt: f32,
+    font_size_pt: f32,
+    leading_pt: f32,
+    color: Color,
+    metrics: &impl RunMetrics,
+) -> Vec<PanelPart> {
+    quill_text_layout::lay_tabs(text, stops, &|s| metrics.measure_run(s, font_size_pt))
+        .into_iter()
+        .map(|seg| PanelPart {
+            dx_pt: origin_dx_pt + seg.x_pt,
+            dy_pt,
+            // `lay_tabs` already resolved the stop into the segment's own extent for all four
+            // alignments, so a segment's measure and its ink are the same rectangle — the
+            // degenerate case of spec 0069's rule, one line at zero indent.
+            w_pt: seg.w_pt,
+            ink_dx_pt: 0.0,
+            ink_w_pt: seg.w_pt,
+            // Each segment is drawn where the stops put it, so it carries no justification: a tab is
+            // a hard position, and stretching the gap in front of one would move the stop.
+            lines: vec![Line::single_run(seg.text, 0.0, 0.0)],
+            color,
+            font_size_pt,
+            leading_pt,
+            link_page: None,
+        })
+        .collect()
+}
+
+/// Build a table of contents from where the headings actually landed (spec 0041).
+///
+/// The entries are *derived*, never stored: a stored entry is stale the moment anything is edited,
+/// and a contents list whose numbers were right one edit ago is worse than none.
+///
+/// **Each entry is a tabbed line** (spec 0070): `"{clipped title}\t{number}"` against one right stop
+/// at the measure's right edge, with a `.` leader. Spec 0041 computed that by hand — an indent, a
+/// clip column, a leader origin, a dot count and a right-aligned number — and spec 0067 then shipped
+/// the general mechanism beside it. This is the same arithmetic, so every x position and the dot
+/// count are unchanged; what moves is the three *widths*, which now report ink rather than columns
+/// (spec 0069).
+///
+/// The **clipping** stays here and did not generalize. Truncating with an ellipsis is not a tab
+/// rule; it is the contents list's own "an entry does not wrap", and a price list or a bibliography
+/// wants no part of it.
 fn measure_toc(
     title: &str,
     max_level: u8,
@@ -1456,7 +1492,6 @@ fn measure_toc(
 
         let indent = (h.level.saturating_sub(1)) as f32 * TOC_INDENT_PT;
         let number = (h.page_index + 1).to_string();
-        let number_w = metrics.measure_run(&number, style.font_size_pt);
 
         // Title, clipped to the space before the number column. A long chapter name is truncated
         // with an ellipsis rather than wrapped: a contents list is scanned, and a two-line entry
@@ -1471,68 +1506,43 @@ fn measure_toc(
             }
             text.push('…');
         }
-        let title_w = metrics.measure_run(&text, style.font_size_pt);
 
-        // An entry's three parts still report their columns rather than their ink, and are the one
-        // stated exception to spec 0069's rule. Spec 0070 deletes this arithmetic outright in
-        // favour of one right tab stop with a dot leader, and moving these widths here would
-        // collide with the equivalence claim that increment is built on — every x and every dot
-        // count byte-identical to spec 0041's, with the three *widths* moving individually and
-        // justified there. The list's own title above is not an entry and moves now.
-        parts.push(PanelPart {
-            dx_pt: indent,
-            dy_pt: y,
-            w_pt: title_max,
-            ink_dx_pt: 0.0,
-            ink_w_pt: title_max,
-            lines: vec![Line::single_run(text.clone(), 0.0, 0.0)],
+        // One right stop at the measure's right edge, with a dot leader — which is what a contents
+        // entry *is*, and what spec 0041 wrote out by hand. The stop is stated relative to the
+        // entry's own origin, so the whole line moves with the level indent.
+        //
+        // Right-aligned, so the number's right edge sits at the measure's right edge and a 3-digit
+        // page ends in the same column as a 1-digit one. The leader fills the gap between the two
+        // and is inset by `TOC_LEADER_GAP_PT` at each end, so it touches neither.
+        let stops = [quill_text_layout::TabStop {
+            position_pt: width - indent,
+            align: quill_text_layout::TabAlign::Right,
+            leader: Some(quill_text_layout::Leader {
+                glyph: '.',
+                gap_pt: TOC_LEADER_GAP_PT,
+            }),
+        }];
+        let mut entry = tab_parts(
+            &format!("{text}\t{number}"),
+            &stops,
+            indent,
+            y,
+            style.font_size_pt,
+            style.leading_pt,
             color,
-            font_size_pt: style.font_size_pt,
-            leading_pt: style.leading_pt,
-            // The entry's destination (spec 0052). Recorded on the *title* run, which is the entry's
-            // placed text, and taken from the same `h.page_index` the printed number is derived from
-            // — so a link and the number beside it can never disagree about where the heading is.
-            link_page: Some(h.page_index),
-        });
-
-        // The leader fills the gap and stops short of the number, so the two never overlap.
-        let leader_x = indent + title_w + TOC_LEADER_GAP_PT;
-        let leader_end = width - number_w - TOC_LEADER_GAP_PT;
-        if leader_end > leader_x {
-            let dot_w = metrics.measure_run(".", style.font_size_pt).max(0.01);
-            let dots = ((leader_end - leader_x) / dot_w).floor().max(0.0) as usize;
-            if dots > 0 {
-                parts.push(PanelPart {
-                    dx_pt: leader_x,
-                    dy_pt: y,
-                    w_pt: leader_end - leader_x,
-                    ink_dx_pt: 0.0,
-                    ink_w_pt: leader_end - leader_x,
-                    lines: vec![Line::single_run(".".repeat(dots), 0.0, 0.0)],
-                    color,
-                    font_size_pt: style.font_size_pt,
-                    leading_pt: style.leading_pt,
-                    link_page: None,
-                });
-            }
+            metrics,
+        );
+        // The entry's destination (spec 0052). Recorded on the *title* run — `lay_tabs` emits the
+        // line's first stretch first, and a leader can only follow a tab — which is the entry's own
+        // placed text, and taken from the same `h.page_index` the printed number is derived from,
+        // so a link and the number beside it can never disagree about where the heading is.
+        //
+        // Under spec 0069 that run's rectangle is now its measured advance rather than the clip
+        // column, so the hot area ends where the title does instead of running across the leader.
+        if let Some(title) = entry.first_mut() {
+            title.link_page = Some(h.page_index);
         }
-
-        // Right-aligned: the number's *right* edge sits at the measure's right edge, so a 3-digit
-        // page and a 1-digit page end in the same column.
-        parts.push(PanelPart {
-            dx_pt: width - number_w,
-            dy_pt: y,
-            // Already the measured advance rather than the reserved column: the page number was one
-            // of the three producers that reported ink before spec 0069 made it the rule.
-            w_pt: number_w,
-            ink_dx_pt: 0.0,
-            ink_w_pt: number_w,
-            lines: vec![Line::single_run(number, 0.0, 0.0)],
-            color,
-            font_size_pt: style.font_size_pt,
-            leading_pt: style.leading_pt,
-            link_page: None,
-        });
+        parts.append(&mut entry);
 
         y += style.leading_pt + style.space_after_pt;
     }
@@ -2219,6 +2229,11 @@ fn place_measured(
                 // The link candidate is emitted from the *same* rectangle as the run it belongs to
                 // (spec 0052), rather than from a separately computed one: a link whose hot area
                 // has drifted off its own text is the defect this makes structurally impossible.
+                //
+                // Sharing the rectangle only makes the hot area right if the rectangle is the ink,
+                // which is why this claim was true vertically and false horizontally until spec
+                // 0070: the only part carrying `link_page` is a contents entry's title, and it
+                // reported the column it was clipped to, so the hot area ran across the dot leader.
                 if let Some(target_page) = p.link_page {
                     out.push(PlacedBlock::Link {
                         source,
@@ -5430,6 +5445,265 @@ mod tests {
             .filter(|c| c.len() == 2)
             .map(|c| (c[0].clone(), c[1].clone()))
             .collect()
+    }
+
+    /// Spec 0041's hand-rolled entry arithmetic, kept as the oracle spec 0070's re-expression is
+    /// measured against.
+    ///
+    /// A deliberate transcription of the code 0070 deleted — indent, clip column, leader origin,
+    /// dot count, right-aligned number — because the equivalence claim is exactly "the mechanism
+    /// puts every part where this put it". A golden captured *after* the change would prove
+    /// nothing; this is the thing the change has to agree with.
+    ///
+    /// Returns `(x, text)` per placed entry part, in emission order.
+    fn toc_reference_geometry(
+        width: f32,
+        max_level: u8,
+        headings: &[HeadingEntry],
+        styles: &StyleSheet,
+        metrics: &impl RunMetrics,
+    ) -> Vec<(f32, String)> {
+        let mut out = Vec::new();
+        for h in headings.iter().filter(|h| h.level <= max_level) {
+            let style = styles
+                .paragraph
+                .get(&toc_entry_style_name(h.level))
+                .copied()
+                .unwrap_or_default();
+            let indent = (h.level.saturating_sub(1)) as f32 * TOC_INDENT_PT;
+            let number = (h.page_index + 1).to_string();
+            let number_w = metrics.measure_run(&number, style.font_size_pt);
+
+            let title_max = (width - indent - TOC_NUMBER_COLUMN_PT - TOC_LEADER_GAP_PT).max(1.0);
+            let mut text = h.text.clone();
+            if metrics.measure_run(&text, style.font_size_pt) > title_max {
+                while !text.is_empty()
+                    && metrics.measure_run(&format!("{text}…"), style.font_size_pt) > title_max
+                {
+                    text.pop();
+                }
+                text.push('…');
+            }
+            let title_w = metrics.measure_run(&text, style.font_size_pt);
+            out.push((indent, text));
+
+            let leader_x = indent + title_w + TOC_LEADER_GAP_PT;
+            let leader_end = width - number_w - TOC_LEADER_GAP_PT;
+            if leader_end > leader_x {
+                let dot_w = metrics.measure_run(".", style.font_size_pt).max(0.01);
+                let dots = ((leader_end - leader_x) / dot_w).floor().max(0.0) as usize;
+                if dots > 0 {
+                    out.push((leader_x, ".".repeat(dots)));
+                }
+            }
+            out.push((width - number_w, number));
+        }
+        out
+    }
+
+    /// A fixture that exercises every branch of the arithmetic above: four indent levels, page
+    /// numbers of more than one width, and a title long enough to be clipped with an ellipsis.
+    fn toc_levels_doc() -> Document {
+        toc_doc(
+            4,
+            &[
+                (1, "Alpha"),
+                (2, "A second-level entry"),
+                (3, "Third level, deeper still"),
+                (
+                    1,
+                    "A chapter with a really quite long name that will certainly have to be \
+                     clipped with an ellipsis before it reaches the number column",
+                ),
+                (2, "Beta"),
+                (4, "Fourth"),
+                (1, "Gamma"),
+            ],
+            60,
+        )
+    }
+
+    /// Every placed contents part below the list's own title, as `(x, text)` in emission order.
+    fn toc_entry_parts(doc: &Document, pages: &[LaidOutPage]) -> Vec<(f32, String)> {
+        let toc_id = doc
+            .content
+            .iter()
+            .find(|b| matches!(b, Block::Toc { .. }))
+            .map(|b| b.id())
+            .expect("a contents block");
+        let all: Vec<(f32, String)> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text {
+                    source,
+                    frame,
+                    lines,
+                    ..
+                } if *source == toc_id => Some((frame.x_pt, lines[0].text.clone())),
+                _ => None,
+            })
+            .collect();
+        // The list's own title comes first and is not an entry.
+        all[1..].to_vec()
+    }
+
+    #[test]
+    fn every_contents_x_and_dot_count_is_what_the_hand_rolled_arithmetic_produced() {
+        // Spec 0070's equivalence claim, and the thing that makes it a generalization rather than
+        // a rewrite: one right tab stop with a dot leader puts every part of every entry at exactly
+        // the x spec 0041 computed by hand, and draws exactly the same number of dots.
+        //
+        // Asserted on the *bits* of each f32 rather than to a tolerance. "Byte-identical" is the
+        // claim, and a tolerance would let the two arithmetics drift apart by a hair each time
+        // either is touched, which is how an equivalence quietly stops being one.
+        let doc = toc_levels_doc();
+        let (pages, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged, "the fixpoint must settle: {status:?}");
+
+        let actual = toc_entry_parts(&doc, &pages);
+        // The default page setup has zero margins, so the text frame starts at the trim's left edge
+        // and a frame-relative x from the reference is directly comparable to a placed one.
+        let width = doc.page_setup.trim.w_pt;
+        assert_eq!(doc.page_setup.margins, quill_core_model::Margins::default());
+        let index = heading_index_of(&doc.content, &pages);
+        let expected = toc_reference_geometry(width, 4, &index, &doc.styles, &MONO);
+
+        assert!(
+            expected.iter().any(|(_, t)| t.ends_with('…')),
+            "the fixture must clip at least one title, or the ellipsis branch is untested"
+        );
+        assert!(
+            expected
+                .iter()
+                .filter(|(_, t)| t.chars().all(|c| c == '.'))
+                .count()
+                >= 7,
+            "every entry must draw a leader, or the dot count is untested: {expected:?}"
+        );
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "the same parts, in the same order:\n  got {actual:?}\n  want {expected:?}"
+        );
+        for (i, ((ax, at), (ex, et))) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(at, et, "part {i}: text, and so the leader's dot count");
+            assert_eq!(
+                ax.to_bits(),
+                ex.to_bits(),
+                "part {i} ({at:?}): x is {ax} but spec 0041 put it at {ex}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contents_entry_reports_the_ink_it_draws_rather_than_the_columns_it_was_given() {
+        // The three widths spec 0070 deliberately moves, each checked against what it now claims to
+        // be. They move because spec 0069 settled that `w_pt` is ink, which makes the mechanism's
+        // values the correct ones and the hand-rolled columns the defect.
+        let doc = toc_levels_doc();
+        let (pages, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged);
+        let width = doc.page_setup.trim.w_pt;
+        let toc_id = doc
+            .content
+            .iter()
+            .find(|b| matches!(b, Block::Toc { .. }))
+            .map(|b| b.id())
+            .expect("a contents block");
+        let placed: Vec<(Rect, String, f32)> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text {
+                    source,
+                    frame,
+                    lines,
+                    font_size_pt,
+                    ..
+                } if *source == toc_id => Some((*frame, lines[0].text.clone(), *font_size_pt)),
+                _ => None,
+            })
+            .collect();
+
+        // 1. The list's *own* title: its measured advance, not the whole frame measure. Spec 0069
+        //    already moved this one, so this verifies rather than changes it.
+        let (frame, text, size) = &placed[0];
+        assert_eq!(text, "Contents");
+        assert_eq!(
+            frame.w_pt.to_bits(),
+            MONO.measure_run(text, *size).to_bits()
+        );
+        assert!(
+            frame.w_pt < width,
+            "the list's title must not report the frame measure"
+        );
+
+        let mut checked_titles = 0;
+        let mut checked_leaders = 0;
+        for (i, (frame, text, size)) in placed.iter().enumerate().skip(1) {
+            if text.chars().all(|c| c == '.') {
+                // 2. A leader: the dots it draws, not the gap it was asked to fill. The gap runs
+                //    from here to the number's left edge less the leader's own inset, and the last
+                //    whole dot always stops short of it — a partial dot is never drawn.
+                let number = &placed[i + 1].0;
+                let gap = (number.x_pt - TOC_LEADER_GAP_PT) - frame.x_pt;
+                let dot_w = MONO.measure_run(".", *size);
+                assert_eq!(
+                    frame.w_pt.to_bits(),
+                    (dot_w * text.chars().count() as f32).to_bits(),
+                    "a leader reports its drawn dots"
+                );
+                assert!(
+                    frame.w_pt <= gap && gap - frame.w_pt < dot_w,
+                    "and they fill the gap to within one dot: {} of {gap}",
+                    frame.w_pt
+                );
+                checked_leaders += 1;
+            } else if text.chars().all(|c| c.is_ascii_digit()) {
+                // 3. The page number was already ink before spec 0069 made it the rule, and is the
+                //    control: it does not move.
+                assert_eq!(
+                    frame.w_pt.to_bits(),
+                    MONO.measure_run(text, *size).to_bits()
+                );
+                assert_eq!(
+                    (frame.x_pt + frame.w_pt).to_bits(),
+                    width.to_bits(),
+                    "and still ends at the measure's right edge"
+                );
+            } else {
+                // 4. An entry title: its measured advance, not the column it was clipped to.
+                let indent = frame.x_pt;
+                let clip = (width - indent - TOC_NUMBER_COLUMN_PT - TOC_LEADER_GAP_PT).max(1.0);
+                assert_eq!(
+                    frame.w_pt.to_bits(),
+                    MONO.measure_run(text, *size).to_bits(),
+                    "an entry title reports its advance"
+                );
+                assert!(
+                    frame.w_pt <= clip,
+                    "which is inside the column it was clipped to ({clip})"
+                );
+                checked_titles += 1;
+            }
+        }
+        assert_eq!(checked_titles, 7, "one title per entry");
+        assert_eq!(checked_leaders, 7, "one leader per entry");
     }
 
     #[test]

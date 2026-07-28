@@ -2680,6 +2680,139 @@ mod tests {
     }
 
     #[test]
+    fn a_contents_links_hot_area_covers_its_title_and_stops_short_of_the_dot_leader() {
+        // Spec 0070, and the defect nobody had filed. A contents entry's title is the only run in
+        // the workspace carrying `link_page`, and until this increment its rectangle was the
+        // *clip column* — so the clickable region ran past the end of the title and all the way
+        // across the dot leader, on every entry of every screen export.
+        //
+        // Neither test that existed could catch it: this file's
+        // `a_screen_export_links_a_contents_entry_to_the_page_its_heading_is_on` and the layout
+        // engine's `every_contents_entry_carries_a_link_candidate_over_its_own_title_run` both
+        // compare the link rect to the *title run's frame*, and the two move together, so both pass
+        // under either semantics. This one names something the defect cannot move with it: the
+        // leader's own origin, and the title's advance measured straight from the font.
+        let opts = ExportOptions {
+            profile: ExportProfile::Screen,
+            ..Default::default()
+        };
+        let doc = linked_doc();
+        let mut bytes = Vec::new();
+        export(&doc, &opts, &mut bytes).expect("screen export needs no ICC");
+
+        let pages = lay_out_like_export(&doc, &opts);
+        let headings = quill_layout_engine::heading_index(&doc, &pages);
+        assert_eq!(headings.len(), 2, "the fixture lists two chapters");
+
+        // Measured through the same family the export laid out with, so "where the title's ink
+        // ends" is the typeface's number rather than one read back out of the geometry under test.
+        use quill_text_layout::RunMetrics as _;
+        let family = build_family(&opts, &collect_doc_faces(&doc)).expect("the export family");
+        let metrics = family.metrics();
+
+        // Filtered by source block: a contents list shares its page with the chapter that follows
+        // it, so "the run whose text is the chapter title" would also match the chapter's heading.
+        let toc_id = doc
+            .content
+            .iter()
+            .find(|b| matches!(b, Block::Toc { .. }))
+            .map(|b| b.id())
+            .expect("a contents block");
+
+        let objs = objects(&bytes);
+        let order = page_order(&objs);
+
+        for h in &headings {
+            let size =
+                doc.styles.paragraph[&quill_core_model::toc_entry_style_name(h.level)].font_size_pt;
+            // The entry's own two runs: its title, and the dot leader sharing a baseline with it.
+            let toc_page = pages
+                .iter()
+                .find(|p| {
+                    p.blocks.iter().any(|b| {
+                        matches!(b, PlacedBlock::Text { source, lines, .. }
+                            if *source == toc_id && lines[0].text == h.text)
+                    })
+                })
+                .expect("a contents page carrying this entry");
+            let title = toc_page
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    PlacedBlock::Text {
+                        source,
+                        frame,
+                        lines,
+                        ..
+                    } if *source == toc_id && lines[0].text == h.text => Some(*frame),
+                    _ => None,
+                })
+                .expect("the entry's title run");
+            let leader = toc_page
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    PlacedBlock::Text {
+                        source,
+                        frame,
+                        lines,
+                        ..
+                    } if *source == toc_id
+                        && !lines[0].text.is_empty()
+                        && lines[0].text.chars().all(|c| c == '.')
+                        && (frame.y_pt - title.y_pt).abs() < 0.01 =>
+                    {
+                        Some(*frame)
+                    }
+                    _ => None,
+                })
+                .expect("the entry's dot leader");
+            assert!(
+                leader.w_pt > 100.0,
+                "the leader must be long enough that running across it is a visible defect: {}",
+                leader.w_pt
+            );
+
+            // The annotation is found by its *destination*, not by its rect: matching on the rect
+            // would make the assertion below circular.
+            let annots = ref_array(&objs[&order[toc_page.index]], "/Annots");
+            let body = annots
+                .iter()
+                .map(|id| &objs[id])
+                .find(|b| {
+                    ref_array(b, "/D")
+                        .first()
+                        .and_then(|d| order.iter().position(|p| p == d))
+                        == Some(h.page_index)
+                })
+                .expect("a link annotation pointing at this heading's page");
+
+            let g = quill_core_model::page_geom(&doc.page_setup, toc_page.index);
+            let r = rect_of(body);
+            let (left, right) = (r[0] - g.off_x, r[2] - g.off_x);
+            let advance = metrics.measure_run(&h.text, size);
+
+            assert!(
+                (left - title.x_pt).abs() < 0.01,
+                "the hot area must start where the title does: {left} vs {}",
+                title.x_pt
+            );
+            assert!(
+                (right - (title.x_pt + advance)).abs() < 0.01,
+                "the hot area must end where the title's ink ends: {right} vs {}",
+                title.x_pt + advance
+            );
+            assert!(
+                right <= leader.x_pt + 0.01,
+                "and must not reach the dot leader: the link ends at {right}, the leader starts \
+                 at {} and runs {} pt",
+                leader.x_pt,
+                leader.w_pt
+            );
+        }
+    }
+
+    #[test]
     fn the_pdfx_identification_is_present_under_press_and_absent_under_screen() {
         // Both directions, in both places the identification lives. Asserting only the presence
         // would pass for a writer that stamped PDF/X on everything; only the absence would pass for

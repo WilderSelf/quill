@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M4 complete; M5 shipped and closing out (0068–0070).** M0 (headless PDF/X export) is
+**Status: M0–M5 complete; 0071 (compress content streams) sequenced and unbuilt.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -128,12 +128,15 @@ TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable compone
 content packs) → **M5** the general typographic core (the neutral core, inline runs, character
 styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
 an index, a book) → **M7** graphics and colour.
-**M0–M4 done**; M0's sole open item is the manual POD upload. **M5 shipped specs 0062–0067 and is
-closing out via 0068–0070** — the writer draws the shaped glyph run rather than the characters
-(0068), a placed part reports the ink it draws rather than the slot it was given (0069), and the
-contents list is re-expressed through the tab mechanism (0070). Hard order: 0069 would trade
-preflight false positives for false *negatives* until 0068 makes measured and drawn the same
-number. M6–M7 are named, not decomposed.
+**M0–M5 done**; M0's sole open item is the manual POD upload. **M5 shipped specs 0062–0070**: the
+typographic core (0062–0067) plus a three-increment closeout — the writer draws the shaped glyph run
+rather than the characters (0068), a placed part reports the ink it draws rather than the slot it was
+given (0069), and the contents list is re-expressed through the tab mechanism (0070). They ran in a
+hard order: 0069 would have traded preflight false positives for false *negatives* until 0068 made
+measured and drawn the same number, and 0070 was not expressible until 0069 settled that `w_pt` is
+ink. **Spec 0071 (`FlateDecode` on content streams) is sequenced and unbuilt** — added by a
+measurement 0068 took rather than assumed, and not part of M5's completion. M6–M7 are named, not
+decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
 `String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the
