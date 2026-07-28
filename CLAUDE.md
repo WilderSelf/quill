@@ -22,12 +22,22 @@ invalidation (0024), the `.tpub` container and versioned load contract (0025), b
 screen render (0033) and the app shell (0034) have all shipped. **The M1 arc is complete.** **M2 — the beginner on-ramp — is COMPLETE**: specs 0035–0043 shipped (per-page masters → document templates →
 decoration primitive → stat blocks → tables → heading index → generated TOC → PDF outline →
 authoring import). A `.md` source now imports to a templated book with stat blocks, tables, a
-generated contents list and PDF bookmarks, and exports press-clean. **M3 (pro polish + POD
-presets) is decomposed into ten increments, specs 0044–0053**: block fragmentation → table and
-stat-block continuation → master-static alignment → hanging indent → POD presets → geometry
-preflight → line-break pruning → the screen export profile → user-authored templates. The
-sequencing, per-increment acceptance criteria and the open questions M3 inherits are in
-`docs/roadmap.md`.
+generated contents list and PDF bookmarks, and exports press-clean. **M3 (pro polish + POD presets) is
+COMPLETE** — specs 0044–0053: block fragmentation → table and stat-block continuation →
+master-static alignment → hanging indent → POD presets → geometry preflight → line-break pruning →
+the screen export profile → user-authored templates. A block now splits across frames, furniture
+sits where a bound book puts it, preflight checks the printer's numbers against placed geometry, and
+a second export profile carries clickable links while the press file stays provably annotation-free.
+`FORMAT_VERSION` is 3. **M4 is decomposed into eight increments, specs 0054–0061**: component
+definitions as data → the `.qpack` container → pack resolution → pack extraction → the baseline grid
+→ screen/press hyphenation parity → the over-long last line → the gallery and authoring guide.
+
+**M4 deliberately does not build executable plugins**, and that is the decision most worth revisiting
+deliberately rather than by accident. A pack is *declarative* — templates, styles, component
+definitions and assets, no code — because an executable extension that emits geometry can emit
+geometry that is wrong, and every mechanism M3 built to make press errors visible assumes quill
+produced the geometry. The argument is in `docs/roadmap.md`; the sequencing and acceptance criteria
+are there too.
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
 making architectural decisions. This file holds architecture, constraints and conventions; the
@@ -97,8 +107,8 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
 
 **M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
 **M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** plugins/ecosystem. **M0–M2 done**; M0's sole open
-item is the manual POD upload. **M3 is decomposed and in progress** (specs 0044–0053).
+TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and content packs). **M0–M3 done**; M0's sole open
+item is the manual POD upload. **M4** is decomposed and not started.
 
 ## Planning: spec-driven development
 
