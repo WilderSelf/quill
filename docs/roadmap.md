@@ -1521,7 +1521,8 @@ increment's PR, not left here as a fixed-but-still-listed defect.
   already does), not on each template. Not done in 0036 because it changes a serialized 0030 type
   and would have carried a model change inside a templates increment.
 
-- **A block never splits across frames — now wanted by three callers.** *(Scheduled: M3 specs 0044, 0045, 0046.)* The pagination loop
+- **A block never splits across frames — now wanted by three callers.** *(Paragraphs fixed by spec
+  0044; tables and stat blocks remain, scheduled as M3 specs 0045 and 0046.)* The pagination loop
   moves a whole block to the next frame when it does not fit, rather than breaking the paragraph
   across the column boundary. On a single-column page this is invisible; on spec 0036's two-column
   `rulebook` template it leaves a visible gap at the foot of a column whenever the next paragraph is
@@ -1545,6 +1546,22 @@ increment's PR, not left here as a fixed-but-still-listed defect.
   so it cannot break between rows, and with no continuation there is nothing for a header to repeat
   onto. **Three callers now want one mechanism** — paragraphs, stat blocks and tables — which is the
   strongest argument yet that it should be built once, deliberately, rather than three times.
+
+- **The screen render and the press export do not hyphenate the same way.** `quill render` lays out
+  with `NoHyphenator` (crates/cli/src/main.rs:323) while `export` uses the real en-US
+  `HypherHyphenator` (crates/export-pdf/src/lib.rs:323-324). So the two paths break lines
+  differently, and a document can have a different line count — and therefore a different page
+  count — on screen than in the file that goes to the printer. `CLAUDE.md` states the rule this
+  breaks in as many words: *one shaper for screen and press, so they cannot drift.* The shaper is
+  shared; the hyphenator is not, because `hyphenate::HypherHyphenator` is private to `export-pdf`
+  and the CLI cannot reach it. The fix is to promote it to `quill-text-layout` or `quill-fonts`
+  alongside the shaper, which is a small refactor with a large blast radius on rendered output, so
+  it is recorded rather than smuggled into an unrelated increment.
+
+  Found by rendering spec 0044's verification page and noticing single-word lines stranded in a
+  narrow justified measure — the sort of break hyphenation exists to prevent. A justified line
+  holding one word has no inter-word space to stretch and so sets short and flush left, which is
+  what made the discrepancy visible at all.
 
 - **A stat block's attribute keys wrap mid-key in a narrow measure.** *(Scheduled: M3 spec 0048.)* `Armour Class: 15 (leather,
   shield)` can break after `Armour` in the ~150 pt column of the two-column `rulebook` template, so

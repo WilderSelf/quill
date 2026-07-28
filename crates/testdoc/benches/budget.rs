@@ -78,6 +78,32 @@ impl Budgets {
             println!("  ok   {key}: {measured:.3} (budget {ceiling:.3}, limit {limit:.3})");
         }
     }
+
+    /// Record a *deterministic counter* against its ceiling, with no tolerance applied.
+    ///
+    /// The tolerance factor exists for one reason, stated at the top of `benches/budgets.toml`:
+    /// shared runners vary by 10-30% between runs. A work counter does not vary at all — the same
+    /// document and the same edit produce the same number on every machine — so doubling its
+    /// ceiling buys nothing and can cost everything. Spec 0044 re-baselined
+    /// `incremental_pages_reflowed` to 260 on a 499-page document, at which point the doubled limit
+    /// of 520 sat above every value the counter can physically take and the gate could no longer
+    /// fail. A budget whose limit is unreachable is not a budget, which is the same lesson this
+    /// repo already paid for with CI jobs that were not required contexts.
+    pub fn check_exact(&self, key: &str, measured: f64, failures: &mut Vec<String>) {
+        let Some((_, ceiling)) = self.entries.iter().find(|(k, _)| k == key) else {
+            println!("  ! no budget for '{key}' (measured {measured:.3}) — add one");
+            failures.push(format!("missing budget for '{key}'"));
+            return;
+        };
+        if measured > *ceiling {
+            println!("  FAIL {key}: {measured:.3} > {ceiling:.3} (exact, no tolerance)");
+            failures.push(format!(
+                "{key}: measured {measured:.3}, ceiling {ceiling:.3} (exact)"
+            ));
+        } else {
+            println!("  ok   {key}: {measured:.3} (budget {ceiling:.3}, exact)");
+        }
+    }
 }
 
 /// Run `f` `n` times and return the fastest run.

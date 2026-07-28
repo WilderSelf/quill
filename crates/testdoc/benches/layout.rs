@@ -111,9 +111,17 @@ fn main() {
         stats.blocks_from_cache,
         fraction * 100.0
     );
-    budgets.check(
+    budgets.check_exact(
         "layout.incremental_pages_reflowed",
         stats.pages_reflowed as f64,
+        &mut failures,
+    );
+    // The gate that actually states "do not redo the expensive work". Since spec 0044 packed the
+    // columns tight, `pages_reflowed` no longer implies re-measurement — see the note in
+    // benches/budgets.toml — and this is the counter that carries the claim.
+    budgets.check_exact(
+        "layout.incremental_blocks_measured",
+        stats.blocks_measured as f64,
         &mut failures,
     );
     // Reported, not gated. Extracting a sub-millisecond edit by subtracting two ~200 ms timings
