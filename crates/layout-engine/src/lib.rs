@@ -268,7 +268,12 @@ pub trait PageTemplate {
     fn frames(&self, page_index: usize) -> Vec<Frame>;
 
     /// Content the template draws on `page_index`, independent of what flows there.
-    fn statics(&self, _page_index: usize) -> Vec<PlacedBlock> {
+    ///
+    /// `metrics` is the same run-metrics the page's text is broken with. Furniture needs it because
+    /// a static can be aligned within its rect (spec 0047), and "centred" is a statement about the
+    /// line's measured width — resolving it anywhere else would mean measuring text twice, in two
+    /// crates, and hoping the two agree.
+    fn statics(&self, _page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
         Vec::new()
     }
 }
@@ -372,47 +377,63 @@ impl PageTemplate for DocumentTemplate<'_> {
             .collect()
     }
 
-    fn statics(&self, page_index: usize) -> Vec<PlacedBlock> {
+    fn statics(&self, page_index: usize, metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
         let Some(master) = self.master(page_index) else {
             return Vec::new();
         };
         master
             .statics
             .iter()
-            .map(|s| match s {
-                MasterStatic::Text {
-                    rect,
-                    text,
-                    color,
-                    style,
-                } => {
-                    // One-based, because that is what a reader sees printed on a page.
-                    let resolved = text.replace(PAGE_TOKEN, &(page_index + 1).to_string());
-                    let ps = style
-                        .as_deref()
-                        .and_then(|n| self.styles.paragraph.get(n).copied())
-                        .unwrap_or_default();
-                    PlacedBlock::Text {
-                        frame: *rect,
-                        // Furniture is not content: it has no block, so no identity.
-                        source: BlockId::UNASSIGNED,
-                        // Master furniture is a single line at a fixed position; it is not flowed,
-                        // so it is not broken. A running head that overflows its rect is an
-                        // authoring problem, and one that is visible on screen.
-                        lines: vec![Line {
-                            text: resolved,
-                            space_adjust_pt: 0.0,
-                        }],
-                        color: *color,
-                        font_size_pt: ps.font_size_pt,
-                        leading_pt: ps.leading_pt,
+            .map(|s| {
+                // Parity mirroring happens first and for both variants' geometry: the rect a static
+                // is aligned *within* is the one it actually occupies on this page (spec 0047).
+                let rect = s.rect_on(page_index, self.page_setup);
+                match s {
+                    MasterStatic::Text {
+                        text,
+                        color,
+                        style,
+                        align,
+                        ..
+                    } => {
+                        // One-based, because that is what a reader sees printed on a page.
+                        let resolved = text.replace(PAGE_TOKEN, &(page_index + 1).to_string());
+                        let ps = style
+                            .as_deref()
+                            .and_then(|n| self.styles.paragraph.get(n).copied())
+                            .unwrap_or_default();
+                        // The placed frame is narrowed to the line it holds, so it reports where the
+                        // text *is* rather than the box it was aligned in — which is what a geometry
+                        // preflight over placed content has to ask.
+                        let line_w = metrics.measure_run(&resolved, ps.font_size_pt);
+                        let x_pt =
+                            align.x_for(rect, line_w, page_index, self.page_setup.facing_pages);
+                        PlacedBlock::Text {
+                            frame: Rect {
+                                x_pt,
+                                w_pt: line_w,
+                                ..rect
+                            },
+                            // Furniture is not content: it has no block, so no identity.
+                            source: BlockId::UNASSIGNED,
+                            // Master furniture is a single line at a fixed position; it is not flowed,
+                            // so it is not broken. A running head that overflows its rect is an
+                            // authoring problem, and one that is visible on screen.
+                            lines: vec![Line {
+                                text: resolved,
+                                space_adjust_pt: 0.0,
+                            }],
+                            color: *color,
+                            font_size_pt: ps.font_size_pt,
+                            leading_pt: ps.leading_pt,
+                        }
                     }
+                    MasterStatic::Image { asset, .. } => PlacedBlock::Image {
+                        frame: rect,
+                        source: BlockId::UNASSIGNED,
+                        asset_id: asset.clone(),
+                    },
                 }
-                MasterStatic::Image { rect, asset } => PlacedBlock::Image {
-                    frame: *rect,
-                    source: BlockId::UNASSIGNED,
-                    asset_id: asset.clone(),
-                },
             })
             .collect()
     }
@@ -1650,7 +1671,7 @@ pub(crate) fn flow(
     let mut page = LaidOutPage {
         index: page_index,
         blocks: Vec::new(),
-        statics: template.statics(page_index),
+        statics: template.statics(page_index, metrics),
     };
     // Which frame on the current page the cursor is filling.
     let mut frame_idx: usize = start.frame_idx;
@@ -1737,7 +1758,7 @@ pub(crate) fn flow(
                         page = LaidOutPage {
                             index: page_index,
                             blocks: Vec::new(),
-                            statics: template.statics(page_index),
+                            statics: template.statics(page_index, metrics),
                         };
                         frame_idx = 0;
                         // Record where the new page begins, so a later edit can resume from here.
@@ -1896,7 +1917,8 @@ fn place_measured(
 mod tests {
     use super::*;
     use quill_core_model::{
-        Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size, BODY_STYLE,
+        Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size, StaticAlign,
+        BODY_STYLE,
     };
     use quill_text_layout::{Hyphenator, MonospaceRunMetrics, NoHyphenator};
     use quill_text_layout::{BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
@@ -2865,7 +2887,7 @@ mod tests {
                 },
             }]
         }
-        fn statics(&self, page_index: usize) -> Vec<PlacedBlock> {
+        fn statics(&self, page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
             vec![PlacedBlock::Text {
                 source: BlockId::UNASSIGNED,
                 frame: Rect {
@@ -3129,6 +3151,8 @@ mod tests {
                 text: "The Dungeon — {page}".into(),
                 color: Color::Gray { v: 0.0 },
                 style: Some("body".into()),
+                align: StaticAlign::Left,
+                mirror: false,
             }],
             ..MasterPage::plain("running-head")
         };
@@ -3239,6 +3263,8 @@ mod tests {
                 text: "{page}".into(),
                 color: Color::Gray { v: 0.0 },
                 style: Some("body".into()),
+                align: StaticAlign::Left,
+                mirror: false,
             }],
             ..MasterPage::plain("body")
         };
@@ -4737,6 +4763,8 @@ mod tests {
                 text: "The Dungeon — {page}".into(),
                 color: Color::Gray { v: 0.0 },
                 style: Some("body".into()),
+                align: StaticAlign::Left,
+                mirror: false,
             }],
             ..MasterPage::plain("running-head")
         };
@@ -5258,5 +5286,172 @@ mod tests {
             .filter(|b| matches!(b, PlacedBlock::Image { .. }))
             .count();
         assert_eq!(images, 1, "an image must be placed once, whole");
+    }
+    // --- Master static alignment and parity (spec 0047) ---------------------------------------
+
+    /// A document whose `body` master carries one text static in the bottom margin band, spanning
+    /// the text measure of a recto (inside 54, outside 40 on a 432 pt page).
+    fn doc_with_folio(align: StaticAlign, mirror: bool, text: &str) -> Document {
+        let margins = Margins {
+            top_pt: 54.0,
+            bottom_pt: 54.0,
+            inside_pt: 54.0,
+            outside_pt: 40.0,
+        };
+        let master = MasterPage {
+            margins: Some(margins),
+            statics: vec![MasterStatic::Text {
+                rect: Rect {
+                    x_pt: 54.0,
+                    y_pt: 606.0,
+                    w_pt: 338.0,
+                    h_pt: 12.0,
+                },
+                text: text.into(),
+                color: Color::Gray { v: 0.0 },
+                style: Some(BODY_STYLE.into()),
+                align,
+                mirror,
+            }],
+            ..MasterPage::plain("body")
+        };
+        let mut doc = doc_with_master(master, many_lines(200));
+        doc.page_setup.margins = margins;
+        doc
+    }
+
+    /// The x of a page's first static.
+    fn static_x(page: &LaidOutPage) -> f32 {
+        match &page.statics[0] {
+            PlacedBlock::Text { frame, .. } => frame.x_pt,
+            other => panic!("expected a text static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_centred_running_head_is_centred_in_its_rect() {
+        // 8 characters at 0.6 em x 10 pt = 48 pt in a 338 pt band: 54 + (338 - 48) / 2 = 199.
+        let doc = doc_with_folio(StaticAlign::Center, false, "The Keep");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 3, "want a three-page document");
+        for page in pages.iter().take(3) {
+            assert!(
+                (static_x(page) - 199.0).abs() < 0.01,
+                "page {}: centred head at {}",
+                page.index,
+                static_x(page)
+            );
+        }
+    }
+
+    #[test]
+    fn a_right_aligned_static_is_flush_to_its_rects_right_edge() {
+        // 54 + 338 - 48 = 344.
+        let doc = doc_with_folio(StaticAlign::Right, false, "The Keep");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!((static_x(&pages[0]) - 344.0).abs() < 0.01);
+        assert!(
+            (static_x(&pages[1]) - 344.0).abs() < 0.01,
+            "an unmirrored `right` is the same edge on both halves of the spread"
+        );
+    }
+
+    #[test]
+    fn an_outside_folio_sits_at_opposite_corners_on_a_recto_and_a_verso() {
+        // The defect this increment exists to fix, end to end. "1" and "2" are one 6 pt character.
+        let doc = doc_with_folio(StaticAlign::Outside, true, PAGE_TOKEN);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let (recto, verso) = (static_x(&pages[0]), static_x(&pages[1]));
+        // Recto: flush to the fore-edge margin on the right — 432 - 40 - 6 = 386.
+        assert!((recto - 386.0).abs() < 0.01, "recto folio at {recto}");
+        // Verso: the rect mirrors, so the fore-edge is on the left — x = 40.
+        assert!((verso - 40.0).abs() < 0.01, "verso folio at {verso}");
+        assert_ne!(recto, verso, "a spread must not repeat one corner");
+        // Both clear the trim by at least the smaller side margin, which is the press rule the
+        // spec-0036 inset was standing in for.
+        for (page, x) in [(0, recto), (1, verso)] {
+            assert!(x >= 40.0, "page {page} folio at {x} is inside the margin");
+            assert!(x + 6.0 <= 392.0, "page {page} folio runs past the margin");
+        }
+    }
+
+    #[test]
+    fn a_single_sided_document_never_mirrors_a_static() {
+        let mut doc = doc_with_folio(StaticAlign::Outside, true, PAGE_TOKEN);
+        doc.page_setup.facing_pages = false;
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!((static_x(&pages[0]) - static_x(&pages[1])).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_placed_static_reports_the_line_it_holds_not_the_band_it_was_aligned_in() {
+        // The frame is narrowed to the measured line, so a preflight over placed geometry
+        // (spec 0050) sees where the ink is rather than the whole 338 pt band.
+        let doc = doc_with_folio(StaticAlign::Center, false, "The Keep");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        match &pages[0].statics[0] {
+            PlacedBlock::Text { frame, .. } => {
+                assert!((frame.w_pt - 48.0).abs() < 0.01, "width {}", frame.w_pt);
+                assert_eq!(frame.y_pt, 606.0, "the vertical band is untouched");
+                assert_eq!(frame.h_pt, 12.0);
+            }
+            other => panic!("expected a text static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_migrated_v2_document_lays_out_where_it_did_before_the_bump() {
+        // Migration correctness as *geometry*, not as "it parses". The fixture is committed bytes
+        // (`crates/core-model/assets/v2-masters.json`) written by a build that predates spec 0047,
+        // and the numbers below are what that build placed: a static drawn from its rect's left
+        // edge, in the same rect on both halves of the spread, inside a text frame whose margins
+        // mirror.
+        const V2: &str = include_str!("../../core-model/assets/v2-masters.json");
+        let doc = Document::from_json(V2).expect("the v2 fixture must load");
+
+        // The recto goes through the whole flow, so what the template says and what a laid-out page
+        // gets cannot disagree; the verso is asked of the template directly, because the fixture is
+        // deliberately one short paragraph — a migration fixture should be readable, not padded to
+        // two pages.
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+        match &pages[0].blocks[0] {
+            PlacedBlock::Text { frame, .. } => {
+                assert_eq!((frame.x_pt, frame.y_pt, frame.w_pt), (54.0, 54.0, 338.0));
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(pages[0].statics, template.statics(0, &MONO));
+
+        for (page, expected_left) in [(0usize, 54.0f32), (1, 40.0)] {
+            // The text frame: margins mirror across the spread, as they did in v2.
+            let frames = template.frames(page);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].rect.x_pt, expected_left, "page {page} text frame");
+            assert_eq!(frames[0].rect.y_pt, 54.0);
+            assert_eq!(frames[0].rect.w_pt, 338.0);
+
+            // The folio: unmirrored and left-aligned, so x is the authored 40 on *both* pages —
+            // spec 0036's fore-edge inset, preserved exactly.
+            let statics = template.statics(page, &MONO);
+            match &statics[0] {
+                PlacedBlock::Text { frame, lines, .. } => {
+                    assert_eq!(frame.x_pt, 40.0, "page {page} folio");
+                    assert_eq!(frame.y_pt, 606.0);
+                    assert_eq!(lines[0].text, format!("{}", page + 1));
+                }
+                other => panic!("expected a text static, got {other:?}"),
+            }
+            // And the background image static is placed full-bleed, unmoved by parity.
+            match &statics[1] {
+                PlacedBlock::Image {
+                    frame, asset_id, ..
+                } => {
+                    assert_eq!(asset_id, "bg");
+                    assert_eq!((frame.x_pt, frame.w_pt), (0.0, 432.0));
+                }
+                other => panic!("expected an image static, got {other:?}"),
+            }
+        }
     }
 }

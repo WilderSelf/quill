@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 
 use crate::{
     heading_style_name, Color, Document, Margins, MasterPage, MasterStatic, PageOverride,
-    PageSetup, ParagraphStyle, Rect, Size, StyleSheet, TextAlign, BODY_STYLE, DEFAULT_BLEED_PT,
-    FORMAT_VERSION, PAGE_TOKEN,
+    PageSetup, ParagraphStyle, Rect, Size, StaticAlign, StyleSheet, TextAlign, BODY_STYLE,
+    DEFAULT_BLEED_PT, FORMAT_VERSION, PAGE_TOKEN,
 };
 
 /// The style name bundled templates give their folios.
@@ -147,7 +147,7 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
     styles
 }
 
-/// A page-number folio in the bottom margin band, inset from the trim edge.
+/// A page-number folio at the fore-edge corner of the bottom margin band.
 ///
 /// Two constraints decide the geometry, and both were found by rendering rather than by arithmetic.
 ///
@@ -155,22 +155,28 @@ fn scaled_styles(body_pt: f32, leading_pt: f32, scale: &[(u8, f32, f32)]) -> Sty
 /// top of the last line — furniture is positioned absolutely and does not participate in the flow,
 /// so nothing else would catch the collision.
 ///
-/// `x_pt` must be inset. A [`MasterStatic::Text`] is drawn as one line starting at its rect's left
-/// edge: there is no alignment on a static and no mirroring by page parity, so a full-width rect
-/// does not centre the number, it prints it hard against the trim — where a trimmer will eventually
-/// cut it off. Inset by the fore-edge margin, which is the smaller of the two sides, so the folio
-/// clears the trim on a recto and a verso alike without ever landing inside the text column.
-fn folio(trim: Size, y_pt: f32, inset_pt: f32) -> MasterStatic {
+/// Horizontally the rect is the **text measure** — from the spine margin to the fore-edge margin, as
+/// the page looks on a recto — set [`StaticAlign::Outside`] and mirrored. The number therefore sits
+/// at the outside corner of whichever half of the spread it lands on, one margin clear of the trim,
+/// which is where a bound book puts it.
+///
+/// Before spec 0047 a static had neither alignment nor mirroring, and this function insetted the
+/// rect by the fore-edge margin instead: with the line drawn from the rect's left edge, a full-width
+/// rect printed the number hard against the trim, where the trimmer goes. That workaround is gone —
+/// it encoded a missing model concept in each template, and the third template encoded it again.
+fn folio(trim: Size, y_pt: f32, margins: Margins) -> MasterStatic {
     MasterStatic::Text {
         rect: Rect {
-            x_pt: inset_pt,
+            x_pt: margins.inside_pt,
             y_pt,
-            w_pt: (trim.w_pt - inset_pt * 2.0).max(0.0),
+            w_pt: (trim.w_pt - margins.inside_pt - margins.outside_pt).max(0.0),
             h_pt: 12.0,
         },
         text: PAGE_TOKEN.to_string(),
         color: INK,
         style: Some(FOLIO_STYLE.to_string()),
+        align: StaticAlign::Outside,
+        mirror: true,
     }
 }
 
@@ -222,7 +228,7 @@ fn adventure() -> Template {
             MasterPage {
                 margins: Some(body_margins),
                 // Text area ends at 648 - 54 = 594; the folio sits below it, inside the margin.
-                statics: vec![folio(DIGEST, 606.0, body_margins.outside_pt)],
+                statics: vec![folio(DIGEST, 606.0, body_margins)],
                 ..MasterPage::plain(BODY_MASTER)
             },
         ],
@@ -271,7 +277,7 @@ fn rulebook() -> Template {
                 margins: Some(body_margins),
                 columns: 2,
                 gutter_pt: 14.0,
-                statics: vec![folio(DIGEST, 606.0, body_margins.outside_pt)],
+                statics: vec![folio(DIGEST, 606.0, body_margins)],
                 ..MasterPage::plain(BODY_MASTER)
             },
         ],
@@ -306,7 +312,7 @@ fn playtest() -> Template {
         master_pages: vec![MasterPage {
             margins: Some(body_margins),
             // Text area ends at 792 - 72 = 720; the folio sits below it, inside the margin.
-            statics: vec![folio(LETTER, 738.0, body_margins.outside_pt)],
+            statics: vec![folio(LETTER, 738.0, body_margins)],
             ..MasterPage::plain(BODY_MASTER)
         }],
         default_master: Some(BODY_MASTER.into()),
@@ -441,39 +447,94 @@ mod tests {
         }
     }
 
+    /// A generous stand-in for a folio's set width — wider than four digits at any bundled body
+    /// size, so a clearance that holds for it holds for the real line. `core-model` sits below the
+    /// font stack and cannot measure text, which is exactly why [`StaticAlign::x_for`] takes a
+    /// width instead of finding one.
+    const FOLIO_W_PT: f32 = 24.0;
+
     #[test]
-    fn no_bundled_static_sits_against_the_trim_edge() {
-        // Found by rendering, not by arithmetic: a folio with a full-width rect at x = 0 does not
-        // come out centred, because a `MasterStatic::Text` is one line drawn from its rect's left
-        // edge — there is no alignment on a static. It printed hard against the trim, which is
-        // where the guillotine goes.
+    fn no_bundled_static_sits_against_the_trim_edge_on_either_half_of_a_spread() {
+        // Found by rendering, not by arithmetic: before spec 0047 a folio with a full-width rect at
+        // x = 0 did not come out centred, because a `MasterStatic::Text` was one line drawn from
+        // its rect's left edge. It printed hard against the trim, which is where the guillotine
+        // goes.
         //
         // Asserted as a margin-relative clearance rather than "> 0" so the assertion states the
-        // press rule (furniture stays inside the margins) rather than the symptom.
+        // press rule (furniture stays inside the margins) rather than the symptom — and now on
+        // **both** pages of a spread, since parity is the half the numeric tests used to miss.
         for t in Template::bundled() {
             for master in &t.master_pages {
                 let m = master.margins.unwrap_or(t.page_setup.margins);
                 let clearance = m.inside_pt.min(m.outside_pt);
-                for s in &master.statics {
-                    let rect = match s {
-                        MasterStatic::Text { rect, .. } | MasterStatic::Image { rect, .. } => rect,
-                    };
-                    assert!(
-                        rect.x_pt >= clearance,
-                        "template `{}` master `{}`: static starts at x={} inside the {clearance} pt \
-                         side margin",
-                        t.name,
-                        master.name,
-                        rect.x_pt
-                    );
-                    assert!(
-                        rect.x_pt + rect.w_pt <= t.page_setup.trim.w_pt - clearance,
-                        "template `{}` master `{}`: static runs past the fore-edge margin",
-                        t.name,
-                        master.name
-                    );
+                let fore_edge = t.page_setup.trim.w_pt - clearance;
+                for page in 0..2 {
+                    for s in &master.statics {
+                        let rect = s.rect_on(page, &t.page_setup);
+                        let (x, w) = match s {
+                            MasterStatic::Text { align, .. } => (
+                                align.x_for(rect, FOLIO_W_PT, page, t.page_setup.facing_pages),
+                                FOLIO_W_PT,
+                            ),
+                            MasterStatic::Image { .. } => (rect.x_pt, rect.w_pt),
+                        };
+                        assert!(
+                            x >= clearance,
+                            "template `{}` master `{}` page {page}: static starts at x={x} inside \
+                             the {clearance} pt side margin",
+                            t.name,
+                            master.name,
+                        );
+                        assert!(
+                            x + w <= fore_edge,
+                            "template `{}` master `{}` page {page}: static ends at {} past the \
+                             {fore_edge} pt fore-edge margin",
+                            t.name,
+                            master.name,
+                            x + w,
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_bundled_folio_sits_at_the_outside_corner_of_both_halves_of_a_spread() {
+        // The design spec 0036 could not express and worked around with a fore-edge inset. A folio
+        // at the same x on a recto and a verso is the defect; two different x values, each one
+        // margin in from its own trim edge, is the fix.
+        for t in Template::bundled()
+            .iter()
+            .filter(|t| t.page_setup.facing_pages)
+        {
+            let master = t
+                .master_pages
+                .iter()
+                .find(|m| m.name == BODY_MASTER)
+                .expect("a body master");
+            let s = master.statics.first().expect("a folio");
+            let m = master.margins.unwrap_or(t.page_setup.margins);
+            let MasterStatic::Text { align, .. } = s else {
+                panic!("the folio must be text")
+            };
+            let recto = align.x_for(s.rect_on(0, &t.page_setup), FOLIO_W_PT, 0, true);
+            let verso = align.x_for(s.rect_on(1, &t.page_setup), FOLIO_W_PT, 1, true);
+            assert_ne!(
+                recto, verso,
+                "template `{}`: a spread must not repeat one corner",
+                t.name
+            );
+            assert!(
+                (recto + FOLIO_W_PT - (t.page_setup.trim.w_pt - m.outside_pt)).abs() < 0.01,
+                "template `{}`: the recto folio must end at the fore-edge margin, got {recto}",
+                t.name
+            );
+            assert!(
+                (verso - m.outside_pt).abs() < 0.01,
+                "template `{}`: the verso folio must start at the fore-edge margin, got {verso}",
+                t.name
+            );
         }
     }
 

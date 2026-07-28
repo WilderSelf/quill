@@ -1090,7 +1090,14 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
-    /// Changed by spec 0041: `StyleSheet::default()` gained `toc-title` and `toc-1`..`toc-6`, so
+    /// Changed by spec 0047: `FORMAT_VERSION` became 3, so `doc.to_json()` changed and with it the
+    /// document identifier. The sample has no masters, so nothing this spec added reaches its page;
+    /// only the version stamp in the manifest text the identifier is hashed from moved. Verified
+    /// identifier-only, the same way spec 0030's bump was: both files are 8786 bytes and differ in
+    /// exactly 116, every one inside the XMP `DocumentID`/`InstanceID` or the trailer `/ID` (both
+    /// halves). No content stream moved.
+    ///
+    /// Previously changed by spec 0041: `StyleSheet::default()` gained `toc-title` and `toc-1`..`toc-6`, so
     /// `doc.to_json()` changed and with it the document identifier. Verified identifier-only: both
     /// files are 8786 bytes and differ in exactly 124, in the two XMP identifier clusters and the
     /// trailer `/ID`. No content stream moved.
@@ -1127,7 +1134,7 @@ mod tests {
     /// Verified by inspecting the emitted text operators rather than by accepting the new number:
     /// before, the stream contained only `/F0 10 Tf` — a heading was distinguishable from body text
     /// only by being ragged-left.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x25c8_f03e_dc43_661b;
+    const SAMPLE_EXPORT_DIGEST: u64 = 0xa7fb_899f_9cf4_d605;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;

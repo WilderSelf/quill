@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "metadata": {
+    "title": "A v2 book with furniture",
+    "authors": ["Anon"]
+  },
+  "page_setup": {
+    "trim": { "w_pt": 432.0, "h_pt": 648.0 },
+    "bleed_pt": 9.0,
+    "facing_pages": true,
+    "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 }
+  },
+  "content": [
+    { "kind": "body", "id": 1, "text": "one two three four five six seven eight nine ten",
+      "color": { "space": "gray", "v": 0.0 } }
+  ],
+  "assets": [],
+  "fonts_embeddable": true,
+  "revision": 0,
+  "next_block_id": 2,
+  "master_pages": [
+    {
+      "name": "body",
+      "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 },
+      "columns": 1,
+      "gutter_pt": 0.0,
+      "statics": [
+        {
+          "kind": "text",
+          "rect": { "x_pt": 40.0, "y_pt": 606.0, "w_pt": 352.0, "h_pt": 12.0 },
+          "text": "{page}",
+          "color": { "space": "gray", "v": 0.0 },
+          "style": "folio"
+        },
+        {
+          "kind": "image",
+          "rect": { "x_pt": 0.0, "y_pt": 0.0, "w_pt": 432.0, "h_pt": 648.0 },
+          "asset": "bg"
+        }
+      ]
+    }
+  ],
+  "default_master": "body"
+}
