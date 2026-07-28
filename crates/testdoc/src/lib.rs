@@ -206,6 +206,7 @@ pub fn document_with_blocks(spec: &SynthSpec, block_count: usize) -> Document {
         // No per-page overrides: the synthetic workload deliberately carries no furniture, so every
         // budget in `benches/budgets.toml` keeps measuring the same thing across spec 0035.
         pages: Vec::new(),
+        components: Default::default(),
     };
     doc.assign_missing_block_ids()
         .expect("generated blocks are unassigned, so cannot collide");

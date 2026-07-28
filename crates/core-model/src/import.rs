@@ -571,6 +571,7 @@ max_level: 3
                 Block::Image { .. } => "image",
                 Block::StatBlock { .. } => "statblock",
                 Block::Table { .. } => "table",
+                Block::Component { .. } => "component",
                 Block::Toc { .. } => "toc",
             })
             .collect();

@@ -44,6 +44,10 @@ pub enum LoadError {
     /// A template file declares a `template_version` newer than this build supports. A refusal, on
     /// the same reasoning as [`LoadError::UnsupportedVersion`].
     UnsupportedTemplateVersion { found: u32, supported: u32 },
+    /// A component definition (spec 0054) is malformed, or declares a version this build does not
+    /// understand. Its own variant, and it names the definition, because a definition is the unit
+    /// a pack ships and a reader has to know which one to fix.
+    ComponentDef(quill_components_ttrpg::ComponentDefError),
 }
 
 impl fmt::Display for LoadError {
@@ -67,6 +71,7 @@ impl fmt::Display for LoadError {
                 "template file version {found} is newer than this build supports \
                  (up to {supported}); upgrade Quill to use it"
             ),
+            LoadError::ComponentDef(e) => write!(f, "{e}"),
         }
     }
 }

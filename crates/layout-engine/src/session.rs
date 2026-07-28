@@ -320,6 +320,7 @@ impl LayoutSession {
             &doc.content,
             &doc.assets,
             &doc.styles,
+            &doc.component_library(),
             headings,
             template,
             metrics,
@@ -580,6 +581,15 @@ fn content_fingerprint(block: &Block) -> u64 {
                 }
             }
         }
+        Block::Component { def, fields, .. } => {
+            // The definition *name* and every authored field. The definition's own shape is
+            // context, not content — it lives on the document, so `context_fingerprint` covers it,
+            // and covering it here as well would re-measure every instance whenever any unrelated
+            // definition changed.
+            eat(b"c");
+            eat(def.as_bytes());
+            eat(format!("{fields:?}").as_bytes());
+        }
     }
     // Colour does not affect measurement, but it does affect the placed block, so a colour-only
     // edit must still invalidate the cached *result*.
@@ -603,9 +613,17 @@ fn context_fingerprint(doc: &Document, headings: &[HeadingEntry]) -> u64 {
     // The resolved contents index belongs here too (spec 0041): a contents block's *content* is
     // derived from it, so a fixpoint iteration that fed a different index must not reuse the
     // previous iterate's pages.
+    // `doc.components` belongs here for the same reason `doc.styles` does (spec 0054): editing a
+    // component definition changes every instance's geometry without touching a single block.
     let text = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-        doc.page_setup, doc.styles, doc.master_pages, doc.default_master, doc.pages, headings
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        doc.page_setup,
+        doc.styles,
+        doc.master_pages,
+        doc.default_master,
+        doc.pages,
+        doc.components,
+        headings
     );
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {

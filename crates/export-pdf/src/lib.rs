@@ -17,7 +17,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use quill_color::within_ink_limit_pct;
-use quill_core_model::{page_geom, Asset, Block, Color, Document, PageGeom, PageSetup, Rect};
+use quill_core_model::{
+    page_geom, Asset, Block, Color, Document, FieldValue, PageGeom, PageSetup, Rect,
+};
 use quill_layout_engine::{LaidOutPage, PlacedBlock};
 use thiserror::Error;
 
@@ -319,6 +321,7 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
             | Block::Body { color, .. }
             | Block::StatBlock { color, .. }
             | Block::Table { color, .. }
+            | Block::Component { color, .. }
             | Block::Toc { color, .. } => Some(color),
             Block::Image { .. } => None,
         };
@@ -777,6 +780,36 @@ fn collect_doc_chars(doc: &Document) -> std::collections::BTreeSet<char> {
                 set.extend('0'..='9');
                 set.insert('.');
                 set.insert('…');
+            }
+            Block::Component { fields, .. } => {
+                // Every authored field of every instance (spec 0054). Same silent-failure surface
+                // as the two bundled components: a character this collector misses renders as a
+                // `.notdef` box with no error anywhere, so the walk is exhaustive over the value
+                // kinds rather than over the ones the bundled definitions happen to use.
+                for value in fields.values() {
+                    match value {
+                        FieldValue::Text(t) => set.extend(t.chars()),
+                        FieldValue::Lines(lines) => {
+                            for l in lines {
+                                set.extend(l.chars());
+                            }
+                        }
+                        FieldValue::Pairs(pairs) => {
+                            for (k, v) in pairs {
+                                set.extend(k.chars());
+                                set.extend(v.chars());
+                            }
+                        }
+                        FieldValue::Rows(rows) => {
+                            for row in rows {
+                                for cell in row {
+                                    set.extend(cell.chars());
+                                }
+                            }
+                        }
+                        FieldValue::Widths(_) | FieldValue::Flag(_) => {}
+                    }
+                }
             }
             Block::Image { .. } => {}
         }

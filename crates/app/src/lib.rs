@@ -248,6 +248,10 @@ impl AppState {
                     Block::Image { .. }
                     | Block::StatBlock { .. }
                     | Block::Table { .. }
+                    // A declared component (spec 0054) is the general case of the same thing: its
+                    // text lives in named fields, and which one a bare string would replace is not
+                    // a question this affordance can answer.
+                    | Block::Component { .. }
                     // A contents block's text is generated; there is nothing here to edit.
                     | Block::Toc { .. } => return EditOutcome::default(),
                 };

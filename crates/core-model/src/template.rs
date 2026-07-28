@@ -194,6 +194,7 @@ impl Document {
             master_pages: template.master_pages.clone(),
             default_master: template.default_master.clone(),
             pages: template.pages.clone(),
+            components: Default::default(),
         };
         // Normalize exactly as `Document::sample()` does, and for the same reason: everything
         // downstream treats what it is handed as a *loaded* document, so one built in memory must

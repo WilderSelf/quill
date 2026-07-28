@@ -8,15 +8,24 @@ use std::fmt;
 
 /// Re-exported so consumers get the component types from the model they appear in, rather than
 /// having to add a dependency on `quill-components-ttrpg` to name a field of `Block` (spec 0038).
-pub use quill_components_ttrpg::{RandomTable, StatBlock, Table, TableEntry};
+pub use quill_components_ttrpg::{
+    normalized_widths, ComponentDef, ComponentDefError, ComponentFields, ComponentLibrary,
+    DefColor, DefStroke, FieldValue, PanelDef, RandomTable, RuleDef, SectionDef, SectionShape,
+    SplitDef, SplitGranularity, StatBlock, Table, TableEntry, ZebraDef, COMPONENT_DEF_VERSION,
+};
 use serde::{Deserialize, Serialize};
 
+mod components;
 mod container;
 mod geom;
 mod import;
 mod template;
 mod version;
 
+pub use components::{
+    builtin_components, statblock_definition, table_definition, STATBLOCK_COMPONENT,
+    STATBLOCK_PADDING_PT, TABLE_CELL_PADDING_PT, TABLE_COMPONENT,
+};
 pub use container::{OpenedTpub, Tpub, MANIFEST_NAME};
 pub use geom::{page_geom, PageGeom};
 pub use import::{import, Diagnostic, ImportError, Imported};
@@ -290,6 +299,26 @@ pub enum Block {
         table: Table,
         color: Color,
     },
+    /// An instance of a declared component (spec 0054) — the general case
+    /// [`Block::StatBlock`] and [`Block::Table`] are the two bundled specializations of.
+    ///
+    /// Additive: a manifest that carries none loads and lays out exactly as before, which is why
+    /// `FORMAT_VERSION` stays 3.
+    Component {
+        #[serde(default)]
+        id: BlockId,
+        /// The definition this instance is set by, resolved against the document's component
+        /// library. A name that does not resolve is skipped, exactly as an unresolved image asset
+        /// is — the refusal for a *malformed* definition happens at load, where there is an error
+        /// channel.
+        def: String,
+        /// The authored content, field by field.
+        #[serde(default)]
+        fields: ComponentFields,
+        /// The ink every run in the component is set in. One colour rather than one per section,
+        /// on [`Block::StatBlock`]'s reasoning.
+        color: Color,
+    },
     Image {
         #[serde(default)]
         id: BlockId,
@@ -306,6 +335,7 @@ impl Block {
             | Block::Image { id, .. }
             | Block::StatBlock { id, .. }
             | Block::Table { id, .. }
+            | Block::Component { id, .. }
             | Block::Toc { id, .. } => *id,
         }
     }
@@ -317,6 +347,7 @@ impl Block {
             | Block::Image { id, .. }
             | Block::StatBlock { id, .. }
             | Block::Table { id, .. }
+            | Block::Component { id, .. }
             | Block::Toc { id, .. } => *id = new,
         }
     }
@@ -351,6 +382,7 @@ impl Block {
             Block::Image { .. }
             | Block::StatBlock { .. }
             | Block::Table { .. }
+            | Block::Component { .. }
             | Block::Toc { .. } => {}
         }
         self
@@ -636,6 +668,7 @@ impl StyleSheet {
             Block::Image { .. }
             | Block::StatBlock { .. }
             | Block::Table { .. }
+            | Block::Component { .. }
             | Block::Toc { .. } => return ParagraphStyle::default(),
         };
         self.paragraph
@@ -879,6 +912,13 @@ pub struct Document {
     /// content that justified them may simply have been deleted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOverride>,
+    /// Component definitions this document carries beyond the bundled two (spec 0054).
+    ///
+    /// Keyed by definition name. Additive and defaulted, so a v3 manifest written before component
+    /// definitions existed loads and lays out exactly as it did — which is why `FORMAT_VERSION`
+    /// stays 3. Spec 0056 adds the other source: definitions resolved from installed packs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, ComponentDef>,
 }
 
 impl Document {
@@ -925,6 +965,7 @@ impl Document {
             master_pages: Vec::new(),
             default_master: None,
             pages: Vec::new(),
+            components: Default::default(),
         };
         // The sample is a *loaded* document as far as everything downstream is concerned, so it
         // carries real ids like one — otherwise every consumer would have to special-case it.
@@ -1031,13 +1072,107 @@ impl Document {
         let mut doc: Document =
             serde_json::from_value(value).map_err(|e| LoadError::Parse(e.to_string()))?;
         doc.assign_missing_block_ids()?;
+        doc.validate_components()?;
         Ok(doc)
+    }
+
+    /// Refuse a document carrying a component definition this build cannot lay out (spec 0054).
+    ///
+    /// Runs on load rather than at measurement, because layout has no error channel by design and
+    /// a definition this build half-understands would otherwise produce geometry that goes to a
+    /// printer. The key a definition is filed under is also checked against the name inside it: a
+    /// mismatch means `Block::Component { def }` would resolve one and validate the other.
+    pub fn validate_components(&self) -> Result<(), LoadError> {
+        for (key, def) in &self.components {
+            def.validate().map_err(LoadError::ComponentDef)?;
+            if &def.name != key {
+                return Err(LoadError::ComponentDef(ComponentDefError::NameMismatch {
+                    key: key.clone(),
+                    def: def.name.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every definition this document can resolve: the bundled two, plus its own.
+    ///
+    /// A document definition of the same name shadows a bundled one — which is what lets a
+    /// publisher restyle the stat block without a new name, and is why the bundled library is
+    /// built first and then extended.
+    pub fn component_library(&self) -> ComponentLibrary {
+        let mut lib = builtin_components();
+        lib.extend(self.components.iter().map(|(k, v)| (k.clone(), v.clone())));
+        lib
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec 0054: a malformed or newer-versioned definition is refused at *load*, with an error
+    /// that names it. Layout has no error channel by design, so this is the only place the refusal
+    /// can happen — and a definition this build half-understands would otherwise produce geometry
+    /// that goes to a printer.
+    #[test]
+    fn a_malformed_component_definition_is_refused_by_name() {
+        let manifest = |def: &str| {
+            let mut value = serde_json::to_value(Document::sample()).expect("serialize");
+            let components: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"clock":{def}}}"#)).expect("definition json");
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("components".into(), components);
+            value.to_string()
+        };
+
+        // A version this build does not understand.
+        let err = Document::from_json(&manifest(
+            r#"{"version":99,"name":"clock","sections":[{"source":"title","style":"body","shape":"text"}]}"#,
+        ))
+        .expect_err("a newer definition version must be refused");
+        assert!(matches!(err, LoadError::ComponentDef(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("clock"), "the error must name it: {text}");
+        assert!(text.contains("99"), "and say what it found: {text}");
+
+        // No sections at all.
+        let err = Document::from_json(&manifest(r#"{"name":"clock","sections":[]}"#))
+            .expect_err("a definition with no sections must be refused");
+        assert!(err.to_string().contains("clock"), "{err}");
+
+        // Filed under one name, calling itself another: `Block::Component { def }` resolves the
+        // key, so this would validate one definition and lay out a different one.
+        let err = Document::from_json(&manifest(
+            r#"{"name":"cloque","sections":[{"source":"title","style":"body","shape":"text"}]}"#,
+        ))
+        .expect_err("a key/name mismatch must be refused");
+        assert!(err.to_string().contains("cloque"), "{err}");
+
+        // And the well-formed one loads.
+        let doc = Document::from_json(&manifest(
+            r#"{"name":"clock","sections":[{"source":"title","style":"body","shape":"text"}]}"#,
+        ))
+        .expect("a well-formed definition loads");
+        assert!(doc.components.contains_key("clock"));
+        assert!(
+            doc.component_library().contains_key(STATBLOCK_COMPONENT),
+            "a document's own definitions extend the bundled library rather than replacing it"
+        );
+    }
+
+    /// A manifest that carries no definitions is byte-identical to one written before they
+    /// existed — which is what makes spec 0054 additive and keeps `FORMAT_VERSION` at 3.
+    #[test]
+    fn a_document_with_no_component_definitions_serializes_none() {
+        let json = Document::sample().to_json().expect("serialize");
+        assert!(
+            !json.contains("\"components\""),
+            "an empty component library must not appear in the manifest"
+        );
+    }
 
     #[test]
     fn sample_round_trips_through_json() {

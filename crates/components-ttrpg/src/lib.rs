@@ -4,6 +4,48 @@
 
 use serde::{Deserialize, Serialize};
 
+mod def;
+
+pub use def::{
+    ComponentDef, ComponentDefError, ComponentFields, ComponentLibrary, DefColor, DefStroke,
+    FieldValue, PanelDef, RuleDef, SectionDef, SectionShape, SplitDef, SplitGranularity, ZebraDef,
+    COMPONENT_DEF_VERSION,
+};
+
+/// Field names the bundled `statblock` definition renders (spec 0054). Constants rather than
+/// literals because the definition and the conversion have to agree, and a typo in either produces
+/// a silently empty section rather than an error.
+pub const STATBLOCK_FIELD_NAME: &str = "name";
+pub const STATBLOCK_FIELD_OVERVIEW: &str = "overview";
+pub const STATBLOCK_FIELD_ATTRIBUTES: &str = "attributes";
+pub const STATBLOCK_FIELD_DETAILS: &str = "details";
+pub const STATBLOCK_FIELD_ACTIONS: &str = "actions";
+pub const STATBLOCK_FIELD_REACTIONS: &str = "reactions";
+
+/// Field names the bundled `table` definition renders.
+pub const TABLE_FIELD_HEADER: &str = "header";
+pub const TABLE_FIELD_ROWS: &str = "rows";
+pub const TABLE_FIELD_COLUMNS: &str = "columns";
+pub const TABLE_FIELD_ZEBRA: &str = "zebra";
+
+/// Column widths normalized to sum to 1, or an equal split when they cannot be.
+///
+/// A zero, negative or non-finite width is not an error here — this is authoring-side, and the
+/// posture the rest of the model takes is that bad input costs the *look*, never the content. An
+/// equal split is wrong-looking and obvious; a degenerate column would silently swallow cells.
+pub fn normalized_widths(widths: &[f32], count: usize) -> Vec<f32> {
+    let usable: Vec<f32> = widths
+        .iter()
+        .copied()
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .collect();
+    let total: f32 = usable.iter().sum();
+    if usable.len() != count || total <= 0.0 {
+        return vec![1.0 / count.max(1) as f32; count];
+    }
+    usable.iter().map(|w| w / total).collect()
+}
+
 /// A creature/NPC stat block. Sections mirror the common compact layout
 /// (Overview / Attributes / Details / Actions / Reactions).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -19,6 +61,30 @@ pub struct StatBlock {
     pub actions: Vec<String>,
     #[serde(default)]
     pub reactions: Vec<String>,
+}
+
+impl StatBlock {
+    /// This stat block as component instance fields (spec 0054). See [`Table::to_fields`].
+    pub fn to_fields(&self) -> ComponentFields {
+        let mut fields = ComponentFields::new();
+        fields.insert(
+            STATBLOCK_FIELD_NAME.into(),
+            FieldValue::Text(self.name.clone()),
+        );
+        for (field, lines) in [
+            (STATBLOCK_FIELD_OVERVIEW, &self.overview),
+            (STATBLOCK_FIELD_DETAILS, &self.details),
+            (STATBLOCK_FIELD_ACTIONS, &self.actions),
+            (STATBLOCK_FIELD_REACTIONS, &self.reactions),
+        ] {
+            fields.insert(field.into(), FieldValue::Lines(lines.clone()));
+        }
+        fields.insert(
+            STATBLOCK_FIELD_ATTRIBUTES.into(),
+            FieldValue::Pairs(self.attributes.clone()),
+        );
+        fields
+    }
 }
 
 /// One row of a random table, covering an inclusive die-roll range `low..=high`.
@@ -137,17 +203,7 @@ impl Table {
     /// An equal split is wrong-looking and obvious; a degenerate column would silently swallow
     /// cells.
     pub fn normalized_columns(&self, count: usize) -> Vec<f32> {
-        let usable: Vec<f32> = self
-            .columns
-            .iter()
-            .copied()
-            .filter(|w| w.is_finite() && *w > 0.0)
-            .collect();
-        let total: f32 = usable.iter().sum();
-        if usable.len() != count || total <= 0.0 {
-            return vec![1.0 / count.max(1) as f32; count];
-        }
-        usable.iter().map(|w| w / total).collect()
+        normalized_widths(&self.columns, count)
     }
 
     /// How many columns the table actually has: the widest row, or the header.
@@ -159,6 +215,29 @@ impl Table {
             .chain(self.rows.iter().map(|r| r.len()))
             .max()
             .unwrap_or(0)
+    }
+
+    /// This table as component instance fields (spec 0054).
+    ///
+    /// `Block::Table` keeps its authored shape — a `columns`/`header`/`rows` struct is a better
+    /// thing to write by hand than a field map — and converts here, so there is exactly one
+    /// measurement path and the bundled table is measured through the same interpreter a packed
+    /// component is.
+    pub fn to_fields(&self) -> ComponentFields {
+        let mut fields = ComponentFields::new();
+        if let Some(header) = &self.header {
+            fields.insert(
+                TABLE_FIELD_HEADER.into(),
+                FieldValue::Rows(vec![header.clone()]),
+            );
+        }
+        fields.insert(TABLE_FIELD_ROWS.into(), FieldValue::Rows(self.rows.clone()));
+        fields.insert(
+            TABLE_FIELD_COLUMNS.into(),
+            FieldValue::Widths(self.columns.clone()),
+        );
+        fields.insert(TABLE_FIELD_ZEBRA.into(), FieldValue::Flag(self.zebra));
+        fields
     }
 
     /// Render a [`RandomTable`] as a two-column table of die range and result.
