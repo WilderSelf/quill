@@ -6,15 +6,15 @@
 //! crates compile and the export pipeline has something to consume. Uses `quill-text-layout`
 //! for line breaking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod session;
 
 pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
-    Asset, Block, Color, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle,
-    Rect, StyleSheet, TextAlign, PAGE_TOKEN,
+    Asset, Block, BlockId, Color, Document, Margins, MasterPage, MasterStatic, PageSetup,
+    ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN,
 };
 use quill_text_layout::{justify_paragraph_hyphenated, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -125,6 +125,13 @@ fn image_size(asset: &Asset, content_width: f32) -> (f32, f32) {
 pub enum PlacedBlock {
     Text {
         frame: Rect,
+        /// The block this came from, or [`BlockId::UNASSIGNED`] for master furniture, which is not
+        /// content and has no identity (spec 0040).
+        ///
+        /// Placed geometry had no way back to the block that produced it, so "which page is this
+        /// heading on" — what a table of contents and a PDF bookmark both need — was unanswerable
+        /// from a `Vec<LaidOutPage>`.
+        source: BlockId,
         /// Broken lines, each carrying its inter-word justification adjustment (spec 0017 incr. 2).
         lines: Vec<Line>,
         color: Color,
@@ -137,6 +144,8 @@ pub enum PlacedBlock {
     },
     Image {
         frame: Rect,
+        /// See [`PlacedBlock::Text::source`].
+        source: BlockId,
         asset_id: String,
     },
     /// A filled and/or stroked rectangle — a rule, a border, a tinted panel (spec 0037).
@@ -181,6 +190,57 @@ pub struct LaidOutPage {
     /// art sits behind flowed content), and incremental relayout can leave it alone, since it does
     /// not depend on where the text happened to break.
     pub statics: Vec<PlacedBlock>,
+}
+
+/// One heading, and the page it landed on (spec 0040).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingEntry {
+    pub id: BlockId,
+    pub level: u8,
+    pub text: String,
+    /// Zero-based page index. A table of contents prints `page_index + 1`, the same one-based
+    /// number [`MasterStatic`]'s `{page}` token resolves to.
+    pub page_index: usize,
+}
+
+/// Which page each heading landed on, in document order.
+///
+/// Derived from the **laid-out pages** rather than accumulated during pagination, and that is the
+/// load-bearing decision. An incremental pass reuses whole pages from the previous layout
+/// (spec 0031), so an index built up as blocks were placed would be missing every heading on a
+/// reused page — and would be missing them precisely when the document had just been edited, which
+/// is always. Deriving it from the final page vector makes it correct by construction for the
+/// incremental path and the cold path alike, at the cost of one walk over the pages.
+///
+/// A heading appearing more than once in the page vector reports its **first** page. That cannot
+/// happen today, because a block is placed whole into one frame and never split (see the roadmap's
+/// known issues) — but a TOC entry and a bookmark both mean "where does this start", so the rule is
+/// stated here rather than left to depend on an invariant that is expected to change.
+///
+/// Master furniture is skipped: it carries [`BlockId::UNASSIGNED`] and is not content.
+pub fn heading_index(doc: &Document, pages: &[LaidOutPage]) -> Vec<HeadingEntry> {
+    let mut seen: BTreeSet<BlockId> = BTreeSet::new();
+    let mut out = Vec::new();
+    for page in pages {
+        for placed in &page.blocks {
+            let PlacedBlock::Text { source, .. } = placed else {
+                continue;
+            };
+            if !source.is_assigned() || !seen.insert(*source) {
+                continue;
+            }
+            let Some(Block::Heading { level, text, .. }) = doc.block(*source) else {
+                continue;
+            };
+            out.push(HeadingEntry {
+                id: *source,
+                level: *level,
+                text: text.clone(),
+                page_index: page.index,
+            });
+        }
+    }
+    out
 }
 
 /// Supplies the geometry and static content of each page.
@@ -325,6 +385,8 @@ impl PageTemplate for DocumentTemplate<'_> {
                         .unwrap_or_default();
                     PlacedBlock::Text {
                         frame: *rect,
+                        // Furniture is not content: it has no block, so no identity.
+                        source: BlockId::UNASSIGNED,
                         // Master furniture is a single line at a fixed position; it is not flowed,
                         // so it is not broken. A running head that overflows its rect is an
                         // authoring problem, and one that is visible on screen.
@@ -339,6 +401,7 @@ impl PageTemplate for DocumentTemplate<'_> {
                 }
                 MasterStatic::Image { rect, asset } => PlacedBlock::Image {
                     frame: *rect,
+                    source: BlockId::UNASSIGNED,
                     asset_id: asset.clone(),
                 },
             })
@@ -743,6 +806,7 @@ pub(crate) fn flow(
                     color,
                     style,
                 } => PlacedBlock::Text {
+                    source: block.id(),
                     // The frame starts *below* the style's space-above: that space belongs to this
                     // block's height (so pagination reserves it) but no text is drawn in it.
                     frame: Rect {
@@ -760,6 +824,7 @@ pub(crate) fn flow(
                     leading_pt: style.leading_pt,
                 },
                 Measured::Image { asset_id, width } => PlacedBlock::Image {
+                    source: block.id(),
                     frame: Rect {
                         x_pt: frame.rect.x_pt,
                         y_pt: y,
@@ -1570,6 +1635,7 @@ mod tests {
             PlacedBlock::Image {
                 asset_id: id,
                 frame,
+                ..
             } => {
                 assert_eq!(id, &asset_id);
                 assert!((frame.w_pt - 216.0).abs() < 0.01, "w = {}", frame.w_pt);
@@ -1759,6 +1825,7 @@ mod tests {
         }
         fn statics(&self, page_index: usize) -> Vec<PlacedBlock> {
             vec![PlacedBlock::Text {
+                source: BlockId::UNASSIGNED,
                 frame: Rect {
                     x_pt: 0.0,
                     y_pt: 620.0,
@@ -2352,6 +2419,87 @@ mod tests {
         assert_eq!(verso.len(), 2);
         assert!((verso[0].rect.x_pt - 40.0).abs() < 0.01);
         assert!((verso[0].rect.w_pt - 162.0).abs() < 0.01);
+    }
+
+    // --- Heading index (spec 0040) --------------------------------------------------------------
+
+    #[test]
+    fn the_heading_index_reports_document_order_and_the_right_pages() {
+        let mut doc = doc_with_blocks(vec![]);
+        doc.content
+            .push(Block::heading(1, "One", Color::Gray { v: 0.0 }));
+        doc.content.extend(many_lines(60));
+        doc.content
+            .push(Block::heading(2, "Two", Color::Gray { v: 0.0 }));
+        doc.content.extend(many_lines(60));
+        doc.content
+            .push(Block::heading(2, "Three", Color::Gray { v: 0.0 }));
+        doc.assign_missing_block_ids().expect("ids");
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let index = heading_index(&doc, &pages);
+
+        assert_eq!(
+            index.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["One", "Two", "Three"],
+            "document order, not page order"
+        );
+        assert_eq!(index.iter().map(|h| h.level).collect::<Vec<_>>(), [1, 2, 2]);
+        assert_eq!(index[0].page_index, 0);
+        assert!(
+            index[2].page_index >= index[1].page_index,
+            "page numbers must be non-decreasing"
+        );
+        // Every entry names a real heading block.
+        for h in &index {
+            assert!(matches!(doc.block(h.id), Some(Block::Heading { .. })));
+        }
+    }
+
+    #[test]
+    fn master_furniture_never_enters_the_heading_index() {
+        // A running head is text on a page and is not content. It carries `BlockId::UNASSIGNED`,
+        // and an index that included it would put the folio in the table of contents.
+        let master = MasterPage {
+            statics: vec![MasterStatic::Text {
+                rect: Rect {
+                    x_pt: 0.0,
+                    y_pt: 620.0,
+                    w_pt: 432.0,
+                    h_pt: 12.0,
+                },
+                text: "The Dungeon — {page}".into(),
+                color: Color::Gray { v: 0.0 },
+                style: Some("body".into()),
+            }],
+            ..MasterPage::plain("running-head")
+        };
+        let mut doc = doc_with_master(
+            master,
+            vec![Block::heading(1, "Only", Color::Gray { v: 0.0 })],
+        );
+        doc.assign_missing_block_ids().expect("ids");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(
+            !pages[0].statics.is_empty(),
+            "the fixture must have furniture"
+        );
+        assert_eq!(heading_index(&doc, &pages).len(), 1);
+    }
+
+    #[test]
+    fn an_empty_document_has_an_empty_heading_index() {
+        let doc = doc_with_blocks(vec![]);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(heading_index(&doc, &pages).is_empty());
+    }
+
+    #[test]
+    fn a_document_of_only_body_text_has_an_empty_heading_index() {
+        // The reuse direction: an index that reported every text block would pass the tests above.
+        let doc = doc_with_blocks(many_lines(20));
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(heading_index(&doc, &pages).is_empty());
     }
 
     #[test]

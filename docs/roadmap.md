@@ -16,7 +16,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0037 shipped |
+| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **in progress** — nine increments, specs 0035–0043, sequenced below; 0035–0037 and 0040 shipped |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
 
@@ -383,7 +383,10 @@ document. 0038 and 0039 are what connect it. 0043 is last in this chain because 
 importer is only worth writing once the things it would import can actually be laid out; writing the
 syntax first would mean designing it against types that do not exist.
 
-**Chain 3 — the TOC cycle must be broken by an explicit fixpoint, not by hoping.** A table of
+**Chain 3 — the TOC cycle must be broken by an explicit fixpoint, not by hoping.** (0040 was taken
+ahead of 0038/0039 in the build order: the chains are independent by construction, and 0040 is the
+milestone's smallest increment while 0038 is its largest, so shipping it first kept a clean boundary
+around the stat-block work rather than splitting it.) A table of
 contents lists page numbers, its own length changes where every subsequent page break falls, and
 that changes the page numbers it lists. Nothing in the engine can express this today: layout is a
 single forward pass and `LaidOutPage` carries no mapping back to the blocks that produced it, so

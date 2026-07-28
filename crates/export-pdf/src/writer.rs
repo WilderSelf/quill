@@ -340,6 +340,7 @@ fn render_page(
                 color,
                 font_size_pt,
                 leading_pt,
+                ..
             } => {
                 content.begin_text();
                 // Per-block size, from the style the layout engine measured with (spec 0028).
@@ -401,7 +402,9 @@ fn render_page(
                 };
                 content.restore_state();
             }
-            PlacedBlock::Image { frame, asset_id } => {
+            PlacedBlock::Image {
+                frame, asset_id, ..
+            } => {
                 if let Some(img) = images_by_id.get(asset_id) {
                     // Bottom-left of the image in PDF space, then scale the unit square to size.
                     let y_bottom = g.media_h - (g.off_y + frame.y_pt + frame.h_pt);
@@ -529,6 +532,7 @@ mod tests {
             index: 0,
             statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
+                source: quill_core_model::BlockId::UNASSIGNED,
                 frame: quill_core_model::Rect {
                     x_pt: 0.0,
                     y_pt: 0.0,
@@ -664,6 +668,7 @@ mod tests {
             index: 0,
             statics: Vec::new(),
             blocks: vec![PlacedBlock::Text {
+                source: quill_core_model::BlockId::UNASSIGNED,
                 frame: quill_core_model::Rect {
                     x_pt: 0.0,
                     y_pt: 0.0,
