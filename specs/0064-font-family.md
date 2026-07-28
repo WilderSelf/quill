@@ -57,7 +57,9 @@ pub struct RunFormat {
 }
 ```
 
-and `RunMetrics` gains one method beside `measure_run`:
+and `RunMetrics` gains one method beside `measure_run`. `natural_width` and `span_offsets`, the two
+helpers that place a broken line, measure through the same per-format segmentation, so the width a
+line was broken to is the width it is drawn at:
 
 ```rust
 fn measure_format(&self, text: &str, fmt: RunFormat) -> f32 {
@@ -141,7 +143,7 @@ pub struct FontFamily { /* one or more faces, each with its weight and slant */ 
 impl FontFamily {
     pub fn bundled() -> FontFamily;                       // the four shipped faces
     pub fn single(font: Font) -> FontFamily;              // a user-supplied program (spec 0004)
-    pub fn select(&self, weight: u16, italic: bool) -> Selection;
+    pub fn select(&self, want: FaceKey) -> Selection;   // FaceKey is a weight and a slant
 }
 ```
 
@@ -164,8 +166,7 @@ measures in the regular face exactly as `Font` does today (so every existing cal
 per glyph and not per character, because that is what a PDF `Tc` adds, and measuring by a different
 unit than the one the page is drawn with is the drift this workspace has one shaper to prevent.
 
-`text-layout` gains one shared helper, so the writer and the painter cannot disagree about where a
-span starts:
+`text-layout` gains one shared helper for where a span starts:
 
 ```rust
 pub fn span_offsets(line: &Line, formats: &[RunFormat], metrics: &impl RunMetrics) -> Vec<f32>
@@ -175,6 +176,12 @@ It accumulates each span's x from the widths of the spans before it, measuring *
 equal format as one string** — so a single-format line is measured exactly as one call on the whole
 prefix, which is what the screen painter does today, and a face change is measured either side of the
 boundary, which is what the breaker did.
+
+The screen painter uses it; the PDF writer does not, and deliberately: PDF advances the text position
+by the glyphs it is shown, so the writer's spans are placed by the file format rather than by a
+second measurement. The two therefore differ wherever a kern pair straddles a span boundary — which
+they already did, because the writer never applied kerning at all. That divergence is recorded in the
+roadmap's known issues with a measurement, rather than papered over here.
 
 ### The export embeds the faces it uses, and only those
 
@@ -267,5 +274,14 @@ swallow.
   different dependency.
 - **Small caps, drop caps, OpenType feature control.** All are run properties and all are downstream
   of this one, but none of them is a face selection.
+- **A format-aware greedy fallback.** When no feasible breaking exists — a word wider than the
+  measure that hyphenation cannot split — the breaker falls back to a greedy pass that measures at
+  the paragraph's size. That path is already producing lines that overflow; measuring them more
+  accurately would not stop them overflowing, and a second format-aware breaker for a case that is
+  already a failure is not worth its surface.
+- **Weight and slant on the styles a panel, a table or a declared component resolves.** Those are
+  placed by the component interpreter, which reads its own style names; they are set in the
+  paragraph face today, and the export subsets accordingly, so nothing renders as `.notdef`. Wiring
+  the interpreter through the family is where that belongs.
 - **Naming a run treatment.** `strong` and `emphasis` as *names* are spec 0065; this spec gives them
   something to resolve to.

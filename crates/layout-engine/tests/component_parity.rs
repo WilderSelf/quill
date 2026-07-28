@@ -67,6 +67,10 @@ fn digest_geometry(pages: &[LaidOutPage]) -> u64 {
 }
 
 /// Remove every `name: value` scalar field, plus the `, ` that separated it from the next.
+///
+/// Textual, like `regex_free_strip` above, and sound for the same reason: the corpus is fixed and
+/// contains no body text spelling a field name. A fixture that did would be caught immediately —
+/// the geometry digest would move against a constant that has not moved since spec 0060.
 fn strip_scalar(text: &str, name: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;

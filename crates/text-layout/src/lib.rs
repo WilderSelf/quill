@@ -720,6 +720,11 @@ pub fn break_runs_shrinkable(
     // A macro rather than a closure: the boxes borrow from a local `String`, whose lifetime has no
     // name to give a closure's argument. Two call sites, one measurement — the duplication a helper
     // would have removed is exactly the drift a helper exists to prevent.
+    // The format of the last box pushed. An inter-word space is *reconstructed* into the span of the
+    // box before it (there is no separate span for a character nobody authored), so it must be
+    // *measured* in that box's format too — measuring it in the format of the byte it occupies would
+    // have the breaker and the writer disagree about the width of every space at a face change.
+    let mut last_fmt = fmts.at(0);
     macro_rules! push_boxes {
         ($seg:expr, $at:expr) => {{
             // A box that straddled a face change would be measured entirely in one of the two, and
@@ -727,18 +732,20 @@ pub fn break_runs_shrinkable(
             // with no glue or penalty between them are not a break opportunity, so splitting here
             // adds no legal break.
             for (piece, off) in fmts.split($seg, $at) {
+                let fmt = fmts.at(off);
                 items.push(Item::Boxed {
                     text: piece,
-                    width: metrics.measure_format(piece, fmts.at(off)),
+                    width: metrics.measure_format(piece, fmt),
                     at: off,
                 });
+                last_fmt = fmt;
             }
         }};
     }
     for (wi, &(word, word_at)) in words.iter().enumerate() {
         if wi > 0 {
-            // The separator's own byte, so the space measures in the run it belongs to.
-            let g = metrics.measure_format(" ", fmts.at(word_at.saturating_sub(1)));
+            // Measured in the format of the box before it — see `last_fmt`.
+            let g = metrics.measure_format(" ", last_fmt);
             items.push(Item::Glue {
                 width: g,
                 stretch: g / 2.0,
@@ -753,8 +760,10 @@ pub fn break_runs_shrinkable(
             }
             let seg = &word[prev..off];
             push_boxes!(seg, word_at + prev);
+            // Likewise the discretionary hyphen: it is drawn in the face of the segment it ends,
+            // and reconstructed into that segment's span.
             items.push(Item::Penalty {
-                hyphen_w: metrics.measure_format("-", fmts.at(word_at + off - 1)),
+                hyphen_w: metrics.measure_format("-", last_fmt),
             });
             prev = off;
         }
@@ -1023,6 +1032,11 @@ pub fn break_runs_shrinkable(
         // Greedy fallback (an over-wide, unbreakable word). Its lines are rebuilt from the source
         // text, so their spans are recovered by walking the same cursor the reconstruction below
         // uses — the fallback is rare but must not lose the run map.
+        // Measured at the paragraph's size rather than per format: this path exists only when some
+        // word is wider than the measure however it is broken, so its lines already overflow and a
+        // more accurate width would not change that. Making it format-aware is a second breaker for
+        // a case that is already a failure, and is named as a non-goal in spec 0064 rather than
+        // half-built here.
         let mut cursor = 0usize;
         return break_by_width(text, rest_width_pt.min(first_width_pt), size_pt, metrics)
             .into_iter()
@@ -2534,6 +2548,35 @@ mod format_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_space_between_two_faces_is_measured_where_it_is_drawn() {
+        // The breaker measures an inter-word space once; the writer and the painter measure it again
+        // when they place the span after it. Both have to pick the *same* run's format, or a space
+        // at a face change is one width in the line breaker and another on the page — which is a
+        // line drawn past its measure by exactly that difference.
+        let runs = ["Alpha", " beta"];
+        let formats = [at(24.0), at(10.0)];
+        let lines = justify_runs_indented(
+            &runs,
+            &formats,
+            1000.0,
+            Indent::default(),
+            10.0,
+            Alignment::Left,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(lines.len(), 1);
+        let drawn = natural_width(&lines[0].text, &lines[0].spans, &formats, at(10.0), &MONO);
+        // What the breaker put in the item stream: five 14.4 pt boxes, one space in the *first*
+        // run's format, four 6 pt boxes.
+        let measured = 5.0 * 14.4 + 14.4 + 4.0 * 6.0;
+        assert!(
+            (drawn - measured).abs() < 0.001,
+            "breaker measured {measured}, drawn {drawn}"
+        );
     }
 
     #[test]

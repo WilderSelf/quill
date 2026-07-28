@@ -463,7 +463,18 @@ impl PageTemplate for DocumentTemplate<'_> {
                         // The placed frame is narrowed to the line it holds, so it reports where the
                         // text *is* rather than the box it was aligned in — which is what a geometry
                         // preflight over placed content has to ask.
-                        let line_w = metrics.measure_run(&resolved, ps.font_size_pt);
+                        // Measured in the face the static is drawn in (spec 0064): a bold running
+                        // head measured regular would be aligned to a width it does not have, and
+                        // would report that width to a geometry preflight.
+                        let line_w = metrics.measure_format(
+                            &resolved,
+                            RunFormat {
+                                size_pt: ps.font_size_pt,
+                                weight: ps.weight.0,
+                                italic: ps.italic,
+                                tracking_pt: 0.0,
+                            },
+                        );
                         let x_pt =
                             align.x_for(rect, line_w, page_index, self.page_setup.facing_pages);
                         PlacedBlock::Text {
@@ -1054,10 +1065,12 @@ fn run_inks(runs: &[quill_core_model::Run], paragraph: Color) -> Vec<Color> {
 
 /// Each run's resolved format: its own overrides folded onto the paragraph's treatment (spec 0064).
 ///
-/// Empty when every run resolves to the paragraph's own format, which is every document that names
-/// no override. That emptiness is load-bearing: the breaker, the writer and the painter all take
-/// their pre-family path when there is one format, so those documents lay out and export byte for
-/// byte as they did.
+/// Empty when every run resolves to the breaker's own default — regular, upright, untracked, at the
+/// paragraph's size — which is every document that names no override anywhere, on the style or on a
+/// run. That emptiness is load-bearing: the breaker, the writer and the painter all take their
+/// pre-family path when there is one format, so those documents lay out and export byte for byte as
+/// they did. It is emptiness against *the default*, not against the paragraph: a bold paragraph
+/// style is a format the breaker has to be told about.
 fn run_formats(runs: &[quill_core_model::Run], style: &ParagraphStyle) -> Vec<RunFormat> {
     let paragraph = RunFormat {
         size_pt: style.font_size_pt,
@@ -1074,7 +1087,12 @@ fn run_formats(runs: &[quill_core_model::Run], style: &ParagraphStyle) -> Vec<Ru
             tracking_pt: r.style.tracking_pt.unwrap_or(0.0),
         })
         .collect();
-    if formats.iter().all(|f| *f == paragraph) {
+    // Empty means "the breaker's own default", which is regular, upright and untracked at the
+    // paragraph's size — *not* "the paragraph's format". A bold paragraph style must therefore be
+    // spelled out, or the line would be measured regular and drawn bold, which is a line drawn past
+    // its measure with nothing to catch it.
+    if paragraph == RunFormat::plain(style.font_size_pt) && formats.iter().all(|f| *f == paragraph)
+    {
         return Vec::new();
     }
     formats
@@ -6094,5 +6112,47 @@ mod tests {
                 other => panic!("expected an image static, got {other:?}"),
             }
         }
+    }
+
+    /// Spec 0064, and the third face of the same defect: a paragraph *style* that is bold must reach
+    /// the breaker.
+    ///
+    /// `run_formats` is empty when every run resolves to the breaker's own default — regular,
+    /// upright, untracked. It is *not* empty merely because every run matches the paragraph: a bold
+    /// paragraph style with plain runs still has a format the breaker has to be told about, or the
+    /// line is measured regular and drawn bold, and a line drawn wider than it was measured is
+    /// exactly what spec 0060 forbids.
+    #[test]
+    fn a_bold_paragraph_style_reaches_the_breaker() {
+        use quill_core_model::{Run, Weight};
+
+        let plain = quill_core_model::ParagraphStyle::default();
+        let bold = quill_core_model::ParagraphStyle {
+            weight: Weight::BOLD,
+            ..plain
+        };
+        let runs = vec![Run::plain(
+            "the vault door had not opened in three hundred years",
+        )];
+
+        assert!(
+            run_formats(&runs, &plain).is_empty(),
+            "a regular paragraph of plain runs takes the pre-family path"
+        );
+        let formats = run_formats(&runs, &bold);
+        assert_eq!(
+            formats,
+            vec![RunFormat {
+                size_pt: bold.font_size_pt,
+                weight: 700,
+                italic: false,
+                tracking_pt: 0.0,
+            }],
+            "a bold paragraph style must be spelled out for the breaker"
+        );
+
+        // That the bold format then *measures* wider is `quill-fonts`' claim, asserted there
+        // (`a_run_measures_in_the_face_it_names`) — this crate is generic over `RunMetrics` and
+        // names no font, which is the property that keeps it testable with a monospace stub.
     }
 }

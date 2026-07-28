@@ -803,8 +803,8 @@ pub fn preflight_pages(
 /// go into **every** used bucket rather than being attributed to a face nobody can select. A
 /// slightly larger subset is a cost; a `.notdef` in a press file is a defect.
 ///
-/// A document that names no weight or slant produces exactly one bucket holding exactly what
-/// the whole document's characters in one bucket, which is what keeps its export byte-identical.
+/// A document that names no weight or slant produces exactly one bucket, holding the whole
+/// document's characters — which is what keeps its export byte-identical.
 fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
     let mut out: BTreeMap<FaceKey, BTreeSet<char>> = BTreeMap::new();
     // Everything not attributable to one face, plus the two characters the breaker can synthesize
@@ -812,6 +812,7 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
     let mut everywhere: BTreeSet<char> = BTreeSet::new();
     everywhere.insert(' ');
     everywhere.insert('-');
+    let mut draws_unattributed_text = false;
 
     for block in &doc.content {
         match block {
@@ -835,11 +836,19 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, BTreeSet<char>> {
             | Block::Toc { .. }
             | Block::Component { .. } => {
                 everywhere.extend(other_block_chars(block));
+                draws_unattributed_text = true;
             }
             Block::Image { .. } => {}
         }
     }
 
+    // A panel, a table, a contents entry and a list marker are all placed in the *regular* face by
+    // the layout engine, whatever their paragraph style says, so the regular face has to be embedded
+    // whenever any of them is drawn — otherwise a document whose only body style is bold embeds one
+    // program and draws its tables from it.
+    if draws_unattributed_text {
+        out.entry(FaceKey::REGULAR).or_default();
+    }
     if out.is_empty() {
         out.insert(FaceKey::REGULAR, BTreeSet::new());
     }
@@ -2073,6 +2082,87 @@ mod tests {
             1,
             "one face was supplied, so one program is embedded"
         );
+    }
+
+    /// Spec 0064, and the defect an adversarial review of it found: a bold run long enough to fill
+    /// whole lines must be *drawn* from the bold subset, not merely embedded alongside it.
+    ///
+    /// The failure was a uniformity test that compared a line's spans to each other rather than to
+    /// the block's own face: an interior line of a long bold run is uniform — uniformly bold — so it
+    /// took the fast path and was encoded with glyph ids cut from the regular subset. Every one of
+    /// those glyphs drew as `.notdef`. Counted here, because "some text is wrong" is not a
+    /// condition a reader of a press file can be expected to notice.
+    #[test]
+    fn a_bold_run_that_fills_whole_lines_draws_no_notdef() {
+        let long = "the vault door had not opened in three hundred years and the dust on its \
+                    hinges had gone to stone before anyone reached for a tool at all";
+        let mut doc = Document::sample();
+        doc.content.push(quill_core_model::Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("lead in "),
+                quill_core_model::Run {
+                    text: long.into(),
+                    style: quill_core_model::InlineStyle {
+                        weight: Some(quill_core_model::Weight::BOLD),
+                        ..quill_core_model::InlineStyle::EMPTY
+                    },
+                },
+                quill_core_model::Run::plain(" and a tail"),
+            ],
+            Color::Gray { v: 0.0 },
+        ));
+
+        let (opts, icc) = opts_with_real_icc("boldlines");
+        let mut buf = Vec::new();
+        export(&doc, &opts, &mut buf).expect("export");
+        let _ = std::fs::remove_file(&icc);
+
+        // Every glyph the content stream shows, and how many of them are `.notdef` (gid 0). The
+        // streams are uncompressed only in `render_page`, so this walks the placed pages instead
+        // and asks the same question of the same encoder the writer uses.
+        let pages = lay_out_for_press(&doc, &opts).expect("layout");
+        let faces = collect_doc_faces(&doc);
+        let family = build_family(&opts, &faces).expect("family");
+        let mut glyphs = 0usize;
+        let mut notdef = 0usize;
+        for page in &pages {
+            for block in page.statics.iter().chain(page.blocks.iter()) {
+                let PlacedBlock::Text {
+                    lines,
+                    run_formats,
+                    weight,
+                    italic,
+                    font_size_pt,
+                    ..
+                } = block
+                else {
+                    continue;
+                };
+                let base = quill_text_layout::RunFormat {
+                    size_pt: *font_size_pt,
+                    weight: *weight,
+                    italic: *italic,
+                    tracking_pt: 0.0,
+                };
+                for line in lines {
+                    let mut at = 0usize;
+                    for sp in &line.spans {
+                        let end = (at + sp.len_bytes).min(line.text.len());
+                        let fmt = run_formats.get(sp.run).copied().unwrap_or(base);
+                        let font = family.font(family.slot(fonts::face_of(fmt)));
+                        for gid in font.encode_line(&line.text[at..end]).chunks(2) {
+                            glyphs += 1;
+                            if gid == [0, 0] {
+                                notdef += 1;
+                            }
+                        }
+                        at = end;
+                    }
+                }
+            }
+        }
+        assert!(glyphs > 200, "sanity: only {glyphs} glyphs drawn");
+        assert_eq!(notdef, 0, "{notdef} of {glyphs} glyphs drew as .notdef");
     }
 
     /// Spec 0004: a user-supplied `font_path` is embedded instead of the bundled default, with a

@@ -211,116 +211,185 @@ pub fn import(source: &str, template: &Template) -> Result<Imported, ImportError
 /// `#`-count for a heading line, or `None`.
 /// Split authored text into runs at `**bold**` and `*italic*` delimiters (spec 0064).
 ///
-/// A hand-rolled scanner, for the reason the whole importer is hand-rolled: the supported set has
-/// to be enumerable. It knows exactly two delimiters, each in two spellings, and it nests them.
+/// Hand-rolled, for the reason the whole importer is hand-rolled: the supported set has to be
+/// enumerable. It knows exactly two delimiters, each in two spellings, and it nests them.
 ///
-/// Three rules keep it from eating text that was never emphasis, and all three are the ones a
-/// reader already expects:
+/// **Two passes, because one cannot be correct.** A single left-to-right scan has to decide whether
+/// a delimiter opens at the moment it sees it, and the only evidence available then is "some later
+/// delimiter could close this" — which pairs the wrong two. In `2*d6 for a *big* hit` it pairs the
+/// `*` in `2*d6` with the one before `big`, consuming both and emphasising nothing a reader asked
+/// for. So the delimiters are collected first, then matched **closer to nearest opener**, which is
+/// the rule that makes `*big*` the pair and leaves `2*d6` alone.
 ///
-/// - **A delimiter only opens if it is closed later.** `**bold` with no close is a paragraph about
-///   asterisks, not an unterminated error and not a swallowed line — the same posture the rest of
-///   this importer takes toward input it cannot honour.
+/// Three rules decide what may pair at all, and all three are ones a reader already expects:
+///
 /// - **An opener is followed by text and a closer is preceded by it.** That is what keeps
-///   `2 * 3 * 4` arithmetic instead of italicising ` 3 `.
-/// - **`_` does not work inside a word.** `snake_case_word` is an identifier. `*` still does, so
-///   `un*frozen*` remains available for the case that wants it.
+///   `2 * 3 * 4` arithmetic.
+/// - **`_` does not work inside a word.** `snake_case_word` is an identifier and `café_x` is a
+///   word. `*` still does, so `un*frozen*` remains available.
+/// - **A pair is the same character.** `_a*` opens nothing: `*` cannot close what `_` opened.
+///
+/// Anything left unmatched is literal text — not an error, and never silently dropped, which is the
+/// posture the rest of this importer takes toward input it cannot honour.
 fn emphasis(text: &str) -> Vec<Run> {
-    let b = text.as_bytes();
+    let delims = scan_delimiters(text);
+    let pairs = match_delimiters(&delims);
+    build_runs(text, &delims, &pairs)
+}
 
-    // The delimiter run starting at `i`, as (byte, length).
-    let delim_at = |i: usize| -> Option<(u8, usize)> {
-        let c = *b.get(i)?;
-        if c != b'*' && c != b'_' {
-            return None;
+/// A maximal run of one delimiter character, with whether it may open and may close.
+#[derive(Debug, Clone, Copy)]
+struct Delim {
+    at: usize,
+    len: usize,
+    ch: char,
+    can_open: bool,
+    can_close: bool,
+}
+
+fn scan_delimiters(text: &str) -> Vec<Delim> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (at, ch) = chars[i];
+        if ch != '*' && ch != '_' {
+            i += 1;
+            continue;
         }
-        Some((c, b[i..].iter().take_while(|x| **x == c).count()))
-    };
-    let alnum = |i: Option<usize>| i.is_some_and(|i| b[i].is_ascii_alphanumeric());
-    let space = |i: Option<usize>| i.is_none_or(|i| b[i].is_ascii_whitespace());
-    let after = |i: usize, run: usize| (i + run < b.len()).then_some(i + run);
-    let can_open = |i: usize, c: u8, run: usize| {
-        !(space(after(i, run)) || c == b'_' && alnum(i.checked_sub(1)))
-    };
-    let can_close = |i: usize, c: u8, run: usize| {
-        !(space(i.checked_sub(1)) || c == b'_' && alnum(after(i, run)))
-    };
-    // Whether a valid closer of `width` exists after `from`.
-    let closes = |from: usize, c: u8, width: usize| {
-        let mut i = from;
-        while i < b.len() {
-            match delim_at(i) {
-                Some((d, run)) if d == c && run >= width && can_close(i, c, run) => return true,
-                Some((_, run)) => i += run,
-                None => i += 1,
+        let mut j = i;
+        while j < chars.len() && chars[j].1 == ch {
+            j += 1;
+        }
+        let before = i.checked_sub(1).map(|k| chars[k].1);
+        let after = chars.get(j).map(|(_, c)| *c);
+        // Flanking: an opener needs text after it, a closer needs text before it. `_` additionally
+        // refuses to work inside a word, which is what protects identifiers and `café_x`.
+        let open_flank = after.is_some_and(|c| !c.is_whitespace());
+        let close_flank = before.is_some_and(|c| !c.is_whitespace());
+        let intraword_ok = |side: Option<char>| !side.is_some_and(char::is_alphanumeric);
+        out.push(Delim {
+            at,
+            len: j - i,
+            ch,
+            can_open: open_flank && (ch == '*' || intraword_ok(before)),
+            can_close: close_flank && (ch == '*' || intraword_ok(after)),
+        });
+        i = j;
+    }
+    out
+}
+
+/// What a matched pair does: `(opener index, closer index, characters used)`.
+type Pair = (usize, usize, usize);
+
+/// Match closers to the nearest compatible opener, consuming one or two characters per pair.
+fn match_delimiters(delims: &[Delim]) -> Vec<Pair> {
+    let mut left: Vec<usize> = delims.iter().map(|d| d.len).collect();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut pairs: Vec<Pair> = Vec::new();
+    for (i, d) in delims.iter().enumerate() {
+        if d.can_close {
+            while left[i] > 0 {
+                let Some(k) = stack
+                    .iter()
+                    .rposition(|&j| delims[j].ch == d.ch && left[j] > 0)
+                else {
+                    break;
+                };
+                let j = stack[k];
+                // Two characters make a strong pair, one an emphasis pair — the greedy choice, so
+                // `***x***` is bold italic rather than three nested emphases.
+                let used = left[i].min(left[j]).min(2);
+                left[i] -= used;
+                left[j] -= used;
+                pairs.push((j, i, used));
+                // Everything opened after the opener we just matched can no longer be closed: its
+                // closer would have to cross this pair.
+                stack.truncate(k + if left[j] > 0 { 1 } else { 0 });
             }
         }
-        false
-    };
+        if d.can_open && left[i] > 0 {
+            stack.push(i);
+        }
+    }
+    pairs
+}
+
+/// Walk the text, applying the matched pairs, and emit one run per stretch of constant emphasis.
+///
+/// A delimiter run can be partly consumed — `**a*` matches one character and leaves one — so each
+/// run is split into "characters used as a closer", "characters nobody matched", and "characters
+/// used as an opener", in that order. The unmatched middle is literal text, which is what keeps a
+/// stray asterisk on the page.
+fn build_runs(text: &str, delims: &[Delim], pairs: &[Pair]) -> Vec<Run> {
+    let mut consumed: std::collections::BTreeMap<usize, (i32, i32)> =
+        std::collections::BTreeMap::new();
+    for &(o, c, used) in pairs {
+        consumed.entry(delims[o].at).or_insert((0, 0)).0 += used as i32;
+        consumed.entry(delims[c].at).or_insert((0, 0)).1 += used as i32;
+    }
+    let by_offset: std::collections::BTreeMap<usize, Delim> =
+        delims.iter().map(|d| (d.at, *d)).collect();
 
     let mut runs: Vec<Run> = Vec::new();
     let mut buf = String::new();
-    let mut bold = false;
-    let mut italic = false;
+    let mut bold = 0i32;
+    let mut italic = 0i32;
+    let flush = |buf: &mut String, bold: i32, italic: i32, runs: &mut Vec<Run>| {
+        if buf.is_empty() {
+            return;
+        }
+        runs.push(Run {
+            text: std::mem::take(buf),
+            style: InlineStyle {
+                weight: (bold > 0).then_some(Weight::BOLD),
+                italic: (italic > 0).then_some(true),
+                ..InlineStyle::EMPTY
+            },
+        });
+    };
+
     let mut i = 0usize;
-
-    // Flush what has accumulated under the *current* emphasis state.
-    macro_rules! flush {
-        () => {
-            if !buf.is_empty() {
-                let style = InlineStyle {
-                    weight: bold.then_some(Weight::BOLD),
-                    italic: italic.then_some(true),
-                    ..InlineStyle::EMPTY
-                };
-                runs.push(Run {
-                    text: std::mem::take(&mut buf),
-                    style,
-                });
+    while i < text.len() {
+        if let Some(d) = by_offset.get(&i) {
+            let (opened, closed) = consumed.get(&i).copied().unwrap_or((0, 0));
+            let literal = d.len as i32 - opened - closed;
+            if closed > 0 {
+                flush(&mut buf, bold, italic, &mut runs);
+                apply(&mut bold, &mut italic, closed, -1);
             }
-        };
-    }
-
-    while i < b.len() {
-        let Some((c, run)) = delim_at(i) else {
-            let ch = text[i..].chars().next().expect("byte index is a boundary");
-            buf.push(ch);
-            i += ch.len_utf8();
-            continue;
-        };
-        // `***` is both at once; anything longer is treated as bold plus italic and then literal.
-        let width = run.min(2);
-        let double = width == 2;
-        let inside = if double { bold } else { italic };
-        if inside && can_close(i, c, run) {
-            flush!();
-            if double {
-                bold = false;
-            } else {
-                italic = false;
+            for _ in 0..literal.max(0) {
+                buf.push(d.ch);
             }
-            i += width;
+            if opened > 0 {
+                flush(&mut buf, bold, italic, &mut runs);
+                apply(&mut bold, &mut italic, opened, 1);
+            }
+            i += d.len * d.ch.len_utf8();
             continue;
         }
-        if !inside && can_open(i, c, width) && closes(i + width, c, width) {
-            flush!();
-            if double {
-                bold = true;
-            } else {
-                italic = true;
-            }
-            i += width;
-            continue;
-        }
-        // Literal: one delimiter character, then round again — a `**` that could not open may still
-        // contain a `*` that can.
-        buf.push(c as char);
-        i += 1;
+        let ch = text[i..].chars().next().expect("byte index is a boundary");
+        buf.push(ch);
+        i += ch.len_utf8();
     }
-    flush!();
+    flush(&mut buf, bold, italic, &mut runs);
     if runs.is_empty() {
         runs.push(Run::plain(text));
     }
     runs
+}
+
+/// Turn `n` consumed characters into emphasis levels: two make a strong, one an emphasis.
+fn apply(bold: &mut i32, italic: &mut i32, consumed: i32, sign: i32) {
+    let mut left = consumed;
+    while left >= 2 {
+        *bold += sign;
+        left -= 2;
+    }
+    if left == 1 {
+        *italic += sign;
+    }
 }
 
 fn heading_level(line: &str) -> Option<u8> {
@@ -900,5 +969,81 @@ max_level: 3
         };
         assert_eq!(runs.len(), 1);
         assert!(runs[0].style.is_empty());
+    }
+
+    /// Every one of these was measured losing *ordinary* characters under the first, one-pass
+    /// version of the scanner, which decided that a delimiter opened as soon as any later delimiter
+    /// could close it — so `2*3` inside a paragraph became `23`.
+    ///
+    /// A matched delimiter is legitimately consumed; nothing else may be. The check is therefore on
+    /// the text with its delimiters removed, which is exactly "did any real character vanish".
+    #[test]
+    fn no_input_loses_a_character_to_the_emphasis_scanner() {
+        let cases = [
+            "the _damage die_ is 2*d6 for a *big* hit",
+            "**bold with a 2*3 inside**",
+            "_multiply 2*3 here_",
+            "_*a*_",
+            "*_a_*",
+            "a * b * c",
+            "***",
+            "****",
+            "**a*",
+            "*a**",
+            "_a*b_",
+            "café_x_ and cafe_x_",
+            "2*3*4",
+            "a**b**c",
+        ];
+        for source in cases {
+            let doc = import(source, tpl()).expect("imports").document;
+            let Block::Body { runs, .. } = &doc.content[0] else {
+                panic!("expected a body paragraph for {source:?}")
+            };
+            let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+            let strip = |s: &str| s.replace(['*', '_'], "");
+            assert_eq!(
+                strip(&joined),
+                strip(source),
+                "a real character vanished from {source:?} (got {joined:?})"
+            );
+        }
+    }
+
+    /// The pairing rule, stated as outcomes rather than as an algorithm: a closer takes the
+    /// *nearest* opener, which is what leaves an unrelated earlier delimiter alone.
+    #[test]
+    fn a_closer_pairs_with_the_nearest_opener() {
+        let doc = import("the 2*d6 for a *big* hit", tpl())
+            .expect("imports")
+            .document;
+        let Block::Body { runs, .. } = &doc.content[0] else {
+            panic!("expected a body paragraph")
+        };
+        let emphasised: Vec<&str> = runs
+            .iter()
+            .filter(|r| r.style.italic == Some(true))
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(emphasised, ["big"], "the wrong pair was matched");
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            joined, "the 2*d6 for a big hit",
+            "only the pair is consumed"
+        );
+    }
+
+    #[test]
+    fn one_delimiter_cannot_close_another_kind() {
+        // `*` must not close what `_` opened, or `_a*` would emphasise and eat both. (`_a* b_`
+        // *does* emphasise, and correctly: the two underscores are the pair, and the `*` inside is
+        // ordinary text.)
+        let doc = import("_a* b", tpl()).expect("imports").document;
+        let Block::Body { runs, .. } = &doc.content[0] else {
+            panic!("expected a body paragraph")
+        };
+        assert!(runs.iter().all(|r| r.style.is_empty()));
+        let joined: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "_a* b");
     }
 }

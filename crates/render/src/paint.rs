@@ -93,16 +93,36 @@ pub enum PaintOp {
 ///
 /// Colours are `f32` and so not `Eq`; compared by debug form, as the writer does, so the two
 /// painters cannot disagree about whether a line needs splitting.
-fn line_is_one_format(
+/// The one format this line is set in, or `None` if its spans disagree (spec 0064).
+///
+/// Against the line's own spans and defaulting to `base`, not against `base` itself: a run long
+/// enough to fill a line makes every interior line of it uniformly bold, and painting those lines in
+/// the block's face would paint a bold paragraph regular from its second line on.
+fn line_format(
     line: &quill_text_layout::Line,
     run_formats: &[quill_text_layout::RunFormat],
-) -> bool {
-    if run_formats.is_empty() {
-        return true;
+    base: quill_text_layout::RunFormat,
+) -> Option<quill_text_layout::RunFormat> {
+    if run_formats.is_empty() || line.spans.is_empty() {
+        return Some(base);
     }
-    let mut fmts = line.spans.iter().map(|sp| run_formats.get(sp.run));
-    let first = fmts.next().flatten();
-    fmts.all(|f| f == first)
+    let first = run_formats.get(line.spans[0].run).copied().unwrap_or(base);
+    line.spans
+        .iter()
+        .all(|sp| run_formats.get(sp.run).copied().unwrap_or(base) == first)
+        .then_some(first)
+}
+
+/// The one baseline shift this line is set at, or `None` if its spans disagree.
+fn line_shift(line: &quill_text_layout::Line, run_shifts: &[f32]) -> Option<f32> {
+    if run_shifts.is_empty() || line.spans.is_empty() {
+        return Some(0.0);
+    }
+    let first = run_shifts.get(line.spans[0].run).copied().unwrap_or(0.0);
+    line.spans
+        .iter()
+        .all(|sp| run_shifts.get(sp.run).copied().unwrap_or(0.0) == first)
+        .then_some(first)
 }
 
 fn line_is_one_ink(line: &quill_text_layout::Line, run_colors: &[quill_core_model::Color]) -> bool {
@@ -168,9 +188,11 @@ pub fn paint_page(
                     // One op per line unless the line's runs really are set in different inks
                     // (spec 0063). The single-ink path is the one every existing document takes,
                     // and it must stay exactly what it was.
-                    if (run_colors.is_empty() || line_is_one_ink(line, run_colors))
-                        && line_is_one_format(line, run_formats)
-                    {
+                    let uniform = (run_colors.is_empty() || line_is_one_ink(line, run_colors))
+                        .then_some(())
+                        .and(line_format(line, run_formats, base))
+                        .zip(line_shift(line, run_shifts));
+                    if let Some((fmt, shift)) = uniform {
                         ops.push(PaintOp::Text {
                             // A line's own left inset (spec 0048), added here and in the PDF writer
                             // from the same field, so the two derivation sites cannot disagree about
@@ -178,20 +200,16 @@ pub fn paint_page(
                             x_pt: x0,
                             baseline_pt,
                             text: line.text.clone(),
-                            size_pt: base.size_pt,
+                            size_pt: fmt.size_pt,
                             space_adjust_pt: line.space_adjust_pt,
                             rgb,
-                            weight: base.weight,
-                            italic: base.italic,
-                            tracking_pt: 0.0,
-                            baseline_shift_pt: 0.0,
+                            weight: fmt.weight,
+                            italic: fmt.italic,
+                            tracking_pt: fmt.tracking_pt,
+                            baseline_shift_pt: shift,
                         });
                         continue;
                     }
-                    // A span starts where everything before it ends: its natural width plus the
-                    // justification already spent on the spaces behind it. That is the same
-                    // accumulation the writer's `TJ` array performs, from the same metrics, which
-                    // is what keeps screen and press from disagreeing about where a run begins.
                     // Where each span starts, from the shared helper the PDF writer's own
                     // advance is measured against (spec 0064) — one derivation, so the screen and
                     // the page cannot disagree about where a run begins.
@@ -598,5 +616,63 @@ mod tests {
         assert!(ops
             .iter()
             .any(|op| matches!(op, PaintOp::Text { rgb, .. } if *rgb == [0, 0, 0])));
+    }
+
+    /// The screen half of the same defect the PDF writer had: a line lying wholly inside a bold run
+    /// is uniform, and painting it in the *block's* face would paint every interior line of a long
+    /// bold run regular — with the page drawing it bold.
+    #[test]
+    fn a_line_inside_a_bold_run_is_painted_bold() {
+        use quill_text_layout::{Line, RunFormat, Span};
+
+        let span = |run: usize, len: usize| Span {
+            run,
+            len_bytes: len,
+        };
+        let line = |text: &str, run: usize| Line {
+            text: text.into(),
+            spans: vec![span(run, text.len())],
+            space_adjust_pt: 0.0,
+            indent_pt: 0.0,
+        };
+        let (mut page, geom, family) = sample_page();
+        page.blocks = vec![PlacedBlock::Text {
+            source: quill_core_model::BlockId::UNASSIGNED,
+            frame: quill_core_model::Rect {
+                x_pt: 0.0,
+                y_pt: 0.0,
+                w_pt: 300.0,
+                h_pt: 36.0,
+            },
+            lines: vec![line("abc", 0), line("def", 1), line("gh", 2)],
+            color: quill_core_model::Color::Gray { v: 0.0 },
+            run_colors: Vec::new(),
+            run_formats: vec![
+                RunFormat::plain(10.0),
+                RunFormat {
+                    size_pt: 10.0,
+                    weight: 700,
+                    italic: false,
+                    tracking_pt: 0.0,
+                },
+                RunFormat::plain(10.0),
+            ],
+            run_shifts: Vec::new(),
+            weight: 400,
+            italic: false,
+            font_size_pt: 10.0,
+            leading_pt: 12.0,
+        }];
+        page.statics.clear();
+
+        let ops = paint_page(&page, &geom, &family, &ProxyCache::new());
+        let weights: Vec<u16> = ops
+            .iter()
+            .filter_map(|op| match op {
+                PaintOp::Text { weight, .. } => Some(*weight),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(weights, vec![400, 700, 400], "ops: {ops:?}");
     }
 }

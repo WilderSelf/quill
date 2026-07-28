@@ -74,8 +74,14 @@ us_per_paragraph = 70.0
 # Spec 0064's mixed-face pass over the same corpus, as a multiple of the single-face pass above.
 # Measured 1.4-1.6x: three runs per paragraph means the item stream is built with a per-boundary
 # glue and hyphen measurement and two extra split boxes, and each of the three formats shapes in its
-# own face. Pinned at 2.5 — the gate is there to catch a *class* of regression (a per-box face
-# lookup that reparses a font, say), not to police a tenth of a multiple.
+# own face. Pinned at 2.5 — the gate is there to catch a *class* of regression (a per-box split that
+# became quadratic, say), not to police a tenth of a multiple.
+#
+# What it cannot catch: this bench measures through the font-free monospace stub, like every other
+# entry here, so the cost of `FontFamily::select` and of shaping in a second face is invisible to
+# it. This budget covers the breaker's own arithmetic; a font-level regression needs a font-level
+# bench, which the harness deliberately does not have (a font lookup is not identical across
+# machines, and the digest discipline this file rests on requires that it is).
 mixed_face_ratio = 2.5
 # An 8x longer paragraph. **Was 35.8x — superlinear, the defect spec 0051 closed. Now 8.1-8.9x**
 # (same machine: 34.2x before the fix, 8.3x after), i.e. linear to within measurement noise, which

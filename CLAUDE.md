@@ -133,13 +133,13 @@ an index, a book) → **M7** graphics and colour.
 (lists) have shipped; 0065 (character styles) and 0067 (tabs and leaders) remain. M6–M7 are named,
 not decomposed.
 
-**Why M5 existed: quill could not bold a word.** It can now — spec 0064 gave the workspace a font
-family, four bundled faces, and per-run size, tracking and baseline shift. The rest of the argument
-still stands for what remains: `Block::Body` and `Block::Heading` each carry one
-`String` and one `Color`, so there is no styled run anywhere in the workspace — which is why the
-importer refuses emphasis on purpose. Character styles, drop caps, small caps, OpenType feature
-control and tracking are all properties of a *run*, so all of them are downstream of that one gap.
-M4 shipped a mechanism for sharing a look before the look could include an italic.
+**Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
+`String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the
+importer refused emphasis on purpose. Spec 0063 gave the paragraph runs and spec 0064 gave the
+workspace a font family, four bundled faces, and per-run size, tracking and baseline shift, so a word
+can now be bolded and imported as bold. Character styles, drop caps, small caps and OpenType feature
+control are the rest of that list, and are what 0065 onward are for. M4 shipped a mechanism for
+sharing a look before the look could include an italic.
 
 **Not scheduled, and deliberately so:** the direct-manipulation authoring surface (move, resize,
 rotate, group, guides, snap, layers, undo/redo). The `app` crate opens a document, scrolls it and
