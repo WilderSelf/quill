@@ -153,6 +153,7 @@ impl Template {
     pub fn seeded_with(&self, seed: PageGeometrySeed) -> Template {
         Template {
             page_setup: PageSetup {
+                baseline_grid: None,
                 bleed_pt: self.page_setup.bleed_pt.max(seed.bleed_pt),
                 ..self.page_setup
             },
@@ -348,6 +349,7 @@ fn adventure() -> Template {
         title: "Adventure module (6×9)".into(),
         description: "Single-column 6×9 digest with a chapter opener and page numbers.".into(),
         page_setup: PageSetup {
+            baseline_grid: None,
             trim: DIGEST,
             bleed_pt: DEFAULT_BLEED_PT,
             facing_pages: true,
@@ -397,6 +399,7 @@ fn rulebook() -> Template {
         title: "Rulebook (6×9, two columns)".into(),
         description: "Two-column 6×9 reference book with a chapter opener and page numbers.".into(),
         page_setup: PageSetup {
+            baseline_grid: None,
             trim: DIGEST,
             bleed_pt: DEFAULT_BLEED_PT,
             facing_pages: true,
@@ -441,6 +444,7 @@ fn playtest() -> Template {
         title: "Playtest document (US Letter)".into(),
         description: "Single-column US Letter draft for hand-outs and playtest packets.".into(),
         page_setup: PageSetup {
+            baseline_grid: None,
             trim: LETTER,
             bleed_pt: DEFAULT_BLEED_PT,
             // A playtest packet is read single-sided and printed at home, so there is no spine to

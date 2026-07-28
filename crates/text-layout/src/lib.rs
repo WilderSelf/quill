@@ -104,6 +104,21 @@ impl CharMetrics for MonospaceMetrics {
 pub trait RunMetrics {
     /// Total shaped advance width of `text` at `size_pt`, in points.
     fn measure_run(&self, text: &str, size_pt: f32) -> f32;
+
+    /// Distance from the top of a line's box down to its **baseline**, at `size_pt` (spec 0058).
+    ///
+    /// The layout engine needs this to snap a baseline to a grid line: a `PlacedBlock::Text` is
+    /// drawn with its first baseline at `frame.y_pt + ascent_pt(size)`, by the PDF writer and the
+    /// screen renderer alike (spec 0032), so putting the *baseline* on the grid means solving for
+    /// the frame top rather than snapping it directly.
+    ///
+    /// Defaulted at `0.8 × size` — a conventional figure, and one that keeps
+    /// [`MonospaceRunMetrics`] font-free and every existing implementation compiling. A real font
+    /// overrides it with its own ascent, which is the same number the writer and the renderer
+    /// already draw with, so all three agree by construction.
+    fn ascent_pt(&self, size_pt: f32) -> f32 {
+        0.8 * size_pt
+    }
 }
 
 /// A fixed-advance run-metrics stub: `width = em_ratio * size_pt * text.chars().count()`.

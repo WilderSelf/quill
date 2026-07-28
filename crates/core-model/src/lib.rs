@@ -111,6 +111,88 @@ pub struct PageSetup {
     /// rule to special-case parity.
     #[serde(default)]
     pub margins: Margins,
+    /// The baseline grid this document's pages are set to (spec 0058), or `None` for none.
+    ///
+    /// Opt-in, and deliberately so. A grid is a design choice, not a correctness fix: a document
+    /// that does not ask for one has no reason to move, and forcing every existing book, template
+    /// and fixture through a re-derivation buys nothing a publisher wanted. The same posture
+    /// [`Margins`] already takes, one field down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_grid: Option<BaselineGrid>,
+}
+
+/// A ladder of baselines every block's first line snaps down to (spec 0058).
+///
+/// Measured from the **top of the trim box**, not from a frame. That is the whole point: two
+/// columns of one page, and the two pages of a spread, share one ladder, so their baselines align.
+/// A frame-relative grid would align each column to itself and to nothing else — which is a
+/// document, not a book.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BaselineGrid {
+    /// Distance between grid lines. Set it to the body leading.
+    pub step_pt: Pt,
+    /// The first grid line, measured down from the top of the trim box.
+    #[serde(default)]
+    pub origin_pt: Pt,
+}
+
+impl BaselineGrid {
+    pub fn new(step_pt: Pt) -> Self {
+        Self {
+            step_pt,
+            origin_pt: 0.0,
+        }
+    }
+
+    /// Whether this grid is usable at all. A non-positive or non-finite step would divide by zero
+    /// or loop forever, so it is treated as "no grid" rather than as an error — the authoring
+    /// posture the rest of the model takes.
+    pub fn is_usable(&self) -> bool {
+        self.step_pt.is_finite() && self.step_pt > 0.0 && self.origin_pt.is_finite()
+    }
+
+    /// The smallest grid position at or below `y_pt`, measured in the same page-top-relative space.
+    ///
+    /// Snaps *down the page* (to a larger y), never up: moving a baseline up could pull it above
+    /// the frame it was placed in, or on top of the block before it.
+    pub fn snap_down(&self, y_pt: Pt) -> Pt {
+        if !self.is_usable() {
+            return y_pt;
+        }
+        let k = ((y_pt - self.origin_pt) / self.step_pt).ceil();
+        // `ceil` of a value that is already on a line returns it unchanged, so a baseline already
+        // on the grid does not jump a whole step. The epsilon guards the f32 case where it lands a
+        // hair below a line and would otherwise be pushed a full step down.
+        let snapped = self.origin_pt + k * self.step_pt;
+        if snapped - y_pt < -0.001 {
+            snapped + self.step_pt
+        } else if (snapped - y_pt) > self.step_pt - 0.001 {
+            snapped - self.step_pt
+        } else {
+            snapped
+        }
+    }
+
+    /// Styles whose leading is **not** a whole multiple of the step, with their leading.
+    ///
+    /// A block's first baseline is snapped; its later lines follow at the style's leading, so they
+    /// land on the grid exactly when that leading is a grid multiple. That is the real typographic
+    /// contract of a baseline grid, and a house style is designed around it — so the honest answer is to
+    /// name the styles that break it rather than to silently misalign them or to lay every line out
+    /// against the grid, which is a different engine.
+    pub fn off_grid_styles(&self, styles: &StyleSheet) -> Vec<(String, Pt)> {
+        if !self.is_usable() {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, Pt)> = Vec::new();
+        for (name, style) in &styles.paragraph {
+            let k = style.leading_pt / self.step_pt;
+            if (k - k.round()).abs() > 0.001 {
+                out.push((name.clone(), style.leading_pt));
+            }
+        }
+        out
+    }
 }
 
 /// Page margins in points, expressed relative to the binding.
@@ -174,6 +256,7 @@ impl Default for PageSetup {
     fn default() -> Self {
         // A common 6x9in "digest" trim.
         Self {
+            baseline_grid: None,
             trim: Size {
                 w_pt: 432.0,
                 h_pt: 648.0,

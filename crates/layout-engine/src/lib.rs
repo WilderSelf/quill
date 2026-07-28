@@ -15,9 +15,9 @@ use component::measure_component;
 pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
-    builtin_components, toc_entry_style_name, Asset, Block, BlockId, Color, ComponentLibrary,
-    Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle, Rect, StyleSheet,
-    TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
+    builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, Color,
+    ComponentLibrary, Document, Margins, MasterPage, MasterStatic, PageSetup, ParagraphStyle, Rect,
+    StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
 };
 use quill_text_layout::{justify_paragraph_indented, Alignment, Hyphenator, Line, RunMetrics};
 
@@ -297,6 +297,15 @@ pub trait PageTemplate {
     fn statics(&self, _page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
         Vec::new()
     }
+
+    /// The baseline grid this template's pages are set to (spec 0058), or `None` for none.
+    ///
+    /// On the template rather than passed alongside it, because a grid is page geometry and the
+    /// template is what owns page geometry. Defaulted to `None`, so every existing implementation —
+    /// and every ungridded document — is unchanged.
+    fn baseline_grid(&self) -> Option<BaselineGrid> {
+        None
+    }
 }
 
 /// A template that gives every page the same frames and no static content.
@@ -396,6 +405,14 @@ impl PageTemplate for DocumentTemplate<'_> {
                 },
             })
             .collect()
+    }
+
+    fn baseline_grid(&self) -> Option<BaselineGrid> {
+        // Measured from the top of the trim box, which is the space the flow cursor already lives
+        // in — so two columns of one page and the two pages of a spread share one ladder.
+        self.page_setup
+            .baseline_grid
+            .filter(BaselineGrid::is_usable)
     }
 
     fn statics(&self, page_index: usize, metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
@@ -634,6 +651,27 @@ impl PanelSplit {
 pub(crate) const MIN_LINES_PER_FRAGMENT: usize = 2;
 
 impl Measured {
+    /// Distance from this block's flow position `y` down to its **first baseline** (spec 0058), or
+    /// `None` for a block that has no baseline.
+    ///
+    /// Mirrors `place_measured` exactly, and has to: a text block is drawn below its style's
+    /// space-above, and a panel's first run sits at its own `dy_pt` inside the panel. Snapping the
+    /// block's *top* instead would put the box on the grid and the type a few points off it, which
+    /// is the error that looks almost right.
+    pub(crate) fn first_baseline_offset(&self, metrics: &impl RunMetrics) -> Option<f32> {
+        match self {
+            Measured::Text { style, .. } => {
+                Some(style.space_before_pt + metrics.ascent_pt(style.font_size_pt))
+            }
+            Measured::Panel { parts, .. } => parts
+                .first()
+                .map(|p| p.dy_pt + metrics.ascent_pt(p.font_size_pt)),
+            // An image has no baseline. Its top snaps instead, so the block after it starts from a
+            // grid position rather than from wherever the image happened to end.
+            Measured::Image { .. } => None,
+        }
+    }
+
     /// The heights of the items this measurement may be cut between, in order. `None` means
     /// indivisible.
     ///
@@ -1480,6 +1518,7 @@ pub(crate) fn flow(
         headings,
         components,
     };
+    let grid = template.baseline_grid().filter(BaselineGrid::is_usable);
 
     let mut pages: Vec<LaidOutPage> = Vec::new();
     let mut checkpoints: Vec<FlowState> = Vec::new();
@@ -1524,6 +1563,14 @@ pub(crate) fn flow(
                 Some((_, _, remainder, remainder_h)) => (remainder, remainder_h),
                 None => (whole, whole_height),
             };
+            // Snap to the baseline grid (spec 0058), before the fit check rather than after: a
+            // block pushed down by the snap may no longer fit, and must then move on like any
+            // other. `O(1)`, reading one number and writing one — the grid is per frame and local,
+            // and a global recompute is a named non-goal.
+            if let Some(grid) = grid {
+                let off = measured.first_baseline_offset(metrics).unwrap_or(0.0);
+                y = grid.snap_down(y + off) - off;
+            }
             let bottom = frame.rect.y_pt + frame.rect.h_pt;
 
             if y + height > bottom {

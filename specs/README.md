@@ -66,6 +66,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0055 | [The `.qpack` container](0055-pack-container.md) | M4 | implemented |
 | 0056 | [Pack resolution](0056-pack-resolution.md) | M4 | implemented |
 | 0057 | [`quill pack extract`](0057-pack-extract.md) | M4 | implemented |
+| 0058 | [The baseline grid](0058-baseline-grid.md) | M4 | implemented |
 | 0059 | [Screen/press hyphenation parity](0059-hyphenation-parity.md) | M4 | implemented |
 | 0060 | [A line may not be drawn past its measure](0060-last-line-measure.md) | M4 | implemented |
 

@@ -322,6 +322,31 @@ fn resolve_preset(name: &Option<String>) -> Result<PodPreset, String> {
     Ok(preset)
 }
 
+/// Styles whose leading is not a whole multiple of the document's baseline grid (spec 0058).
+///
+/// Printed rather than returned as a finding: it is a *design* note, not a press failure — the file
+/// will print correctly, it just will not be on the grid its author asked for. A silent
+/// misalignment is the failure mode this exists to prevent; a list of the styles that need their
+/// leading rounded is a fix that takes a minute.
+fn print_grid_note(doc: &Document) {
+    let Some(grid) = doc.page_setup.baseline_grid else {
+        return;
+    };
+    let off = grid.off_grid_styles(&doc.styles);
+    if off.is_empty() {
+        return;
+    }
+    println!(
+        "baseline grid: {} style(s) have a leading that is not a multiple of {:.2}pt, so only \
+         their first line lands on the grid:",
+        off.len(),
+        grid.step_pt
+    );
+    for (name, leading) in off {
+        println!("  {name}: leading {leading:.2}pt");
+    }
+}
+
 fn print_report(report: &PreflightReport) {
     if report.findings.is_empty() {
         println!("preflight: no findings.");
@@ -381,10 +406,11 @@ fn main() -> ExitCode {
             };
             // No ICC supplied here, so the OutputIntent check will report — that is expected
             // for a bare preflight and signals what an export would still need.
+            print_grid_note(&loaded.doc);
             let report = preflight(
                 &loaded.doc,
                 &ExportOptions {
-                    asset_root: loaded.asset_root,
+                    asset_root: loaded.asset_root.clone(),
                     preset,
                     ..Default::default()
                 },
