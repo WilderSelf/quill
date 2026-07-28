@@ -46,6 +46,19 @@ pub enum PaintOp {
         space_adjust_pt: f32,
         rgb: [u8; 3],
     },
+    /// A filled and/or stroked rectangle — a rule, a border, a tinted panel (spec 0037).
+    ///
+    /// Distinct from [`PaintOp::TrimGuide`], which is a screen-only guide that is never press
+    /// content. This one is ink: the same op the PDF writer emits.
+    Rect {
+        x_pt: f32,
+        y_pt: f32,
+        w_pt: f32,
+        h_pt: f32,
+        fill_rgb: Option<[u8; 3]>,
+        /// Outline colour and width in points.
+        stroke: Option<([u8; 3], f32)>,
+    },
     /// A linked image, drawn from its cached screen proxy.
     Image {
         x_pt: f32,
@@ -113,6 +126,28 @@ pub fn paint_page(
                     });
                 }
             }
+            PlacedBlock::Rect {
+                frame,
+                fill,
+                stroke,
+            } => {
+                // Nothing to draw is drawn as nothing, rather than as an empty path: a degenerate
+                // rect must not put an operator in the list that the PDF writer would then have to
+                // emit as a malformed `re n`.
+                if (fill.is_none() && stroke.is_none()) || frame.w_pt <= 0.0 || frame.h_pt <= 0.0 {
+                    continue;
+                }
+                ops.push(PaintOp::Rect {
+                    x_pt: geom.off_x + frame.x_pt,
+                    y_pt: geom.off_y + frame.y_pt,
+                    w_pt: frame.w_pt,
+                    h_pt: frame.h_pt,
+                    fill_rgb: fill.as_ref().map(quill_color::to_srgb),
+                    stroke: stroke
+                        .as_ref()
+                        .map(|s| (quill_color::to_srgb(&s.color), s.width_pt)),
+                });
+            }
             PlacedBlock::Image { frame, asset_id } => {
                 let Some(proxy) = proxies.get(asset_id) else {
                     continue; // no proxy yet, or an unresolvable link — draw nothing
@@ -145,7 +180,7 @@ pub fn screen_rgb(color: &Color) -> [u8; 3] {
 mod tests {
     use super::*;
     use quill_core_model::{page_geom, Document};
-    use quill_layout_engine::lay_out;
+    use quill_layout_engine::{lay_out, Stroke};
     use quill_text_layout::NoHyphenator;
 
     fn sample_page() -> (LaidOutPage, PageGeom, Font) {
@@ -165,6 +200,95 @@ mod tests {
         let a = paint_page(&page, &geom, &font, &cache);
         let b = paint_page(&page, &geom, &font, &cache);
         assert_eq!(a, b);
+    }
+
+    // --- Decoration (spec 0037) ---------------------------------------------------------------
+
+    fn rect_block(fill: Option<Color>, stroke: Option<Stroke>) -> PlacedBlock {
+        PlacedBlock::Rect {
+            frame: quill_core_model::Rect {
+                x_pt: 10.0,
+                y_pt: 20.0,
+                w_pt: 80.0,
+                h_pt: 30.0,
+            },
+            fill,
+            stroke,
+        }
+    }
+
+    const TINT: Color = Color::Gray { v: 0.9 };
+
+    #[test]
+    fn a_decoration_rect_paints_with_its_page_offset_applied() {
+        let (mut page, geom, font) = sample_page();
+        page.blocks = vec![rect_block(Some(TINT), None)];
+        let ops = paint_page(&page, &geom, &font, &ProxyCache::new());
+        let rect = ops
+            .iter()
+            .find(|o| matches!(o, PaintOp::Rect { .. }))
+            .expect("a rect op");
+        match rect {
+            PaintOp::Rect {
+                x_pt,
+                y_pt,
+                w_pt,
+                h_pt,
+                fill_rgb,
+                stroke,
+            } => {
+                assert_eq!(*x_pt, geom.off_x + 10.0);
+                assert_eq!(*y_pt, geom.off_y + 20.0);
+                assert_eq!((*w_pt, *h_pt), (80.0, 30.0));
+                assert!(fill_rgb.is_some());
+                assert!(stroke.is_none());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn decoration_paints_before_the_text_it_sits_behind() {
+        // A panel must not paint over the text it frames. Ops are emitted in block order and the
+        // list is the golden artifact, so ordering is asserted on the list rather than on pixels.
+        let (mut page, geom, font) = sample_page();
+        let text = page.blocks[0].clone();
+        page.blocks = vec![rect_block(Some(TINT), None), text];
+        let ops = paint_page(&page, &geom, &font, &ProxyCache::new());
+        let rect_at = ops
+            .iter()
+            .position(|o| matches!(o, PaintOp::Rect { .. }))
+            .expect("rect");
+        let text_at = ops
+            .iter()
+            .position(|o| matches!(o, PaintOp::Text { .. }))
+            .expect("text");
+        assert!(rect_at < text_at, "the panel must be painted first");
+    }
+
+    #[test]
+    fn a_decoration_that_draws_nothing_emits_no_op() {
+        // No colours, and degenerate geometry. Neither may put an op in the list: the PDF writer
+        // would have to turn it into a path with no paint operator.
+        let (page, geom, font) = sample_page();
+        for block in [
+            rect_block(None, None),
+            PlacedBlock::Rect {
+                frame: quill_core_model::Rect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 0.0,
+                    h_pt: 10.0,
+                },
+                fill: Some(TINT),
+                stroke: None,
+            },
+        ] {
+            let mut p = page.clone();
+            p.blocks = vec![block];
+            let ops = paint_page(&p, &geom, &font, &ProxyCache::new());
+            assert!(!ops.iter().any(|o| matches!(o, PaintOp::Rect { .. })));
+        }
     }
 
     #[test]

@@ -139,6 +139,29 @@ pub enum PlacedBlock {
         frame: Rect,
         asset_id: String,
     },
+    /// A filled and/or stroked rectangle — a rule, a border, a tinted panel (spec 0037).
+    ///
+    /// Introduced at parity: nothing in the model produces one yet. It exists because a stat block
+    /// (spec 0038) is a tinted, ruled, padded box, and until now the engine could emit only text
+    /// and images — there was no way to draw a line.
+    ///
+    /// Both `fill` and `stroke` are optional and a rectangle with neither draws nothing, so a
+    /// caller can express a rule (stroke only), a tint (fill only) or a panel (both) without three
+    /// variants.
+    Rect {
+        frame: Rect,
+        fill: Option<Color>,
+        stroke: Option<Stroke>,
+    },
+}
+
+/// A rectangle's outline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stroke {
+    pub color: Color,
+    /// Line width in **points**, not pixels. A hairline that silently becomes device-dependent is
+    /// the classic press bug here: 0.25 pt is a real hairline at 2400 dpi and invisible at 300.
+    pub width_pt: f32,
 }
 
 /// A laid-out page.
@@ -1146,8 +1169,9 @@ mod tests {
             .blocks
             .iter()
             .map(|b| match b {
-                PlacedBlock::Text { frame, .. } => frame.x_pt,
-                PlacedBlock::Image { frame, .. } => frame.x_pt,
+                PlacedBlock::Text { frame, .. }
+                | PlacedBlock::Image { frame, .. }
+                | PlacedBlock::Rect { frame, .. } => frame.x_pt,
             })
             .collect();
         assert!(
@@ -1409,8 +1433,9 @@ mod tests {
             .blocks
             .iter()
             .map(|b| match b {
-                PlacedBlock::Text { frame, .. } => frame.x_pt,
-                PlacedBlock::Image { frame, .. } => frame.x_pt,
+                PlacedBlock::Text { frame, .. }
+                | PlacedBlock::Image { frame, .. }
+                | PlacedBlock::Rect { frame, .. } => frame.x_pt,
             })
             .collect();
         // Partition, not just presence: the 8-line-tall first column holds exactly the first 8

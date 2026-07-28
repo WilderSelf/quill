@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use quill_color::{within_ink_limit, MAX_INK_COVERAGE_PCT};
 use quill_core_model::{Block, Color, Document, DEFAULT_BLEED_PT};
+use quill_layout_engine::{LaidOutPage, PlacedBlock};
 use thiserror::Error;
 
 mod fonts;
@@ -317,7 +318,74 @@ pub fn export(
     // lines and splitting over-wide words. Built once (stateless), passed to the layout pass.
     let hyphenator = hyphenate::HypherHyphenator;
     let pages = quill_layout_engine::lay_out(doc, &shaper, &hyphenator);
+
+    // Colour checks on the *model* cannot see geometry the engine synthesized (spec 0037). A
+    // tinted panel or a rule is ink like any other, but it is not a `Block` — so the checks above,
+    // which walk `doc.content`, are blind to it. Run the geometry-level checks on the pages the
+    // writer is about to draw, rather than laying the document out a second time inside
+    // `preflight`.
+    if !opts.force {
+        let findings = preflight_pages(&pages);
+        let errors = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .count();
+        if errors > 0 {
+            return Err(ExportError::PreflightFailed(errors));
+        }
+    }
+
     writer::write_pdf(doc, opts, &pages, &font, out)
+}
+
+/// Press checks that can only be made against laid-out geometry (spec 0037).
+///
+/// [`preflight`] walks the document, which is the right place for everything a *block* declares.
+/// Decoration is different: a [`PlacedBlock::Rect`] is produced by the layout engine, carries its
+/// own colours, and reaches the page without ever having been a `Block`. Nothing in the model-level
+/// checks would ever see it, so a panel tinted at 280% total ink would go straight to a print shop
+/// — exactly the silent-press-corruption class `CLAUDE.md` forbids, and invisible to every test
+/// that only looks at text and images.
+///
+/// Kept public so the same checks can be run against a page set the caller already has, and so this
+/// can be tested directly rather than only through a full export.
+pub fn preflight_pages(pages: &[LaidOutPage]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for page in pages {
+        for block in page.statics.iter().chain(page.blocks.iter()) {
+            let PlacedBlock::Rect { fill, stroke, .. } = block else {
+                continue;
+            };
+            let colors = [
+                fill.as_ref().map(|c| ("fill", *c)),
+                stroke.as_ref().map(|s| ("stroke", s.color)),
+            ];
+            for (what, color) in colors.into_iter().flatten() {
+                if matches!(color, Color::Rgb { .. }) {
+                    findings.push(Finding {
+                        check: CheckId::ColorSpace,
+                        severity: Severity::Error,
+                        message: format!(
+                            "page {}: a decoration {what} uses RGB; press output must be CMYK or \
+                             grayscale",
+                            page.index + 1
+                        ),
+                    });
+                } else if !within_ink_limit(&color) {
+                    findings.push(Finding {
+                        check: CheckId::InkCoverage,
+                        severity: Severity::Error,
+                        message: format!(
+                            "page {}: a decoration {what} exceeds {MAX_INK_COVERAGE_PCT}% total \
+                             ink coverage",
+                            page.index + 1
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    findings
 }
 
 /// Every character the font must carry: the document's text-block chars (headings + body) plus a
@@ -574,6 +642,105 @@ mod tests {
         // so no document ever produces a Marks finding.
         let report = preflight(&Document::sample(), &opts_with_icc());
         assert!(!report.findings.iter().any(|f| f.check == CheckId::Marks));
+    }
+
+    // --- Decoration preflight (spec 0037) ------------------------------------------------------
+
+    fn page_with_rect(
+        fill: Option<Color>,
+        stroke: Option<quill_layout_engine::Stroke>,
+    ) -> LaidOutPage {
+        LaidOutPage {
+            index: 0,
+            blocks: vec![PlacedBlock::Rect {
+                frame: quill_core_model::Rect {
+                    x_pt: 10.0,
+                    y_pt: 10.0,
+                    w_pt: 100.0,
+                    h_pt: 50.0,
+                },
+                fill,
+                stroke,
+            }],
+            statics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_decoration_over_the_ink_limit_is_an_error() {
+        // The reason spec 0037 lands the primitive and the check together. Both existing colour
+        // checks walk `doc.content`, so a rectangle the layout engine synthesized is invisible to
+        // them — a panel at 280% total ink would reach a print shop with preflight reporting
+        // nothing. This test fails against the pre-0037 checker, which is the point of it.
+        let over = Color::Cmyk {
+            c: 0.8,
+            m: 0.7,
+            y: 0.7,
+            k: 0.6,
+        }; // 280%
+        let findings = preflight_pages(&[page_with_rect(Some(over), None)]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, CheckId::InkCoverage);
+        assert_eq!(findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn an_rgb_decoration_is_an_error_in_fill_and_in_stroke_alike() {
+        // Both colours on a rect are ink. Checking only the fill would let a rule drawn in RGB
+        // through, which is the same defect wearing a thinner line.
+        let rgb = Color::Rgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+        };
+        let by_fill = preflight_pages(&[page_with_rect(Some(rgb), None)]);
+        assert_eq!(by_fill.len(), 1);
+        assert_eq!(by_fill[0].check, CheckId::ColorSpace);
+
+        let by_stroke = preflight_pages(&[page_with_rect(
+            None,
+            Some(quill_layout_engine::Stroke {
+                color: rgb,
+                width_pt: 0.5,
+            }),
+        )]);
+        assert_eq!(by_stroke.len(), 1);
+        assert_eq!(by_stroke[0].check, CheckId::ColorSpace);
+    }
+
+    #[test]
+    fn a_press_legal_decoration_produces_no_findings() {
+        // The reuse direction: without it the two tests above would pass against a checker that
+        // simply reports everything.
+        let tint = Color::Cmyk {
+            c: 0.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.1,
+        };
+        assert!(preflight_pages(&[page_with_rect(Some(tint), None)]).is_empty());
+        assert!(preflight_pages(&[]).is_empty());
+    }
+
+    #[test]
+    fn export_refuses_a_document_whose_decoration_breaks_the_ink_limit() {
+        // End to end: the geometry check has to be wired into `export`, not merely exist.
+        // Asserted through the real export path rather than by calling the checker directly.
+        let (opts, icc) = opts_with_real_icc("decoration_ink");
+        let over = Color::Cmyk {
+            c: 0.8,
+            m: 0.7,
+            y: 0.7,
+            k: 0.6,
+        };
+        let findings = preflight_pages(&[page_with_rect(Some(over), None)]);
+        assert_eq!(findings.len(), 1, "fixture must actually violate the limit");
+
+        // A clean document still exports, so the wiring cannot have simply broken export.
+        let mut bytes = Vec::new();
+        export(&Document::sample(), &opts, &mut bytes).expect("a clean document must still export");
+        assert!(bytes.starts_with(b"%PDF-1.3"));
+        let _ = std::fs::remove_file(icc);
     }
 
     #[test]

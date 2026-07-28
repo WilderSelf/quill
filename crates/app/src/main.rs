@@ -134,6 +134,37 @@ fn draw(ui: &egui::Ui, origin: egui::Pos2, ops: &[PaintOp], zoom: f32) {
                     egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
                 );
             }
+            PaintOp::Rect {
+                x_pt,
+                y_pt,
+                w_pt,
+                h_pt,
+                fill_rgb,
+                stroke,
+            } => {
+                let rect = egui::Rect::from_min_size(
+                    at(*x_pt, *y_pt),
+                    egui::vec2(w_pt * zoom, h_pt * zoom),
+                );
+                if let Some(rgb) = fill_rgb {
+                    painter.rect_filled(
+                        rect,
+                        0.0_f32,
+                        egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                    );
+                }
+                if let Some((rgb, width_pt)) = stroke {
+                    painter.rect_stroke(
+                        rect,
+                        0.0_f32,
+                        egui::Stroke::new(
+                            width_pt * zoom,
+                            egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                        ),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+            }
             PaintOp::Image {
                 x_pt,
                 y_pt,
