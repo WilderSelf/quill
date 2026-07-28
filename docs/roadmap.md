@@ -16,7 +16,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 |---|---|---|
 | **M0** | Press-output spike — headless PDF/X export, Ghostscript-gated | code-complete; one manual item open (a real POD upload validated with a B2A-equipped CMYK profile) |
 | **M1** | Editing core + 500-page performance | **complete** — specs 0016–0034 shipped |
-| **M2** | Beginner on-ramp — templates, stat blocks, TOC | not started |
+| **M2** | Beginner on-ramp — templates, stat blocks, TOC | **decomposed** — specs 0035–0044, sequenced below; none shipped |
 | **M3** | Pro polish + POD presets | not started |
 | **M4** | Plugins / ecosystem | not started |
 
@@ -53,6 +53,35 @@ Decisions that are settled, and would otherwise be re-litigated every time someo
   68–250 s, so it is never the critical path, and the repo is public so Actions minutes are free.
   If the bench step ever flakes on runner noise, split it into its own advisory job rather than
   dropping the whole context — the other four checks in that job are deterministic.
+- **Master statics are pre-placed geometry that resolves a style name — not semantic blocks.** This
+  answers an M1 open question, by implementation: `MasterStatic::Text { rect, text, color, style }`
+  (crates/core-model/src/lib.rs:426-434) positions absolutely against the trim box and resolves
+  `style` against the document stylesheet. So a running head is typographically consistent with the
+  book, but never enters the flow, never gets a `BlockId`, and never appears in a measurement-cache
+  key. Both halves matter: a folio that consumed flow space would shift the text it labels, and
+  giving furniture block identity would put non-content into every cache key in spec 0031's session.
+- **M2 changes the document model only additively; `FORMAT_VERSION` stays 2.** Five M2 increments add
+  serialized shape (per-page master assignment, template provenance, stat blocks, tables, TOC
+  blocks). Every one of them is a `#[serde(default)]` field or a new `#[serde(tag = "kind")]` `Block`
+  variant whose absence reproduces today's behavior exactly, so no migration is needed and v2 files
+  keep loading. This is deliberate: spec 0030's migration is the milestone's one-way door, and there
+  is no reason to open a second one for features that default cleanly. An increment that finds it
+  *cannot* stay additive must say so in its spec and bump on its own, not smuggle a bump in.
+- **Decoration (fills, rules, borders) is press content and goes through the same preflight as
+  everything else.** A tinted stat-block panel is ink. The moment `PlacedBlock` can carry a filled
+  rectangle, the color preflight at crates/export-pdf/src/lib.rs:195-196 and the 240% ink-coverage
+  check stop being complete, because both walk `Block` variants and neither knows about geometry the
+  layout engine synthesized. Spec 0035 therefore lands the primitive *and* extends the checks in the
+  same increment — a rectangle at 280% total ink is exactly the silent-press-corruption class
+  `CLAUDE.md` forbids, and it is invisible to every test that only looks at text and images.
+- **M2 is finished when a beginner can make a book without hand-writing JSON.** The milestone's
+  three named features (templates, stat blocks, TOC) are the *content* of that claim, but the claim
+  itself is the exit criterion, and it is what forces the last two increments: today the only way to
+  produce a document is to author `document.json` by hand against `core-model`'s schema and pack it
+  with `quill pack` (crates/cli/src/main.rs:243-280). The shell can open and scroll it, edit the
+  text of an existing `Heading`/`Body` block (crates/app/src/lib.rs:212-247), and nothing else — no
+  block creation, no save, and `document_mut()` (crates/app/src/lib.rs:260-262) is an escape hatch
+  called only from tests. A stat block nobody can insert is not an on-ramp.
 
 ## M1 increments (all shipped)
 
@@ -72,7 +101,7 @@ No increment may leave the workspace broken.
 | 9 | 0033 | [Screen render](#0033-screen-render) | large |
 | 10 | 0034 | [egui + Skia-family app shell](#0034-egui-app-shell) | large |
 
-## Sequencing rationale
+## M1 sequencing rationale
 
 The order is forced by three hard dependency chains that the surveys make explicit.
 
@@ -86,7 +115,7 @@ The order is forced by three hard dependency chains that the surveys make explic
 
 **Two cross-cutting rules shaped the acceptance criteria.** First, every increment carries an explicit regression bullet asserting the `Document::sample()` export stays byte-identical (SHA-256, introduced in 0025) — because `Document::sample()` is the CI Ghostscript golden fixture and `write_pdf` hashes `doc.to_json()` into the PDF `/ID`, so a model change silently moves the golden path. Second, the incremental-layout gate is stated as deterministic work counters (`LayoutStats`, mirroring `PopulateReport`) plus same-run ratios, never absolute wall-clock: measured idle variance here is ±6% on `lay_out`, shared GitHub runners swing 10-30%, and `rust-toolchain.toml` pins the floating `stable` channel so any absolute ms ceiling drifts on every Rust release. Counters also state the actual M1 claim — "re-flow only affected pages" — far more precisely than a timer.
 
-## Increment detail
+## M1 increment detail
 
 ### 0025 tpub-container-and-load-contract
 
@@ -299,6 +328,564 @@ Screen render and the app shell cannot lay out or draw text: `mod fonts;` and `m
 
 **Risks** — `cargo clippy --all-targets --all-features` will enable a `gui` feature if it exists, dragging `eframe`/`winit` into the three-OS matrix and breaking the ubuntu leg until system libraries are installed — this is the single most likely way this increment reddens required contexts, and the spec must decide between an apt step and dropping `--all-features`. egui's MSRV floor forces the stale `rust-version` fix. Painting must be virtualized from the first commit or the 500-page smoothness constraint is violated by the shell itself.
 
+## M2 increments
+
+M1 built a layout engine an expert can drive from hand-written JSON. M2 is about someone who has
+never used a page-layout tool getting a book that looks like a book: **start from a template rather
+than a blank page**, drop in the two content objects this product exists for (**stat blocks** and
+**random tables**), and get a **table of contents** and PDF bookmarks without laying either out by
+hand.
+
+Same rule as M1: each increment compiles, its tests pass, and it is a coherent PR on its own. No
+increment may leave the workspace broken, and every one carries the `Document::sample()` export
+byte-hash regression bullet — that hash is the CI Ghostscript golden path, so any increment that
+moves it has changed press output without meaning to.
+
+| # | Spec | Increment | Size |
+|---|---|---|---|
+| 1 | 0035 | [Per-page master assignment — chapter openers and front matter](#0035-per-page-master-assignment) | medium |
+| 2 | 0036 | [Document templates: bundled starters, `Document::from_template`, `quill new`](#0036-document-templates) | medium |
+| 3 | 0037 | [Decoration primitive: fills, rules and borders, with preflight extended to cover them](#0037-decoration-primitive) | medium |
+| 4 | 0038 | [`Block::StatBlock` — the composite, keep-together TTRPG component](#0038-stat-block) | large |
+| 5 | 0039 | [`Block::Table` — random tables and row/column layout](#0039-tables) | medium |
+| 6 | 0040 | [Heading index: which page each heading landed on](#0040-heading-index) | small |
+| 7 | 0041 | [`Block::Toc` — generated contents with a bounded stabilization loop](#0041-generated-toc) | large |
+| 8 | 0042 | [PDF outline and named destinations, plus the annotation/bleed preflight guard](#0042-pdf-outline) | medium |
+| 9 | 0043 | [Markdown-ish import — the actual on-ramp](#0043-markdown-import) | large |
+
+## M2 sequencing rationale
+
+Three dependency chains force the order, and one of them is a cycle that has to be broken
+deliberately rather than discovered during implementation.
+
+**Chain 1 — templates are a model capability before they are a preset.** A "template" in the
+beginner sense is a document that already has margins, a stylesheet, masters, and a chapter-opener
+page. Two of those four do not exist yet. `Margins::default()` is zero on every edge
+(crates/core-model/src/lib.rs:95-107) so the shipped default still lets text run to the trim edge,
+and `Document.default_master: Option<String>` (crates/core-model/src/lib.rs:509-515) applies **one**
+master to **every** page — spec 0030's `pages: Vec<Page>` list was planned and not built, so there
+is currently no way to say "page 0 is a chapter opener." A starter template with no chapter opener
+is just a margin preset, which is why 0035 precedes 0036. 0036 is also where the roadmap's
+long-standing margins question gets answered without moving the CI golden path: templates carry
+non-zero margins, `PageSetup::default()` stays at zero, and `Document::sample()` never changes.
+
+**Chain 2 — the drawing primitive, then the component, then the authoring syntax.** A stat block is
+a tinted, ruled, padded box containing several differently-styled lines that must not be split
+mid-box if it can be helped. The workspace cannot draw any of that: `PlacedBlock` has exactly two
+variants, `Text` and `Image` (crates/layout-engine/src/lib.rs:125-142), and `PaintOp` has four,
+none of which is a rectangle fill or a stroke (crates/render/src/paint.rs:27-60). So 0037 lands the
+primitive at parity — nothing emits it yet, export stays byte-identical — and, per the decisions log
+above, extends the color and ink-coverage preflight to see it in the same PR. Only then can 0038
+build the component. `quill-components-ttrpg` already defines `StatBlock` and `RandomTable`
+(crates/components-ttrpg/src/lib.rs) with real logic and tests, and **nothing in the workspace
+depends on that crate** — it is a data model with no layout, no export and no way to put one in a
+document. 0038 and 0039 are what connect it. 0043 is last in this chain because a markdown-ish
+importer is only worth writing once the things it would import can actually be laid out; writing the
+syntax first would mean designing it against types that do not exist.
+
+**Chain 3 — the TOC cycle must be broken by an explicit fixpoint, not by hoping.** A table of
+contents lists page numbers, its own length changes where every subsequent page break falls, and
+that changes the page numbers it lists. Nothing in the engine can express this today: layout is a
+single forward pass and `LaidOutPage` carries no mapping back to the blocks that produced it, so
+"which page is heading X on" is unanswerable (crates/layout-engine/src/session.rs:69-77 —
+`LayoutResult` reports `pages`, `stats` and `changed_pages`, and nothing else). 0040 answers that
+question alone, as a small additive change, and is deliberately separate from 0041 for the same
+reason spec 0027 separated the measuring stick from the work it gates: if the index and the fixpoint
+loop land together and the TOC comes out wrong, neither is trustworthy. 0041 then iterates
+layout→resolve→regenerate under an explicit iteration bound and a documented behavior on
+non-convergence — spec 0031 already flagged unbounded "reflow until state matches" as the way a
+pathological document loops forever, and a TOC is the case that actually oscillates (an entry that
+pushes a heading onto the next page, whose new number shortens the entry, which pulls it back).
+0042 consumes 0040's index too, but not 0041's loop, so it could ship before the TOC if the fixpoint
+proves harder than estimated — that ordering freedom is intentional slack.
+
+**Two cross-cutting rules, both inherited from M1.** First, `Document::sample()`'s export byte-hash
+is a bullet in every increment: five M2 increments add `Block` variants or serialized fields, and
+the sample is the Ghostscript golden fixture whose `/ID` is a hash of `doc.to_json()`. Second, every
+new `Block` variant breaks four exhaustive match sites that the compiler will point at, and one that
+it will not care about but which fails silently: `collect_doc_chars`
+(crates/export-pdf/src/lib.rs:334-341) feeds the font subset, so a variant whose text it does not
+collect exports as `.notdef` boxes rather than as an error. Spec 0026 hit exactly this. Every
+variant-adding increment here carries a non-ASCII-glyph export test for that reason.
+
+## M2 increment detail
+
+### 0035 per-page-master-assignment
+
+**Per-page master assignment: a page list, front matter, and chapter openers** · size: medium ·
+branch: `feat/per-page-master-assignment`
+
+`Document.default_master` applies one master to the whole book (crates/core-model/src/lib.rs:509-515,
+which says in as many words that per-page assignment is a follow-up), and `DocumentTemplate`
+(crates/layout-engine/src/lib.rs:211-260) resolves that single master for every page index. So a
+document can have consistent furniture or no furniture, and nothing else — no title page without a
+folio, no chapter opener with a deeper top margin, no front matter in roman numerals. Add a
+`pages: Vec<PageOverride>` list to `Document` where `PageOverride { master: Option<String> }` applies
+to a page by index, and make `DocumentTemplate` consult it before falling back to `default_master`.
+Additive and `#[serde(default)]`: an absent or empty list is exactly today's behavior, so
+`FORMAT_VERSION` stays 2 and no migration is written.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; the Ghostscript CI job stays green.
+- A document with `master_pages` `opener` (2-column, 108 pt top margin) and `body` (2-column, 36 pt),
+  `default_master: "body"`, and `pages[0].master = "opener"` lays out page 0 with a text frame whose
+  `y_pt` is 108.0 and pages 1+ at 36.0 — asserted to 0.01 pt on a 3-page document.
+- A `PageOverride` naming a master not in `master_pages` falls back to `default_master`, and then to
+  the document's own page setup — laid out, not rejected. Asserted for both fallback steps. (A
+  missing master is the authoring-posture case, like a missing style at
+  crates/core-model/src/lib.rs:401-414: losing the page would be worse than losing the furniture.)
+- A `pages` list shorter than the page count governs the pages it covers and leaves the rest on
+  `default_master`; a list *longer* than the page count is not an error (the document shrank) and the
+  surplus entries are ignored — asserted both ways.
+- Statics resolve per page against the *page's* master, so a page-0 opener with no folio and a body
+  master with a `{page}` folio produces zero statics on page 0 and one on page 1 — asserted, and the
+  flow cursor is identical with and without statics (the spec-0029 invariant, re-asserted here
+  because 0035 is the first thing to vary statics *between* pages).
+- Incremental safety: `LayoutSession`'s `previous_context` fingerprint
+  (crates/layout-engine/src/session.rs:104-113) includes the page list, so changing `pages[7].master`
+  and calling `relayout` reports the affected pages as changed rather than returning stale pages.
+  Asserted in both directions — changed context ⇒ `pages_reused == 0` for the affected run, identical
+  context ⇒ `blocks_measured == 0`.
+- `quill-testdoc` is unchanged and the 500-page target assertion still holds (this increment adds no
+  default furniture).
+
+**Test strategy** — Inline tests in core-model for the serde default and the fallback chain, and in
+layout-engine for geometry-per-page, asserted as exact arithmetic in the repo's style. The
+load-bearing test is the `previous_context` one: spec 0031's own comment says a context the
+fingerprint misses is "a stale document presented as a current one", and a page list is precisely
+such a context.
+
+**Risks** — The fingerprint omission is the silent-wrongness bug and the only real hazard here.
+Assigning by index means an inserted page shifts every subsequent assignment; that is the accepted
+semantics for this increment (the alternative, anchoring assignment to a chapter's first block, is
+0041's territory and is recorded as a follow-up, not smuggled in here).
+
+### 0036 document-templates
+
+**Document templates: a `Template` type, bundled starters, `Document::from_template`, `quill new`,
+and the app's New-from-template** · size: medium · branch: `feat/document-templates`
+
+There is no way to start a document. `AppState` offers `open` and `sample`
+(crates/app/src/lib.rs:81-90) and the CLI offers `sample`, `preflight`, `export`, `pack`, `render`
+and `synth-icc` (crates/cli/src/main.rs) — a beginner's only starting point is
+`Document::sample()`'s two hardcoded blocks, or hand-written JSON. Add a `Template` = everything a
+document has *except* content: `page_setup` (with real margins), `styles`, `master_pages`,
+`default_master` and an initial `pages` list. Bundle three as data — a 6×9 single-column adventure,
+a 6×9 two-column rulebook, and a US-Letter one-column playtest doc — expose
+`Template::bundled() -> &[Template]` and `Document::from_template(&Template)`, add `quill new
+--template <name> -o out.tpub`, and an `AppState::new_from_template`.
+
+This is where the roadmap's margins question is answered: templates carry non-zero margins,
+`PageSetup::default()` stays at zero, and `Document::sample()` is untouched — so the shipped default
+is still "text to the trim edge", but nobody reaches it by accident any more, because the on-ramp
+never starts there.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; `PageSetup::default()` still returns
+  `Margins::default()` (all zero), asserted, so the CI golden path provably cannot move.
+- Every bundled template round-trips: `Document::from_template(t)` → `to_json` → `from_json` is
+  `assert_eq!`-equal, for each template, in a loop over `Template::bundled()`.
+- Every bundled template produces a **press-clean** document: `preflight(&Document::from_template(t))`
+  reports zero `Severity::Error` findings for each one — a starter that fails preflight is worse than
+  no starter, because it teaches the beginner that the error panel is noise.
+- Every bundled template has non-zero margins on all four edges and a stylesheet containing `body`
+  and `h1`..`h3` at minimum — asserted in the same loop, so a template cannot be added without them.
+- A template with a chapter-opener master assigns it to page 0 via the spec-0035 `pages` list;
+  laying out a from-template document with 3 pages of body text puts the opener geometry on page 0
+  only (asserted).
+- `quill new --template rulebook -o out.tpub` exits 0, writes a `.tpub` that `Tpub::open` reads back
+  to an equal `Document`, and `quill new --template nope` exits non-zero listing the valid names.
+  `quill new --list` prints them.
+- `AppState::new_from_template(t)` returns a state whose `page_count() >= 1` and which paints without
+  panicking on an empty content list — asserted headlessly (the empty-document case is new: every
+  existing app test opens a document that has content).
+- Templates are data in `quill-core-model`, not files on disk: no new runtime dependency, no asset
+  path to resolve, and `cargo tree -d` reports no new duplicates.
+
+**Test strategy** — The loop-over-all-bundled-templates tests are the design point: adding a fourth
+template must be caught by the same assertions rather than needing new ones. Preflight-cleanliness is
+the acceptance criterion that actually protects the beginner. The app test covers the empty-content
+path, which nothing exercises today.
+
+**Risks** — Bundling templates as Rust data keeps the dependency graph clean but makes them
+non-editable by users; a user-authored template format is explicitly deferred to M3 and recorded as
+a follow-up. The empty-document path through layout, paint and preflight is genuinely untested
+today, so expect this increment to surface at least one unwrap on `content[0]`-shaped reasoning.
+
+### 0037 decoration-primitive
+
+**Decoration primitive: filled and stroked rectangles through layout, paint list and PDF writer —
+with the color and ink-coverage preflight extended to cover them** · size: medium · branch:
+`feat/decoration-primitive`
+
+Nothing in the workspace can draw a line or a box. `PlacedBlock` is `Text | Image`
+(crates/layout-engine/src/lib.rs:125-142) and `PaintOp` is `Page | TrimGuide | Text | Image`
+(crates/render/src/paint.rs:27-60) — `TrimGuide` is a screen-only guide, not press content, and there
+is no stroke anywhere. Add `PlacedBlock::Rect { frame, fill: Option<Color>, stroke:
+Option<(Color, Pt)> }`, a matching `PaintOp::Rect`, `tiny-skia` rasterization, and PDF emission
+(`re` plus `f`/`S`/`B` with the correct color operators per space). Land it **at parity**: no
+`Block` variant produces one yet, so no existing document changes and the export byte-hash holds.
+
+The increment's real content is the second half. Both press checks currently walk `Block`, not
+geometry: the color check matches `Block::Heading | Block::Body` for a color and returns `None` for
+images (crates/export-pdf/src/lib.rs:195-196), and ink coverage is enforced per-image and per-text
+color. A synthesized rectangle is neither, so on the day 0038 emits a tinted panel at 280% total ink
+it would sail past preflight into a print shop. Extend both checks to walk the laid-out geometry,
+and prove it with a rectangle that violates each rule.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; every existing export-pdf and render
+  test passes untouched; Ghostscript CI green.
+- A page carrying one `PlacedBlock::Rect { fill: Cmyk(0,0,0,0.1), stroke: (Cmyk(0,0,0,1), 0.5) }`
+  exports a content stream containing the fill color operator, `re`, and `B` (or `f` then `S`), with
+  operands equal to the frame geometry to 0.01 pt — asserted by decompressing the stream, as the
+  existing writer tests do.
+- Rect ordering is deterministic and behind text: within a page, statics paint first, then blocks in
+  order, and a `Rect` emitted before a `Text` in the same list stays before it. Asserted on the op
+  list, which is the golden artifact (spec 0033).
+- Rasterization: a page with a single black-filled rect at a known position produces a black pixel at
+  the rect's center and a white pixel outside it, at 1× — the coarse-invariant style spec 0033
+  established, no pixel golden.
+- **Preflight sees it.** A document whose laid-out geometry contains a rect filled at 280% total ink
+  produces a `Severity::Error` `InkCoverage` finding naming the offending element; an RGB-filled rect
+  produces the same `Severity::Error` the color check gives RGB text. Both asserted, and both fail
+  before this increment's preflight change (stated in the spec as the reason the check moved).
+- A rect with neither fill nor stroke emits nothing (no empty `re n`), and a zero-width or
+  zero-height rect emits nothing — asserted, so degenerate geometry cannot produce a malformed
+  content stream.
+- Stroke width is in points and unscaled by any CTM the writer sets; a 0.5 pt stroke measures 0.5 pt
+  in the emitted `w` operand — asserted, because a hairline that silently becomes 0.5 px is the
+  classic press bug here.
+- `benches/budgets.toml` unchanged (this increment adds no work to any measured path) — asserted by
+  the CI bench step staying green without a re-baseline.
+
+**Test strategy** — Parity first: the byte-hash plus the untouched existing suites prove the seam is
+inert. Capability tests construct `PlacedBlock::Rect` directly rather than through a document, which
+is exactly how the repo proves a parameter is threaded (the `HalfStub` precedent at
+layout-engine/src/lib.rs:410-418). The two preflight tests are the load-bearing ones and must be
+written to fail against the pre-change checker.
+
+**Risks** — Preflight walking laid-out geometry rather than the document is a structural change to
+what preflight *is*, and export currently preflights the model. If that turns out to require laying
+out inside `export()`, say so in the spec and decide it there rather than during implementation —
+the fallback is that `Block`-level checks stay on the model and geometry-level checks run on the
+already-computed pages the writer is about to draw. PDF color-space operators differ per space
+(`k`/`K`, `g`/`G`, and RGB must not appear at all in PDF/X); getting the stroke/fill pair wrong is a
+silent color bug, which is why the operand assertions are exact.
+
+### 0038 stat-block
+
+**`Block::StatBlock`: the composite, keep-together TTRPG component** · size: large · branch:
+`feat/stat-block`
+
+`quill-components-ttrpg` defines `StatBlock { name, overview, attributes, details, actions,
+reactions }` with serde and tests, and **no crate in the workspace depends on it** — it cannot be put
+in a document, laid out, drawn or exported. Add `Block::StatBlock` carrying that type (plus a
+`BlockId` and an optional style-prefix name), and teach `measure_block` to break it into a sequence
+of styled lines inside a padded, tinted, ruled panel built from spec 0037's rect. Built-in styles
+`statblock-title`, `statblock-attr` and `statblock-body` extend `StyleSheet::default()`
+(crates/core-model/src/lib.rs:364-392) so a stat block looks right with zero authoring.
+
+The layout question this increment exists to answer is **breaking**. A stat block is taller than a
+column more often than not in a 6×9 book, so "never split" is not implementable; the rule is
+keep-together-if-it-fits-in-an-empty-frame, otherwise split at a section boundary and repeat the
+panel decoration on the continuation.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; Ghostscript CI green.
+- Non-ASCII guard: a stat block whose name contains `é` exports with that glyph present in the font
+  subset, not `.notdef` — the spec-0026 silent-failure test, because `collect_doc_chars`
+  (crates/export-pdf/src/lib.rs:334-341) must learn the new variant.
+- The four other exhaustive `Block` match sites compile-error until updated and are each updated
+  deliberately: the color preflight (export-pdf/src/lib.rs:195-196), `measure_block`
+  (layout-engine/src/lib.rs:410-442), the session's content fingerprint (session.rs:428-448) and
+  `StyleSheet::resolve` (core-model/src/lib.rs:401-414). The spec names all five.
+- Geometry: a stat block with a 6 pt padding, one title line and three attribute lines measures to
+  `padding*2 + title_leading + 3*attr_leading` in height, to 0.01 pt, with `MonospaceRunMetrics
+  { em_ratio: 0.6 }` — hand-computed in a comment above the assertion, per repo convention.
+- Panel decoration: the placed output contains exactly one `PlacedBlock::Rect` whose frame is the
+  full panel including padding, emitted *before* the panel's text blocks, and the text is inset by
+  the padding on all four edges (asserted on x, y and width).
+- Keep-together: a stat block that does not fit in the remaining space of a partly-filled frame, but
+  *does* fit in an empty one, moves whole to the next frame — asserted by placing it on the next page
+  with no split, and by asserting the previous page's other content is unchanged.
+- Split: a stat block taller than an empty frame splits at a section boundary (never mid-attribute),
+  every fragment carries its own panel rect, and concatenating the fragments' lines equals the
+  unsplit line sequence — asserted, so splitting cannot silently drop a line.
+- Cache correctness: the session's content fingerprint covers every field of the stat block —
+  editing only `reactions[0]` gives `blocks_measured == 1` on relayout, and editing nothing gives
+  `blocks_measured == 0`. Both directions asserted (the spec-0031 rule: a key that misses a
+  dimension is a silently stale document).
+- `quill-testdoc` gains a `statblock_every_n` knob defaulting to 0 (off), so the 500-page target and
+  every existing budget in `benches/budgets.toml` are unchanged; a separate unit test lays out a
+  100-stat-block document and asserts every block placed.
+
+**Test strategy** — Inline, `MonospaceRunMetrics`-based geometry assertions for measurement; op-list
+assertions for decoration order; and the split test asserted by line-sequence concatenation rather
+than by fragment count, because fragment count is an implementation detail and dropped lines are the
+failure that matters. The keep-together and split tests are the two that justify the increment's
+"large" size — everything else is plumbing a variant through five match sites.
+
+**Risks** — The split rule is where this increment can quietly go wrong: a fragment that repeats the
+panel but loses a line, or a keep-together that infinite-loops by moving a block that never fits, are
+both plausible. The "never fits anywhere" case needs an explicit escape (place it and overflow, do
+not loop) or a 500-page document with one oversized stat block hangs the app — the same
+termination-bound hazard spec 0031 recorded. Knuth-Plass superlinearity (see Known issues) is more
+exposed here than anywhere: a stat block's `details` entries are prose and could plausibly be long.
+
+### 0039 tables
+
+**`Block::Table`: random tables, column widths, header rows and page-breaking rows** · size: medium
+· branch: `feat/table-block`
+
+The other half of `quill-components-ttrpg`: `RandomTable { die, entries: Vec<TableEntry { low, high,
+result }> }` with `lookup` and `is_complete` already implemented and tested
+(crates/components-ttrpg/src/lib.rs), and no way to put one on a page. Add `Block::Table` carrying a
+general two-column-or-more table (a random table is the special case where column 0 is a die range),
+with per-column widths as fractions of the frame, an optional header row that repeats on
+continuation, zebra fill via spec 0037's rect, and row-granular page breaking.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; the non-ASCII font-subset guard as in
+  0038; all five `Block` match sites updated deliberately and named in the spec.
+- Column geometry: a table with widths `[0.25, 0.75]` in a 200 pt frame places column 0 at `x = 0`
+  width 50 and column 1 at `x = 50` width 150, to 0.01 pt. Widths that do not sum to 1.0 are
+  normalized, and a zero or negative width fails loudly at load with a `LoadError` rather than
+  emitting degenerate geometry (mirroring the `columns: 0` rule in spec 0030).
+- A cell whose text is wider than its column wraps to multiple lines and the row's height is the
+  tallest cell's height — asserted with `MonospaceRunMetrics`.
+- Breaking: a table that overflows a frame breaks between rows, never inside one, and the header row
+  repeats at the top of the continuation — asserted by comparing the first row of the continuation to
+  the header.
+- `RandomTable` → `Block::Table` conversion is a tested function: a d100 table with 6 entries
+  produces 6 rows whose column 0 reads `1-10`, `11-25`, … (single values render as `7`, not `7-7`) —
+  asserted, including the singleton case.
+- `is_complete() == false` is surfaced, not silently laid out: a gappy random table lays out fine but
+  preflight emits a `Severity::Warning` naming the gap. (Authoring posture — a gap in a d100 table is
+  a content mistake, not a press defect, so it must not block export.)
+- Zebra fill emits one `PlacedBlock::Rect` per shaded row, behind that row's text, and none when
+  zebra is off — asserted on the op list.
+- Cache correctness: editing one cell gives `blocks_measured == 1`; editing nothing gives `0`.
+- `benches/budgets.toml` unchanged; a unit test lays out a 500-row table and asserts every row
+  placed across the pages it needs.
+
+**Test strategy** — Geometry as exact arithmetic; breaking asserted by header-repetition and by
+row-sequence concatenation (as in 0038, dropped rows are the failure that matters). The
+`RandomTable` conversion test covers the singleton range because `7-7` is the kind of detail that
+ships and then embarrasses.
+
+**Risks** — Row-height-from-tallest-cell interacts with the keep-together machinery from 0038; if
+0038's splitting turns out to generalize, this increment should reuse it rather than fork it, and the
+spec must say which. A 500-row table in one frame is a plausible user input and a plausible
+performance cliff.
+
+### 0040 heading-index
+
+**Heading index: which page each heading landed on, reported by layout** · size: small · branch:
+`feat/heading-index`
+
+"Which page is chapter 3 on" is currently unanswerable. `LayoutResult` reports `pages`, `stats` and
+`changed_pages` (crates/layout-engine/src/session.rs:69-77) and `LaidOutPage` carries `index`,
+`blocks` and `statics` (crates/layout-engine/src/lib.rs:146-161) — a `PlacedBlock` has geometry but
+no back-reference to the `BlockId` that produced it, so nothing downstream can map content to a page.
+Add that mapping: an ordered `Vec<HeadingEntry { id, level, text, page_index }>` produced by both the
+one-shot `lay_out*` entry points and `LayoutSession::relayout`. Purely additive — no export change,
+no model change, no new `Block` variant.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; every existing layout test passes
+  untouched.
+- On a 3-page document with headings on pages 0, 1 and 1, the index has three entries with
+  `page_index` `0, 1, 1`, in document order, carrying the right `BlockId`, `level` and resolved text.
+- A heading that splits across a page boundary (its first line on page 4, its second on page 5)
+  reports the page its **first line** landed on — asserted, because that is what a TOC entry and a
+  bookmark both mean, and the alternative is a silent off-by-one that only shows up in a real book.
+- Parity between paths: the index from `lay_out_with_template` and from
+  `LayoutSession::relayout` is `assert_eq!`-equal for the same document, including the 500-page
+  synthetic one.
+- Incremental correctness: after an edit that pushes a heading from page 250 to page 251, the index
+  reflects the new number even though `stats.pages_reused >= 495` — this is the one that proves the
+  index is not accidentally cached alongside the pages it describes.
+- Empty document ⇒ empty index, no panic.
+- `benches/budgets.toml` unchanged: building the index is one push per heading during a pass already
+  walking every block, and the CI bench step must stay green without a re-baseline.
+
+**Test strategy** — Straight assertions on the returned vector; the load-bearing two are the
+split-heading page attribution and the incremental-edit case. Both are cheap and both are the bugs
+this would otherwise ship with.
+
+**Risks** — Small increment, one real hazard: the index must be rebuilt (or correctly patched) on an
+incremental pass that reuses pages, or a TOC built on it goes stale exactly when the document is
+edited, which is always.
+
+### 0041 generated-toc
+
+**`Block::Toc`: generated contents with a bounded stabilization loop** · size: large · branch:
+`feat/generated-toc`
+
+The cyclic increment. Add `Block::Toc { id, title, max_level, style_prefix }` which generates its own
+content from spec 0040's heading index: one line per heading at or above `max_level`, with a leader
+and a page number, styled by `toc-1`..`toc-6` built-ins. Because the generated content changes the
+document's pagination, layout becomes a fixpoint: lay out, read the index, regenerate the TOC's
+lines, lay out again, and stop when the index stops changing — with an explicit iteration cap and
+documented behavior when it is hit.
+
+Two things make this tractable rather than open-ended. First, the TOC's *content* is derived, so it
+never enters the measurement cache keyed on authored text — its cache key must include the index it
+was generated from, or an edit elsewhere in the book leaves a stale TOC. Second, oscillation is real
+and must be handled, not assumed away: an entry that pushes a heading to the next page can shorten
+the TOC on the next iteration and pull it back, forever. On hitting the cap, the loop takes the last
+iterate and records it, rather than looping or failing the document.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash unchanged; Ghostscript CI green; non-ASCII
+  font-subset guard as in 0038; all five `Block` match sites updated and named in the spec.
+- A 3-chapter document with a TOC at the front lists three entries whose page numbers equal the
+  numbers those headings actually appear on in the *final* layout — asserted by cross-checking the
+  TOC's rendered text against spec 0040's index of the same final pass. This is the whole feature and
+  it must be asserted against the final state, not the first pass.
+- Convergence: the loop reaches a fixpoint in `<= 2` iterations on a document whose TOC fits on one
+  page, and `<= 4` on one whose TOC spans three pages — asserted via an exposed iteration counter, so
+  "it converged" is a measured claim.
+- Oscillation: a hand-built document constructed to oscillate terminates at the cap, returns the last
+  iterate, produces a laid-out document with no missing content, and reports the non-convergence
+  through a counter or flag the caller can see (asserted). It must not loop, panic, or silently
+  present an inconsistent TOC as converged.
+- `max_level: 2` lists h1 and h2 and omits h3 — asserted.
+- Leaders and numbers: an entry's page number is right-aligned to the frame's right edge to 0.01 pt
+  and the leader fills the gap without overlapping either side — asserted on geometry, not on
+  rendered appearance.
+- Cache correctness: editing a chapter heading's text updates that TOC entry's text on the next
+  relayout (`blocks_measured >= 1` for the TOC block); editing an unrelated body paragraph that does
+  not move any heading leaves the TOC unmeasured (`blocks_measured` for the TOC block `== 0`). Both
+  directions asserted — this is spec 0031's rule applied to derived content.
+- A document with a TOC and no headings lays out an empty TOC (title only) and does not panic.
+- `benches/budgets.toml` gains a `toc.iterations` ceiling; the 500-page synthetic document's existing
+  budgets are unchanged, because `quill-testdoc` does not emit a TOC by default.
+
+**Test strategy** — The final-state cross-check against spec 0040's index is the primary test and is
+deliberately written so it cannot pass by comparing a first-pass TOC to first-pass numbers. The
+oscillating fixture is hand-built rather than found, and its purpose is to prove the cap is real. The
+two cache-direction assertions prevent both a stale TOC and a TOC that re-measures on every keystroke.
+
+**Risks** — The fixpoint is the risk and the cap is the mitigation; the spec must state the cap's
+value, the tie-break, and what the user sees on non-convergence *before* implementation starts.
+Derived content in a cache keyed on authored content is the second hazard, and it fails silently in
+the stale direction. Interaction with spec 0035's index-based page assignment is real: a TOC that
+grows by a page shifts every subsequent `PageOverride`, which is a genuine consequence of 0035's
+accepted semantics and must be called out in the spec, and covered by a test, rather than discovered
+by a user whose chapter openers all slid by one.
+
+### 0042 pdf-outline
+
+**PDF outline and named destinations, plus the annotation/bleed preflight guard** · size: medium ·
+branch: `feat/pdf-outline`
+
+A 500-page PDF with no bookmarks is unusable, and a grep for `Outlines`, `Dests`, `Annots` and
+`bookmark` across the workspace returns **zero hits** — the writer emits a catalog and a page tree and
+nothing navigational. Build an `/Outlines` tree from spec 0040's heading index (nested by level, with
+correct `/First`, `/Last`, `/Count` and `/Parent` links) plus a named destination per heading, and
+point each outline item at its page.
+
+The press constraint decides the scope. Outlines and destinations are document-level structure and
+are fine in PDF/X. **Link annotations are not** — PDF/X-1a requires annotations to sit outside the
+BleedBox, and a clickable TOC entry sits in the middle of the text block by definition. So this
+increment ships outlines and destinations, does **not** ship clickable TOC links, and adds the
+preflight check that makes the rule enforceable rather than remembered: any annotation whose rect
+intersects the BleedBox is a `Severity::Error`. That check has nothing to guard today, which is
+exactly when it is cheap to add and exactly the spec-0013 lesson — the validator and the writer must
+agree on the rule before anything relies on it.
+
+**Acceptance criteria**
+
+- Regression: `Document::sample()` export byte-hash **changes** (the catalog gains `/Outlines`), so
+  the committed constant is updated in this PR with the reason in the commit message, and the
+  Ghostscript CI job stays green. This is the one M2 increment expected to move the hash; it says so
+  here so a reviewer does not treat it as an accident.
+- A document with h1/h2/h1 produces an outline tree of two top-level items, the first with one child;
+  `/Count` on the root is correct and each item's `/Parent`, `/First`, `/Last`, `/Prev` and `/Next`
+  are consistent — asserted by parsing the emitted objects, not by eyeballing.
+- Each outline item's destination resolves to the page the heading is on, verified against spec
+  0040's index for the same layout.
+- A document with no headings emits **no** `/Outlines` entry at all (not an empty one) — asserted,
+  because an empty outline tree renders as an empty, confusing bookmark pane.
+- Ghostscript parses every generated file with outlines without warnings; the CI job's existing
+  parse gate covers it and the sample gains headings at two levels so the gate actually exercises the
+  tree.
+- Preflight: a document carrying an annotation whose rect intersects the BleedBox produces a
+  `Severity::Error`; one entirely outside it does not. Both asserted against a hand-constructed
+  annotation, since nothing emits annotations yet.
+- Outline titles are the heading text with the font subset covering their glyphs, and PDF text
+  strings are encoded correctly for non-ASCII (UTF-16BE with BOM) — asserted on a heading containing
+  `é`, because outline strings are a *different* encoding path from page content and get this wrong
+  independently.
+- `benches/budgets.toml` unchanged.
+
+**Test strategy** — Object-graph assertions by parsing the emitted PDF, mirroring the existing writer
+tests' decompress-and-match approach. The no-headings and non-ASCII cases are the two that ship
+broken otherwise. The annotation preflight test constructs its input directly because the feature it
+guards does not exist — that is the point.
+
+**Risks** — Outline tree links (`/Count` semantics for closed vs open items in particular) are fiddly
+and wrong-in-a-viewer rather than wrong-in-a-parser, so Ghostscript passing is necessary and not
+sufficient. Moving the golden hash means every test pinning it must be updated in the same PR, and a
+reviewer must be able to tell this move from an accidental one.
+
+### 0043 markdown-import
+
+**Markdown-ish import: `quill import`, the actual on-ramp** · size: large · branch:
+`feat/markdown-import`
+
+Everything above makes a good book *possible*; nothing above makes it *easy to type*. The current
+authoring input is hand-written JSON — `Document::sample()` and `quill sample` are the only
+document-producing paths in the CLI, and a grep for markdown, import or parsing across the workspace
+finds nothing. Add a small, explicitly-specified line-oriented syntax — `#`..`######` headings, blank-
+line-separated body paragraphs, `![](asset-id)` images, and fenced `:::statblock` / `:::table`
+blocks carrying the component data — and a `quill import doc.md -o out.tpub --template rulebook` that
+composes it with spec 0036's templates. Hand-rolled: no markdown crate, per the workspace's
+minimal-and-permissive dependency rule, and because the syntax is deliberately a subset rather than
+CommonMark.
+
+**Acceptance criteria**
+
+- Regression: no change to any existing crate's behavior; `Document::sample()` export byte-hash
+  unchanged.
+- Round-trip fidelity on the constructs it claims: a fixture document containing every supported
+  construct imports to a `Document` whose `content` matches a hand-written expected `Vec<Block>`
+  exactly (ids excepted) — asserted block by block, not by count.
+- Unsupported syntax is reported, never silently dropped: an unknown `:::foo` fence, a malformed
+  stat-block field, or an inline construct the subset does not cover produces a diagnostic with a
+  **line number**, and the import either fails or completes with warnings per a rule the spec states
+  explicitly. Asserted for each case. (Silently dropping a paragraph a beginner typed is the worst
+  failure this feature can have, and it is the easy one to write.)
+- `quill import` composes with a template: `--template rulebook` produces a document with the
+  template's margins, styles and masters and the file's content; `--template` omitted uses a
+  documented default and says which in the output.
+- The importer is a library function in its own module with the CLI as a thin caller, so the app can
+  reuse it (asserted structurally: the CLI's handler is under 20 lines).
+- A 5,000-paragraph input imports in well under the 500-page layout budget and is asserted to produce
+  the expected block count — the importer must not be the new bottleneck.
+- No new dependency; `cargo tree -d` clean.
+- `docs/format-spec.md` gains the import syntax as a documented, versioned appendix, and a test parses
+  the doc's own example, per the spec-0030 precedent that stops docs drifting from code.
+
+**Test strategy** — Table-driven parser tests over small inputs, plus one whole-document fixture
+asserted block by block. The diagnostics tests are as important as the happy path and are written
+first. The doc-example-parses test is the anti-drift guard the repo already uses.
+
+**Risks** — Scope. A "markdown-ish" syntax invites unbounded creep toward CommonMark; the spec must
+enumerate exactly what is supported and state everything else as an explicit non-goal, or this
+increment never closes. Round-tripping *out* to markdown is not in scope and should be named as a
+non-goal. The stat-block and table fences duplicate structure that 0038/0039 defined in Rust types —
+that duplication must be a serde derive over the same types, not a second hand-written schema.
+
 ## Known issues
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten.
@@ -317,14 +904,21 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
 Deliberately unresolved; each would change work if answered differently. Recorded so they are
 decided explicitly rather than by accident.
 
-- Are master-page statics (running heads, folios, background art) semantic `Block`s — styled, reflowable, participating in the style system — or pre-placed geometry-only `PlacedBlock`s? Spec 0030's `{page}` token resolution and the styling of running heads both hang on this.
 - Should the 500-page synthetic document target page count by measurement (robust: stays ~500 when leading, margins or hyphenation change, but the workload silently changes size) or fix the block count (stable workload, drifting page count)? Spec 0027 assumes measure-to-target; the alternative makes bench numbers comparable across increments that change layout.
 - Does the CI perf gate assert any wall-clock at all, or only work counters plus same-run ratios? The plan uses ratios and a 2x blowup ceiling; a stricter gate would need self-hosted or pinned runners.
 - Deferred by design: `text-layout::Line` still carries no glyph ids or positions, so spec 0033's renderer re-shapes each line through the shared `quill-fonts` shaper and derives word positions from `space_adjust_pt`, exactly as `writer::render_page` does for `TJ`. That keeps one shaper but two derivation sites. Is that acceptable through M1, or should `text-layout` emit positioned glyph runs (spec 0016's still-open named non-goal, including shaping-GID ↔ subset-GID reconciliation) before the app shell ships?
-- Does `PageSetup::default()` eventually gain non-zero margins? Every increment here keeps it at zero so `Document::sample()` and the CI Ghostscript golden path never move — which means the shipped default still lets text bleed to the trim edge. Changing it is an M2 template concern but should be an explicit decision, not an oversight.
+- Is per-page master assignment by **index** (spec 0035) the right anchor, or should a master be attached to the chapter it opens? Index-based assignment means a TOC that grows by a page slides every chapter opener by one (spec 0041 names this). Anchoring to a heading's `BlockId` would survive repagination but needs a notion of "section" the model does not have. M2 ships index-based; M3 should decide whether that survives contact with a real book.
+- Should stat blocks and tables share one splitting mechanism? Spec 0038 defines keep-together-else-split-at-a-section-boundary and 0039 defines break-between-rows-repeat-the-header. They are the same shape. If 0038's turns out to generalize, 0039 reuses it; if it does not, the repo carries two breaking rules and should say why.
+- Do clickable internal links ever ship? Spec 0042 excludes them because PDF/X-1a requires annotations outside the BleedBox and a TOC entry sits mid-text-block by definition. The options are a non-PDF/X "screen PDF" export profile alongside the press one, or never. This is an M3 POD-preset question.
 
-## Beyond M1
+Answered by M2's decomposition, kept here as pointers: master statics are pre-placed geometry that
+resolves a style name (moved to the decisions log), and `PageSetup::default()` keeps zero margins
+permanently — spec 0036 gives templates real margins instead, so the on-ramp never starts at the
+trim edge while the CI golden path never moves.
 
-M2–M4 are not yet decomposed into increments. They are sketched in `CLAUDE.md` and will be
-sequenced here once M1 closes, following the same rule: a spec per feature, ordered by dependency,
-each independently shippable.
+## Beyond M2
+
+M3 (pro polish + POD presets) and M4 (plugins / ecosystem) are not yet decomposed into increments.
+They are sketched in `CLAUDE.md` and will be sequenced here once M2 closes, following the same rule:
+a spec per feature, ordered by dependency, each independently shippable. The open questions above
+are the M3 inputs.
