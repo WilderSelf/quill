@@ -17,6 +17,9 @@ quill-core-model = { workspace = true }
 quill-layout-engine = { workspace = true }
 quill-text-layout = { workspace = true }
 quill-render = { workspace = true }
+# The export-size budget (spec 0071) measures the artefact, so it runs the real writer over the
+# synthetic document. Still one-way: nothing in `export-pdf` knows this crate exists.
+quill-export-pdf = { workspace = true }
 
 # `harness = false` because these are hand-rolled `std::time::Instant` timings, not libtest
 # benchmarks: criterion would add ~30 transitive crates, against the minimal-graph rule in the
@@ -34,5 +37,10 @@ test = false
 
 [[bench]]
 name = "proxy_cache"
+harness = false
+test = false
+
+[[bench]]
+name = "export_size"
 harness = false
 test = false

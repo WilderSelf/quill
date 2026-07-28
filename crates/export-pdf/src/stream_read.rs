@@ -219,9 +219,36 @@ pub fn streams(pdf: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Every stream payload in a finished PDF, as the bytes a reader would see: `/FlateDecode`d
+/// streams inflated, everything else verbatim (spec 0071).
+///
+/// Inflation is attempted on every stream and the raw bytes kept when it fails, rather than being
+/// driven off the `/Filter` key in the dictionary. Reading the dictionary would mean parsing it,
+/// and the deliberate crudeness of [`streams`] is what keeps this a test helper rather than a PDF
+/// parser. A stream that is not zlib does not start with a valid zlib header, so the attempt fails
+/// immediately — it does not silently produce plausible-looking wrong bytes.
+pub fn decoded_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
+    streams(pdf).into_iter().map(|s| inflate(&s)).collect()
+}
+
+/// zlib-inflate `data`, or return it unchanged if it is not a zlib stream.
+fn inflate(data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    match flate2::read::ZlibDecoder::new(data).read_to_end(&mut out) {
+        Ok(_) => out,
+        Err(_) => data.to_vec(),
+    }
+}
+
 /// The streams that are page content — the ones carrying text operators.
+///
+/// Since spec 0071 these are `/FlateDecode`d in the file, so the filter below runs over the
+/// *inflated* bytes. Reading them raw would find no `BT` in any stream and return an empty list,
+/// which is the failure mode that spec worried about: a check that stops seeing what it asserts
+/// rather than failing.
 pub fn content_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
-    streams(pdf)
+    decoded_streams(pdf)
         .into_iter()
         .filter(|s| {
             find(s, b"BT").is_some() && (find(s, b" Tj").is_some() || find(s, b" TJ").is_some())
@@ -234,9 +261,14 @@ pub fn content_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
 /// Parses the `beginbfchar … endbfchar` blocks of every CMap in the file. A document set in one
 /// face has one, which is what the round-trip test uses; a multi-face document's maps are merged,
 /// and the test that cares asserts on a single-face export.
+///
+/// Reads through [`decoded_streams`] rather than [`streams`]. The CMap is written uncompressed
+/// today — deliberately, so it is the object a human can open by hand — but a reader that only
+/// works while that stays true would go quietly empty if it ever changed, which is the failure
+/// spec 0071 had to fix in `content_streams`.
 pub fn to_unicode_map(pdf: &[u8]) -> std::collections::BTreeMap<u16, String> {
     let mut out = std::collections::BTreeMap::new();
-    for stream in streams(pdf) {
+    for stream in decoded_streams(pdf) {
         let mut at = 0;
         while let Some(rel) = find(&stream[at..], b"beginbfchar") {
             let start = at + rel + b"beginbfchar".len();

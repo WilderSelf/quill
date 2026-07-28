@@ -19,7 +19,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M2** | Beginner on-ramp — templates, stat blocks, TOC | **complete** — specs 0035–0043 shipped |
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
-| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0070 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took and remains sequenced and unbuilt |
+| **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | named, not decomposed |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
@@ -2416,7 +2416,8 @@ worth carrying beyond the spec:
 
 ### 0071 compress-content-streams
 
-**Content streams are `FlateDecode`'d** · size: small · branch: `feat/compress-content-streams`
+**Content streams are `FlateDecode`'d** · size: small · branch: `feat/compress-content-streams` ·
+**shipped**
 
 Added to the closeout by a measurement 0068 took rather than assumed. Every other stream in the file
 is already compressed — images, font programs — and the content stream never was. That was
@@ -2442,6 +2443,42 @@ book is the workload the product is *for*.
   which most writer tests already do — and the CI checks need the same treatment or they go
   structurally blind rather than failing, the trap 0068 already met twice.
 - PDF/X-1a is unaffected: `FlateDecode` is PDF 1.2 and already used for this file's other streams.
+
+**As built.** The claim holds by a wider margin than it needed to, and the expensive part was the
+audit rather than the change. Measured three ways against the committed parity ICC — a worktree at
+`9811d6c` (the commit before 0068), `main`, and this branch — over the same 3346-block, 499-page
+synthetic document on every build:
+
+| document | pre-0068 | main | now |
+|---|---|---|---|
+| `Document::sample()` | 8786 | 10220 | **8454** |
+| 500-page synthetic | 13,763,105 | 15,791,758 | **1,308,263** |
+
+The 500-page file is **9.5% of its pre-0068 size**. Four things worth carrying beyond the spec:
+
+- **The margin is not the kern adjustments.** 0068 added ~14.7% and this removes ~90%, because a
+  content stream is mostly repeated `Tf`/`Td`/`Tj` scaffolding and decimal coordinates and always
+  was. What 0068 added was the reason anyone looked, not the bulk that compresses. The honest
+  reading is that the file had been paying this since spec 0002.
+- **The digest move is provable rather than argued, and that was available here.** Fourteen objects
+  both sides, exactly one differs — the content stream — and it differs only in its dictionary
+  (`/Length 2214` → `/Length 426 /Filter /FlateDecode`) and in the encoding of its payload, which
+  **inflates to the old 2214 bytes byte for byte**. Not one glyph, `TJ` amount or operator needed
+  inspecting individually, because none of them moved.
+- **The audit found one test the first sweep missed, and the way it was missed is the finding.**
+  `a_runs_colour_override_reaches_the_content_stream` searches the whole exported file for
+  `"0 1 1 0 k"` — a colour operator, but written as a full literal, so a grep for operator *tokens*
+  (`Tj`, `TJ`, `Tf`, `Td`, `re`, `Do`) walks straight past it. It failed loudly, which is the good
+  case; the bad case is a negative assertion built the same way, which would have gone quietly
+  vacuous. Every negative byte assertion in the crate was therefore checked against a positive
+  control instead of being reasoned about.
+- **Not one CI `grep -aq` was affected, and the honest conclusion was that this is a gap.** All of
+  them look for dictionary or metadata strings — `/Annots`, `/Subtype /Link`, `PDF/X-1a:2001`,
+  `GTS_PDFXVersion`, `npes.org`, `/OutputIntents` — whose objects are still uncompressed, verified
+  by running every check against both sides. So nothing went blind, but nothing in `pdf-preflight`
+  had ever asserted that the press file *draws* anything, and Ghostscript cannot see that either
+  since an empty page is well-formed. The job gains a step that inflates and asserts both halves:
+  no operator text in the stored bytes, and operators present after inflation.
 
 ## Known issues
 

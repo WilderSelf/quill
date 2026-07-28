@@ -106,3 +106,32 @@ ms_per_image = 7.0
 # enormous headroom — the gate fires only if skipping stops working, which is the point.
 warm_speedup_floor = 0.01
 
+# Export size — the only section here that measures an artefact rather than a cost (spec 0071).
+#
+# Every entry above is a duration or a counter. These are the bytes a publisher uploads, and until
+# spec 0071 nothing watched them: spec 0068 grew the 500-page export by 14.7% and it was found by a
+# hand measurement rather than by the gate. Both are exported against the committed parity ICC
+# (`crates/export-pdf/assets/parity-outputintent.icc`), because a synthesized profile stamps the
+# current time into its header and would make the size a clock.
+#
+# **Both are checked with `check_exact`, not against `tolerance_factor`.** An exported byte count is
+# deterministic — same document, same committed font, same committed profile, same file — so the
+# runner-to-runner variance the tolerance exists for does not apply. It would also be actively
+# harmful here: doubling `synthetic_500_page_bytes` puts the limit at 3.2 MB, above nothing the
+# writer can currently produce, while doubling it a second time would clear 13.7 MB — the pre-0068
+# size this increment exists to get back under. A budget that cannot fail for the regression it
+# guards is spec 0051's lesson, and it is why these are counters rather than timings.
+[export]
+# `Document::sample()`, one page. Measured 8454 — 8786 before spec 0068, 10220 after it, 8454 with
+# content streams deflated. `SAMPLE_EXPORT_DIGEST` pins these same bytes exactly; this entry is not
+# a substitute for it but the thing that says *which way* and *by how much* when it moves.
+sample_bytes = 9000
+# The 500-page synthetic document — 3346 blocks, 499 pages, art-heavy by spec 0027's generator.
+# Measured 1,308,263. It was 13,763,105 before spec 0068 and 15,791,758 after, so compressing the
+# content streams cut it to 9.5% of the pre-0068 file: the whole document is text, and text
+# operators plus repeated integer kern adjustments are what a deflate window eats.
+#
+# Pinned at 1.6 MB — ~22% headroom for ordinary content growth, and still 9.9x below the 15.79 MB a
+# writer that stopped compressing would produce. That is the regression this line is for.
+synthetic_500_page_bytes = 1600000
+

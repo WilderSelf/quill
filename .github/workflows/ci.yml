@@ -151,6 +151,72 @@ jobs:
           ! grep -aq '/Annots' /tmp/screen-as-press.pdf
           grep -aq 'PDF/X-1a:2001' /tmp/screen-as-press.pdf
 
+      - name: Compressed content streams (spec 0071)
+        run: |
+          set -euo pipefail
+          # Page content streams are `/FlateDecode`d since spec 0071, which is why no check in this
+          # job greps the finished file for a text operator. Every `grep -aq` above looks for a
+          # dictionary or metadata string — `/Annots`, `/Subtype /Link`, `PDF/X-1a:2001`,
+          # `GTS_PDFXVersion`, `npes.org`, `/OutputIntents` — and every one of those objects is
+          # still written uncompressed, so none of them went blind. That was verified by running
+          # each check against output from both sides of the change rather than assumed.
+          #
+          # This step is the one that would have gone blind, and so it is written to inflate: it
+          # asserts BOTH halves, because either alone is satisfiable by a defect. That the stored
+          # bytes carry no `BT` proves the compression happened; that the inflated bytes carry the
+          # operators proves the page still draws. A check that only did the second would pass over
+          # a writer that had quietly stopped compressing, and one that only did the first would
+          # pass over a page that drew nothing at all — which Ghostscript's parse gate below also
+          # cannot see, since an empty page is perfectly well-formed.
+          python3 - <<'PY'
+          import re, sys, zlib
+
+          def streams(data):
+              """(object number, dictionary, stored payload) for every stream in the file."""
+              for m in re.finditer(rb'(\d+) 0 obj', data):
+                  num, start = int(m.group(1)), m.end()
+                  end = data.find(b'endobj', start)
+                  body = data[start:end]
+                  i = body.find(b'stream')
+                  if i < 0:
+                      continue
+                  head = body[:i]
+                  length = re.search(rb'/Length (\d+)', head)
+                  j = i + len(b'stream')
+                  while j < len(body) and body[j] in (13, 10):
+                      j += 1
+                  payload = body[j:j + int(length.group(1))] if length \
+                      else body[j:body.find(b'endstream', j)]
+                  yield num, head, payload
+
+          def check(path):
+              data = open(path, 'rb').read()
+              assert b' Tj' not in data and b' TJ' not in data, \
+                  f'{path}: operator text is greppable in the raw file — content is uncompressed'
+              drawn = 0
+              for num, head, payload in streams(data):
+                  assert b'BT' not in payload, \
+                      f'{path}: object {num} stores operator text uncompressed'
+                  try:
+                      inflated = zlib.decompress(payload)
+                  except zlib.error:
+                      continue
+                  if b'BT' not in inflated:
+                      continue
+                  assert b'/Filter /FlateDecode' in head, \
+                      f'{path}: object {num} inflates to content but declares no filter'
+                  assert b' Tf' in inflated and (b' Tj' in inflated or b' TJ' in inflated), \
+                      f'{path}: object {num} sets no font or shows no text'
+                  drawn += 1
+              assert drawn > 0, f'{path}: no page draws any text at all'
+              print(f'{path}: {len(data)} bytes, {drawn} compressed content stream(s), '
+                    f'operators readable after inflation')
+
+          for path in ('/tmp/sample.pdf', '/tmp/sample-x3.pdf', '/tmp/screen.pdf',
+                       '/tmp/screen-as-press.pdf'):
+              check(path)
+          PY
+
       - name: Ghostscript parse check (gate)
         run: |
           set -euo pipefail
