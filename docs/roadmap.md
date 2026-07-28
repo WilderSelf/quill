@@ -2103,8 +2103,17 @@ just edited.
 
 **Tab stops and leaders** · size: medium · branch: `feat/tabs-and-leaders`
 
-A paragraph style gains an ordered list of tab stops, each with a position, an alignment (left,
-centre, right, decimal) and an optional leader string. A `\t` in a run advances to the next stop.
+A paragraph gains an ordered list of tab stops, each with a position, an alignment (left, centre,
+right, decimal) and an optional leader character. A `\t` in a run advances to the next stop.
+
+**Where the stops live is a design fork, and it is resolved here rather than at the keyboard.**
+`ParagraphStyle` is `Copy` and is looked up and copied per block per measurement — putting a
+`Vec<TabStop>` on it would either cost a heap allocation on that path or force the type to stop being
+`Copy`, and both are worse than the alternative. **The stops belong in `StyleSheet` as their own map
+keyed by style name** (`tabs: BTreeMap<String, Vec<TabStop>>`), resolved beside the paragraph style
+and passed by reference. `ParagraphStyle` stays `Copy`, the measurement path allocates nothing new,
+and a stylesheet remains the one place a treatment is named. A fixed-size array on the style was
+considered and rejected: eight stops is both an arbitrary ceiling and ~96 bytes copied per block.
 This is what sets a contents entry's page number against the right margin with dots between, a price
 list, a bibliography or a specification sheet — and quill currently draws its generated contents
 (spec 0041) without one.
@@ -2119,8 +2128,13 @@ list, a bibliography or a specification sheet — and quill currently draws its 
   asserted.
 - Justification and tabs compose: a justified line containing a tab does not stretch the tabbed gap,
   because a tab is a hard position and not a space.
-- The generated contents list (0041) is re-expressed on a right tab with a dot leader, and the change
-  to its rendered output is shown in the PR.
+- **The generated contents list (0041) is re-expressed through the general mechanism**, and its
+  hand-rolled version is deleted. `measure_toc` currently computes an indent, clips the title with an
+  ellipsis, measures the page number, and lays a dot leader into the gap between them by hand — which
+  is a right tab with a dot leader, written out. Its *current placed geometry is the acceptance
+  criterion*: byte-identical, or the generalization is wrong. That is the pattern spec 0054 used to
+  retire the hand-written component measurement, and it is the reason this increment is worth more
+  than the feature alone.
 - A document with no tab stop exports byte-identically to before this increment.
 
 ## Known issues
