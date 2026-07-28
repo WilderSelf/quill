@@ -74,8 +74,13 @@ impl PodPreset {
     ///
     /// Two fields have no pre-0049 predecessor and are therefore stated for what they are:
     ///
-    /// - `safety_pt` is 0.25 in, **print-trade convention rather than any vendor's requirement**.
-    ///   It is conservative, it is attributed to nobody, and nothing reads it until spec 0050.
+    /// - `safety_pt` is **0.0 — `generic` states no safety margin**, for the same reason the vendor
+    ///   presets state no trim catalogue: no figure has been confirmed against a printer, and quill
+    ///   will not invent a requirement. That makes spec 0050's safe-area check inert by default;
+    ///   set it from your printer's specification to turn it on. This is not a nominal default
+    ///   either: `PageSetup::default()` has zero margins on purpose (spec 0036 gives templates real
+    ///   ones instead), so a non-zero figure here would fail the shipped sample — correctly, which
+    ///   is precisely why the number has to come from a printer and not from quill.
     /// - `trim_sizes` is a short list of common trade trims — a convenience, explicitly not a
     ///   vendor catalogue. A trim outside it is a `Warning`, never an `Error`.
     pub fn generic() -> Self {
@@ -84,7 +89,7 @@ impl PodPreset {
             title: "Generic POD (conservative)".into(),
             source: "quill's own press constraints — specs/0001-pdf-x-export.md and CLAUDE.md: \
                      0.125in bleed, 300 dpi images (600 dpi line art), 240% total ink, \
-                     PDF/X-1a:2001. The 0.25in safety margin is print-trade convention, not any \
+                     PDF/X-1a:2001. No safety margin is stated — supply your printer's figure to \
                      vendor's stated requirement. The trim list is common trade sizes, not a \
                      vendor catalogue."
                 .into(),
@@ -105,7 +110,7 @@ impl PodPreset {
                 }, // A5
             ],
             bleed_pt: 0.125 * IN_PT,
-            safety_pt: 0.25 * IN_PT,
+            safety_pt: 0.0,
             max_ink_pct: 240.0,
             min_dpi_color: 300.0,
             min_dpi_line_art: 600.0,
