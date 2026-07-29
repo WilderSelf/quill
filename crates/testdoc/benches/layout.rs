@@ -263,5 +263,73 @@ fn main() {
         &mut failures,
     );
 
+    // --- The book fixpoint (spec 0079) --------------------------------------------------------
+    //
+    // The M6 audit's named risk, measured rather than discovered: a book's contents list names
+    // headings from chapters it does not contain, so the fixpoint's derived quantity spans every
+    // chapter and *each iteration re-lays every chapter*. With `FIXPOINT_MAX_ITERATIONS = 8`, a
+    // 10-chapter book could in principle cost 80 chapter layouts per relayout.
+    //
+    // The question that decides whether it is linear or quadratic is precisely **whether the
+    // iteration count grows with the chapter count**, because a pass is a whole-book pass either
+    // way. So the workload holds the total content fixed and varies only how many chapters it is
+    // cut into: if the cost multiplied by the chapter count, the ratio below would be 2.
+    let book_spec = SynthSpec {
+        target_pages: 200,
+        ..SynthSpec::default()
+    };
+    let five = quill_testdoc::synthetic_book(&book_spec, 5);
+    let ten = quill_testdoc::synthetic_book(&book_spec, 10);
+
+    let mut five_session = quill_layout_engine::LayoutSession::new();
+    let five_result = five_session.relayout(&five.document, &HARNESS_METRICS, &NoHyphenator);
+    let mut ten_session = quill_layout_engine::LayoutSession::new();
+    let ten_result = ten_session.relayout(&ten.document, &HARNESS_METRICS, &NoHyphenator);
+
+    println!(
+        "book fixpoint: 5 chapters → {} pages in {} iterations (converged {}); \
+         10 chapters → {} pages in {} iterations (converged {})",
+        five_result.pages.len(),
+        five_result.fixpoint.iterations,
+        five_result.fixpoint.converged,
+        ten_result.pages.len(),
+        ten_result.fixpoint.iterations,
+        ten_result.fixpoint.converged
+    );
+    assert!(
+        five_result.fixpoint.converged && ten_result.fixpoint.converged,
+        "the book fixture must settle; a non-converging one would pin the cap rather than the cost"
+    );
+
+    budgets.check_exact(
+        "layout.book_fixpoint_iterations",
+        ten_result.fixpoint.iterations as f64,
+        &mut failures,
+    );
+    // `check_exact` on a *ratio*, which is unusual here and is right for the same reason the
+    // iteration count is: both sides are deterministic pass counts, so the runner variance
+    // `tolerance_factor` exists for does not apply. Applying it would put the limit at 2.0 — exactly
+    // the value a cost that multiplied by the chapter count would produce — which is the
+    // unreachable-limit trap spec 0051 recorded.
+    let chapter_ratio =
+        ten_result.fixpoint.iterations as f64 / five_result.fixpoint.iterations.max(1) as f64;
+    budgets.check_exact("layout.book_chapter_ratio", chapter_ratio, &mut failures);
+
+    // And the per-pass shape, so a book that settles in the same number of passes but does more work
+    // per pass is still caught. Timed, therefore `check`.
+    let book_pages = ten_result.pages.len();
+    let book_elapsed = budget::min_of(3, || {
+        let mut session = quill_layout_engine::LayoutSession::new();
+        std::hint::black_box(session.relayout(&ten.document, &HARNESS_METRICS, &NoHyphenator));
+    });
+    let book_ms_per_page = book_elapsed.as_secs_f64() * 1000.0 / book_pages as f64;
+    println!(
+        "book layout: {book_pages} pages in {:.1} ms  ({book_ms_per_page:.3} ms/page, \
+         {} fixpoint passes)",
+        book_elapsed.as_secs_f64() * 1000.0,
+        ten_result.fixpoint.iterations
+    );
+    budgets.check("layout.book_ms_per_page", book_ms_per_page, &mut failures);
+
     budget::report(failures);
 }

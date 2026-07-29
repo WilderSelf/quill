@@ -435,6 +435,14 @@ predates them prints the literal text `{section}` on every page. That is wrong o
 added to the model, either: the tokens live inside a `text` string a user can type at any time, so no
 version gate could stop them arriving. `format_version` stays **6**.
 
+**Spec 0079 is the rule not firing for a different reason: there is no document to be wrong about.**
+A book is a new artifact with its own `book_version` (below), and it adds no field to `Document`,
+`StyleSheet`, `MasterPage`, `PageSetup` or `PageOverride`. A build that predates books, handed a
+`.qbook`, does not recognise the extension and never opens it — neither half of the rule can fire,
+because there is no silence to be wrong in and nothing of the author's to lose. The chapters
+themselves are ordinary v9 `.tpub`s that an older build opens exactly as it always did.
+`format_version` stays **9**.
+
 > **Bumping `FORMAT_VERSION`? Check whether `TEMPLATE_VERSION` is owed one too.** A template file
 > (below) embeds `page_setup`, `styles`, `master_pages` and `pages`. A document bump that changes
 > the serialized shape of any of those four changes every template file as well, and the template
@@ -533,6 +541,84 @@ a trim, so the precedence is fixed rather than left to the invocation:
   lowering it would cost something.
 
 With no template at all, a preset seeds both outright.
+
+## Book files (spec 0079)
+
+A **book file** is several `.tpub` chapters composed into one press file: one page-number sequence,
+one contents list, one set of embedded subsets, one OutputIntent, one preflight. It is plain JSON
+with the extension `.qbook` — not a container, for the reason a template file is not one: a book
+links no assets of its own, and its chapters carry theirs.
+
+```json
+{
+  "book_version": 1,
+  "metadata": { "title": "The Ruined Keep", "authors": ["A. Cartographer"] },
+  "requires": [ { "name": "house-style", "version": "1" } ],
+  "chapters": [
+    { "path": "front.tpub", "name": "Front matter",
+      "folio": { "format": "lower_roman", "restart_at": 1 } },
+    { "path": "ch1.tpub", "name": "The Ruined Keep",
+      "folio": { "format": "decimal", "restart_at": 1 } },
+    { "path": "ch2.tpub", "name": "The Sunken Vault" }
+  ]
+}
+```
+
+- `path` is relative to the book file. Absolute paths and paths escaping the book's own directory are
+  refused, not sanitized — the rule a `.tpub` entry and a `.qpack` path already get.
+- `name` is the chapter's name **as a section**: what `{section}` prints in a running head.
+- `folio` is the `Folio` above, unchanged, and this is what `restart_at`'s "the offset a chapter
+  extracted from a larger book needs" meant.
+- `master` names the master for the chapter's opening page; omitted, the chapter's own positional
+  override for its own page 0 supplies it.
+- `requires` is spec 0056's list. **Shared styles are `.qpack` and nothing else**, and a requirement
+  that does not resolve refuses the book rather than falling back.
+
+**A book resolves to one `Document` before anything lays it out.** Content is concatenated, block ids
+are rebased so no two chapters collide, asset ids are namespaced (`0/map`) and asset paths repointed
+under `chapters/<i>/`, styles/masters/definitions merge first-wins, and one `Section` is synthesised
+per chapter. Everything downstream — the layout fixpoint, the incremental session, the font-subset
+collector, geometry preflight, the PDF/X writer — is unchanged, which is the point: those are the
+paths that have been tested since M0.
+
+Consequences worth stating, because each is a decision:
+
+- **Pagination is continuous with nothing stated.** The composed document is one page vector, so the
+  run at page 0 already numbers every chapter in sequence. There is no page-number offset anywhere; a
+  book that wants a break says so with a chapter `folio`.
+- **A chapter does not start on a new page.** The model has no forced page break anywhere — named as
+  a non-goal by specs 0072 and 0073 and again by 0079 — so chapter 2 begins on the page chapter 1
+  ended on. The numbering is still continuous and correct; what is missing is the recto opener.
+- **Every chapter must share one `trim`, `bleed` and `facing_pages`,** or the book is refused: a press
+  file whose pages are not one trim is not a press file. Differing margins or baseline grids are
+  settled by the first chapter and *reported*.
+- **A cross-reference cannot reach another chapter.** A `BlockId` is unique within a document, so
+  chapter 1's block 12 and chapter 3's block 12 are both block 12; rebasing shifts a chapter's ids and
+  its references by the same offset, so a reference always resolves to the block it meant, and no id
+  an author could write reaches out of its own file. A qualified target is the path, and it is a
+  `format_version` decision of its own.
+- **Positional page overrides for a chapter's later pages are dropped and reported.** They name
+  positions in a document that no longer starts at page 1.
+
+### Versioning a book file
+
+`book_version` is an integer and a **separate one** from `format_version`, `template_version` and
+`pack_version`, on the reasoning that separated the template's: a book file is not a document. The
+rules are identical to the other three — the gate runs on the untyped JSON before deserialization,
+and a file newer than this build is refused (`LoadError::UnsupportedBookVersion`) rather than
+half-loaded.
+
+| `book_version` | Behavior |
+|---|---|
+| absent | treated as current |
+| older | migrated forward, one step per version |
+| current | loaded as-is |
+| newer | refused |
+
+`BOOK_VERSION` is **1** and the migration chain is empty. Unlike a template file, a book file embeds
+no document structure at all — it names chapters by path and states a `Folio` per chapter — so a
+`format_version` bump does not automatically owe one here. What owes a bump is a change to the book
+envelope itself.
 
 ## Reading a container
 

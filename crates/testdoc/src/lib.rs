@@ -273,9 +273,75 @@ pub fn synthetic_document(spec: &SynthSpec) -> Document {
     );
 }
 
+/// A synthetic **book** (spec 0079): `chapters` chapters totalling `spec.target_pages` pages, with a
+/// contents list in the first one, composed into a single document.
+///
+/// The contents list is what makes this the workload the M6 audit was worried about: a book's
+/// contents list names headings from chapters it does not itself contain, so the layout fixpoint's
+/// derived quantity spans every chapter. Splitting a fixed total across a varying number of chapters
+/// is what turns "does the cost multiply by the chapter count?" into a measurement — the total
+/// content is held constant and only the number of chapters moves.
+pub fn synthetic_book(spec: &SynthSpec, chapters: usize) -> quill_core_model::ComposedBook {
+    assert!(chapters > 0, "a book must have at least one chapter");
+    let per_chapter = (spec.target_pages / chapters).max(1);
+    let docs: Vec<Document> = (0..chapters)
+        .map(|i| {
+            let mut doc = synthetic_document(&SynthSpec {
+                target_pages: per_chapter,
+                seed: spec.seed.wrapping_add(i as u64 * 1013),
+                ..*spec
+            });
+            if i == 0 {
+                doc.content.insert(
+                    0,
+                    Block::Toc {
+                        id: quill_core_model::BlockId::UNASSIGNED,
+                        title: "Contents".into(),
+                        max_level: 2,
+                        color: Color::Gray { v: 0.0 },
+                    },
+                );
+                doc.assign_missing_block_ids().expect("ids");
+            }
+            doc
+        })
+        .collect();
+
+    let book = quill_core_model::Book {
+        book_version: quill_core_model::BOOK_VERSION,
+        metadata: Default::default(),
+        requires: Vec::new(),
+        chapters: (0..chapters)
+            .map(|i| quill_core_model::BookChapter {
+                path: format!("ch{i}.tpub"),
+                name: format!("Chapter {i}"),
+                folio: None,
+                master: None,
+            })
+            .collect(),
+    };
+    book.compose(&docs).expect("a synthetic book must compose")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_synthetic_book_is_its_chapters() {
+        let spec = SynthSpec {
+            target_pages: 20,
+            ..SynthSpec::default()
+        };
+        let book = synthetic_book(&spec, 4);
+        assert_eq!(book.chapter_anchors.len(), 4);
+        assert_eq!(book.document.sections.len(), 4);
+        assert!(book
+            .document
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Toc { .. })));
+    }
 
     #[test]
     fn hits_the_page_target() {

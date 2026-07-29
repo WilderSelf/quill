@@ -15,6 +15,7 @@ pub use quill_components::{
 };
 use serde::{Deserialize, Serialize};
 
+mod book;
 mod collate;
 mod components;
 mod container;
@@ -25,6 +26,9 @@ mod resolve;
 mod template;
 mod version;
 
+pub use book::{
+    chapter_prefix, Book, BookChapter, BookNote, ComposedBook, OpenedBook, BOOK_VERSION,
+};
 pub use collate::{collation_key, CollationKey};
 pub use components::{
     builtin_components, statblock_definition, table_definition, PANEL_PADDING_PT,
@@ -1068,6 +1072,23 @@ impl Block {
             | Block::Component { .. }
             | Block::Toc { .. }
             | Block::Index { .. } => &[],
+        }
+    }
+
+    /// [`Block::runs`], mutably (spec 0079).
+    ///
+    /// The one caller is book composition, which has to shift every identity a run names by the
+    /// chapter's id offset. Written as the mirror of [`Block::runs`] — the same exhaustive match over
+    /// the same variants — so the two cannot come to disagree about which blocks carry runs.
+    pub fn runs_mut(&mut self) -> &mut [Run] {
+        match self {
+            Block::Heading { runs, .. } | Block::Body { runs, .. } => runs,
+            Block::Image { .. }
+            | Block::Panel { .. }
+            | Block::Table { .. }
+            | Block::Component { .. }
+            | Block::Toc { .. }
+            | Block::Index { .. } => &mut [],
         }
     }
 

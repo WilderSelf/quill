@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use crate::{FORMAT_VERSION, PACK_VERSION, TEMPLATE_VERSION};
+use crate::{BOOK_VERSION, FORMAT_VERSION, PACK_VERSION, TEMPLATE_VERSION};
 
 /// Everything that can go wrong loading a document or a `.tpub` container.
 ///
@@ -83,6 +83,21 @@ pub enum LoadError {
         version: String,
         path: String,
     },
+    /// A book file (spec 0079) is not well-formed, or does not match the schema this build
+    /// understands. Its own variant for [`LoadError::TemplateParse`]'s reason: a malformed *book*
+    /// reported as a malformed document sends the reader to the wrong file.
+    BookParse(String),
+    /// A book file declares a `book_version` newer than this build supports. A refusal, on the same
+    /// reasoning as [`LoadError::UnsupportedVersion`].
+    UnsupportedBookVersion { found: u32, supported: u32 },
+    /// A book names a chapter by an absolute path, or one that escapes the book's own directory. A
+    /// book file is something a user can receive from someone else.
+    BookUnsafePath { path: String },
+    /// A chapter's press geometry differs from the book's. A refusal rather than a note, and the
+    /// split is deliberate: a press file whose pages are not one trim is not a press file. Margins
+    /// and the baseline grid are settled by the book and reported as a
+    /// [`BookNote`](crate::BookNote) instead.
+    BookPageSetup { chapter: usize, field: &'static str },
 }
 
 impl fmt::Display for LoadError {
@@ -164,6 +179,23 @@ impl fmt::Display for LoadError {
                 f,
                 "a different pack `{pack}` {version} is already installed at '{path}'; \
                  pass --force to replace it"
+            ),
+            LoadError::BookParse(m) => write!(f, "malformed book file: {m}"),
+            LoadError::UnsupportedBookVersion { found, supported } => write!(
+                f,
+                "book file version {found} is newer than this build supports \
+                 (up to {supported}); upgrade Quill to open it"
+            ),
+            LoadError::BookUnsafePath { path } => write!(
+                f,
+                "this book names the chapter '{path}', which is absolute or escapes the book's \
+                 own directory"
+            ),
+            LoadError::BookPageSetup { chapter, field } => write!(
+                f,
+                "chapter {chapter}'s {field} differs from the first chapter's; every chapter of a \
+                 book must share one trim, bleed and facing-page setting — a press file whose \
+                 pages are not one trim will be rejected by the printer"
             ),
         }
     }
@@ -460,6 +492,41 @@ pub fn migrate_pack(value: &mut serde_json::Value) -> Result<(), LoadError> {
     }
 
     obj.insert("pack_version".into(), PACK_VERSION.into());
+    Ok(())
+}
+
+/// Bring a **book file** (spec 0079) forward to [`BOOK_VERSION`], or refuse it.
+///
+/// The **fourth** version gate in this workspace, and written arm for arm with the two above for the
+/// reason `migrate_pack` states about the third: a differently-shaped gate is another thing to get
+/// wrong. Read the declared version, refuse a newer one, stamp the current one; the chain is empty
+/// because nothing is older than v1, and the shape is here so the first real bump is an added arm
+/// rather than a redesign.
+///
+/// A book file embeds no part of a document — it names chapters by path and states a [`crate::Folio`]
+/// per chapter — so a [`FORMAT_VERSION`] bump does not automatically owe one here, unlike a template
+/// file, which embeds four document structures. What owes a bump is a change to the book envelope
+/// itself.
+pub fn migrate_book(value: &mut serde_json::Value) -> Result<(), LoadError> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| LoadError::BookParse("book file root is not a JSON object".into()))?;
+
+    let found = match obj.get("book_version") {
+        None => BOOK_VERSION,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            LoadError::BookParse("`book_version` is not a non-negative integer".into())
+        })? as u32,
+    };
+
+    if found > BOOK_VERSION {
+        return Err(LoadError::UnsupportedBookVersion {
+            found,
+            supported: BOOK_VERSION,
+        });
+    }
+
+    obj.insert("book_version".into(), BOOK_VERSION.into());
     Ok(())
 }
 

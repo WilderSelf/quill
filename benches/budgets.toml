@@ -79,6 +79,44 @@ incremental_blocks_measured = 2.0
 # named and which would show as 5 and upward. Spec 0079's book-level pagination is the next thing
 # that will test it.
 fixpoint_iterations = 4
+# The same loop over a **book** (spec 0079): ten chapters totalling ~200 pages, composed into one
+# document, with a contents list in the first chapter that names headings from the other nine.
+#
+# This is the M6 audit's named risk, and the arithmetic it feared: a book's contents list makes the
+# fixpoint's derived quantity span every chapter, and each iteration re-lays every chapter, so a
+# 10-chapter book could in principle cost `FIXPOINT_MAX_ITERATIONS` x 10 = 80 chapter layouts per
+# relayout. Since a pass is a whole-book pass either way, the question that actually decides linear
+# vs quadratic is **whether the iteration count grows with the chapter count** — which is what
+# `book_chapter_ratio` below measures and this line pins.
+#
+# Measures 3, the same as the single-document fixpoint: place, resolve what the first pass could not
+# know, agree. Pinned at 4 for the reason `fixpoint_iterations` is, and checked with `check_exact`
+# for the same reason: an iteration count is deterministic, and doubling a ceiling of 4 puts the
+# limit at `FIXPOINT_MAX_ITERATIONS` itself.
+book_fixpoint_iterations = 4
+# Fixpoint passes over a 10-chapter book divided by passes over a 5-chapter book **of the same total
+# size**. Measures 1.0 — the cost is `iterations x book`, not `iterations x chapters x book`, so a
+# book is linear in its page count and indifferent to how many files it was authored in.
+#
+# The workload holds the content fixed and varies only the number of chapters, which is what makes
+# this a direct answer rather than an inference. A cost that multiplied by the chapter count would
+# read 2.0, so the ceiling is 1.5 and it is checked **exactly**: with the 2.0 tolerance the limit
+# would land on 3.0 and the regression this line exists for would sail through it.
+book_chapter_ratio = 1.5
+# Full relayout of that 10-chapter book through a cold `LayoutSession`, per page — every pass of the
+# fixpoint included, which is why it is about twice `ms_per_page` above rather than three times it:
+# that entry is one cold `lay_out` pass, and passes 2 and 3 here are served largely from the
+# measurement cache.
+#
+# **Measured 0.231 on the machine spec 0079 was built on, which runs `ms_per_page` at 0.110 against
+# the 0.475 the reference machine recorded — about 4x faster.** The ceiling is therefore stated in
+# the reference machine's units (0.231 x 0.475/0.110 ~= 1.0) with the usual headroom, rather than
+# pinning this machine's speed into the gate. Re-pinning it from a fast machine is the mistake
+# `line_breaking.us_per_paragraph` above records having avoided.
+#
+# What it catches that the two counters above cannot: a book that settles in the same number of
+# passes but does more work in each of them.
+book_ms_per_page = 1.6
 # The same edit as a fraction of a full layout pass. Stated as a ratio against a pass measured in
 # the same run, so it does not drift with runner speed.
 # There is deliberately no wall-clock budget for the incremental edit. Isolating it means

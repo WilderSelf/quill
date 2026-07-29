@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use quill_core_model::{import, Document, Template, Tpub};
+use quill_core_model::{import, Book, Document, Template, Tpub};
 use quill_export_pdf::{
     export, preflight, synth_cmyk_profile, ExportOptions, ExportProfile, PdfxVersion, PodPreset,
     PreflightReport, Severity,
@@ -86,7 +86,8 @@ struct NewArgs {
 
 #[derive(Args)]
 struct RenderArgs {
-    /// Path to a `.tpub` or `document.json` (optional; falls back to the built-in sample).
+    /// Path to a `.qbook` book, a `.tpub`, or a `document.json` (optional; falls back to the
+    /// built-in sample).
     input: Option<String>,
     /// Zero-based page to render.
     #[arg(long, default_value_t = 0)]
@@ -194,7 +195,8 @@ impl From<ProfileArg> for ExportProfile {
 
 #[derive(Args)]
 struct DocArgs {
-    /// Path to a `.tpub` `document.json` (optional; falls back to the built-in sample).
+    /// Path to a `.qbook` book, a `.tpub`, or a `document.json` (optional; falls back to the
+    /// built-in sample).
     input: Option<String>,
     /// POD preset supplying the preflight thresholds. Defaults to `generic`, which is exactly the
     /// values quill has always checked. See `quill presets`.
@@ -204,7 +206,8 @@ struct DocArgs {
 
 #[derive(Args)]
 struct ExportArgs {
-    /// Path to a `.tpub` `document.json` (optional; falls back to the built-in sample).
+    /// Path to a `.qbook` book, a `.tpub`, or a `document.json` (optional; falls back to the
+    /// built-in sample).
     input: Option<String>,
     /// Output PDF path.
     #[arg(short, long)]
@@ -240,12 +243,16 @@ struct Loaded {
     asset_root: PathBuf,
 }
 
-/// Load a `.tpub` container or a bare `document.json`.
+/// Load a `.qbook` book, a `.tpub` container, or a bare `document.json`.
 ///
 /// A `.tpub` is extracted next to itself (`book.tpub` → `book.tpub.d/`) so that repeated opens are
 /// idempotent and the extracted assets are findable rather than hidden in a temp directory that
 /// nothing owns. A bare `document.json` resolves its assets against its own directory — not the
 /// process working directory, which is what the writer used to assume.
+///
+/// A `.qbook` (spec 0079) composes to a `Document` here, which is why **no command needs a
+/// book-shaped variant**: `preflight`, `export` and `render` all take a document, and a book is one
+/// by the time they see it.
 fn load_doc(input: &Option<String>) -> Result<Loaded, String> {
     let mut loaded = load_doc_unresolved(input)?;
     // Content packs are resolved at load, before anything can lay the document out (spec 0056).
@@ -266,6 +273,28 @@ fn load_doc_unresolved(input: &Option<String>) -> Result<Loaded, String> {
         });
     };
     let path = Path::new(path);
+
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("qbook"))
+    {
+        let extract_to = path.with_extension("qbook.d");
+        let opened = Book::open_into(path, &extract_to).map_err(|e| e.to_string())?;
+        // Printed rather than swallowed: each of these is a decision composition made on the
+        // author's behalf, and none of them is a press failure — a press failure is a refusal.
+        for note in &opened.composed.notes {
+            eprintln!("note: {note}");
+        }
+        println!(
+            "book: {} chapters composed into {} blocks",
+            opened.composed.chapter_anchors.len(),
+            opened.composed.document.content.len()
+        );
+        return Ok(Loaded {
+            doc: opened.composed.document,
+            asset_root: opened.asset_root,
+        });
+    }
 
     if path
         .extension()

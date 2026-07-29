@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M5 complete; M6 through spec 0078.** M0 (headless PDF/X export) is
+**Status: M0–M6 complete (specs 0072–0079 shipped).** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -128,7 +128,7 @@ TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable compone
 content packs) → **M5** the general typographic core (the neutral core, inline runs, character
 styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
 an index, a book) → **M7** graphics and colour.
-**M0–M5 done**; M0's sole open item is the manual POD upload. **M5 shipped specs 0062–0070**: the
+**M0–M6 done**; M0's sole open item is the manual POD upload. **M5 shipped specs 0062–0070**: the
 typographic core (0062–0067) plus a three-increment closeout — the writer draws the shaped glyph run
 rather than the characters (0068), a placed part reports the ink it draws rather than the slot it was
 given (0069), and the contents list is re-expressed through the tab mechanism (0070). They ran in a
@@ -189,7 +189,22 @@ a per-entry `sort_as` — are declared *data*, so the mechanism is not English-s
 list's cache route (`context_fingerprint` + eviction), not 0076's `MeasureKey`, because there is one
 of it; the fixpoint gained a fourth quantity and still measures 3 passes. `FORMAT_VERSION` is **9**,
 decided by the quiet half of the rule: an older build refuses the index *block* loudly but drops
-every *mark* in silence.
+every *mark* in silence. **0079 then closed the milestone with a book**, and closed it by *not*
+breaking the one-`Document` assumption the audit named in four crates: a book is a new artifact
+(`.qbook`, `BOOK_VERSION` 1, a fourth gate written arm for arm with the other three) whose
+`compose` is a **pure function to one `Document`** — content concatenated, block ids rebased, assets
+namespaced, one `Section` per chapter — so `export`, `AppState`, `OpenedTpub` and `LayoutSession` are
+untouched and the press file takes the path that has been tested since M0. Continuous pagination
+needs no page-number offset at all, which is what makes a stale folio unrepresentable: the offset
+*is* a `Section`'s `Folio`, and `doc.sections` has been in `context_fingerprint` since 0072. Rebasing
+shifts a chapter's ids and its references by the same amount, so a cross-reference always means the
+block it meant and cannot reach another chapter — which is the answer to the collision that would
+otherwise have put a wrong page number in a press file silently. The fixpoint cost the audit feared
+(up to 80 chapter layouts per relayout) measures **3 passes, indifferent to chapter count**
+(`layout.book_chapter_ratio` = 1.0 over ten chapters against five of the same total size), and
+`FORMAT_VERSION` stays **9** because there is no *document* an older build could be wrong about. The
+residual is named: the model still has no forced page break, so a chapter begins on the page the
+previous one ended on.
 `TEMPLATE_VERSION` stays 1 throughout.
 M7 is named, not decomposed.
 
@@ -237,6 +252,7 @@ cargo run -p quill-cli -- new --template reference --output book.tpub
 cargo run -p quill-cli -- new --from my-template.json --output book.tpub  # user-authored (0053)
 cargo run -p quill-cli -- import doc.md --output book.tpub --template reference
 cargo run -p quill-cli -- tpub document.json --output book.tpub   # was `pack`, renamed by 0055
+cargo run -p quill-cli -- export book.qbook --output book.pdf --icc press.icc  # a book (0079)
 cargo run -p quill-cli -- pack install examples/packs/pbta-moves.json   # content packs (0055-0057)
 cargo run -p quill-cli -- pack list
 cargo run -p quill-cli -- pack extract book.tpub --name house --version 1.0.0 \
