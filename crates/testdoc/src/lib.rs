@@ -206,6 +206,11 @@ pub fn document_with_blocks(spec: &SynthSpec, block_count: usize) -> Document {
         // No per-page overrides: the synthetic workload deliberately carries no furniture, so every
         // budget in `benches/budgets.toml` keeps measuring the same thing across spec 0035.
         pages: Vec::new(),
+        // And no sections (spec 0072), for the same reason: a section puts the document in the
+        // layout fixpoint, and a workload that took two passes where it used to take one would
+        // re-baseline every budget in the file against a change to the measurement rather than to
+        // the engine.
+        sections: Vec::new(),
         components: Default::default(),
         requires: Vec::new(),
     };

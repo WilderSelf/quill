@@ -46,16 +46,19 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
-/// **3** since spec 0047 gave [`MasterStatic::Text`] an alignment and page-parity mirroring; **2**
-/// since spec 0030 added master pages and margins. Each bump is deliberate even though the new
-/// fields are all `serde(default)` and an older manifest therefore loads unchanged: the point of a
-/// version is to stop an *older* build from opening a document it would silently mis-lay-out. A
-/// build that predates master pages would ignore `master_pages` entirely and produce a document
-/// without its running heads, folios or column geometry; a build that predates spec 0047 would draw
-/// every static left-aligned in an unmirrored rect, putting the folio in the gutter on every verso.
-/// Either could then save that back over the original. Refusing to open is the correct outcome;
-/// quietly dropping the layout is exactly the silent corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 4;
+/// **5** since spec 0072 gave a document [`Section`]s; **4** since spec 0063 replaced a paragraph's
+/// `text` with styled `runs`; **3** since spec 0047 gave [`MasterStatic::Text`] an alignment and
+/// page-parity mirroring; **2** since spec 0030 added master pages and margins. Each bump is
+/// deliberate even though the new fields are all `serde(default)` and an older manifest therefore
+/// loads unchanged: the point of a version is to stop an *older* build from opening a document it
+/// would silently mis-lay-out. A build that predates master pages would ignore `master_pages`
+/// entirely and produce a document without its running heads, folios or column geometry; a build
+/// that predates spec 0047 would draw every static left-aligned in an unmirrored rect, putting the
+/// folio in the gutter on every verso; a build that predates spec 0072 would drop `sections` and
+/// set every chapter opener in the body master. Either could then save that back over the original.
+/// Refusing to open is the correct outcome; quietly dropping the layout is exactly the silent
+/// corruption `CLAUDE.md` forbids.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -1482,15 +1485,60 @@ impl MasterPage {
 /// Per-page overrides of what the document otherwise decides (spec 0035).
 ///
 /// Indexed positionally: `pages[i]` governs page `i`. Assignment by index means inserting content
-/// that pushes the book by a page slides every subsequent assignment — accepted semantics for now;
-/// anchoring a master to the chapter it opens needs a notion of "section" the model does not have,
-/// and is recorded as an open question in `docs/roadmap.md`.
+/// that pushes the book by a page slides every subsequent assignment.
+///
+/// That was recorded here as the gap a notion of "section" would have to fill, and spec 0072 fills
+/// it — **without replacing this type**. A [`Section`] is anchored to a [`BlockId`]; the page its
+/// anchor lands on is read off the laid-out page vector each pass, and a `Vec<PageOverride>` is
+/// synthesised from it by [`Document::page_assignment`]. So index assignment turned out to be the
+/// right *representation* and the wrong authoring surface: this is still what resolution reads, and
+/// [`Document::master_for`] is unchanged. A positionally authored list is still honoured, and is
+/// still positional — it is a section that survives repagination, not an entry in this list.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PageOverride {
     /// The master this page uses, overriding [`Document::default_master`].
     ///
     /// `None` declines to override — which is deliberately *not* the same as "no master": an
     /// explicit entry that sets nothing still falls through to the document's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master: Option<String>,
+}
+
+/// A named division of the document, anchored to the block that opens it (spec 0072).
+///
+/// The anchor is a [`BlockId`], not a page index, and that is the whole point: a block id is stable
+/// across every edit that does not delete the block (spec 0026), so "the master that opens this
+/// chapter" survives repagination in a way `pages[7]` cannot. Where the section *starts* is derived
+/// — the first page its anchor block was placed on — and from that derivation the engine synthesises
+/// the [`PageOverride`] list that [`Document::master_for`] has always read.
+///
+/// A section is deliberately **not** a container: it does not own its blocks and there is no tree.
+/// It marks a point in the flat content list, and a section runs until the next section's anchor.
+/// Nesting a part inside a chapter is expressible as two sections whose anchors are adjacent, and
+/// making it a container would change every consumer of `Document::content` for a feature nothing
+/// needs yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Section {
+    /// What this section is called — a chapter title, "Front matter", "Appendix A".
+    ///
+    /// Authored rather than derived from the anchor's text, because the two are routinely different:
+    /// a running head says "The Ruined Keep" where the chapter opener says "Chapter One: The Ruined
+    /// Keep". Spec 0074 is what prints it.
+    pub name: String,
+    /// The block that opens the section.
+    ///
+    /// An anchor naming a block the document does not contain is **not** an error: the section is
+    /// simply not placed, and contributes no assignment. Losing a chapter opener's furniture because
+    /// the heading it pointed at was deleted is recoverable and visible; refusing to open the
+    /// document is neither — the same posture a dangling master name gets.
+    pub start: BlockId,
+    /// The master applied to the section's **opening page**, overriding
+    /// [`Document::default_master`] there and nowhere else.
+    ///
+    /// One page, not a range, because that is what the feature this answers actually is: a chapter
+    /// opener has a deeper top margin and no folio, and page two of the chapter is ordinary body.
+    /// A master for the rest of the section is a different thing (it would have to lose to the
+    /// *next* section's opener) and is left for whoever needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master: Option<String>,
 }
@@ -1537,6 +1585,18 @@ pub struct Document {
     /// content that justified them may simply have been deleted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pages: Vec<PageOverride>,
+    /// The document's sections (spec 0072), in document order.
+    ///
+    /// Order is the author's, not derived from where the anchors sit in `content`: nothing here
+    /// re-sorts them, because a list that silently reorders itself is a list nobody can edit. What
+    /// *is* derived is where each one starts — see [`Document::page_assignment`].
+    ///
+    /// An empty list is exactly the pre-0072 behaviour, which is why every other document is
+    /// unmoved. It is **not** why `FORMAT_VERSION` moved: an older build would drop this list and
+    /// set every chapter opener in the body master, silently, which is the bump rule in
+    /// `docs/format-spec.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<Section>,
     /// Component definitions this document carries beyond the bundled two (spec 0054).
     ///
     /// Keyed by definition name. Additive and defaulted, so a v3 manifest written before component
@@ -1596,6 +1656,7 @@ impl Document {
             master_pages: Vec::new(),
             default_master: None,
             pages: Vec::new(),
+            sections: Vec::new(),
             components: Default::default(),
             requires: Vec::new(),
         };
@@ -1661,8 +1722,21 @@ impl Document {
     /// moment the page is looked at; a document that refuses to lay out is not recoverable by the
     /// person who typed the name.
     pub fn master_for(&self, page_index: usize) -> Option<&MasterPage> {
-        let named = self
-            .pages
+        self.master_in(&self.pages, page_index)
+    }
+
+    /// [`Document::master_for`] against an explicit assignment.
+    ///
+    /// The same resolution, reading a list handed in rather than `self.pages`, so that the
+    /// section-derived assignment (spec 0072) resolves through *this* function and not a second one
+    /// that could disagree with it. `master_for` is this with `self.pages`, so nothing about a
+    /// document without sections moves.
+    pub fn master_in<'d>(
+        &'d self,
+        pages: &[PageOverride],
+        page_index: usize,
+    ) -> Option<&'d MasterPage> {
+        let named = pages
             .get(page_index)
             .and_then(|p| p.master.as_deref())
             .and_then(|name| self.master_pages.iter().find(|m| m.name == name));
@@ -1671,6 +1745,36 @@ impl Document {
                 .as_deref()
                 .and_then(|name| self.master_pages.iter().find(|m| m.name == name))
         })
+    }
+
+    /// Synthesise the per-page assignment from where each section's anchor landed (spec 0072).
+    ///
+    /// `starts` is parallel to [`Document::sections`]: `starts[i]` is the zero-based page
+    /// `sections[i]`'s anchor block was first placed on, or `None` if the anchor is not in the
+    /// document (or was not placed). The result is the authored [`Document::pages`] list with one
+    /// entry written per placed section that names a master.
+    ///
+    /// **A section wins over a positional entry at the same index**, and that is the one precedence
+    /// decision here. The two disagree only when a document carries both; the section is the one
+    /// that tracked the content through repagination, and the positional entry is by construction
+    /// the stale statement of the same intent — which is the defect spec 0035 recorded and could not
+    /// fix. Sections themselves are applied in list order, so two sections whose anchors land on the
+    /// same page give that page the later one's master.
+    ///
+    /// Pure, and deliberately not a method on the engine: it takes numbers and returns the list, so
+    /// the derivation can be tested without laying anything out.
+    pub fn page_assignment(&self, starts: &[Option<usize>]) -> Vec<PageOverride> {
+        let mut pages = self.pages.clone();
+        for (section, start) in self.sections.iter().zip(starts) {
+            let (Some(start), Some(master)) = (start, section.master.as_ref()) else {
+                continue;
+            };
+            if pages.len() <= *start {
+                pages.resize(*start + 1, PageOverride::default());
+            }
+            pages[*start].master = Some(master.clone());
+        }
+        pages
     }
 
     /// Look up a block by identity.
@@ -2252,6 +2356,127 @@ mod tests {
             master: Some("opener".into()),
         }));
         assert_eq!(doc.master_for(0).map(|m| m.name.as_str()), Some("opener"));
+    }
+
+    // --- Sections (spec 0072) -----------------------------------------------------------------
+
+    /// Two masters, two blocks, and a section anchored to the second.
+    fn doc_with_a_section() -> Document {
+        let mut doc = doc_with_two_masters();
+        let anchor = doc.content[1].id();
+        doc.sections = vec![Section {
+            name: "Chapter One".into(),
+            start: anchor,
+            master: Some("opener".into()),
+        }];
+        doc
+    }
+
+    #[test]
+    fn a_section_writes_its_master_onto_the_page_its_anchor_landed_on() {
+        // The derivation, as arithmetic: the whole engine-side mechanism is this function plus a
+        // page number read off the laid-out pages.
+        let doc = doc_with_a_section();
+        assert_eq!(
+            doc.page_assignment(&[Some(0)])[0].master.as_deref(),
+            Some("opener")
+        );
+
+        // And it reaches wherever the anchor went, growing the list as needed. Pages before it are
+        // untouched entries, which resolve to the document default.
+        let pages = doc.page_assignment(&[Some(3)]);
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[3].master.as_deref(), Some("opener"));
+        assert!(pages[..3].iter().all(|p| p.master.is_none()));
+        assert_eq!(
+            doc.master_in(&pages, 0).map(|m| m.name.as_str()),
+            Some("body")
+        );
+        assert_eq!(
+            doc.master_in(&pages, 3).map(|m| m.name.as_str()),
+            Some("opener")
+        );
+    }
+
+    #[test]
+    fn a_section_that_is_not_placed_or_names_no_master_assigns_nothing() {
+        // Two ways a section contributes nothing, and neither is an error: its anchor was deleted
+        // (so nothing derived a start), or it exists only to be named — which is what spec 0074's
+        // running head will use it for.
+        let mut doc = doc_with_a_section();
+        assert_eq!(doc.page_assignment(&[None]), doc.pages);
+
+        doc.sections[0].master = None;
+        assert_eq!(doc.page_assignment(&[Some(2)]), doc.pages);
+    }
+
+    #[test]
+    fn a_section_wins_over_a_positional_entry_for_the_same_page() {
+        // The one precedence decision in the increment. A document carrying both is a document
+        // whose positional entry is the stale statement of the same intent — it was written when
+        // the chapter opened on page 0 and did not move when the chapter did.
+        let mut doc = doc_with_a_section();
+        doc.pages = vec![
+            PageOverride {
+                master: Some("opener".into()),
+            },
+            PageOverride { master: None },
+        ];
+        let pages = doc.page_assignment(&[Some(1)]);
+        assert_eq!(
+            pages[1].master.as_deref(),
+            Some("opener"),
+            "the section's page"
+        );
+        assert_eq!(
+            pages[0].master.as_deref(),
+            Some("opener"),
+            "and an authored entry the section does not reach is left exactly as authored"
+        );
+
+        // Where they collide, the section wins.
+        let pages = doc.page_assignment(&[Some(0)]);
+        doc.sections[0].master = Some("body".into());
+        let collided = doc.page_assignment(&[Some(0)]);
+        assert_eq!(pages[0].master.as_deref(), Some("opener"));
+        assert_eq!(collided[0].master.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn sections_round_trip_through_the_manifest() {
+        let doc = doc_with_a_section();
+        let json = doc.to_json().expect("save");
+        let back = Document::from_json(&json).expect("load");
+        assert_eq!(back, doc, "a document with sections must equal itself");
+        assert_eq!(back.sections[0].start, doc.content[1].id());
+        assert_eq!(back.sections[0].name, "Chapter One");
+    }
+
+    #[test]
+    fn the_empty_cases_round_trip_too() {
+        // Spec 0053's lesson: a new model surface owes its empty case a test, because that is the
+        // case every existing document is in. Two of them here — no sections, and no blocks at all
+        // to anchor one to.
+        let doc = Document::sample();
+        let json = doc.to_json().expect("save");
+        assert!(
+            !json.contains("\"sections\""),
+            "an empty list must not reach the manifest: it would move the `/ID` of every \
+             document in existence. {json}"
+        );
+        assert_eq!(Document::from_json(&json).expect("load"), doc);
+
+        let mut empty = Document::sample();
+        empty.content.clear();
+        empty.sections = vec![Section {
+            name: "Front matter".into(),
+            // A block id that is not in the document — the anchor was deleted, or never existed.
+            start: BlockId(999),
+            master: None,
+        }];
+        let back = Document::from_json(&empty.to_json().expect("save")).expect("load");
+        assert_eq!(back, empty, "a document with no blocks still round-trips");
+        assert_eq!(back.page_assignment(&[None]), Vec::new());
     }
 
     #[test]

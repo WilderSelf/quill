@@ -142,8 +142,14 @@ is the load-bearing gap, and four of its six features are downstream of it). **0
 out of sequence**, because it was the one M6 increment that fixed defects already shipping rather
 than adding a feature: a contents list taller than its frame overflowed the page, a composite could
 not cut inside a section, and — found while proving the first — a contents list laid out through
-`LayoutSession`, the path the app uses, had *always* been empty but for its own title. M7 is named,
-not decomposed.
+`LayoutSession`, the path the app uses, had *always* been empty but for its own title. **0072 then
+landed the milestone's load-bearing increment**: a section anchored to a `BlockId`, *generating* the
+per-page master assignment rather than replacing it, so a chapter opener survives repagination —
+the defect spec 0035 recorded and could not fix. Master assignment joins the contents list's fixpoint
+(one shared loop, `FIXPOINT_MAX_ITERATIONS`, `converged: false` reported rather than guessed), and
+`FORMAT_VERSION` is **5**, bumped on its own and argued in the spec: an older build would drop
+`sections` and set every chapter opener in the body master, silently. `TEMPLATE_VERSION` stays 1.
+M7 is named, not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
 `String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the

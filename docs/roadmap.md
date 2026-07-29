@@ -2608,16 +2608,37 @@ Deliberately shorter than M5's. A decomposition eight increments deep is one who
 be wrong; what belongs here is the ordering argument, the constraint each increment must respect, and
 the thing it must not forget. Each gets a spec when it is built.
 
-#### 0072 section
+#### 0072 section — **SHIPPED**
 
 Sections anchored to a `BlockId`, generating the per-page assignment rather than replacing it.
-Answers the standing open question about index-based master assignment. **Must state whether it bumps
-`FORMAT_VERSION`, and bump on its own if so** — which also drags `TEMPLATE_VERSION` if `PageOverride`
-or `MasterStatic` change shape. "Start this section on the next recto" is a *forced page break*, which
-the model has no mechanism for and which is not a fixpoint but a forward-only rule; it may be deferred
-but must be named. **`docs/format-spec.md` is stale at v3 and never recorded the `3 → 4` migration —
-the only one so far that is not a structural no-op. This is the increment that fixes it**, because it
-is the increment judged against that document's own bump rule.
+`specs/0072-sections.md`. Answers the standing open question about index-based master assignment:
+index assignment is the right representation and the wrong authoring surface, so `master_for`,
+`frames` and `statics` are all unchanged and the increment is one derivation plus the loop that runs
+it. **`FORMAT_VERSION` 5**, bumped on its own and argued in the spec against format-spec's own rule —
+an older build drops `sections` and sets every chapter opener in the body master, silently, and can
+save that back over authored intent. `TEMPLATE_VERSION` stays 1: none of the four structures a
+template embeds changed shape, and a template has no content to anchor a section to. "Start this
+section on the next recto" is named as a non-goal — it is a forced page break, which the model has no
+mechanism for anywhere. `docs/format-spec.md` is brought current: v5 example with styled runs, the
+missing `3 → 4` row, `4 → 5`, a Sections section, and the `**bold**`/`*italic*` appendix entry.
+
+Master assignment joins the contents list's fixpoint rather than getting its own — nesting would
+multiply passes where sharing adds one, and the two are not independent. `TOC_MAX_ITERATIONS` is now
+`FIXPOINT_MAX_ITERATIONS` and `TocStatus` is `FixpointStatus`, because the status is no longer about
+a contents list. Sections oscillate readily where a contents list could not (0075 could construct no
+oscillating fixture; this one is three lines), so the `converged: false` report finally has a case.
+
+Two things it found that the entry did not predict. **A session resuming at page 0 took its start `y`
+from the previous pass's checkpoint rather than from the current template**, so a master reassignment
+that moved page 0's text frame flowed the page from the old master's top margin — reachable since
+spec 0035 by reassigning `pages[0]` through a `LayoutSession`, and invisible because those tests
+assert that pages were recomputed, not where the text landed. It made the session converge in two
+passes on a document the cold path cannot settle at all. And **`doc.sections` in `context_fingerprint`
+is redundant today** — the derived fingerprint already forces a recompute on every pass — which is
+recorded as an honest gap rather than claimed as coverage.
+
+`SAMPLE_EXPORT_DIGEST` moved and is classified identifier-only (8454 bytes both sides, 124 bytes in 8
+runs, all inside the XMP identifiers or the trailer `/ID`); `component_parity` did not move.
 
 #### 0073 folio formats and restart
 
@@ -2724,7 +2745,7 @@ decided explicitly rather than by accident.
 - Should the 500-page synthetic document target page count by measurement (robust: stays ~500 when leading, margins or hyphenation change, but the workload silently changes size) or fix the block count (stable workload, drifting page count)? Spec 0027 assumes measure-to-target and the *benches* still do. **Answered for the line-breaking equivalence corpus by spec 0060**, which had to pin it by block count before it could prove anything: a corpus sized by laying a document out moves whenever the thing it is testing moves, and the two are then indistinguishable. Whether the benches should follow is still open — they measure throughput, where a workload that tracks a page target is arguably the point.
 - Does the CI perf gate assert any wall-clock at all, or only work counters plus same-run ratios? The plan uses ratios and a 2x blowup ceiling; a stricter gate would need self-hosted or pinned runners.
 - ~~Deferred by design: `text-layout::Line` still carries no glyph ids or positions…~~ **Answered by spec 0068, three milestones after it was asked, and answered by necessity rather than by preference.** The question was whether the shaping-GID ↔ subset-GID reconciliation could keep being deferred; the answer is that it could, right up until someone measured what the deferral cost — the press file draws a different glyph sequence from the one that was measured, by up to 4.90 pt on an ordinary sentence. What the question got wrong was framing it as a tidiness concern about "one shaper but two derivation sites". Two derivation sites are fine when they agree. These did not, and nothing in the question would have revealed that, because it asked about the shape of the code rather than about whether the two sites produced the same number. **The general form is worth keeping: when a duplicated derivation is deferred, the thing to record is not that it is duplicated but what it measures differently, and if that has never been measured, that is the finding.**
-- ~~Is per-page master assignment by **index** (spec 0035) the right anchor…~~ **Answered by M6's decomposition: neither, quite.** Index assignment is the right *representation* and the wrong *authoring surface*. A section anchored to a `BlockId` yields a derived `page_index` from the final page vector, from which the existing `Vec<PageOverride>` is synthesised each pass — so `Document::master_for`, `DocumentTemplate::frames` and `statics` are all unchanged, and the anchor survives repagination. Asked of M3, deferred through M4 and M5, and it turned out not to be a fork at all: the two candidates are the same mechanism at different layers. Worth keeping as a shape — **when a question offers two anchors, check whether one can be derived from the other before choosing between them.** The cost is real and belongs in spec 0072: a section-driven master change alters column count and margins, so master assignment joins the fixpoint rather than being resolved before it.
+- ~~Is per-page master assignment by **index** (spec 0035) the right anchor…~~ **Answered by M6's decomposition: neither, quite.** Index assignment is the right *representation* and the wrong *authoring surface*. A section anchored to a `BlockId` yields a derived `page_index` from the final page vector, from which the existing `Vec<PageOverride>` is synthesised each pass — so `Document::master_for`, `DocumentTemplate::frames` and `statics` are all unchanged, and the anchor survives repagination. Asked of M3, deferred through M4 and M5, and it turned out not to be a fork at all: the two candidates are the same mechanism at different layers. Worth keeping as a shape — **when a question offers two anchors, check whether one can be derived from the other before choosing between them.** The cost is real and belongs in spec 0072: a section-driven master change alters column count and margins, so master assignment joins the fixpoint rather than being resolved before it. **Shipped as spec 0072**, and the cost landed exactly where it was predicted: one shared loop, `FIXPOINT_MAX_ITERATIONS` passes, and a `converged: false` report that a sectioned document can actually reach.
 - Should a `PodPreset` ever be recorded *in* a `.tpub`? Spec 0049 says no — a document is not bound
   to one printer, and a persisted preset would go stale inside a file nobody re-opens. The cost is
   that the vendor a book was built for is not recoverable from the book. If that turns out to matter

@@ -207,6 +207,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 4 {
         migrate_3_to_4(obj);
     }
+    if found < 5 {
+        migrate_4_to_5(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -229,17 +232,6 @@ fn migrate_1_to_2(obj: &mut serde_json::Map<String, serde_json::Value>) {
         .or_insert_with(|| serde_json::json!([]));
 }
 
-/// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
-///
-/// Structurally a no-op, on the same principle as [`migrate_1_to_2`] and written out for the same
-/// reason. A v2 static *meant* "left-aligned, in a rect that does not mirror across the spine", and
-/// that is exactly what the defaults produce — so a v2 document lays out unchanged. Defaulting them
-/// here rather than relying on `serde(default)` keeps the chain readable as a record of what each
-/// version changed.
-///
-/// The written-out defaults do not survive back into the manifest: both fields are
-/// `skip_serializing_if`-defaulted, so a migrated document re-serializes without them and its
-/// exported `/ID` does not move. That is deliberate — see spec 0047's risks.
 /// v3 → v4 (spec 0063): a paragraph's single `text` becomes an ordered list of styled `runs`.
 ///
 /// Unlike the two before it this is a real rewrite rather than a defaulted field — the old key is
@@ -272,6 +264,34 @@ fn migrate_3_to_4(obj: &mut serde_json::Map<String, serde_json::Value>) {
     }
 }
 
+/// v4 → v5 (spec 0072): a document gains `sections`.
+///
+/// Structurally a no-op, like every step but 3 → 4: a v4 document had no sections, and an empty
+/// list is exactly what it meant. Written out anyway, for the reason the chain has always been
+/// written out — it is the record of what each version changed, and the empty arm is the honest
+/// record that this one added a field rather than rewrote one.
+///
+/// The bump is *not* a no-op, and the distinction is the whole of spec 0072's version argument: an
+/// older build would open a v5 document, drop `sections` as an unknown key, set every chapter
+/// opener in the body master, and be able to save that back over the original — losing authored
+/// intent, not derived state. `docs/format-spec.md`'s rule is that a bump is warranted whenever an
+/// older build would silently lay a document out wrongly, and this is that.
+fn migrate_4_to_5(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.entry("sections")
+        .or_insert_with(|| serde_json::json!([]));
+}
+
+/// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
+///
+/// Structurally a no-op, on the same principle as [`migrate_1_to_2`] and written out for the same
+/// reason. A v2 static *meant* "left-aligned, in a rect that does not mirror across the spine", and
+/// that is exactly what the defaults produce — so a v2 document lays out unchanged. Defaulting them
+/// here rather than relying on `serde(default)` keeps the chain readable as a record of what each
+/// version changed.
+///
+/// The written-out defaults do not survive back into the manifest: both fields are
+/// `skip_serializing_if`-defaulted, so a migrated document re-serializes without them and its
+/// exported `/ID` does not move. That is deliberate — see spec 0047's risks.
 fn migrate_2_to_3(obj: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(masters) = obj.get_mut("master_pages").and_then(|v| v.as_array_mut()) else {
         return;
@@ -555,6 +575,17 @@ mod tests {
         assert_eq!(v2.format_version, FORMAT_VERSION);
         assert_eq!(v2.master_pages.len(), 1);
 
+        // …and every later step of the chain, each still meaning what it meant: a v4 document has
+        // runs and a positional assignment, and no sections.
+        let v4 = Document::from_json(V4_MASTERS).expect("v4");
+        assert_eq!(v4.format_version, FORMAT_VERSION);
+        assert_eq!(v4.master_pages.len(), 2);
+        assert!(v4.sections.is_empty());
+        assert_eq!(
+            v4.content[0].plain_text().as_deref(),
+            Some("The Ruined Keep")
+        );
+
         // And the far end of the chain still refuses: v(current + 1) is not a document this build
         // may open, whatever it contains.
         let next = FORMAT_VERSION + 1;
@@ -586,13 +617,32 @@ mod tests {
 
         let doc = Document::from_json(example).expect("the documented manifest must load");
         assert_eq!(doc.format_version, FORMAT_VERSION);
-        // And it must show what it claims to: a master with both spec-0047 fields exercised. Page 1
-        // rather than 0, because the example also demonstrates a page override — page 0 is the
-        // chapter opener, which carries no furniture.
+
+        // And it must show what it claims to. The chapter opener is assigned by a **section**
+        // anchored to the heading (spec 0072), not positionally: with the heading on page 0, the
+        // derivation writes the opener onto page 0, and `pages[0]` — which the example leaves
+        // empty — is what it writes into.
+        assert_eq!(doc.sections.len(), 1);
+        assert_eq!(doc.sections[0].start, doc.content[0].id());
         assert_eq!(
-            doc.master_for(0).map(|m| m.name.as_str()),
+            doc.master_in(&doc.page_assignment(&[Some(0)]), 0)
+                .map(|m| m.name.as_str()),
             Some("chapter-opener")
         );
+        assert_eq!(
+            doc.master_for(0).map(|m| m.name.as_str()),
+            Some("body"),
+            "and without the derivation it is the document default, not the opener"
+        );
+
+        // Styled runs (spec 0063/0064) reach the example too — it is the manifest someone copies,
+        // and a `text` key has not been a paragraph since v4.
+        assert_eq!(
+            doc.content[1].plain_text().as_deref(),
+            Some("A dank corridor stretches into darkness.")
+        );
+
+        // A master with both spec-0047 fields exercised.
         let master = doc.master_for(1).expect("the documented body master");
         let aligns: Vec<(crate::StaticAlign, bool)> = master
             .statics
@@ -609,6 +659,52 @@ mod tests {
                 (crate::StaticAlign::Outside, true)
             ]
         );
+    }
+
+    /// A document written by a v4 build (spec 0072's fixture), committed **as bytes**.
+    ///
+    /// The same reasoning as [`V2_MASTERS`]: a fixture the current serializer produced would
+    /// migrate correctly by construction and prove nothing. This one is the shape a v4 build put on
+    /// disk — styled `runs`, an aligned and mirrored folio, a positional chapter-opener assignment —
+    /// and it must still lay out the way that build laid it out.
+    const V4_MASTERS: &str = include_str!("../assets/v4-masters.json");
+
+    #[test]
+    fn a_v4_manifest_migrates_forward_to_v5() {
+        let doc = Document::from_json(V4_MASTERS).expect("a v4 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+        // It means what it meant: no sections, and the positional assignment it was authored with.
+        assert!(
+            doc.sections.is_empty(),
+            "a v4 document had no sections, and an empty list is what it meant"
+        );
+        assert_eq!(doc.pages.len(), 1);
+        assert_eq!(
+            doc.master_for(0).map(|m| m.name.as_str()),
+            Some("chapter-opener")
+        );
+        assert_eq!(doc.master_for(1).map(|m| m.name.as_str()), Some("body"));
+        assert_eq!(doc.content.len(), 2);
+    }
+
+    #[test]
+    fn migrating_a_v4_document_does_not_move_its_exported_identity() {
+        // Spec 0047's hazard, re-asserted for the bump spec 0072 makes: a migration that wrote a
+        // defaulted key into every document would change the `/ID` of every document in existence,
+        // because the identifier is a hash of the manifest text. `skip_serializing_if` is what
+        // stops it.
+        let migrated = Document::from_json(V4_MASTERS).expect("load");
+        let json = migrated.to_json().expect("save");
+        assert!(
+            !json.contains("\"sections\""),
+            "migration must not add `sections`: {json}"
+        );
+
+        // And the manifest is byte-identical to the one the same document reaches as a native v5
+        // read — the migration is lossless in the identity direction, not only in meaning.
+        let native = V4_MASTERS.replace("\"format_version\": 4", "\"format_version\": 5");
+        let native = Document::from_json(&native).expect("load as v5");
+        assert_eq!(json, native.to_json().expect("save"));
     }
 
     #[test]

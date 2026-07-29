@@ -37,8 +37,8 @@ use quill_core_model::{Block, BlockId, Document};
 use quill_text_layout::{Hyphenator, RunMetrics};
 
 use crate::{
-    flow, heading_index, measure_block, BlockContext, DocumentTemplate, FlowState, HeadingEntry,
-    LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet, TocStatus,
+    flow, heading_index, measure_block, BlockContext, DocumentTemplate, FixpointStatus, FlowState,
+    HeadingEntry, LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
 };
 
 /// What a relayout actually did.
@@ -79,10 +79,10 @@ pub struct LayoutResult {
     /// reuses whole pages and a carried-forward index would go stale exactly when the document was
     /// edited. See [`crate::heading_index`].
     pub headings: Vec<HeadingEntry>,
-    /// How the contents fixpoint resolved (spec 0041). `converged: false` means the cap was hit and
-    /// this is the last iterate — a complete document whose contents may be one page out, surfaced
-    /// rather than presented as settled.
-    pub toc: TocStatus,
+    /// How the layout fixpoint resolved (specs 0041, 0072). `converged: false` means the cap was hit
+    /// and this is the last iterate — a complete document whose contents may be one page out, or
+    /// whose chapter opener may be on the wrong page, surfaced rather than presented as settled.
+    pub fixpoint: FixpointStatus,
 }
 
 /// Identifies a measurement: everything a broken paragraph depends on.
@@ -176,10 +176,14 @@ impl LayoutSession {
 
     /// [`relayout`](Self::relayout) against an explicit template.
     ///
-    /// A document containing a contents block (spec 0041) is laid out repeatedly until its page
-    /// numbers settle. Every other document takes exactly one pass through [`Self::pass`] — the
-    /// loop is not entered at all, so nothing about the incremental behaviour of a document without
-    /// a contents list changes.
+    /// A document containing a contents block (spec 0041), or a section (spec 0072), is laid out
+    /// repeatedly until both settle. Every other document takes exactly one pass through
+    /// [`Self::pass`]: the loop is entered but exits on its first comparison, so nothing about the
+    /// incremental behaviour of a document with neither changes.
+    ///
+    /// Deliberately the same loop as [`crate::lay_out_with_fixpoint_status`]'s, arm for arm — two
+    /// fixpoints over the same two quantities, converging by different rules, would be a way for
+    /// the app's pages and the exporter's to disagree.
     pub fn relayout_with_template(
         &mut self,
         doc: &Document,
@@ -187,9 +191,7 @@ impl LayoutSession {
         metrics: &impl RunMetrics,
         hyphenator: &impl Hyphenator,
     ) -> LayoutResult {
-        if !doc.content.iter().any(|b| matches!(b, Block::Toc { .. })) {
-            return self.pass(doc, template, &[], metrics, hyphenator);
-        }
+        let has_toc = doc.content.iter().any(|b| matches!(b, Block::Toc { .. }));
 
         // The pages this relayout started from. Intermediate iterations overwrite `self.pages`, so
         // the caller's `changed_pages` has to be measured against where the *document* was before
@@ -198,24 +200,30 @@ impl LayoutSession {
 
         let mut headings: Vec<HeadingEntry> = Vec::new();
         let mut result = self.pass(doc, template, &headings, metrics, hyphenator);
+        let mut reassigned = template.reassign(&result.pages);
         let mut iterations = 1;
         let converged = loop {
-            let next = crate::heading_index(doc, &result.pages);
-            if next == headings {
+            let next = if has_toc {
+                crate::heading_index(doc, &result.pages)
+            } else {
+                Vec::new()
+            };
+            if next == headings && !reassigned {
                 break true;
             }
-            if iterations >= crate::TOC_MAX_ITERATIONS {
+            if iterations >= crate::FIXPOINT_MAX_ITERATIONS {
                 break false;
             }
             headings = next;
             result = self.pass(doc, template, &headings, metrics, hyphenator);
+            reassigned = template.reassign(&result.pages);
             iterations += 1;
         };
 
         result.changed_pages = (0..result.pages.len().max(before.len()))
             .filter(|i| before.get(*i) != result.pages.get(*i))
             .collect();
-        result.toc = TocStatus {
+        result.fixpoint = FixpointStatus {
             iterations,
             converged,
         };
@@ -238,8 +246,11 @@ impl LayoutSession {
             .collect();
 
         // Anything that is not block content but still changes layout — styles, margins, masters —
-        // invalidates the whole document, because it can move every page.
-        let context = context_fingerprint(doc, headings);
+        // invalidates the whole document, because it can move every page. Including what the
+        // template derived this pass (spec 0072): the section-driven assignment is not on the
+        // document, so a fingerprint over the document alone would call a pass that moved a chapter
+        // opener "nothing changed" and hand back the previous iterate's pages.
+        let context = context_fingerprint(doc, headings, template.derived_fingerprint());
         let context_changed = self.primed && context != self.previous_context;
 
         // A contents block is measured from the heading index, and the index is deliberately *not*
@@ -282,7 +293,7 @@ impl LayoutSession {
             // Nothing changed. Note this still returns the previous pages rather than recomputing:
             // a no-op edit (or a repaint request) must cost nothing.
             return LayoutResult {
-                toc: TocStatus {
+                fixpoint: FixpointStatus {
                     iterations: 1,
                     converged: true,
                 },
@@ -310,18 +321,25 @@ impl LayoutSession {
                 c.block_idx < dirty_from || (c.block_idx == dirty_from && c.split_at == 0)
             })
             .unwrap_or(0);
-        let start = self
-            .checkpoints
-            .get(resume_page)
-            .copied()
-            .unwrap_or(FlowState {
-                block_idx: 0,
-                split_at: 0,
-                page_index: 0,
-                frame_idx: 0,
-                y: crate::frames_for(template, 0)[0].rect.y_pt,
-                frame_empty: true,
-            });
+        // A resume at page 0 is a cold start, and a cold start belongs to the *current* template —
+        // never to the checkpoint the previous pass recorded. A checkpoint carries the `y` the flow
+        // began at, and page 0's `y` is the top of its text frame; when the context changed because
+        // a master was reassigned (which is what a section does, spec 0072), that number moved.
+        // Resuming on the stale one flowed page 0 from the old master's top margin under the new
+        // master's frame — silently, and only where the two masters differ at the top.
+        //
+        // This was reachable before sections existed — reassigning `pages[0]` through a session does
+        // it — and nothing caught it, because the session tests for spec 0035 assert that the pages
+        // were *recomputed*, not where the recomputed text landed. Sections made it the common case
+        // rather than an unusual edit.
+        let start = if resume_page == 0 {
+            FlowState::start(template)
+        } else {
+            self.checkpoints
+                .get(resume_page)
+                .copied()
+                .unwrap_or_else(|| FlowState::start(template))
+        };
 
         let kept: Vec<LaidOutPage> = self.pages.iter().take(start.page_index).cloned().collect();
         let previous_pages = std::mem::take(&mut self.pages);
@@ -407,7 +425,7 @@ impl LayoutSession {
         self.primed = true;
 
         LayoutResult {
-            toc: TocStatus {
+            fixpoint: FixpointStatus {
                 iterations: 1,
                 converged: true,
             },
@@ -684,7 +702,7 @@ fn measured_style(run: &quill_core_model::Run) -> String {
 /// would show up as a document that refuses to re-flow after an edit nobody can see. `Debug` is
 /// derived, so it tracks the struct automatically. It runs once per relayout, against layout that
 /// costs milliseconds.
-fn context_fingerprint(doc: &Document, headings: &[HeadingEntry]) -> u64 {
+fn context_fingerprint(doc: &Document, headings: &[HeadingEntry], derived: u64) -> u64 {
     // `doc.pages` belongs here for exactly the reason the rest of this list does (spec 0035):
     // reassigning page 7's master changes page 7's geometry without touching a single block, so a
     // fingerprint blind to it would see "nothing changed" and hand back the previous pages.
@@ -693,13 +711,21 @@ fn context_fingerprint(doc: &Document, headings: &[HeadingEntry]) -> u64 {
     // previous iterate's pages.
     // `doc.components` belongs here for the same reason `doc.styles` does (spec 0054): editing a
     // component definition changes every instance's geometry without touching a single block.
+    // `doc.sections` belongs here because a section drives the master assignment (spec 0072):
+    // re-anchoring a section, or renaming the master it opens with, changes page geometry without
+    // touching a block. Note what that costs and why it is accepted: a changed context sets
+    // `dirty_from = Some(0)`, a whole-document reflow. A section list is authored and changes about
+    // as often as a master page does, which is the company it is keeping here — unlike a
+    // cross-reference (spec 0076), of which a book has hundreds and which must therefore go in
+    // `MeasureKey` instead.
     let text = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{derived}",
         doc.page_setup,
         doc.styles,
         doc.master_pages,
         doc.default_master,
         doc.pages,
+        doc.sections,
         doc.components,
         headings
     );
@@ -1647,9 +1673,13 @@ mod tests {
 
         let mut session = LayoutSession::new();
         let first = session.relayout(&doc, &MONO, &NoHyphenator);
-        assert!(first.toc.converged, "must settle: {:?}", first.toc);
         assert!(
-            first.toc.iterations > 1,
+            first.fixpoint.converged,
+            "must settle: {:?}",
+            first.fixpoint
+        );
+        assert!(
+            first.fixpoint.iterations > 1,
             "a document with a contents block runs the fixpoint"
         );
         assert_eq!(first.headings.len(), 2);
@@ -1684,7 +1714,7 @@ mod tests {
         doc.content[31].set_id(id);
         doc.bump_revision();
         let after = session.relayout(&doc, &MONO, &NoHyphenator);
-        assert!(after.toc.converged);
+        assert!(after.fixpoint.converged);
         assert!(
             after.headings.iter().any(|h| h.text == "Renamed chapter"),
             "the index must see the rename"
@@ -1723,9 +1753,9 @@ mod tests {
         let mut session = LayoutSession::new();
         let result = session.relayout(&doc, &MONO, &NoHyphenator);
         assert!(
-            result.toc.iterations <= crate::TOC_MAX_ITERATIONS,
+            result.fixpoint.iterations <= crate::FIXPOINT_MAX_ITERATIONS,
             "the loop must be bounded, took {}",
-            result.toc.iterations
+            result.fixpoint.iterations
         );
         assert!(!result.pages.is_empty(), "a document must still come back");
         // Every authored block is still placed, converged or not.
@@ -1891,5 +1921,117 @@ mod tests {
                 "editing {what} must re-measure"
             );
         }
+    }
+
+    // ----- spec 0072: sections on the incremental path ------------------------------------------
+
+    /// A document whose chapter opens at a known block, with an opener master and a body master.
+    ///
+    /// The same shape as `lib.rs`'s `sectioned_doc`, built here from this module's helpers rather
+    /// than shared, because the two are asserting different things: there, that the derivation is
+    /// right; here, that the *session* sees it.
+    fn sectioned_doc(filler: usize) -> Document {
+        let mut doc = Document::sample();
+        doc.content = (0..filler + 5)
+            .map(|i| Block::body(format!("L{i}"), INK))
+            .collect();
+        doc.assets.clear();
+        doc.assign_missing_block_ids().expect("ids");
+        doc.master_pages = vec![
+            MasterPage {
+                name: "chapter-opener".into(),
+                margins: Some(Margins {
+                    top_pt: 216.0,
+                    bottom_pt: 54.0,
+                    inside_pt: 54.0,
+                    outside_pt: 54.0,
+                }),
+                columns: 1,
+                gutter_pt: 0.0,
+                statics: Vec::new(),
+            },
+            MasterPage {
+                name: "body".into(),
+                margins: Some(Margins {
+                    top_pt: 54.0,
+                    bottom_pt: 54.0,
+                    inside_pt: 54.0,
+                    outside_pt: 54.0,
+                }),
+                columns: 1,
+                gutter_pt: 0.0,
+                statics: Vec::new(),
+            },
+        ];
+        doc.default_master = Some("body".into());
+        doc.sections = vec![quill_core_model::Section {
+            name: "Chapter One".into(),
+            start: doc.content[filler].id(),
+            master: Some("chapter-opener".into()),
+        }];
+        doc
+    }
+
+    #[test]
+    fn a_session_lays_a_sectioned_document_out_exactly_as_a_cold_pass_does() {
+        // The lesson spec 0075 paid for: a derived quantity that is right in `lay_out` and wrong
+        // through `LayoutSession` is wrong *in the path the app uses*, and no test of the former
+        // notices. Parity is asserted page for page, not by page count.
+        let doc = sectioned_doc(30);
+        let cold = crate::lay_out(&doc, &MONO, &NoHyphenator);
+
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(result.fixpoint.converged, "{:?}", result.fixpoint);
+        assert_eq!(result.pages, cold);
+
+        // And a second relayout of an unchanged document reaches the same place. (It does not reuse
+        // pages: the fixpoint's first pass starts from the underived assignment every time, exactly
+        // as the contents fixpoint starts from an empty heading index. That is a cost sections
+        // share with the contents list, not one they introduce.)
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(again.pages, cold);
+    }
+
+    #[test]
+    fn the_session_sees_the_section_list() {
+        // Spec 0035's both-directions fingerprint test, for the field spec 0072 adds. Asserting only
+        // that a change invalidates would pass against an implementation that invalidates on
+        // everything; asserting only reuse would pass against one that never invalidates.
+        let doc = sectioned_doc(30);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let mut renamed = doc.clone();
+        renamed.sections[0].master = Some("body".into());
+        let after = session.relayout(&renamed, &MONO, &NoHyphenator);
+        assert_ne!(
+            after.pages, first.pages,
+            "re-pointing a section's master must move the pages, not return the previous ones"
+        );
+
+        // The other direction: a document that has not changed at all still reaches a stable answer
+        // rather than a different one each call.
+        let a = session.relayout(&renamed, &MONO, &NoHyphenator);
+        let b = session.relayout(&renamed, &MONO, &NoHyphenator);
+        assert_eq!(a.pages, b.pages);
+    }
+
+    #[test]
+    fn a_session_reports_a_section_assignment_that_will_not_settle() {
+        // The bound, on the incremental path too — and the same requirement: terminate, return a
+        // complete document, and say it did not settle rather than presenting the last guess as an
+        // answer. The fixture oscillates because the anchor sits between the two masters' page
+        // capacities; see the cold-path test of the same name in `lib.rs`.
+        let doc = sectioned_doc(40);
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            !result.fixpoint.converged,
+            "this fixture is chosen to oscillate: {:?}",
+            result.fixpoint
+        );
+        assert_eq!(result.fixpoint.iterations, crate::FIXPOINT_MAX_ITERATIONS);
+        assert!(!result.pages.is_empty());
     }
 }
