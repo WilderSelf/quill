@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M5 complete, through spec 0071.** M0 (headless PDF/X export) is
+**Status: M0–M5 complete; M6 through spec 0076.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -156,7 +156,16 @@ both read, so **adding a token without teaching the collector does not compile**
 `.notdef`-in-a-press-file near-misses — and moved furniture to a post-pass over the finished page
 vector, which is what stopped a reused tail page printing the previous chapter's running head.
 `FORMAT_VERSION` stays 6 there: an older build prints the literal `{section}`, which is wrong but
-*loud*, and the bump rule turns on silence. `TEMPLATE_VERSION` stays 1 throughout.
+*loud*, and the bump rule turns on silence. **0076 then shipped cross-references**, the milestone's
+design problem: a resolved "see page 42" goes in **`MeasureKey`**, not `context_fingerprint`, because
+a book has hundreds of them and the latter is a whole-document reflow — spec 0066's `marker` pattern
+at scale, proved with a counter (4 blocks re-measured of 400, against 6 and no reused pages the other
+way). It also landed the fixpoint-iteration budget the M6 audit found missing, the first derived
+quantity that provably *oscillates* (roman numerals are not monotone in width), and a second
+exhaustive `contributes` match for the font subset — a body run's generated characters are a new path,
+so they owe 0074's structural treatment rather than a special case. `FORMAT_VERSION` is **7**: the
+older build's output is loud, but `source` is authored intent and is destroyed on save-back, which is
+the half of the rule 0074 did not have to answer to. `TEMPLATE_VERSION` stays 1 throughout.
 M7 is named, not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one

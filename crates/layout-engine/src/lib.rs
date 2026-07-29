@@ -18,8 +18,8 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 use quill_core_model::{
     builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
     Color, ComponentLibrary, Document, FolioRun, ListMarker, Margins, MasterPage, MasterStatic,
-    PageOverride, PageSetup, ParagraphStyle, Rect, StaticToken, StyleSheet, TextAlign,
-    STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
+    PageOverride, PageSetup, ParagraphStyle, Rect, RunSource, StaticToken, StyleSheet, TextAlign,
+    STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE, UNRESOLVED_REFERENCE,
 };
 use quill_text_layout::{
     justify_runs_indented, Alignment, Hyphenator, Line, RunFormat, RunMetrics,
@@ -1520,6 +1520,19 @@ pub(crate) struct BlockContext<'a> {
     /// whole pages, so a counter advanced during placement goes missing on a reused page — and goes
     /// missing exactly when the document was just edited, which is always.
     pub markers: &'a BTreeMap<BlockId, String>,
+    /// What each cross-referenced block's folio currently resolves to, keyed by the **target**
+    /// block (spec 0076). Empty for every document that contains no cross-reference, and on the
+    /// cold path's first pass, where nothing has been placed yet.
+    ///
+    /// Keyed by target rather than by referring block so the derivation is one walk over the placed
+    /// pages regardless of how many runs point at the same chapter — a book cites its important
+    /// pages many times — and so that two references to one block cannot disagree.
+    ///
+    /// A target absent from this map is **unresolved** and draws
+    /// [`quill_core_model::UNRESOLVED_REFERENCE`]. That is a state, not an error: it is what the
+    /// first pass of the cold fixpoint sees, and it is what a reference to a deleted block sees for
+    /// ever.
+    pub references: &'a BTreeMap<BlockId, String>,
 }
 
 /// Every list item's marker, derived from the blocks in document order (spec 0066).
@@ -1567,6 +1580,83 @@ pub(crate) fn list_markers(content: &[Block], styles: &StyleSheet) -> BTreeMap<B
         out.insert(block.id(), text);
     }
     out
+}
+
+/// What each cross-reference target's folio says, derived from where it actually landed (spec 0076).
+///
+/// Keyed by the **target** block, one entry per distinct block any run refers to. A target that is
+/// nowhere in the page vector — deleted, or an id that names nothing — is simply absent, which is
+/// what makes it draw [`quill_core_model::UNRESOLVED_REFERENCE`].
+///
+/// Derived from the **laid-out pages** rather than accumulated while placing, for exactly the reason
+/// [`heading_index_of`] and [`section_starts`] are: an incremental pass reuses whole pages, so
+/// anything counted during placement goes missing on a reused page — and goes missing precisely when
+/// the document has just been edited. A block placed on more than one page (spec 0044 can split one)
+/// reports its **first**: a reference means "where does this start".
+///
+/// The number is the page's **folio**, through [`PageTemplate::folio`] — the same function the
+/// `{page}` token and a contents entry go through, so a cross-reference, a running folio and a
+/// contents list cannot print three different numbers for one page.
+///
+/// Returns empty when `targets` is empty, and every caller skips the walk entirely in that case, so
+/// a document with no cross-reference pays nothing.
+pub fn reference_folios(
+    targets: &BTreeSet<BlockId>,
+    pages: &[LaidOutPage],
+    template: &impl PageTemplate,
+) -> BTreeMap<BlockId, String> {
+    let mut out: BTreeMap<BlockId, String> = BTreeMap::new();
+    if targets.is_empty() {
+        return out;
+    }
+    for page in pages {
+        for placed in &page.blocks {
+            // Every variant that carries an identity, for `section_starts`' reason: a reference may
+            // name an image, a table or a stat block as readily as a heading, and a composite's
+            // parts all carry the composite's id. `Rect` is furniture within a block and has none.
+            let source = match placed {
+                PlacedBlock::Text { source, .. }
+                | PlacedBlock::Image { source, .. }
+                | PlacedBlock::Link { source, .. } => *source,
+                PlacedBlock::Rect { .. } => BlockId::UNASSIGNED,
+            };
+            if source.is_assigned() && targets.contains(&source) {
+                out.entry(source)
+                    .or_insert_with(|| template.folio(page.index));
+            }
+        }
+    }
+    out
+}
+
+/// Each run's drawn text: its own characters, or what its [`RunSource`] resolves to (spec 0076).
+///
+/// **The resolver half of the contract [`RunSource`] describes**, and the `match` below is
+/// exhaustive, which is half of what makes adding a run source without teaching the font-subset
+/// collector fail to compile — the other half is `RunSource::contributes`.
+///
+/// Returns `None` when every run is authored, which is every paragraph in every document that has no
+/// cross-reference. That is not a tidiness: the caller then borrows the runs' own `&str`s exactly as
+/// it did before this existed, so the hot measurement path allocates nothing new and a document
+/// without the feature costs precisely what it cost.
+fn resolve_run_texts(
+    runs: &[quill_core_model::Run],
+    references: &BTreeMap<BlockId, String>,
+) -> Option<Vec<String>> {
+    if runs.iter().all(|r| r.source.is_authored()) {
+        return None;
+    }
+    Some(
+        runs.iter()
+            .map(|r| match r.source {
+                RunSource::Authored => r.text.clone(),
+                RunSource::Reference { target } => references
+                    .get(&target)
+                    .cloned()
+                    .unwrap_or_else(|| UNRESOLVED_REFERENCE.to_string()),
+            })
+            .collect(),
+    )
 }
 
 /// A run's treatment, resolved through all three layers: the paragraph, the character style it
@@ -1667,6 +1757,7 @@ pub(crate) fn measure_block(
         headings,
         components,
         markers,
+        references,
     } = *ctx;
     match block {
         Block::Heading { runs, color, .. } | Block::Body { runs, color, .. } => {
@@ -1681,7 +1772,18 @@ pub(crate) fn measure_block(
             // The runs are one paragraph to the breaker (spec 0063): a change of treatment must
             // not be able to move a break, or the run model would be a layout change rather than a
             // generalization. What comes back is per-line spans naming the run each stretch is from.
-            let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+            //
+            // A cross-reference run draws its resolved folio rather than its own text (spec 0076),
+            // and it is substituted **here**, before the item stream is built: its width moves line
+            // breaks — "see page 142" is three digits where "see page 42" is two — so it has to be
+            // in the paragraph the breaker sees rather than painted over it afterwards. `None` is
+            // every paragraph of every document without the feature, and takes the borrowing path
+            // this line always took.
+            let resolved = resolve_run_texts(runs, references);
+            let texts: Vec<&str> = match &resolved {
+                Some(v) => v.iter().map(String::as_str).collect(),
+                None => runs.iter().map(|r| r.text.as_str()).collect(),
+            };
             // A paragraph whose style names tab stops, and whose text actually contains a tab, is
             // positioned by those stops rather than broken to the measure (spec 0067). Both
             // conditions, so a document that names stops it does not use lays out exactly as it did.
@@ -2223,13 +2325,14 @@ fn lay_out_resolved(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> (Vec<LaidOutPage>, FixpointStatus) {
-    let once = |headings: &[HeadingEntry]| {
+    let once = |headings: &[HeadingEntry], references: &BTreeMap<BlockId, String>| {
         flow(
             content,
             assets,
             styles,
             components,
             headings,
+            references,
             template,
             metrics,
             hyphenator,
@@ -2240,16 +2343,21 @@ fn lay_out_resolved(
         .pages
     };
 
-    // Two derived quantities, one loop (spec 0072). Nesting them — settle the sections, then settle
-    // the contents inside that — would multiply the pass count rather than add to it, and a pass is
-    // a whole-document flow. They are also not independent: a section's opener master changes the
-    // page count, which changes the numbers the contents list prints.
+    // Three derived quantities, one loop (specs 0072, 0076). Nesting them — settle the sections,
+    // then settle the contents inside that — would multiply the pass count rather than add to it,
+    // and a pass is a whole-document flow. They are also not independent: a section's opener master
+    // changes the page count, which changes the numbers the contents list prints and the numbers the
+    // cross-references print.
     let has_toc = content.iter().any(|b| matches!(b, Block::Toc { .. }));
+    // Empty for every document without a cross-reference, which is what skips the derivation, the
+    // comparison and the extra pass outright.
+    let targets = quill_core_model::reference_targets(content);
 
-    let mut pages = once(&[]);
+    let mut references: BTreeMap<BlockId, String> = BTreeMap::new();
+    let mut pages = once(&[], &references);
     // Asked once before the loop, so a template that derives nothing answers `false` and the loop
     // exits on its first comparison — one pass, exactly as before, for every document that has
-    // neither a contents list nor a section.
+    // neither a contents list, nor a section, nor a cross-reference.
     let mut reassigned = template.reassign(&pages);
 
     let mut headings: Vec<HeadingEntry> = Vec::new();
@@ -2260,14 +2368,16 @@ fn lay_out_resolved(
         } else {
             Vec::new()
         };
-        if next == headings && !reassigned {
+        let next_refs = reference_folios(&targets, &pages, template);
+        if next == headings && next_refs == references && !reassigned {
             break true;
         }
         if iterations >= FIXPOINT_MAX_ITERATIONS {
             break false;
         }
         headings = next;
-        pages = once(&headings);
+        references = next_refs;
+        pages = once(&headings, &references);
         reassigned = template.reassign(&pages);
         iterations += 1;
     };
@@ -2429,6 +2539,7 @@ pub(crate) fn flow(
     styles: &StyleSheet,
     components: &ComponentLibrary,
     headings: &[HeadingEntry],
+    references: &BTreeMap<BlockId, String>,
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
@@ -2447,6 +2558,7 @@ pub(crate) fn flow(
         headings,
         components,
         markers: &markers,
+        references,
     };
     let grid = template.baseline_grid().filter(BaselineGrid::is_usable);
 
@@ -4913,6 +5025,7 @@ mod tests {
             headings: &[],
             components: &components,
             markers: &markers,
+            references: &BTreeMap::new(),
         };
         measure_block(block, width, &ctx, &MONO, &NoHyphenator)
             .expect("the fixtures all measure")
@@ -8218,6 +8331,7 @@ mod tests {
             text: "x".into(),
             style,
             character: named.then(|| "named".to_string()),
+            source: Default::default(),
         };
         // An empty result means "the breaker's own default", which is the contract `run_formats`
         // documents — so the helper spells that out rather than indexing into nothing.
@@ -8330,6 +8444,7 @@ mod tests {
                 ..InlineStyle::EMPTY
             },
             character: Some("no-such-style".into()),
+            source: Default::default(),
         };
         let fmt = run_formats(std::slice::from_ref(&run), &paragraph, &styles)[0];
         assert_eq!(fmt.size_pt, paragraph.font_size_pt, "the paragraph's size");
@@ -8353,6 +8468,7 @@ mod tests {
                 text: "x".into(),
                 style: InlineStyle::EMPTY,
                 character: Some(name.into()),
+                source: Default::default(),
             };
             run_formats(std::slice::from_ref(&run), &paragraph, &styles)[0]
         };
@@ -8382,6 +8498,7 @@ mod tests {
             text: "x".into(),
             style: InlineStyle::EMPTY,
             character: Some(quill_core_model::EMPHASIS_STYLE.into()),
+            source: Default::default(),
         };
         let fmt = run_formats(
             std::slice::from_ref(&run),
@@ -8605,5 +8722,310 @@ mod tests {
         for block in &doc.content {
             assert!(placed.contains(&block.id()), "{:?} was dropped", block.id());
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Cross-references (spec 0076)
+    // ---------------------------------------------------------------------------------------
+
+    /// A paragraph reading "See page N." where N is a reference to `target`.
+    fn refers_to(target: BlockId) -> Block {
+        use quill_core_model::Run;
+        Block::body_runs(
+            vec![
+                Run::plain("See page "),
+                Run::reference(target),
+                Run::plain(" for more."),
+            ],
+            Color::Gray { v: 0.0 },
+        )
+    }
+
+    /// What a block actually printed, joined across its placed lines.
+    fn printed(pages: &[LaidOutPage], id: BlockId) -> String {
+        let mut out = String::new();
+        for page in pages {
+            for placed in &page.blocks {
+                if let PlacedBlock::Text { source, lines, .. } = placed {
+                    if *source == id {
+                        for l in lines {
+                            out.push_str(&l.text);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A body block that carries no reference and one that does, for `reference_fingerprint`'s
+    /// distinguished zero.
+    pub(crate) fn oscillating_doc() -> Document {
+        use quill_core_model::{Folio, NumberFormat, Run, Section};
+        // The construction, stated because the test is worthless if the fixture stops oscillating
+        // and nobody notices. Page capacity here is 54 lines; the target block is the 431st line of
+        // the document when the referring paragraph sets in **one** line and the 432nd when it sets
+        // in two, and 431 is the last line of page 7 — so the target sits astride the 7/8 boundary
+        // and the paragraph's own width is what decides which side it falls on.
+        //
+        // The paragraph's last word is the reference plus a full stop, and the 30 filler words
+        // leave exactly four columns for it. A **lower-roman** folio is what closes the loop, and
+        // it is the load-bearing choice: roman width is not monotone in the page number, so page 8
+        // writes `viii` (four columns, does not fit, paragraph takes a second line) and page 9
+        // writes `ix` (two columns, fits, paragraph takes one). Decimal cannot oscillate this way —
+        // a wider reference pushes its target later and a later page has a wider number, which only
+        // ever grows — and this is exactly the case spec 0075 recorded that a contents list has no
+        // free variable for.
+        let mut content: Vec<Block> = vec![Block::body("placeholder", Color::Gray { v: 0.0 })];
+        content.extend(many_lines(430));
+        content.push(Block::body("TARGET", Color::Gray { v: 0.0 }));
+        let mut doc = doc_with_blocks(content);
+        let target = doc.content.last().expect("target").id();
+        let first = doc.content[0].id();
+        let mut p = Block::body_runs(
+            vec![
+                Run::plain("w ".repeat(30)),
+                Run::plain("See page "),
+                Run::reference(target),
+                Run::plain("."),
+            ],
+            Color::Gray { v: 0.0 },
+        );
+        p.set_id(first);
+        doc.content[0] = p;
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: first,
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        doc
+    }
+
+    /// Which page a block was placed on, or `None`.
+    fn page_of(pages: &[LaidOutPage], id: BlockId) -> Option<usize> {
+        pages.iter().find_map(|p| {
+            p.blocks
+                .iter()
+                .any(|b| match b {
+                    PlacedBlock::Text { source, .. }
+                    | PlacedBlock::Image { source, .. }
+                    | PlacedBlock::Link { source, .. } => *source == id,
+                    PlacedBlock::Rect { .. } => false,
+                })
+                .then_some(p.index)
+        })
+    }
+
+    /// A document whose first block refers to a block `after` paragraphs further on.
+    fn referring_doc(after: usize) -> Document {
+        let mut content = vec![Block::body("placeholder", Color::Gray { v: 0.0 })];
+        content.extend(many_lines(after));
+        content.push(Block::heading(
+            1,
+            "The Sunken Vault",
+            Color::Gray { v: 0.0 },
+        ));
+        let mut doc = doc_with_blocks(content);
+        let target = doc.content.last().expect("target").id();
+        let first = doc.content[0].id();
+        let mut p = refers_to(target);
+        p.set_id(first);
+        doc.content[0] = p;
+        doc
+    }
+
+    #[test]
+    fn a_cross_reference_prints_the_folio_of_the_page_its_target_landed_on() {
+        let doc = referring_doc(120);
+        let (pages, status, _) = lay_out_sectioned(&doc);
+        assert!(status.converged, "{status:?}");
+        let target = doc.content.last().expect("target").id();
+        let landed = page_of(&pages, target).expect("the target is in the document");
+        assert!(
+            landed > 0,
+            "the fixture exists to put the target off page 0"
+        );
+        assert_eq!(
+            printed(&pages, doc.content[0].id()),
+            format!("See page {} for more.", landed + 1),
+            "the reference prints where the target actually is"
+        );
+    }
+
+    #[test]
+    fn a_cross_reference_prints_the_folio_rather_than_the_page_index() {
+        // Spec 0073's split, applied. A reference is a number a *reader* is told, so it follows the
+        // folio; a `/Link` destination is a number a *machine* is told and keeps the index. A
+        // document numbering its pages in roman is where the two visibly differ, and printing `8`
+        // for a page printed `viii` would send the reader to a page that does not answer to it.
+        use quill_core_model::{Folio, NumberFormat, Section};
+        let mut doc = referring_doc(120);
+        let first = doc.content[0].id();
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: first,
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        let (pages, status, _) = lay_out_sectioned(&doc);
+        assert!(status.converged, "{status:?}");
+        let landed = page_of(&pages, doc.content.last().expect("t").id()).expect("placed");
+        assert_eq!(landed, 2, "the fixture is chosen so the folio is `iii`");
+        assert_eq!(printed(&pages, first), "See page iii for more.");
+    }
+
+    #[test]
+    fn a_cross_reference_survives_repagination() {
+        // The whole feature, asserted from both sides on spec 0072's reasoning: a test that only
+        // checked the new number would pass against an implementation that printed the *last* page
+        // of the document, and one that only checked that it changed would pass against one that
+        // printed anything at all.
+        let doc = referring_doc(120);
+        let (pages, _, _) = lay_out_sectioned(&doc);
+        let first = doc.content[0].id();
+        let before = printed(&pages, first);
+
+        let mut edited = doc.clone();
+        edited.content.splice(1..1, many_lines(120));
+        edited.assign_missing_block_ids().expect("ids");
+        let (pages, status, _) = lay_out_sectioned(&edited);
+        assert!(status.converged, "{status:?}");
+        let landed = page_of(&pages, edited.content.last().expect("t").id()).expect("placed");
+        let after = printed(&pages, first);
+        assert_ne!(after, before, "content inserted before the target moved it");
+        assert_eq!(
+            after,
+            format!("See page {} for more.", landed + 1),
+            "and the printed number followed it"
+        );
+    }
+
+    #[test]
+    fn a_cross_reference_may_name_any_block_not_only_a_heading() {
+        // The deliberate scope decision. "See the table on page 42" is the same sentence as "see the
+        // chapter on page 42", and `section_starts` already anchors to every placed variant that
+        // carries an identity — so a heading-only rule would be a structure-shaped restriction on a
+        // mechanism that is general for free.
+        let mut content = vec![Block::body("placeholder", Color::Gray { v: 0.0 })];
+        content.extend(many_lines(120));
+        content.push(Block::Table {
+            id: BlockId::UNASSIGNED,
+            table: quill_core_model::Table {
+                columns: vec![1.0, 1.0],
+                header: Some(vec!["Roll".into(), "Result".into()]),
+                rows: vec![vec!["1".into(), "a locked door".into()]],
+                zebra: false,
+            },
+            color: Color::Gray { v: 0.0 },
+        });
+        let mut doc = doc_with_blocks(content);
+        let target = doc.content.last().expect("target").id();
+        let first = doc.content[0].id();
+        let mut p = refers_to(target);
+        p.set_id(first);
+        doc.content[0] = p;
+
+        let (pages, status, _) = lay_out_sectioned(&doc);
+        assert!(status.converged, "{status:?}");
+        let landed = page_of(&pages, target).expect("a table is placed like anything else");
+        assert_eq!(
+            printed(&pages, first),
+            format!("See page {} for more.", landed + 1)
+        );
+    }
+
+    #[test]
+    fn a_cross_reference_to_a_block_that_is_not_there_prints_a_visible_marker() {
+        // `CLAUDE.md`: prefer a visible failure over silent press-corruption. The alternatives were
+        // an empty string — "See page  for more." in a sentence that reads as finished — and
+        // refusing the document, which spec 0072 already rejected for a dangling section anchor
+        // because losing a whole book to one stale id is worse than losing the thing it named.
+        // A cross-reference is content rather than furniture, so it cannot take 0072's *silent*
+        // half: it says so on the page.
+        let mut doc = referring_doc(60);
+        let first = doc.content[0].id();
+        let mut p = refers_to(BlockId(9999));
+        p.set_id(first);
+        doc.content[0] = p;
+
+        let (pages, status, _) = lay_out_sectioned(&doc);
+        assert!(status.converged, "an unresolvable reference is not a hang");
+        // The literal, not `format!("…{UNRESOLVED_REFERENCE}…")`: a test written against the
+        // constant is a formula checked against itself, and would pass just as happily if the
+        // marker were changed to the empty string — which is the silent option this decision
+        // rejects.
+        assert_eq!(printed(&pages, first), "See page [?] for more.");
+        // And the rest of the document is intact: this is a marker, not a refusal.
+        for block in &doc.content {
+            assert!(
+                page_of(&pages, block.id()).is_some(),
+                "{:?} was dropped",
+                block.id()
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_with_no_cross_reference_takes_exactly_one_pass() {
+        // The claim that this increment costs every other document nothing, and the layout half of
+        // "lays out and exports exactly as before" — the export half is `SAMPLE_EXPORT_DIGEST`.
+        let doc = doc_with_blocks(many_lines(60));
+        let (_, status, _) = lay_out_sectioned(&doc);
+        assert_eq!(status.iterations, 1);
+        assert!(status.converged);
+        assert!(
+            quill_core_model::reference_targets(&doc.content).is_empty(),
+            "and the derivation is skipped outright"
+        );
+
+        // A referring document costs exactly one extra pass: resolve, re-lay, agree. That is the
+        // same single resolving pass spec 0073 charged for a section, for the same reason — a
+        // reference's target has to be *placed* before its page is known.
+        let (_, status, _) = lay_out_sectioned(&referring_doc(120));
+        assert_eq!(status.iterations, 2);
+        assert!(status.converged);
+    }
+
+    #[test]
+    fn a_cross_reference_that_will_not_settle_stops_at_the_cap() {
+        // Unlike spec 0073's folios, a cross-reference is genuinely *in the flow*: its width moves a
+        // line break, which moves a page, which moves the number. Spec 0075 could construct no
+        // oscillating contents fixture because an entry's height does not depend on its number;
+        // this one has exactly that free variable, and the bound and its `converged: false` report
+        // finally have the case they were kept for.
+        let doc = oscillating_doc();
+        let (pages, status, _) = lay_out_sectioned(&doc);
+        assert!(
+            !status.converged,
+            "this fixture is chosen to oscillate; if it settles it has stopped testing the \
+             bound: {status:?}"
+        );
+        assert_eq!(status.iterations, FIXPOINT_MAX_ITERATIONS);
+
+        // The last iterate is a whole document — nothing missing — and it is *honestly* one out:
+        // the number printed disagrees with the page the target actually landed on, which is what
+        // `converged: false` is telling the caller.
+        for block in &doc.content {
+            assert!(
+                page_of(&pages, block.id()).is_some(),
+                "{:?} was dropped",
+                block.id()
+            );
+        }
+        let target = doc.content.last().expect("target").id();
+        let landed = page_of(&pages, target).expect("placed");
+        let printed_here = printed(&pages, doc.content[0].id());
+        assert!(
+            printed_here.ends_with("See page ix."),
+            "the last iterate printed {printed_here:?}"
+        );
+        assert_eq!(landed, 7, "…while the target is on the page printed `viii`");
     }
 }

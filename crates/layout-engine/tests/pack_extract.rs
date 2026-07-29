@@ -340,6 +340,7 @@ fn extract_carries_the_character_styles_a_books_runs_name() {
                 text: "The vault door".into(),
                 style: InlineStyle::EMPTY,
                 character: Some("house-lead".into()),
+                source: Default::default(),
             },
             Run::plain(" had not opened in three hundred years."),
         ],

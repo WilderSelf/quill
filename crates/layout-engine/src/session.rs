@@ -31,7 +31,7 @@
 //! real constraint rather than a hidden assumption, and it is why the type is a session rather than
 //! a free function with a global cache.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use quill_core_model::{Block, BlockId, Document};
 use quill_text_layout::{Hyphenator, RunMetrics};
@@ -104,6 +104,26 @@ struct MeasureKey {
     /// would serve stale ordinals from the cache — the exact failure spec 0041 records for anything
     /// derived from position.
     marker: u64,
+    /// The text this block's cross-references currently resolve to, hashed (spec 0076). `0` — and
+    /// therefore the key this block has always had — when it contains none.
+    ///
+    /// **This is the increment's design decision, and it is a decision about where *not* to put
+    /// it.** A cross-reference is derived from where its target landed, so it is context rather than
+    /// content, exactly as a list marker is; the obvious home for context is
+    /// [`context_fingerprint`], which is where the resolved heading index lives. That is affordable
+    /// for a contents list because a document has *one*, and a changed context sets
+    /// `dirty_from = Some(0)` — a whole-document reflow — once. A book has **hundreds** of
+    /// cross-references, and any edit anywhere that moves any page moves at least one of them, so the
+    /// same treatment would reflow and re-measure the entire document on every keystroke and put
+    /// `benches/budgets.toml`'s `incremental_blocks_measured` — "editing one paragraph must not
+    /// re-break the document" — permanently out of reach.
+    ///
+    /// Per-block, in the key, is spec 0066's `marker` at scale: the blocks whose *reference text*
+    /// changed get a different key and re-measure, and every other block in the book keeps the key
+    /// it had and is served from cache. It also owes no eviction, which is spec 0075's lesson — a
+    /// changed derivation produces a different key rather than an entry that has to be found and
+    /// dropped.
+    references: u64,
     /// Style fingerprint: size, leading, alignment and the surrounding space all change the result.
     style: u64,
 }
@@ -192,37 +212,63 @@ impl LayoutSession {
         hyphenator: &impl Hyphenator,
     ) -> LayoutResult {
         let has_toc = doc.content.iter().any(|b| matches!(b, Block::Toc { .. }));
+        let targets = quill_core_model::reference_targets(&doc.content);
 
         // The pages this relayout started from. Intermediate iterations overwrite `self.pages`, so
         // the caller's `changed_pages` has to be measured against where the *document* was before
         // the call, not against the previous iterate.
         let before = self.pages.clone();
 
+        // **Seeded from the previous relayout's pages, not from nothing.** Spec 0072 records that
+        // both existing fixpoints restart from the underived state on every relayout, so a sectioned
+        // document's first pass is always thrown away; it named that a cost sections *share* rather
+        // than introduce, and left the optimisation untaken. A cross-reference cannot leave it
+        // untaken. Starting from an empty map means every reference in the book prints `[?]` on the
+        // first pass and its real folio on the second, so **every referring block would re-measure
+        // twice on every keystroke** — the exact cost this increment exists to avoid, arriving
+        // through the loop instead of through the cache key.
+        //
+        // It is sound because it only moves the loop's starting point: the exit condition still
+        // compares two consecutive derivations, and the map that ships is always derived from the
+        // pages that ship.
+        let mut references = crate::reference_folios(&targets, &self.pages, template);
         let mut headings: Vec<HeadingEntry> = Vec::new();
-        let mut result = self.pass(doc, template, &headings, metrics, hyphenator);
+        let mut result = self.pass(doc, template, &headings, &references, metrics, hyphenator);
         let mut reassigned = template.reassign(&result.pages);
         let mut iterations = 1;
+        // Work counters accumulate across the whole relayout; the page counts below stay the final
+        // pass's, because they describe the page vector this call emits. A fixpoint's cost is the
+        // sum of its passes, and reporting only the last one would report a converged pass that
+        // measured nothing and call it the price of the edit.
+        let mut measured = result.stats.blocks_measured;
+        let mut from_cache = result.stats.blocks_from_cache;
         let converged = loop {
             let next = if has_toc {
                 crate::heading_index(doc, &result.pages)
             } else {
                 Vec::new()
             };
-            if next == headings && !reassigned {
+            let next_refs = crate::reference_folios(&targets, &result.pages, template);
+            if next == headings && next_refs == references && !reassigned {
                 break true;
             }
             if iterations >= crate::FIXPOINT_MAX_ITERATIONS {
                 break false;
             }
             headings = next;
-            result = self.pass(doc, template, &headings, metrics, hyphenator);
+            references = next_refs;
+            result = self.pass(doc, template, &headings, &references, metrics, hyphenator);
             reassigned = template.reassign(&result.pages);
+            measured += result.stats.blocks_measured;
+            from_cache += result.stats.blocks_from_cache;
             iterations += 1;
         };
 
         result.changed_pages = (0..result.pages.len().max(before.len()))
             .filter(|i| before.get(*i) != result.pages.get(*i))
             .collect();
+        result.stats.blocks_measured = measured;
+        result.stats.blocks_from_cache = from_cache;
         result.fixpoint = FixpointStatus {
             iterations,
             converged,
@@ -236,13 +282,24 @@ impl LayoutSession {
         doc: &Document,
         template: &impl PageTemplate,
         headings: &[HeadingEntry],
+        references: &BTreeMap<BlockId, String>,
         metrics: &impl RunMetrics,
         hyphenator: &impl Hyphenator,
     ) -> LayoutResult {
+        // The diff is over content **and** what each block's cross-references currently print (spec
+        // 0076). Without the second term a pass whose references moved but whose text did not would
+        // see "nothing changed" and hand back the previous pages — spec 0075's shape, in the one
+        // place this increment could reintroduce it. Folded into the same `u64` rather than added as
+        // a third tuple element because the diff only ever asks whether two entries differ.
         let current: Vec<(BlockId, u64)> = doc
             .content
             .iter()
-            .map(|b| (b.id(), content_fingerprint(b)))
+            .map(|b| {
+                (
+                    b.id(),
+                    content_fingerprint(b) ^ reference_fingerprint(b, references),
+                )
+            })
             .collect();
 
         // Anything that is not block content but still changes layout — styles, margins, masters —
@@ -374,6 +431,7 @@ impl LayoutSession {
             &doc.styles,
             &doc.component_library(),
             headings,
+            references,
             template,
             metrics,
             hyphenator,
@@ -545,6 +603,9 @@ impl Measurer for CachingMeasurer<'_> {
             content: content_fingerprint(block),
             width_bits: width.to_bits(),
             marker: marker_fingerprint(ctx.markers.get(&block.id())),
+            // Off the same `ctx` the measurement itself resolves from, so the key and the
+            // measurement cannot disagree about what a reference says.
+            references: reference_fingerprint(block, ctx.references),
             style: style_fingerprint(self.styles, block),
         };
         if let Some(hit) = self.cache.get(&key) {
@@ -590,6 +651,11 @@ fn content_fingerprint(block: &Block) -> u64 {
                 // colour tail below — a key missing a dimension the measurement depends on returns
                 // a stale layout and the document is silently wrong.
                 eat(measured_style(r).as_bytes());
+                // Which block a cross-reference points at is *authored* (spec 0076): re-pointing a
+                // reference is an edit, and it must mark this block dirty even when the two targets
+                // happen to sit on the same page today. What the reference currently *says* is
+                // context and lives in `MeasureKey::references` instead.
+                eat(format!("{:?}", r.source).as_bytes());
                 // A boundary byte, so ["ab"] and ["a","b"] cannot collide: same text, different
                 // runs, and one of them can be recoloured mid-word.
                 eat(&[0xff]);
@@ -605,6 +671,11 @@ fn content_fingerprint(block: &Block) -> u64 {
                 // colour tail below — a key missing a dimension the measurement depends on returns
                 // a stale layout and the document is silently wrong.
                 eat(measured_style(r).as_bytes());
+                // Which block a cross-reference points at is *authored* (spec 0076): re-pointing a
+                // reference is an edit, and it must mark this block dirty even when the two targets
+                // happen to sit on the same page today. What the reference currently *says* is
+                // context and lives in `MeasureKey::references` instead.
+                eat(format!("{:?}", r.source).as_bytes());
                 // A boundary byte, so ["ab"] and ["a","b"] cannot collide: same text, different
                 // runs, and one of them can be recoloured mid-word.
                 eat(&[0xff]);
@@ -761,6 +832,40 @@ fn marker_fingerprint(marker: Option<&String>) -> u64 {
     for b in marker.map_or(&b""[..], |m| m.as_bytes()) {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Hash of what this block's cross-references currently print (spec 0076).
+///
+/// `0` for a block with no cross-reference — a distinguished value rather than a hash of nothing, so
+/// that every block in every document without the feature keeps the exact [`MeasureKey`] it had and
+/// its cached measurement is untouched. That is the whole perf claim, stated as one branch.
+///
+/// The runs' resolved values in run order, so two references to the same target in one paragraph are
+/// not confused with one, and so a target whose folio is *absent* — unresolved — hashes differently
+/// from one that resolves to the empty string.
+fn reference_fingerprint(block: &Block, references: &BTreeMap<BlockId, String>) -> u64 {
+    let runs = block.runs();
+    if runs.iter().all(|r| r.source.is_authored()) {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for run in runs {
+        let Some(target) = run.source.target() else {
+            continue;
+        };
+        match references.get(&target) {
+            Some(folio) => eat(folio.as_bytes()),
+            None => eat(quill_core_model::UNRESOLVED_REFERENCE.as_bytes()),
+        }
+        eat(&[0xff]);
     }
     h
 }
@@ -1122,6 +1227,7 @@ mod tests {
                         text: "enough".into(),
                         style,
                         character: None,
+                        source: Default::default(),
                     },
                     Run::plain(" words in it to occupy a line or so of text"),
                 ],
@@ -2000,6 +2106,7 @@ mod tests {
                         text: "lead in".into(),
                         style: InlineStyle::EMPTY,
                         character: Some("house-lead".into()),
+                        source: Default::default(),
                     },
                     Run::plain(" and the rest of a paragraph long enough to occupy a line"),
                 ],
@@ -2186,5 +2293,240 @@ mod tests {
         );
         assert_eq!(result.fixpoint.iterations, crate::FIXPOINT_MAX_ITERATIONS);
         assert!(!result.pages.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Cross-references (spec 0076)
+    // ---------------------------------------------------------------------------------------
+
+    /// A 400-paragraph document carrying cross-references to **two** targets: one early in the
+    /// document and one late.
+    ///
+    /// Two rather than one, and this is what makes the counter below a statement about the design
+    /// rather than about the fixture. An edit in the middle moves the late target's page and leaves
+    /// the early one exactly where it was, so a cache invalidated by "the derivation changed"
+    /// re-measures both groups while one keyed on *what this block's references say* re-measures
+    /// only the second. Those two designs are indistinguishable on a document with one target.
+    ///
+    /// Returns `(doc, early target, late target, referrers to the early one, referrers to the late
+    /// one)`.
+    #[allow(clippy::type_complexity)]
+    fn referring_doc() -> (Document, BlockId, BlockId, Vec<BlockId>, Vec<BlockId>) {
+        use quill_core_model::Run;
+        let mut doc = doc_of(400);
+        let early = doc.content[50].id();
+        let late = doc.content[380].id();
+        let mut to_early = Vec::new();
+        let mut to_late = Vec::new();
+        for (i, target) in [(5usize, early), (6, early), (7, late), (8, late), (9, late)] {
+            let id = doc.content[i].id();
+            doc.content[i] = Block::body_runs(
+                vec![
+                    Run::plain("A paragraph that carries a cross-reference: see page "),
+                    Run::reference(target),
+                    Run::plain(" for the rest of it."),
+                ],
+                INK,
+            );
+            doc.content[i].set_id(id);
+            if target == early {
+                to_early.push(id);
+            } else {
+                to_late.push(id);
+            }
+        }
+        (doc, early, late, to_early, to_late)
+    }
+
+    fn printed(pages: &[LaidOutPage], id: BlockId) -> String {
+        let mut out = String::new();
+        for page in pages {
+            for placed in &page.blocks {
+                if let crate::PlacedBlock::Text { source, lines, .. } = placed {
+                    if *source == id {
+                        for l in lines {
+                            out.push_str(&l.text);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn page_of(pages: &[LaidOutPage], id: BlockId) -> usize {
+        pages
+            .iter()
+            .find_map(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, crate::PlacedBlock::Text { source, .. } if *source == id))
+                    .then_some(p.index)
+            })
+            .expect("the block is placed")
+    }
+
+    #[test]
+    fn an_edit_that_moves_a_page_re_measures_only_the_blocks_whose_reference_moved() {
+        // **The increment's reason for existing, stated as a counter.**
+        //
+        // A cross-reference is derived from where its target landed, so the obvious home for it is
+        // `context_fingerprint` — where the contents list's resolved index lives. A contents list
+        // can afford that: there is one of it, and a changed context costs one whole-document
+        // reflow. A book has hundreds of cross-references and *any* edit that moves *any* page
+        // changes the derivation, so the same treatment reflows the whole document on every
+        // keystroke and — because a fingerprint outside `MeasureKey` needs spec 0075's eviction to
+        // stay correct — re-measures **every referring block in the book**, including all the ones
+        // whose number did not change.
+        //
+        // Per-block, in the key, is spec 0066's `marker` at scale: the two references to a block
+        // that did not move keep the key they had.
+        let (doc, early, late, to_early, to_late) = referring_doc();
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(first.fixpoint.converged, "{:?}", first.fixpoint);
+        let early_before = printed(&first.pages, to_early[0]);
+        let late_before = printed(&first.pages, to_late[0]);
+        let early_page = page_of(&first.pages, early);
+
+        // The edit: one paragraph, between the early target and the late one, replaced by a longer
+        // one — by more than a page, so the late target certainly moves and the early one certainly
+        // does not. One block's text changes and nothing else does, which is exactly the edit
+        // `incremental_blocks_measured` is about.
+        let mut edited = doc.clone();
+        let long = "an edited paragraph with a great many more words in it than the one it \
+                    replaced had, so that it occupies more than a page on its own and every page \
+                    below it moves down. "
+            .repeat(30);
+        edit(&mut edited, 200, &long);
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert!(after.fixpoint.converged, "{:?}", after.fixpoint);
+
+        // The fixture really is asymmetric — without this the counter below would be measuring a
+        // document in which nothing had to be re-resolved.
+        assert_eq!(
+            page_of(&after.pages, early),
+            early_page,
+            "the early target must sit above the edit and not move"
+        );
+        assert_eq!(
+            printed(&after.pages, to_early[0]),
+            early_before,
+            "…so its references must print the same number they did"
+        );
+        let late_now = printed(&after.pages, to_late[0]);
+        assert_ne!(late_now, late_before, "the late target must have moved");
+        assert!(
+            late_now.contains(&format!("see page {} for", page_of(&after.pages, late) + 1)),
+            "printed {late_now:?}"
+        );
+
+        // The claim. One edited paragraph, plus the three blocks whose reference text changed —
+        // and neither the two whose reference text did not, nor the 400-block document. Counted
+        // across **every** pass of the fixpoint, because the cost of a relayout is the sum of its
+        // passes and the last one measures nothing.
+        assert_eq!(
+            after.stats.blocks_measured,
+            1 + to_late.len(),
+            "only the edit and the blocks whose reference text changed may re-measure"
+        );
+        assert!(
+            after.stats.blocks_from_cache > 300,
+            "…and the rest of the document came from cache: {}",
+            after.stats.blocks_from_cache
+        );
+        assert!(
+            after.stats.pages_reused > 0,
+            "…and the pages above the edit were reused rather than reflowed"
+        );
+    }
+
+    #[test]
+    fn a_relayout_of_an_unchanged_referring_document_measures_nothing() {
+        // The half that proves the fixpoint is *seeded* from the previous relayout's pages rather
+        // than restarted from the underived state, which is the shortcut spec 0072 left untaken for
+        // sections and this increment cannot. Restarting prints `[?]` on the first pass of every
+        // relayout and the real folio on the second, so **every relayout of every referring
+        // document costs a second whole-document pass** — and a cold one costs a second measurement
+        // of every referring block as well. Reintroducing it is caught by the `iterations`
+        // assertion below rather than by the counter, because a warm cache holds both states.
+        let (doc, _, _, _, _) = referring_doc();
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            again.stats.blocks_measured, 0,
+            "an unchanged document must not re-measure, references included"
+        );
+        assert_eq!(again.fixpoint.iterations, 1, "and must not iterate");
+    }
+
+    #[test]
+    fn the_session_and_the_cold_path_agree_about_cross_references() {
+        // Across an edit as well as before one, which is where spec 0074's lesson lands: a session
+        // reuses whole tail pages verbatim, so anything it reuses must not depend on derived state
+        // it did not re-check. A cross-reference *is* derived state — and it is safe here because
+        // the resolved value is folded into the per-pass diff, so a block whose reference moved is
+        // inside the dirty range by construction and cannot sit in a reused tail. This asserts the
+        // consequence rather than the argument.
+        let (doc, _, _, _, _) = referring_doc();
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            result.pages,
+            crate::lay_out(&doc, &MONO, &NoHyphenator),
+            "two fixpoints over the same quantity must not settle differently"
+        );
+
+        let mut edited = doc.clone();
+        let long = "an edited paragraph with a great many more words in it than the one it \
+                    replaced had, so that it occupies more than a page on its own and every page \
+                    below it moves down. "
+            .repeat(30);
+        edit(&mut edited, 200, &long);
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert!(after.stats.pages_reused > 0, "the fixture must reuse pages");
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&edited, &MONO, &NoHyphenator),
+            "…and every page it kept must still say what a cold pass would say"
+        );
+    }
+
+    #[test]
+    fn the_session_reports_the_same_non_convergence_the_cold_path_does() {
+        // The one fixture, shared rather than rebuilt: two documents that oscillate for two
+        // slightly different reasons would make a disagreement between the paths look like
+        // agreement.
+        let doc = crate::tests::oscillating_doc();
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            !result.fixpoint.converged,
+            "the session must report what the cold path reports: {:?}",
+            result.fixpoint
+        );
+        assert_eq!(result.fixpoint.iterations, crate::FIXPOINT_MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn a_reference_whose_value_moved_is_not_mistaken_for_an_unchanged_block() {
+        // Spec 0075's shape, in the one place this increment could reintroduce it. The per-pass diff
+        // is over `(id, content ^ references)`; with the second term missing, a pass whose
+        // references moved but whose *text* did not would see "nothing changed" and hand back the
+        // previous pages with the previous numbers on them, for ever.
+        let (doc, _, _, _, referrers) = referring_doc();
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        let cold = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            printed(&first.pages, referrers[0]),
+            printed(&cold, referrers[0]),
+            "the session's first relayout must already print the resolved number"
+        );
+        assert!(
+            !printed(&first.pages, referrers[0]).contains(quill_core_model::UNRESOLVED_REFERENCE),
+            "and not the unresolved marker it started from"
+        );
     }
 }

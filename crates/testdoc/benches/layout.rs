@@ -130,5 +130,102 @@ fn main() {
     // the claim ("re-flow only affected pages") both precisely and deterministically.
     println!("  (timing ratio is informational only — too noisy at this magnitude to gate)");
 
+    // --- Fixpoint iterations over a document with every derived quantity (spec 0076) ----------
+    //
+    // The gap the M6 audit found: `FIXPOINT_MAX_ITERATIONS` *bounds* the loop and nothing
+    // *measures* it. Every iteration is a full-document pass, so the cost multiplies with each
+    // derived quantity a document carries, and `layout.scaling_ratio` above cannot see it — that
+    // ratio measures the shape of one pass, and this growth is in the number of passes.
+    //
+    // The workload is deliberately the worst one the engine can currently be handed: the 500-page
+    // synthetic document with all three derived quantities at once — a generated contents list, two
+    // sections with folio formats, and forty cross-references scattered through it.
+    let mut derived = doc.clone();
+    derived.content.insert(
+        0,
+        quill_core_model::Block::Toc {
+            id: quill_core_model::BlockId::UNASSIGNED,
+            title: "Contents".into(),
+            max_level: 2,
+            color: quill_core_model::Color::Gray { v: 0.0 },
+        },
+    );
+    derived.assign_missing_block_ids().expect("ids");
+    let headings: Vec<quill_core_model::BlockId> = derived
+        .content
+        .iter()
+        .filter(|b| matches!(b, quill_core_model::Block::Heading { .. }))
+        .map(|b| b.id())
+        .collect();
+    // Two sections: front matter in roman, body in arabic restarting at 1.
+    derived.sections = vec![
+        quill_core_model::Section {
+            name: "Front matter".into(),
+            start: derived.content[1].id(),
+            master: None,
+            folio: Some(quill_core_model::Folio {
+                format: quill_core_model::NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        },
+        quill_core_model::Section {
+            name: "Body".into(),
+            start: headings[1],
+            master: None,
+            folio: Some(quill_core_model::Folio {
+                format: quill_core_model::NumberFormat::Decimal,
+                restart_at: Some(1),
+            }),
+        },
+    ];
+    // Forty cross-references, each naming a heading a long way further on.
+    let mut placed = 0usize;
+    for i in (20..derived.content.len()).step_by(80) {
+        if placed >= 40 {
+            break;
+        }
+        let quill_core_model::Block::Body { .. } = &derived.content[i] else {
+            continue;
+        };
+        let id = derived.content[i].id();
+        let target = headings[(placed * 3 + 5) % headings.len()];
+        derived.content[i] = quill_core_model::Block::body_runs(
+            vec![
+                quill_core_model::Run::plain("A paragraph that cites something else: see page "),
+                quill_core_model::Run::reference(target),
+                quill_core_model::Run::plain(" for the rest of that discussion, at length."),
+            ],
+            quill_core_model::Color::Gray { v: 0.0 },
+        );
+        derived.content[i].set_id(id);
+        placed += 1;
+    }
+    assert_eq!(placed, 40, "the fixture must actually carry its references");
+
+    let mut fixpoint_session = quill_layout_engine::LayoutSession::new();
+    let derived_result = fixpoint_session.relayout(&derived, &HARNESS_METRICS, &NoHyphenator);
+    println!(
+        "fixpoint: {} pages, {} iterations, converged {}  (contents list + 2 sections + 40 \
+         cross-references)",
+        derived_result.pages.len(),
+        derived_result.fixpoint.iterations,
+        derived_result.fixpoint.converged
+    );
+    assert!(
+        derived_result.fixpoint.converged,
+        "the fixture must settle; a non-converging one would pin the cap rather than the cost"
+    );
+    // `check_exact`, not `check`. An iteration count is a deterministic work counter — same
+    // document, same metrics, same passes on every machine — so the tolerance the timing entries
+    // need does not apply, and applying it would be actively harmful here: doubling a ceiling of 4
+    // puts the limit at 8, which *is* `FIXPOINT_MAX_ITERATIONS`, so the gate could only fire on a
+    // document that already reports `converged: false` and reports it loudly. That is spec 0051's
+    // lesson — a budget whose limit is unreachable is not a budget.
+    budgets.check_exact(
+        "layout.fixpoint_iterations",
+        derived_result.fixpoint.iterations as f64,
+        &mut failures,
+    );
+
     budget::report(failures);
 }
