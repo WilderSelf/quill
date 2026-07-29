@@ -52,6 +52,8 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
+/// **10** since spec 0080 gave a document [`PageBreak`]s — where the flow starts a new page, and
+/// which side of the spread it must start on;
 /// **9** since spec 0078 gave a [`Run`] an [`IndexMark`] and the model a [`Block::Index`] — the
 /// terms a back-of-book index is built from;
 /// **8** since spec 0077 gave a document [`Footnote`]s — an anchor in the text flow and note text
@@ -74,11 +76,14 @@ pub type Pt = f32;
 /// **destroy every note's prose** — not intent this time but the author's own words; and a build that
 /// predates spec 0078 would drop every `index` mark and **destroy the whole index**, which is
 /// authored intent in exactly [`RunSource`]'s sense: which terms an author chose to index, and what
-/// each files under, cannot be recovered from anything left in the file. Any of them could
+/// each files under, cannot be recovered from anything left in the file; and a build that predates
+/// spec 0080 would drop every `breaks` entry and **run every chapter of the book on**, setting a
+/// chapter opener halfway down the page the previous chapter ended on — visually wrong everywhere
+/// and announced nowhere. Any of them could
 /// then save that back over the original.
 /// Refusing to open is the correct outcome; quietly dropping the layout is exactly the silent
 /// corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -2333,6 +2338,88 @@ pub struct FolioRun {
     pub start: u32,
 }
 
+/// A forced page break: the content at [`PageBreak::before`] resumes on a **new page** rather than
+/// in the frame the flow had reached (spec 0080).
+///
+/// ### Where a break lives, and why it is not on the block
+///
+/// A break is a property *of a block* and not a `Block` variant of its own — spec 0066's finding
+/// about a list, at the second site that needed it. A `Block::PageBreak` would be a block with no
+/// content that every consumer of a block has to skip: it would need an id, a measurement, a
+/// placement, a fragment rule and an arm in the font-subset collector, and deleting the heading it
+/// was written for would leave it behind, breaking the page in front of whatever moved up. It is
+/// also the shape the model has already rejected once: a section is a marker anchored to a block,
+/// not a container block sitting between two others.
+///
+/// It is **anchored** rather than stored inside the block for a reason with teeth: a break changes
+/// *where a block goes*, never *what it measures*, so it must not be inside the value the
+/// measurement cache keys on. `MeasureKey` hashes the block's content (`content_fingerprint`), so a
+/// `break_before` field on `Block::Body` would re-break a paragraph — at the same width, to the
+/// identical line list — every time an author moved a chapter opener. That is exactly the mistake
+/// spec 0077 declined to make with a note's text, and anchoring makes it unrepresentable rather
+/// than merely avoided.
+///
+/// An entry naming a block the document does not contain is **not** an error and contributes
+/// nothing — the posture a dangling section anchor (spec 0072), a dangling master name and a
+/// dangling style name already have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageBreak {
+    /// The block the flow must start a page for. The break belongs to the seam *in front of* it.
+    pub before: BlockId,
+    /// What kind of page it must start on. Defaulted, because an entry that exists at all is a
+    /// break: the common case says nothing and gets [`BreakKind::Page`].
+    #[serde(default)]
+    pub kind: BreakKind,
+}
+
+/// What a [`PageBreak`] demands of the page the content resumes on (spec 0080).
+///
+/// Three kinds and one rule: the flow advances pages until it is at the top of a page the kind
+/// accepts. `Recto` and `Verso` are the same parity test with the two answers — a mechanism about
+/// *which side of the spread*, not about right-hand pages, because "the plate faces the opener" is
+/// as ordinary a request as "the chapter opens right".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakKind {
+    /// No break: the content continues in the frame the flow had reached. Representable so that a
+    /// book file can *decline* the break its chapters get by default (see `BookChapter`), and
+    /// filtered out before the flow ever sees it.
+    None,
+    /// The next page, whichever side it falls on.
+    #[default]
+    Page,
+    /// The next right-hand page, inserting one blank page when the next page is a verso. This is
+    /// "start this section on the next recto", named as a non-goal by specs 0072 and 0073.
+    Recto,
+    /// The next left-hand page, by the same rule with the other answer.
+    Verso,
+}
+
+impl BreakKind {
+    /// Whether a break of this kind is satisfied by a page starting at `page_index`.
+    ///
+    /// Parity goes through [`is_recto`] rather than through a parity test written here, so the side
+    /// a break lands on and the side a margin mirrors to cannot disagree — the one place page parity
+    /// is decided (spec 0047).
+    ///
+    /// **With facing pages off, every kind accepts every page.** A single-sided document has no
+    /// spread, which is the same answer [`Margins::left_right`] already gives, and it is also what
+    /// bounds the flow: a `Verso` break on a document with no versos would otherwise search for a
+    /// page that does not exist.
+    pub fn accepts(self, page_index: usize, facing_pages: bool) -> bool {
+        match self {
+            BreakKind::None | BreakKind::Page => true,
+            BreakKind::Recto => is_recto(page_index, facing_pages),
+            BreakKind::Verso => !facing_pages || !is_recto(page_index, facing_pages),
+        }
+    }
+
+    /// Whether this kind asks the flow for anything at all.
+    pub fn is_break(self) -> bool {
+        self != BreakKind::None
+    }
+}
+
 /// The whole document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
@@ -2398,6 +2485,17 @@ pub struct Document {
     /// `FORMAT_VERSION` moved, which is that an older build drops this list and destroys the notes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub footnotes: Vec<Footnote>,
+    /// The document's forced page breaks (spec 0080), anchored to the blocks they open a page for.
+    ///
+    /// Order here is not meaningful: a break is looked up by its anchor, and two entries naming the
+    /// same block are resolved by the last one, on [`Document::sections`]' "later authored wins".
+    ///
+    /// An empty list is exactly the pre-0080 behaviour — every document without one lays out and
+    /// exports byte for byte as it did. It is **not** why `FORMAT_VERSION` moved: an older build
+    /// drops this list, sets the whole book as one run of text with every chapter beginning halfway
+    /// down a page, and saves that back over the author's intent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breaks: Vec<PageBreak>,
     /// Component definitions this document carries beyond the bundled two (spec 0054).
     ///
     /// Keyed by definition name. Additive and defaulted, so a v3 manifest written before component
@@ -2459,6 +2557,7 @@ impl Document {
             pages: Vec::new(),
             sections: Vec::new(),
             footnotes: Vec::new(),
+            breaks: Vec::new(),
             components: Default::default(),
             requires: Vec::new(),
         };
@@ -3509,6 +3608,82 @@ mod tests {
         let back = Document::from_json(&empty.to_json().expect("save")).expect("load");
         assert_eq!(back, empty, "a document with no blocks still round-trips");
         assert_eq!(back.page_assignment(&[None]), Vec::new());
+    }
+
+    // --- Forced page breaks (spec 0080) -------------------------------------------------------
+
+    #[test]
+    fn a_break_round_trips_and_stays_out_of_the_manifest_when_absent() {
+        // Spec 0053's lesson, and the empty case is every document in existence: a document that
+        // breaks nowhere must not write a `breaks` key, because doing so would move the `/ID` of
+        // every file quill has ever written.
+        let plain = Document::sample();
+        let json = plain.to_json().expect("save");
+        assert!(
+            !json.contains("\"breaks\""),
+            "a document with no break must not write `breaks`: {json}"
+        );
+
+        let mut doc = Document::sample();
+        doc.assign_missing_block_ids().expect("ids");
+        doc.breaks = vec![
+            PageBreak {
+                before: doc.content[1].id(),
+                kind: BreakKind::Recto,
+            },
+            // The common case says nothing about its kind, which is what makes `Page` the default
+            // that matters: it is the one an author writes by writing the entry.
+            PageBreak {
+                before: doc.content[0].id(),
+                kind: BreakKind::Page,
+            },
+        ];
+        let json = doc.to_json().expect("save");
+        let back = Document::from_json(&json).expect("load");
+        assert_eq!(back, doc, "a document with breaks must equal itself");
+        assert_eq!(back.breaks[0].kind, BreakKind::Recto);
+
+        // A break naming a block the document does not hold round-trips as readily, and so does a
+        // document with no blocks at all to anchor one to: a dangling anchor is a state the model
+        // holds, not an error it refuses (spec 0072's posture).
+        let mut dangling = Document::sample();
+        dangling.content.clear();
+        dangling.breaks = vec![PageBreak {
+            before: BlockId(999),
+            kind: BreakKind::Verso,
+        }];
+        assert_eq!(
+            Document::from_json(&dangling.to_json().expect("save")).expect("load"),
+            dangling
+        );
+    }
+
+    /// Parity, at the one place it is decided, and in all three directions — including the one that
+    /// bounds the flow: with facing pages off there are no versos, so every kind accepts every page.
+    #[test]
+    fn a_break_kind_accepts_pages_by_parity() {
+        assert!(BreakKind::Page.accepts(0, true) && BreakKind::Page.accepts(1, true));
+        assert!(BreakKind::Recto.accepts(0, true), "page 0 is a recto");
+        assert!(!BreakKind::Recto.accepts(1, true));
+        assert!(BreakKind::Recto.accepts(2, true));
+        assert!(!BreakKind::Verso.accepts(0, true));
+        assert!(BreakKind::Verso.accepts(1, true));
+        // …and it is `is_recto` deciding, not a second parity rule written here.
+        for page in 0..6 {
+            assert_eq!(BreakKind::Recto.accepts(page, true), is_recto(page, true));
+            assert_eq!(BreakKind::Verso.accepts(page, true), !is_recto(page, true));
+        }
+        // Facing pages off: a single-sided document has no spread to mirror across, which is the
+        // answer `Margins::left_right` already gives — and it is what stops a `Verso` break
+        // searching for a page that cannot exist.
+        for page in 0..6 {
+            assert!(BreakKind::Recto.accepts(page, false));
+            assert!(BreakKind::Verso.accepts(page, false));
+        }
+        // `None` is not a break at all, which is how a book file declines the one it would get.
+        assert!(!BreakKind::None.is_break());
+        assert!(BreakKind::Page.is_break() && BreakKind::Recto.is_break());
+        assert_eq!(BreakKind::default(), BreakKind::Page);
     }
 
     // --- Folio formats and restart (spec 0073) ------------------------------------------------

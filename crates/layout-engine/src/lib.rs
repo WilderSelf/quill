@@ -16,11 +16,11 @@ use component::measure_component;
 pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
-    builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
-    Color, ComponentLibrary, Document, FolioRun, IndexMark, ListMarker, Margins, MasterPage,
-    MasterStatic, NumberFormat, PageOverride, PageSetup, ParagraphStyle, Rect, RunSource,
-    StaticToken, StyleSheet, TextAlign, INDEX_ENTRY_STYLE, INDEX_TITLE_STYLE, STATBLOCK_COMPONENT,
-    TABLE_COMPONENT, TOC_TITLE_STYLE, UNRESOLVED_REFERENCE,
+    builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, BreakKind,
+    CharacterStyle, Color, ComponentLibrary, Document, FolioRun, IndexMark, ListMarker, Margins,
+    MasterPage, MasterStatic, NumberFormat, PageBreak, PageOverride, PageSetup, ParagraphStyle,
+    Rect, RunSource, StaticToken, StyleSheet, TextAlign, INDEX_ENTRY_STYLE, INDEX_TITLE_STYLE,
+    STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE, UNRESOLVED_REFERENCE,
 };
 use quill_text_layout::{
     justify_runs_indented, Alignment, Hyphenator, Line, RunFormat, RunMetrics,
@@ -797,6 +797,21 @@ pub trait PageTemplate {
     fn folio_number(&self, page_index: usize) -> (NumberFormat, u32) {
         (NumberFormat::Decimal, page_index as u32 + 1)
     }
+
+    /// Whether this template's pages are a bound spread — the input to page parity (spec 0080).
+    ///
+    /// Asked of the template rather than of the document for [`PageTemplate::folio`]'s reason: the
+    /// flow holds a template and not a document, and which side of the spread a page falls on is
+    /// page geometry in exactly the sense margins are. It resolves through
+    /// [`quill_core_model::is_recto`] at the one site that reads it, so a recto break and a mirrored
+    /// margin cannot disagree about what a recto is.
+    ///
+    /// The default is `false` — a bare thread of frames is not a bound book — and with facing pages
+    /// off every break kind accepts every page, which is the same answer `Margins::left_right`
+    /// already gives a single-sided document.
+    fn facing_pages(&self) -> bool {
+        false
+    }
 }
 
 /// A template that gives every page the same frames and no static content.
@@ -1082,6 +1097,13 @@ impl PageTemplate for DocumentTemplate<'_> {
             .map(str::to_string)
     }
 
+    fn facing_pages(&self) -> bool {
+        // The document's own answer, not a second one: `Margins::left_right` and `StaticAlign`
+        // already resolve parity from this field, and a recto break that read a different one would
+        // put a chapter opener on a page whose margins mirror the other way.
+        self.page_setup.facing_pages
+    }
+
     fn statics_read_headings(&self) -> bool {
         self.doc
             .master_pages
@@ -1150,6 +1172,9 @@ pub fn lay_out(
         // Synthesised once per layout rather than once per fixpoint pass, for the component
         // library's reason (spec 0077). Empty for every document without a footnote.
         &doc.footnote_blocks(),
+        // The document's forced page breaks (spec 0080). Empty for every document that states
+        // none, which is what makes such a document take the path it took before they existed.
+        &doc.breaks,
         &doc.assets,
         &doc.styles,
         // The document's own definitions shadow the bundled ones (spec 0054). Built here rather
@@ -2588,6 +2613,8 @@ pub fn lay_out_with_library(
     lay_out_resolved(
         content,
         &[],
+        // See above: a bare block list carries no forced breaks either — they live on the document.
+        &[],
         assets,
         styles,
         components,
@@ -2651,7 +2678,8 @@ pub fn lay_out_with_fixpoint_status(
 ) -> (Vec<LaidOutPage>, FixpointStatus) {
     lay_out_resolved(
         content,
-        // See [`lay_out_with_library`]: a bare block list carries no footnotes.
+        // See [`lay_out_with_library`]: a bare block list carries no footnotes and no breaks.
+        &[],
         &[],
         assets,
         styles,
@@ -2666,6 +2694,7 @@ pub fn lay_out_with_fixpoint_status(
 fn lay_out_resolved(
     content: &[Block],
     notes: &[Block],
+    breaks: &[PageBreak],
     assets: &[Asset],
     styles: &StyleSheet,
     components: &ComponentLibrary,
@@ -2678,6 +2707,7 @@ fn lay_out_resolved(
             flow(
                 content,
                 notes,
+                breaks,
                 assets,
                 styles,
                 components,
@@ -3266,6 +3296,7 @@ fn open_band<M: RunMetrics, H: Hyphenator>(
 pub(crate) fn flow(
     content: &[Block],
     notes: &[Block],
+    breaks: &[PageBreak],
     assets: &[Asset],
     styles: &StyleSheet,
     components: &ComponentLibrary,
@@ -3287,6 +3318,19 @@ pub(crate) fn flow(
     // id → note block, for the same reason `assets` is an index: an anchor resolves its note once
     // per placement attempt. Empty for every document without a footnote.
     let note_index: BTreeMap<BlockId, &Block> = notes.iter().map(|b| (b.id(), b)).collect();
+    // id → the break in front of that block (spec 0080). Built here, beside the note index, for the
+    // same two reasons: the loop asks per block, and it must not ask a list.
+    //
+    // `BreakKind::None` is filtered out rather than carried, so "there is an entry" and "the flow
+    // does something" are the same statement inside the loop. **Empty for every document that
+    // states no break**, which is what makes such a document take exactly the path it took before
+    // this increment — the map is consulted once per block and answers nothing.
+    let break_index: BTreeMap<BlockId, BreakKind> = breaks
+        .iter()
+        .filter(|b| b.kind.is_break())
+        .map(|b| (b.before, b.kind))
+        .collect();
+    let facing_pages = template.facing_pages();
     let ctx = BlockContext {
         assets: &assets,
         styles,
@@ -3336,6 +3380,89 @@ pub(crate) fn flow(
         // How much of this block earlier frames already took (spec 0044). Non-zero only for the
         // block a resumed flow was in the middle of.
         let mut split_at = if offset == 0 { start.split_at } else { 0 };
+
+        // **The forced page break** (spec 0080), and the whole of it: advance pages until the flow
+        // is at the top of a page the break's kind accepts. Skipped when `split_at > 0`, because a
+        // break belongs to the seam in front of a block and a *continuation* of that block has
+        // already crossed it — re-firing on the remainder would page for ever.
+        //
+        // **Three properties, and each is what stops something going wrong:**
+        //
+        // 1. *A break at the top of an untouched page is a no-op.* `frame_empty && frame_idx == 0`
+        //    is exactly "this page has received nothing" — `frame_empty` is set true on every frame
+        //    and page advance, and frames are filled in order, so an empty first frame means an
+        //    empty page. Without this, the first block of a document, and every block whose break
+        //    the flow has just honoured, would insert a spurious blank page. It is also what makes
+        //    a *chapter opened on its own* cost nothing: page 0 has received nothing.
+        // 2. *A break advances a **page**, never a frame.* On a two-column page a break in the
+        //    **first** column does not settle for the second — the page carries the previous
+        //    chapter's text either way — so a non-empty page fails the test however many frames it
+        //    has left, and the loop advances the page rather than the frame. (A break in the *last*
+        //    column is the case that cannot tell the two apart, which is why the test is written
+        //    against the first.)
+        // 3. *It terminates, and the bound is two.* Each turn either advances to a page that has
+        //    received nothing (making 1 true) or, having done that, flips the page's parity — and
+        //    parity alternates, so at most one blank page is ever inserted. The assertion states
+        //    that rather than trusting it: this is a **new way to advance without consuming
+        //    content**, which is the one thing spec 0044's progress invariants do not cover, since
+        //    they bound a cut of a block and a blank page cuts nothing at all.
+        if split_at == 0 {
+            if let Some(kind) = break_index.get(&block.id()).copied() {
+                let mut advances = 0usize;
+                while !(frame_idx == 0 && frame_empty && kind.accepts(page_index, facing_pages)) {
+                    debug_assert!(
+                        frame_idx > 0 || !frame_empty || page.blocks.is_empty(),
+                        "a page whose first frame is empty must have received nothing"
+                    );
+                    // The band belongs to the frame being left, exactly as in the doesn't-fit
+                    // branch: a page inserted for parity still sets whatever note the previous page
+                    // carried into it, rather than dropping the tail of a note to stay blank.
+                    band.flush(&mut page, &frames[frame_idx], metrics);
+                    pages.push(page);
+                    page_index += 1;
+                    frames = frames_for(template, page_index);
+                    page = LaidOutPage {
+                        index: page_index,
+                        blocks: Vec::new(),
+                        statics: Vec::new(),
+                    };
+                    frame_idx = 0;
+                    // A page emitted by a break is a page like any other and records where the flow
+                    // had reached, so a later edit can resume from it. **The state is unchanged by
+                    // this increment**: resuming here re-evaluates the break against this page's
+                    // own parity and re-derives the same decision, which is why a blank page's
+                    // checkpoint reproduces a blank page rather than filling it in.
+                    checkpoints.push(FlowState {
+                        block_idx,
+                        split_at,
+                        page_index,
+                        frame_idx: 0,
+                        y: frames[0].rect.y_pt,
+                        frame_empty: true,
+                        note_carry: carry,
+                    });
+                    let (b, c) = open_band(
+                        carry,
+                        &note_index,
+                        &frames[0],
+                        &ctx,
+                        measurer,
+                        metrics,
+                        hyphenator,
+                    );
+                    band = b;
+                    carry = c;
+                    y = frames[0].rect.y_pt;
+                    frame_empty = true;
+                    advances += 1;
+                    assert!(
+                        advances <= 2,
+                        "a forced page break must be satisfied within one page advance and at \
+                         most one blank page, or the flow cannot terminate"
+                    );
+                }
+            }
+        }
         // Advance frames / pages until the block fits, then place it. The block is re-measured
         // against each candidate frame's width (wrapping/sizing depend on it), so a block that
         // advances into a narrower frame re-wraps to that width rather than keeping a stale
@@ -4593,6 +4720,7 @@ mod tests {
             pages: Vec::new(),
             sections: Vec::new(),
             footnotes: Vec::new(),
+            breaks: Vec::new(),
         };
         // Give the blocks ids, as a loaded document would have (spec 0026).
         doc.assign_missing_block_ids().expect("fresh blocks");
@@ -4685,6 +4813,7 @@ mod tests {
             pages: Vec::new(),
             sections: Vec::new(),
             footnotes: Vec::new(),
+            breaks: Vec::new(),
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -9943,6 +10072,7 @@ mod tests {
         lay_out_resolved(
             &doc.content,
             &doc.footnote_blocks(),
+            &doc.breaks,
             &doc.assets,
             &doc.styles,
             &doc.component_library(),
@@ -10327,6 +10457,7 @@ mod tests {
             flow(
                 &doc.content,
                 &notes,
+                &doc.breaks,
                 &doc.assets,
                 &doc.styles,
                 &components,
@@ -10931,5 +11062,564 @@ mod tests {
             let (format, n) = uniform.folio_number(i);
             assert_eq!(uniform.folio(i), format.format(n));
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Forced page breaks (spec 0080)
+    // ---------------------------------------------------------------------------------------
+
+    /// Whether a block's first line sits at the very top of the frame it was placed in.
+    fn at_frame_top(pages: &[LaidOutPage], id: BlockId, template: &impl PageTemplate) -> bool {
+        pages.iter().any(|p| {
+            p.blocks.iter().any(|b| match b {
+                PlacedBlock::Text { source, frame, .. } if *source == id => {
+                    (frame.y_pt - frames_for(template, p.index)[0].rect.y_pt).abs() < 0.01
+                }
+                _ => false,
+            })
+        })
+    }
+
+    /// How many blocks a page of `many_lines` filler holds, derived rather than assumed — the
+    /// fixtures below need to place a break mid-page and on a page of a chosen parity, and a
+    /// hard-coded line count would silently stop meaning that if a metric moved.
+    fn lines_per_page() -> usize {
+        let doc = doc_with_blocks(many_lines(400));
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        pages[0].blocks.len()
+    }
+
+    /// `filler` lines, then a marked block carrying `kind`, then `after` more lines.
+    fn doc_with_break(filler: usize, kind: BreakKind, after: usize) -> (Document, BlockId) {
+        let mut content = many_lines(filler);
+        content.push(Block::body("MARK", Color::Gray { v: 0.0 }));
+        content.extend(many_lines(after));
+        let mut doc = doc_with_blocks(content);
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        let mark = doc.content[filler].id();
+        doc.breaks = vec![PageBreak { before: mark, kind }];
+        (doc, mark)
+    }
+
+    /// **The general mechanism**: content resumes on a new page, and the page it left keeps
+    /// everything that was already on it.
+    ///
+    /// Both halves, for spec 0072's reason. A test asserting only that the marked block starts a
+    /// page would pass against an implementation that started a page for every block; one asserting
+    /// only that the previous page kept its lines would pass against one that broke nowhere. The
+    /// same document without the break is asserted to run on, so the defect is in the test file
+    /// rather than described in the spec.
+    #[test]
+    fn a_break_before_a_block_starts_a_page_and_the_previous_page_keeps_its_content() {
+        let per_page = lines_per_page();
+        let filler = per_page / 2;
+        let (doc, mark) = doc_with_break(filler, BreakKind::Page, 4);
+        let template = DocumentTemplate::new(&doc);
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(page_of(&pages, mark), Some(1), "the mark starts a new page");
+        assert!(
+            at_frame_top(&pages, mark, &template),
+            "and starts it at the top of the frame, not part way down"
+        );
+        assert_eq!(
+            pages[0].blocks.len(),
+            filler,
+            "the page it left keeps every line it had — a break moves what follows, not what \
+             preceded it"
+        );
+
+        // The same document with no break: the mark continues on page 0. This is what shipped
+        // before this increment, and it is what spec 0079's known issue describes.
+        let mut run_on = doc.clone();
+        run_on.breaks.clear();
+        let pages = lay_out(&run_on, &MONO, &NoHyphenator);
+        assert_eq!(
+            page_of(&pages, mark),
+            Some(0),
+            "without the break it runs on"
+        );
+        assert!(!at_frame_top(&pages, mark, &template));
+    }
+
+    /// A break at the top of a page the flow has not written to inserts nothing.
+    ///
+    /// The guard the whole mechanism rests on: without it, *every* break would emit a spurious blank
+    /// page, because the first thing a break does is put the flow at the top of an empty page.
+    /// Asserted from both ends — the document's very first block, which has never had a page to
+    /// leave, and a block whose break the flow has already honoured.
+    #[test]
+    fn a_break_at_the_top_of_an_empty_page_inserts_nothing() {
+        let mut doc = doc_with_blocks(many_lines(30));
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        let first = doc.content[0].id();
+        let second = doc.content[1].id();
+        let plain = lay_out(&doc, &MONO, &NoHyphenator);
+
+        // A break before the first block of the document.
+        doc.breaks = vec![PageBreak {
+            before: first,
+            kind: BreakKind::Page,
+        }];
+        assert_eq!(
+            lay_out(&doc, &MONO, &NoHyphenator),
+            plain,
+            "a break at the very start of a document is a no-op, page for page"
+        );
+
+        // Two breaks in a row: the second block's break arrives at the top of the page the first
+        // one just started, and must add nothing.
+        doc.breaks = vec![
+            PageBreak {
+                before: first,
+                kind: BreakKind::Page,
+            },
+            PageBreak {
+                before: second,
+                kind: BreakKind::Page,
+            },
+        ];
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            page_of(&pages, second),
+            Some(1),
+            "the second block breaks once"
+        );
+        assert_eq!(
+            pages.len(),
+            2,
+            "and exactly once — no blank page between them"
+        );
+        assert_eq!(pages[1].blocks.len(), doc.content.len() - 1);
+    }
+
+    /// **A break advances a page, not a frame.** On a two-column page a break in the second column
+    /// must not settle for the next column: the page still carries the previous chapter's text.
+    #[test]
+    fn a_break_advances_to_the_next_page_not_the_next_column() {
+        // A two-column document, and a mark that lands part way down the *second* column of page 0
+        // — the one arrangement in which advancing a frame and advancing a page give different
+        // answers. The fixture is built by measuring where the mark actually falls rather than by
+        // arithmetic over a line height, and the arrangement is asserted before the claim is: a
+        // fixture that quietly stopped reaching the second column would make this test pass against
+        // a frame-advancing implementation.
+        let two_column = |doc: &mut Document| {
+            doc.master_pages = vec![MasterPage {
+                columns: 2,
+                gutter_pt: 12.0,
+                margins: Some(Margins::uniform(36.0)),
+                ..MasterPage::plain("body")
+            }];
+            doc.default_master = Some("body".into());
+        };
+        let column_x = |pages: &[LaidOutPage], id: BlockId| {
+            pages.iter().find_map(|p| {
+                p.blocks.iter().find_map(|b| match b {
+                    PlacedBlock::Text { source, frame, .. } if *source == id => {
+                        Some((p.index, frame.x_pt, frame.y_pt))
+                    }
+                    _ => None,
+                })
+            })
+        };
+
+        // Find a filler count that puts the mark in the second column of page 0, part way down it.
+        let mut fixture = None;
+        for filler in 1..400 {
+            let (mut doc, mark) = doc_with_break(filler, BreakKind::None, 4);
+            two_column(&mut doc);
+            let pages = lay_out(&doc, &MONO, &NoHyphenator);
+            let columns = frames_for(&DocumentTemplate::new(&doc), 0);
+            let Some((page, x, y)) = column_x(&pages, mark) else {
+                continue;
+            };
+            // Part way down the first column: the flow has written to this frame and to no other.
+            if page == 0
+                && (x - columns[0].rect.x_pt).abs() < 0.01
+                && y > columns[0].rect.y_pt + 0.01
+                && pages[0].blocks.len() > filler
+            {
+                fixture = Some(filler);
+                break;
+            }
+        }
+        let filler = fixture.expect("no filler count puts the mark part way down the first column");
+
+        let (mut doc, mark) = doc_with_break(filler, BreakKind::Page, 4);
+        two_column(&mut doc);
+        let template = DocumentTemplate::new(&doc);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+
+        let (page, x, y) = column_x(&pages, mark).expect("the mark");
+        assert_eq!(page, 1, "the next page, not the next column");
+        let columns = frames_for(&template, 1);
+        assert_eq!(columns.len(), 2, "the fixture must really be two-column");
+        assert!(
+            (x - columns[0].rect.x_pt).abs() < 0.01,
+            "and in the first column of it, at {x} against {}",
+            columns[0].rect.x_pt
+        );
+        assert!((y - columns[0].rect.y_pt).abs() < 0.01, "at the top of it");
+        // The page it left keeps both its columns' content.
+        assert!(
+            pages[0].blocks.len() >= filler,
+            "the page it left keeps every line it had"
+        );
+    }
+
+    /// **Next recto**: a blank page is inserted when the break lands on a verso, and is not when it
+    /// lands on a recto. Both directions, because a test that only asserted the first would pass
+    /// against an implementation that inserted a blank page every time.
+    #[test]
+    fn a_recto_break_inserts_a_blank_page_only_when_it_lands_on_a_verso() {
+        let per_page = lines_per_page();
+
+        // Landing on a verso: the flow is part way down page 0, so the next page is page 1.
+        let (doc, mark) = doc_with_break(per_page / 2, BreakKind::Recto, 4);
+        assert!(doc.page_setup.facing_pages, "parity needs a spread");
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            page_of(&pages, mark),
+            Some(2),
+            "a recto, skipping the verso"
+        );
+        assert!(
+            pages[1].blocks.is_empty(),
+            "page 1 is the inserted blank: {:?}",
+            pages[1].blocks.len()
+        );
+        assert!(
+            quill_core_model::is_recto(2, true),
+            "and page 2 really is a recto"
+        );
+
+        // Landing on a recto: the flow is part way down page 1, so the next page is page 2 and
+        // nothing is inserted.
+        let (doc, mark) = doc_with_break(per_page + per_page / 2, BreakKind::Recto, 4);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(page_of(&pages, mark), Some(2));
+        assert!(
+            !pages[1].blocks.is_empty(),
+            "no blank page: page 1 carries the filler it always did"
+        );
+
+        // And the mirror rule, so `Recto` is a parity mechanism rather than a right-hand-page one.
+        let (doc, mark) = doc_with_break(per_page / 2, BreakKind::Verso, 4);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            page_of(&pages, mark),
+            Some(1),
+            "a verso needs no blank here"
+        );
+        let (doc, mark) = doc_with_break(per_page + per_page / 2, BreakKind::Verso, 4);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(page_of(&pages, mark), Some(3), "and skips the recto");
+        assert!(pages[2].blocks.is_empty(), "page 2 is the inserted blank");
+    }
+
+    /// **A blank page is still a page**: it takes its master's furniture and it consumes a folio.
+    ///
+    /// The second half is the one that would be a printed defect rather than a cosmetic one. If an
+    /// inserted page did not count, every folio after it would be one out — the whole book, silently.
+    #[test]
+    fn a_blank_page_inserted_for_a_recto_break_carries_its_furniture_and_consumes_a_folio() {
+        let per_page = {
+            let doc = doc_with_folio(StaticAlign::Left, false, "{page}");
+            lay_out(&doc, &MONO, &NoHyphenator)[0].blocks.len()
+        };
+        let mut doc = doc_with_folio(StaticAlign::Left, false, "{page}");
+        let mut content = many_lines(per_page / 2);
+        content.push(Block::body("MARK", Color::Gray { v: 0.0 }));
+        content.extend(many_lines(4));
+        doc.content = content;
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        let mark = doc.content[per_page / 2].id();
+        doc.breaks = vec![PageBreak {
+            before: mark,
+            kind: BreakKind::Recto,
+        }];
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert_eq!(page_of(&pages, mark), Some(2));
+        assert!(pages[1].blocks.is_empty(), "page 1 is blank of content");
+        // Furniture: the blank page draws the master's folio like every other page.
+        assert_eq!(
+            static_text(&pages[1]),
+            "2",
+            "the blank page prints its folio"
+        );
+        // And it consumed a number: the page after it is 3, not 2.
+        let printed: Vec<String> = pages.iter().map(static_text).collect();
+        assert_eq!(
+            printed,
+            (1..=pages.len()).map(|n| n.to_string()).collect::<Vec<_>>(),
+            "every page, once, in order — a blank page that consumed no number would repeat one"
+        );
+    }
+
+    /// **A section starts on a new page**, which is what a chapter opener is: the opener master
+    /// lands on a page that carries the chapter and nothing before it.
+    ///
+    /// Spec 0072 could put the master on the right page; it could not stop the previous chapter's
+    /// tail sharing that page with it. Asserted on placed geometry, and against the same document
+    /// without the break — which is exactly the run-on spec 0079 recorded.
+    #[test]
+    fn a_section_that_starts_on_a_new_page_gets_a_page_of_its_own() {
+        use quill_core_model::Section;
+        let per_page = lines_per_page();
+        let mut content = many_lines(per_page / 2);
+        content.push(Block::heading(1, "Chapter Two", Color::Gray { v: 0.0 }));
+        content.extend(many_lines(6));
+        let mut doc = doc_with_opener_and_body(content);
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        let opener_block = doc.content[per_page / 2].id();
+        doc.sections = vec![Section {
+            name: "Chapter Two".into(),
+            start: opener_block,
+            master: Some("opener".into()),
+            folio: None,
+        }];
+
+        // Without the break: the chapter opens part way down a page it shares with chapter one.
+        let run_on = lay_out(&doc, &MONO, &NoHyphenator);
+        let shared = page_of(&run_on, opener_block).expect("placed");
+        assert!(
+            run_on[shared]
+                .blocks
+                .iter()
+                .any(|b| !matches!(b, PlacedBlock::Text { source, .. } if *source == opener_block)),
+            "the recorded defect: the opener master's page still carries the previous chapter"
+        );
+
+        doc.breaks = vec![PageBreak {
+            before: opener_block,
+            kind: BreakKind::Page,
+        }];
+        let (pages, status) = lay_out_noted(&doc);
+        assert!(status.converged, "{status:?}");
+        let opened = page_of(&pages, opener_block).expect("placed");
+        assert_eq!(
+            pages[opened].blocks.first().and_then(|b| match b {
+                PlacedBlock::Text { source, .. } => Some(*source),
+                _ => None,
+            }),
+            Some(opener_block),
+            "the chapter is the first thing on its page"
+        );
+        // The opener master really is the one in force there, and the chapter sits at the top of
+        // *its* frame: the opener's 108 pt top margin puts the first line lower than the body
+        // master's 36 pt would, which is what makes this an assertion about the master rather than
+        // about the page number.
+        let opener_y = pages[opened]
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PlacedBlock::Text { source, frame, .. } if *source == opener_block => {
+                    Some(frame.y_pt)
+                }
+                _ => None,
+            })
+            .expect("the chapter opener");
+        assert!(
+            opener_y > 100.0,
+            "the opener master's deep top margin, not the body master's: {opener_y}"
+        );
+        let body_y = pages[opened - 1]
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                PlacedBlock::Text { frame, .. } => Some(frame.y_pt),
+                _ => None,
+            })
+            .expect("the previous page's first line");
+        assert!(body_y < 60.0, "against the body master's: {body_y}");
+        assert!(
+            pages[opened - 1]
+                .blocks
+                .iter()
+                .all(|b| !matches!(b, PlacedBlock::Text { source, .. } if *source == opener_block)),
+            "and the page before it is the previous chapter's, entire"
+        );
+    }
+
+    /// **The resume contract, for a break.** Spec 0077's lesson, applied without waiting to be
+    /// bitten by it: the contract is that resuming from *any* checkpoint reproduces a full pass, so
+    /// the test is written against `flow` and every checkpoint the document records — not against
+    /// the session, which picks its own resume points and would never have to pick the one that
+    /// matters here (the checkpoint of a blank page inserted for parity).
+    #[test]
+    fn resuming_from_any_checkpoint_across_a_forced_break_reproduces_a_full_pass() {
+        let per_page = lines_per_page();
+        let mut content = many_lines(per_page / 2);
+        content.push(Block::body("MARK ONE", Color::Gray { v: 0.0 }));
+        content.extend(many_lines(per_page + 3));
+        content.push(Block::body("MARK TWO", Color::Gray { v: 0.0 }));
+        content.extend(many_lines(per_page * 2));
+        // A third break, on a block tall enough to be **cut** across pages, so that the document
+        // records checkpoints whose `split_at` is non-zero *inside* a block that carries a break.
+        // Those are the checkpoints that distinguish "a break belongs to the seam in front of a
+        // block" from "a break fires whenever the flow reaches this block".
+        content.push(Block::body("long ".repeat(4000), Color::Gray { v: 0.0 }));
+        let mut doc = doc_with_blocks(content);
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        doc.breaks = vec![
+            PageBreak {
+                before: doc.content[per_page / 2].id(),
+                kind: BreakKind::Recto,
+            },
+            PageBreak {
+                before: doc.content[per_page / 2 + per_page + 4].id(),
+                kind: BreakKind::Recto,
+            },
+            PageBreak {
+                before: doc.content.last().expect("the long block").id(),
+                kind: BreakKind::Recto,
+            },
+        ];
+        let notes = doc.footnote_blocks();
+        let template = DocumentTemplate::new(&doc);
+        let components = doc.component_library();
+        let run = |start: FlowState| {
+            flow(
+                &doc.content,
+                &notes,
+                &doc.breaks,
+                &doc.assets,
+                &doc.styles,
+                &components,
+                &[],
+                &[],
+                &BTreeMap::new(),
+                &template,
+                &MONO,
+                &NoHyphenator,
+                start,
+                &mut NoCache,
+                None,
+            )
+        };
+
+        let full = run(FlowState::start(&template));
+        assert!(
+            full.pages.iter().any(|p| p.blocks.is_empty()),
+            "the fixture exists to insert a blank page for parity; it inserted none"
+        );
+        assert_eq!(
+            full.checkpoints.len(),
+            full.pages.len(),
+            "every page records where the flow had reached, blank pages included"
+        );
+        assert!(
+            full.checkpoints.iter().any(|c| c.split_at > 0),
+            "the fixture exists to record a checkpoint inside a block that carries a break"
+        );
+        for (i, checkpoint) in full.checkpoints.iter().enumerate() {
+            let resumed = run(*checkpoint);
+            assert_eq!(
+                resumed.pages,
+                full.pages[i..],
+                "resuming at page {i} must reproduce the full pass"
+            );
+        }
+    }
+
+    /// A break belongs to the seam in **front of** a block, so a block that is cut across pages must
+    /// not break again for its own remainder.
+    ///
+    /// The failure is not a hang — a re-fired break at a page start is a no-op for `Page`, and for
+    /// `Recto` it is worse than a hang because it is quiet: the paragraph's continuation skips to
+    /// the next recto and leaves a blank page in the middle of a paragraph. So the fixture is a
+    /// parity break on a block tall enough to span pages, and the assertion is that its pages are
+    /// consecutive.
+    #[test]
+    fn a_block_cut_across_pages_does_not_break_again_for_its_own_remainder() {
+        let mut content = many_lines(lines_per_page() / 2);
+        content.push(Block::body("long ".repeat(4000), Color::Gray { v: 0.0 }));
+        let mut doc = doc_with_blocks(content);
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        let long = doc.content.last().expect("the long block").id();
+        doc.breaks = vec![PageBreak {
+            before: long,
+            kind: BreakKind::Recto,
+        }];
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let on: Vec<usize> = pages
+            .iter()
+            .filter(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == long))
+            })
+            .map(|p| p.index)
+            .collect();
+        assert!(
+            on.len() > 2,
+            "the fixture must span several pages, got {on:?}"
+        );
+        for w in on.windows(2) {
+            assert_eq!(
+                w[1],
+                w[0] + 1,
+                "a paragraph continues on the very next page: {on:?}"
+            );
+        }
+        assert!(
+            pages[on[0]..].iter().all(|p| !p.blocks.is_empty()),
+            "and no blank page is inserted inside it"
+        );
+    }
+
+    /// A break is forward-only, not a derived quantity: it costs no fixpoint pass at all.
+    #[test]
+    fn a_break_costs_no_extra_fixpoint_pass() {
+        let (doc, _) = doc_with_break(lines_per_page() / 2, BreakKind::Recto, 40);
+        let (_, status) = lay_out_noted(&doc);
+        assert!(status.converged, "{status:?}");
+        assert_eq!(status.iterations, 1, "a break is settled inside the pass");
+    }
+
+    /// The claim every increment here owes: a document without the feature is untouched — the same
+    /// page vector, not merely a similar one.
+    #[test]
+    fn a_document_with_no_break_lays_out_exactly_as_before() {
+        let doc = doc_with_blocks(many_lines(200));
+        assert!(doc.breaks.is_empty());
+        let with_path = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+        let (bare, status) = lay_out_with_fixpoint_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &template,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(status.iterations, 1);
+        assert_eq!(
+            with_path, bare,
+            "the break path must be a no-op without one"
+        );
+        // A break naming a block the document does not contain is not an error and changes nothing
+        // — a dangling section anchor's posture (spec 0072).
+        let mut dangling = doc.clone();
+        dangling.breaks = vec![PageBreak {
+            before: BlockId(999_999),
+            kind: BreakKind::Recto,
+        }];
+        assert_eq!(lay_out(&dangling, &MONO, &NoHyphenator), with_path);
+        // And so is a break that states `None`, which is what a book file uses to decline one.
+        let mut declined = doc.clone();
+        declined.breaks = vec![PageBreak {
+            before: doc.content[10].id(),
+            kind: BreakKind::None,
+        }];
+        assert_eq!(lay_out(&declined, &MONO, &NoHyphenator), with_path);
     }
 }

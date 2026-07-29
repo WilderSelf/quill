@@ -483,6 +483,9 @@ impl LayoutSession {
         let result = flow(
             &doc.content,
             notes,
+            // Spec 0080. The session hands the flow the same list the cold path does, and
+            // `context_fingerprint` below is what stops a changed list serving stale pages.
+            &doc.breaks,
             &doc.assets,
             &doc.styles,
             &doc.component_library(),
@@ -893,14 +896,21 @@ fn context_fingerprint(
     // Routing it through `MeasureKey` instead would also have been *wrong* rather than merely
     // expensive: a `MeasureKey` term is a property of the block being measured, and the index's
     // entries are derived from marks scattered through every other block in the document.
+    // `doc.breaks` belongs here for `doc.sections`' reason and with more force (spec 0080): a
+    // break moves every page after it without touching a single block, so a fingerprint blind to it
+    // would call "this chapter now opens recto" nothing-changed and hand back pages laid out the
+    // old way. It keeps the same company for the same cost — a break list is authored, it changes
+    // about as often as a master page does, and a whole-document reflow is the right answer to a
+    // change that genuinely repaginates the whole document from that block on.
     let text = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{derived}",
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{derived}",
         doc.page_setup,
         doc.styles,
         doc.master_pages,
         doc.default_master,
         doc.pages,
         doc.sections,
+        doc.breaks,
         doc.components,
         headings,
         index
@@ -2921,6 +2931,70 @@ mod tests {
         assert!(
             !printed(&first.pages, referrers[0]).contains(quill_core_model::UNRESOLVED_REFERENCE),
             "and not the unresolved marker it started from"
+        );
+    }
+
+    // ----- spec 0080: forced page breaks --------------------------------------------------------
+
+    /// A document that breaks to the next recto part way in, and again later.
+    fn broken_doc(n: usize) -> (Document, Vec<BlockId>) {
+        use quill_core_model::{BreakKind, PageBreak};
+        let mut doc = doc_of(n);
+        let marks = vec![doc.content[n / 3].id(), doc.content[2 * n / 3].id()];
+        doc.breaks = marks
+            .iter()
+            .map(|id| PageBreak {
+                before: *id,
+                kind: BreakKind::Recto,
+            })
+            .collect();
+        (doc, marks)
+    }
+
+    /// The session and the cold path must agree page for page over a document with breaks —
+    /// before an edit and after one, which is where a reused tail page would show up as a
+    /// disagreement.
+    #[test]
+    fn the_session_and_the_cold_path_agree_across_a_forced_break() {
+        let (doc, _) = broken_doc(300);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(first.pages, crate::lay_out(&doc, &MONO, &NoHyphenator));
+
+        let mut edited = doc.clone();
+        edit(
+            &mut edited,
+            20,
+            "an edited paragraph, one line shorter than it was",
+        );
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert!(after.stats.pages_reused > 0, "the fixture must reuse pages");
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&edited, &MONO, &NoHyphenator),
+            "…and every page it kept must still be the page a cold pass produces"
+        );
+    }
+
+    /// Editing the **break list** must reach the pages. It is not block content, so the per-block
+    /// diff cannot see it — `context_fingerprint` is what does, and this is the assertion that
+    /// fails without it (spec 0075's shape, at a new site).
+    #[test]
+    fn changing_a_break_re_lays_the_document() {
+        use quill_core_model::BreakKind;
+        let (doc, _) = broken_doc(300);
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).pages.clone();
+
+        let mut changed = doc.clone();
+        changed.breaks[0].kind = BreakKind::None;
+        changed.bump_revision();
+        let after = session.relayout(&changed, &MONO, &NoHyphenator);
+        assert_ne!(after.pages, before, "a changed break must move the pages");
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&changed, &MONO, &NoHyphenator),
+            "and must move them to where a cold pass puts them"
         );
     }
 }

@@ -216,6 +216,7 @@ impl Document {
             // `TEMPLATE_VERSION` did not move when `FORMAT_VERSION` did.
             sections: Vec::new(),
             footnotes: Vec::new(),
+            breaks: Vec::new(),
             components: Default::default(),
             requires: Vec::new(),
         };

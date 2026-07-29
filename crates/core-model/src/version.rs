@@ -254,6 +254,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 9 {
         migrate_8_to_9(obj);
     }
+    if found < 10 {
+        migrate_9_to_10(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -399,6 +402,25 @@ fn migrate_7_to_8(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 /// So the two halves point the same way for once, and the one that decides it is the quiet one.
 fn migrate_8_to_9(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 
+/// v9 → v10 (spec 0080): a document gains `breaks` — forced page breaks anchored to blocks.
+///
+/// Structurally a no-op for [`migrate_6_to_7`]'s reason: a v9 document breaks nowhere, which is
+/// exactly what the absent list already means, and inserting `"breaks": []` into every document in
+/// existence would rewrite its manifest text and move its exported `/ID` with it.
+///
+/// **The bump is decided by the silence half of the rule** (spec 0074's condition, refined by 0076
+/// and 0077). A v9 build meeting a v10 document drops `breaks` as an unknown key and lays the book
+/// out as one continuous run of text: every chapter opener lands halfway down the page the previous
+/// chapter ended on, the chapter-opener master is applied to a page still carrying the previous
+/// chapter's tail, and every recto opener is on whichever side the flow happened to reach. Nothing
+/// is missing, nothing errors, and nothing on the page says so — the pages are simply the wrong
+/// pages, which is exactly the failure mode this rule exists for.
+///
+/// The **loss** half fires with it and is the same class as spec 0076's `source`: a break is
+/// *authored intent* — "this chapter opens right" — and nothing left in the file can regenerate it,
+/// so one open-and-save through a v9 build deletes the structure of the book.
+fn migrate_9_to_10(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
+
 /// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
 ///
 /// Structurally a no-op, on the same principle as [`migrate_1_to_2`] and written out for the same
@@ -526,9 +548,23 @@ pub fn migrate_book(value: &mut serde_json::Value) -> Result<(), LoadError> {
         });
     }
 
+    if found < 2 {
+        migrate_book_1_to_2(obj);
+    }
+
     obj.insert("book_version".into(), BOOK_VERSION.into());
     Ok(())
 }
+
+/// Book v1 → v2 (spec 0080): a chapter gains `break_before`.
+///
+/// Structurally a no-op, and the *reason* it is a no-op is the increment's decision rather than an
+/// accident: the absent field defaults to [`crate::BreakKind::Page`], so a v1 book composed by this
+/// build opens every chapter on a new page — which is what a book has always meant and what spec
+/// 0079 could not yet do. Writing the default in here would say the same thing in the file and
+/// serialize back out to nothing (`skip_serializing_if`), so the chain records the change and
+/// changes no bytes.
+fn migrate_book_1_to_2(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 
 #[cfg(test)]
 mod runs_migration_tests {
@@ -855,6 +891,13 @@ mod tests {
             "the documented anchor must actually name the documented note"
         );
 
+        // And a forced page break (spec 0080): the chapter opens on the next recto, anchored to the
+        // same heading its section is — which is the shape a book file's `break_before` composes to.
+        assert_eq!(doc.breaks.len(), 1);
+        assert_eq!(doc.breaks[0].before, doc.content[0].id());
+        assert_eq!(doc.breaks[0].kind, crate::BreakKind::Recto);
+        assert_eq!(doc.breaks[0].before, doc.sections[0].start);
+
         // A master with both spec-0047 fields exercised.
         let master = doc.master_for(1).expect("the documented body master");
         let aligns: Vec<(crate::StaticAlign, bool)> = master
@@ -1152,6 +1195,67 @@ mod tests {
 
         let native = V8_FOOTNOTE.replace(
             "\"format_version\": 8",
+            &format!("\"format_version\": {FORMAT_VERSION}"),
+        );
+        let native = Document::from_json(&native).expect("load as current");
+        assert_eq!(json, native.to_json().expect("save"));
+    }
+
+    /// The v9 fixture: committed **as bytes**, for spec 0047's reason — a fixture the current
+    /// serializer wrote would migrate correctly by construction and prove nothing.
+    ///
+    /// It is the shape a v9 build put on disk: an index block and a marked run, a footnote, a
+    /// cross-reference and roman front matter, because those are everything v9 could hold and are
+    /// what this step must not disturb.
+    const V9_INDEX: &str = include_str!("../assets/v9-index.json");
+
+    #[test]
+    fn a_v9_manifest_migrates_forward_to_v10() {
+        let doc = Document::from_json(V9_INDEX).expect("a v9 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+
+        // It means what it meant: a v9 document breaks nowhere.
+        assert!(doc.breaks.is_empty());
+
+        // …and everything the previous versions claimed survived the step.
+        assert!(doc
+            .content
+            .iter()
+            .any(|b| matches!(b, crate::Block::Index { .. })));
+        assert_eq!(
+            doc.content[1]
+                .runs()
+                .iter()
+                .filter_map(|r| r.index.as_ref())
+                .map(|m| m.term.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vault, the sunken"]
+        );
+        assert_eq!(doc.footnotes.len(), 1);
+        assert_eq!(
+            crate::reference_targets(&doc.content),
+            std::collections::BTreeSet::from([crate::BlockId(1)])
+        );
+        assert_eq!(
+            doc.sections[0].folio.expect("folio").format,
+            crate::NumberFormat::LowerRoman
+        );
+    }
+
+    #[test]
+    fn migrating_a_v9_document_does_not_move_its_exported_identity() {
+        // Spec 0047's hazard, for the sixth time, and the reason `migrate_9_to_10` writes nothing:
+        // defaulting `"breaks": []` into every document would rewrite the manifest text of every
+        // file quill has written, and the `/ID` is a hash of that text.
+        let migrated = Document::from_json(V9_INDEX).expect("load");
+        let json = migrated.to_json().expect("save");
+        assert!(
+            !json.contains("\"breaks\""),
+            "migration must not add `breaks`: {json}"
+        );
+
+        let native = V9_INDEX.replace(
+            "\"format_version\": 9",
             &format!("\"format_version\": {FORMAT_VERSION}"),
         );
         let native = Document::from_json(&native).expect("load as current");

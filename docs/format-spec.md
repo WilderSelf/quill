@@ -25,7 +25,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 ```json
 {
-  "format_version": 8,
+  "format_version": 10,
   "metadata": { "title": "The Ruined Keep", "authors": ["Anon"] },
   "page_setup": { "trim": { "w_pt": 468.0, "h_pt": 720.0 }, "bleed_pt": 9.0, "facing_pages": true,
                   "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 } },
@@ -45,6 +45,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
   "default_master": "body",
   "pages": [ {}, {} ],
   "sections": [ { "name": "The Ruined Keep", "start": 1, "master": "chapter-opener" } ],
+  "breaks": [ { "before": 1, "kind": "recto" } ],
   "styles": { "paragraph": {
     "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" },
     "folio": { "font_size_pt": 9.0, "leading_pt": 12.0, "align": "left" } } },
@@ -332,6 +333,43 @@ Two limits are stated rather than left to be discovered:
 there is an article only when the term continues with a space or an apostrophe, so `Theatre` is not
 `The` + `atre`, and the longest match wins so `["A", "An"]` cannot file `An Atlas` under `n`.
 
+## Forced page breaks (spec 0080, v10)
+
+A **break** says that the content at a block resumes on a new page rather than in the frame the flow
+had reached. It is what a chapter opener is, and — with `recto` — what "start this section on the
+next recto" asks for.
+
+```json
+"breaks": [ { "before": 1, "kind": "recto" } ]
+```
+
+- `before` is the [`BlockId`](#block-identity) the break sits in front of. An id the document does
+  not contain is **not** an error: the break is not applied, the posture a dangling section anchor
+  and a dangling master name already have.
+- `kind` is `page` (the default, and what an entry with no `kind` means), `recto`, `verso` or
+  `none`. `recto` and `verso` are one parity rule with the two answers, resolved through the same
+  `is_recto` that decides which way a margin mirrors; with `facing_pages: false` every kind accepts
+  every page, because a single-sided document has no spread. `none` is a break that asks for
+  nothing, and exists so a *book file* can decline the break its chapters get by default.
+
+**A break is anchored, not a field on the block, and not a block of its own.** A `page-break` block
+would be a block with no content that every consumer has to skip, and deleting the heading it was
+written for would leave it behind, breaking the page in front of whatever moved up. A field on the
+block would be inside the value the measurement cache keys on — and a break changes *where* a block
+goes, never *what it measures*, so it must not re-break a paragraph that has not moved. Anchoring
+makes that unrepresentable rather than merely avoided. It is the same shape spec 0066 found for a
+list: a property of a paragraph, not a kind of block.
+
+**What a break does to the pages, exactly:**
+
+- The flow advances **pages**, never frames — on a two-column page a break in the first column does
+  not settle for the second, because the page still carries what came before.
+- A break at the top of a page the flow has not written to is a **no-op**. Without that rule every
+  break would insert a blank page, and a chapter opened on its own would begin on page 2.
+- A parity break may insert **one blank page**, and a blank page is a page in every other respect:
+  it takes its master, prints its folio and its running head, and **consumes a page number**. A page
+  that did not would leave every folio after it one out.
+
 ## Master statics: alignment and page parity (spec 0047, v3)
 
 A text static carries two optional fields, both defaulting to the pre-v3 behavior and both omitted
@@ -387,6 +425,7 @@ version changed.
 | 6 → 7 | 0076 | `source` on a run — a cross-reference to a block | defaults `source` to `authored` on every run: a v6 run drew its own `text`, which is what an absent `source` still means. Nothing is written into the manifest, for the reason 5 → 6 writes nothing |
 | 7 → 8 | 0077 | `footnotes`, and a `footnote` anchor on a run's `source` | defaults `footnotes` to empty: a v7 document had no notes, and no run could name one. Nothing is written into the manifest, for the reason 6 → 7 writes nothing |
 | 8 → 9 | 0078 | `index` on a run, and the `index` block | defaults `index` to absent on every run: a v8 document marked nothing, which is what an absent `index` still means. Nothing is written into the manifest, for the reason 7 → 8 writes nothing |
+| 9 → 10 | 0080 | `breaks` — forced page breaks anchored to blocks | defaults `breaks` to empty: a v9 document breaks nowhere, which is what an absent list still means. Nothing is written into the manifest, for the reason 8 → 9 writes nothing |
 
 A bump is warranted whenever an **older** build would open the document and silently lay it out
 wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
@@ -443,6 +482,16 @@ because there is no silence to be wrong in and nothing of the author's to lose. 
 themselves are ordinary v9 `.tpub`s that an older build opens exactly as it always did.
 `format_version` stays **9**.
 
+**Spec 0080 is the silence half at its plainest, and the loss half rides with it.** A pre-0080 build
+meeting a v10 document drops `breaks` as an unknown key and sets the whole book as one continuous run
+of text: every chapter opener lands halfway down the page the previous chapter ended on, a
+chapter-opener master is applied to a page still carrying the previous chapter's tail, and every
+recto opener falls on whichever side the flow happened to reach. Nothing is missing, nothing errors,
+and nothing on the page says so — which is the failure the first half of the rule exists for. The
+second half fires with it, in 0076's sense exactly: a break is authored intent ("this chapter opens
+right"), nothing left in the file can regenerate it, and one open-and-save through an older build
+deletes the structure of the book. `format_version` is **10**.
+
 > **Bumping `FORMAT_VERSION`? Check whether `TEMPLATE_VERSION` is owed one too.** A template file
 > (below) embeds `page_setup`, `styles`, `master_pages` and `pages`. A document bump that changes
 > the serialized shape of any of those four changes every template file as well, and the template
@@ -454,6 +503,9 @@ themselves are ordinary v9 `.tpub`s that an older build opens exactly as it alwa
 > `index-*` paragraph styles add entries to a map without changing `StyleSheet`'s shape — the same
 > reasoning specs 0041, 0066 and 0077 applied to their own built-in styles. A template written
 > before them simply resolves them through the defaults, exactly as it does `toc-*`.
+> Spec 0080's 9 → 10 was checked and is **not** owed one either: `breaks` is a field on the document
+> beside those four and changes none of them, and a template file has no content, therefore no block
+> ids for a break to be anchored to — the same argument that kept a section out of a template.
 
 ## Template files (spec 0053)
 
@@ -551,15 +603,15 @@ links no assets of its own, and its chapters carry theirs.
 
 ```json
 {
-  "book_version": 1,
+  "book_version": 2,
   "metadata": { "title": "The Ruined Keep", "authors": ["A. Cartographer"] },
   "requires": [ { "name": "house-style", "version": "1" } ],
   "chapters": [
     { "path": "front.tpub", "name": "Front matter",
       "folio": { "format": "lower_roman", "restart_at": 1 } },
     { "path": "ch1.tpub", "name": "The Ruined Keep",
-      "folio": { "format": "decimal", "restart_at": 1 } },
-    { "path": "ch2.tpub", "name": "The Sunken Vault" }
+      "folio": { "format": "decimal", "restart_at": 1 }, "break_before": "recto" },
+    { "path": "ch2.tpub", "name": "The Sunken Vault", "break_before": "recto" }
   ]
 }
 ```
@@ -571,6 +623,10 @@ links no assets of its own, and its chapters carry theirs.
   extracted from a larger book needs" meant.
 - `master` names the master for the chapter's opening page; omitted, the chapter's own positional
   override for its own page 0 supplies it.
+- `break_before` (spec 0080) is the page the chapter opens on — `page` (the default), `recto`,
+  `verso` or `none`. It becomes a `breaks` entry on the composed document, anchored to the same block
+  the chapter's `Section` is. The first chapter's costs nothing whatever it says, because page 0 has
+  received no content and a break at the top of an untouched page is a no-op.
 - `requires` is spec 0056's list. **Shared styles are `.qpack` and nothing else**, and a requirement
   that does not resolve refuses the book rather than falling back.
 
@@ -586,9 +642,10 @@ Consequences worth stating, because each is a decision:
 - **Pagination is continuous with nothing stated.** The composed document is one page vector, so the
   run at page 0 already numbers every chapter in sequence. There is no page-number offset anywhere; a
   book that wants a break says so with a chapter `folio`.
-- **A chapter does not start on a new page.** The model has no forced page break anywhere — named as
-  a non-goal by specs 0072 and 0073 and again by 0079 — so chapter 2 begins on the page chapter 1
-  ended on. The numbering is still continuous and correct; what is missing is the recto opener.
+- **A chapter starts on a new page** (spec 0080), because `compose` gives every chapter a `breaks`
+  entry. A book states nothing to get it; `break_before: "recto"` gets the opener a printed book
+  usually wants, inserting a blank page where one is needed, and `"none"` declines it for parts that
+  genuinely run on.
 - **Every chapter must share one `trim`, `bleed` and `facing_pages`,** or the book is refused: a press
   file whose pages are not one trim is not a press file. Differing margins or baseline grids are
   settled by the first chapter and *reported*.
@@ -615,10 +672,14 @@ half-loaded.
 | current | loaded as-is |
 | newer | refused |
 
-`BOOK_VERSION` is **1** and the migration chain is empty. Unlike a template file, a book file embeds
-no document structure at all — it names chapters by path and states a `Folio` per chapter — so a
-`format_version` bump does not automatically owe one here. What owes a bump is a change to the book
-envelope itself.
+`BOOK_VERSION` is **2**. Unlike a template file, a book file embeds no document structure at all — it
+names chapters by path and states a `Folio` per chapter — so a `format_version` bump does not
+automatically owe one here. What owes a bump is a change to the book envelope itself, and spec 0080's
+`break_before` is the first: a v1 build handed a book that says `"break_before": "recto"` drops the
+key as unknown and opens every chapter on whichever side the flow reached, silently, which is the
+document chain's own rule applied to this envelope. The 1 → 2 migration is a structural no-op — the
+absent field already means `page`, which is what a book has always meant and what spec 0079 could not
+yet do.
 
 ## Reading a container
 

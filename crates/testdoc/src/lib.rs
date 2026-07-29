@@ -212,6 +212,7 @@ pub fn document_with_blocks(spec: &SynthSpec, block_count: usize) -> Document {
         // the engine.
         sections: Vec::new(),
         footnotes: Vec::new(),
+        breaks: Vec::new(),
         components: Default::default(),
         requires: Vec::new(),
     };
@@ -317,6 +318,9 @@ pub fn synthetic_book(spec: &SynthSpec, chapters: usize) -> quill_core_model::Co
                 name: format!("Chapter {i}"),
                 folio: None,
                 master: None,
+                // What a book file that states nothing gets (spec 0080), which is what this
+                // workload is for: the benched book is the ordinary one, breaks included.
+                break_before: quill_core_model::BreakKind::default(),
             })
             .collect(),
     };
