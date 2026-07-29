@@ -1,0 +1,61 @@
+{
+  "format_version": 8,
+  "metadata": {
+    "title": "A v8 book with a footnote and a cross-reference",
+    "authors": ["Anon"]
+  },
+  "page_setup": {
+    "trim": { "w_pt": 432.0, "h_pt": 648.0 },
+    "bleed_pt": 9.0,
+    "facing_pages": true,
+    "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 }
+  },
+  "content": [
+    { "kind": "heading", "id": 1, "level": 1,
+      "runs": [{ "text": "The Sunken Vault" }],
+      "color": { "space": "gray", "v": 0.0 } },
+    { "kind": "body", "id": 2,
+      "runs": [
+        { "text": "one two three " },
+        { "text": "four five six", "style": { "italic": true } },
+        { "text": " and see page " },
+        { "text": "[?]", "source": { "kind": "reference", "target": 1 } },
+        { "text": " for the rest of it" },
+        { "text": "[?]", "source": { "kind": "footnote", "note": 3 } }
+      ],
+      "color": { "space": "gray", "v": 0.0 } }
+  ],
+  "footnotes": [
+    { "id": 3,
+      "runs": [{ "text": "As recorded by the vault's own keepers." }],
+      "color": { "space": "gray", "v": 0.0 } }
+  ],
+  "assets": [],
+  "fonts_embeddable": true,
+  "revision": 0,
+  "next_block_id": 4,
+  "master_pages": [
+    {
+      "name": "body",
+      "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 },
+      "columns": 1,
+      "gutter_pt": 0.0,
+      "statics": [
+        {
+          "kind": "text",
+          "rect": { "x_pt": 54.0, "y_pt": 606.0, "w_pt": 338.0, "h_pt": 12.0 },
+          "text": "{page}",
+          "color": { "space": "gray", "v": 0.0 },
+          "style": "folio",
+          "align": "outside",
+          "mirror": true
+        }
+      ]
+    }
+  ],
+  "default_master": "body",
+  "sections": [
+    { "name": "Front matter", "start": 1,
+      "folio": { "format": "lower_roman", "restart_at": 1 } }
+  ]
+}

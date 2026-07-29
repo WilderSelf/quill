@@ -266,6 +266,72 @@ and a run may name one, through the same `source` field a cross-reference uses:
   column its anchor is in. A footnote area spanning the columns of a page is a named non-goal: it is
   not in any frame, and the flow reserves space in frames.
 
+## The index (spec 0078, v9)
+
+A back-of-book index is a **generated block** plus **marks on runs**. The block stores no entries,
+for the reason a `toc` stores none: they are derived from the pages the marked runs actually landed
+on, and a stored entry is a page number that was right one edit ago.
+
+```json
+{ "kind": "index", "id": 9, "title": "Index",
+  "ignore_leading": ["A", "An", "The"],
+  "color": { "space": "gray", "v": 0.0 } }
+```
+
+and a run says what it puts in the index, beside `style`, `character` and `source` rather than inside
+any of them:
+
+```json
+{ "text": "the routed militia broke", "index": { "term": "morale", "sort_as": null } }
+```
+
+- **The mark is not a `source`.** `source`'s variants are mutually exclusive — a run draws its own
+  characters, or a reference's folio, or a footnote's number — and a mark is not that kind of thing:
+  one run can be both a cross-reference and an index term. It is an annotation on a run, which is the
+  slot `character` occupies.
+- **`term` is authored, not taken from the run's text.** That is what lets a paragraph about routing
+  be indexed under "morale", and a normally-set sentence be filed as "Keep, the Ruined".
+- **`sort_as`** is what the term files under when that is not the term itself: `de Gaulle, Charles`
+  under `Gaulle`, `1984` under `Nineteen Eighty-Four`. No collation rule can derive those, because
+  they are facts about the language and the author's intent rather than about the characters.
+- **A term's page is the page its own *run* landed on**, not the first page of its block. A
+  paragraph cut across a page boundary reports a term marked in its last sentence on the page that
+  sentence is on.
+- **A term marked twice on one page appears once**, and two marks with the same `term` are one
+  entry however they are spelled.
+- **The entries print folios**, and consecutive folios coalesce: `iv, 42–45, 47`. Coalescing is over
+  the *numbering* (format plus number), not the printed strings and not the page indices, so a
+  section boundary that changes the format or restarts the count breaks the run — `ix` and `1` are
+  never printed as a range.
+- **An index longer than a frame splits between entries**, through the same mechanism a contents
+  list and a table split by. Its own title is stated once and never repeated on a continuation.
+- **It joins the layout fixpoint**, as the contents list does, and reports `converged: false` rather
+  than presenting a last iterate as settled.
+
+### Collation
+
+The order terms are filed in is a **named, tested rule**, not byte order. `BTreeMap<String, _>` would
+file `Zebra` before `apple`, `Zürich` after `Zyklon`, and `The Ruined Keep` under T.
+
+A term's key is four levels, compared in order: base letters (case folded, accents folded,
+everything that is neither a letter nor a digit ignored, digits sorting ahead of letters); then the
+accents that were folded away; then case, lower before upper; then the term itself, so the order is
+total and collating a set is deterministic.
+
+Two limits are stated rather than left to be discovered:
+
+- **Filing is letter-by-letter**, so `New York` files after `Newark`. Word-by-word filing is the
+  other convention publishing sanctions and is not implemented.
+- **The rule is not language-tailored.** It is right wherever a script's alphabetical order agrees
+  with its Unicode order after folding — which covers Latin, Greek and Cyrillic — and wrong wherever
+  a language *tailors* that order, as Swedish does by filing `å ä ö` after `z`. `ignore_leading` and
+  `sort_as` cover the two exceptions a book can state for itself; a language-wide tailoring needs a
+  Unicode collator, and `specs/0078-index.md` prices that.
+
+`ignore_leading` is **empty by default**: quill never guesses a language it was not told. A word
+there is an article only when the term continues with a space or an apostrophe, so `Theatre` is not
+`The` + `atre`, and the longest match wins so `["A", "An"]` cannot file `An Atlas` under `n`.
+
 ## Master statics: alignment and page parity (spec 0047, v3)
 
 A text static carries two optional fields, both defaulting to the pre-v3 behavior and both omitted
@@ -320,6 +386,7 @@ version changed.
 | 5 → 6 | 0073 | `folio` on a section | defaults `folio` to absent on every section: a v5 document numbered every page arabic from 1, which is what a section stating no folio still means |
 | 6 → 7 | 0076 | `source` on a run — a cross-reference to a block | defaults `source` to `authored` on every run: a v6 run drew its own `text`, which is what an absent `source` still means. Nothing is written into the manifest, for the reason 5 → 6 writes nothing |
 | 7 → 8 | 0077 | `footnotes`, and a `footnote` anchor on a run's `source` | defaults `footnotes` to empty: a v7 document had no notes, and no run could name one. Nothing is written into the manifest, for the reason 6 → 7 writes nothing |
+| 8 → 9 | 0078 | `index` on a run, and the `index` block | defaults `index` to absent on every run: a v8 document marked nothing, which is what an absent `index` still means. Nothing is written into the manifest, for the reason 7 → 8 writes nothing |
 
 A bump is warranted whenever an **older** build would open the document and silently lay it out
 wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
@@ -347,6 +414,14 @@ derived state and not even intent: it is **prose**, the author's own sentences, 
 deletes every one of them with nothing left in the file to regenerate them from. 0076 bumped for
 losing which block a reference pointed at; this loses the note. `format_version` is **8**.
 
+**Spec 0078 fires on both halves at once, and the one that decides it is the quiet one.** A pre-0078
+build meeting an `index` *block* refuses the document outright — `kind` is a tagged enum and `index`
+is a tag it does not have — which is as loud as a failure gets. But the marks are not in the block;
+they are on the *runs*, where a pre-0078 build drops them as unknown keys, lays the book out with no
+visible difference anywhere, and deletes the entire index on the first save. Which terms an author
+chose to index, and what each files under, is authored intent in precisely 0076's sense: nothing left
+in the file can regenerate it. `format_version` is **9**.
+
 Note what the rule does *not* turn on. Not "did a struct gain a field" — spec 0035's `pages`, spec
 0054's `components` and spec 0056's `requires` were all additive without a bump, because an older
 build that drops them lays the document out exactly as the author would have got before writing
@@ -365,7 +440,12 @@ version gate could stop them arriving. `format_version` stays **6**.
 > the serialized shape of any of those four changes every template file as well, and the template
 > format has its own version and its own migration chain. Spec 0047's 2 → 3 was exactly such a bump.
 > Spec 0072's 4 → 5 was checked against this and is **not**: it adds a field to the document beside
-> those four and changes none of them, and a template cannot carry a section anyway.
+> those four and changes none of them, and a template cannot carry a section anyway. Spec 0078's
+> 8 → 9 was checked too and is **not**: a `Run` is in none of the four (a master static's text is a
+> `String`, not runs), the `index` block is content and a template has none, and the two new
+> `index-*` paragraph styles add entries to a map without changing `StyleSheet`'s shape — the same
+> reasoning specs 0041, 0066 and 0077 applied to their own built-in styles. A template written
+> before them simply resolves them through the defaults, exactly as it does `toc-*`.
 
 ## Template files (spec 0053)
 

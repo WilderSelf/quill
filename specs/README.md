@@ -86,6 +86,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0075 | [A derived or composite block may span frames](0075-blocks-span-frames.md) | M6 | implemented |
 | 0076 | [Cross-references: "see page 42", and where a derived value may not live](0076-cross-references.md) | M6 | implemented |
 | 0077 | [Footnotes: a band at the foot of the frame, and the one term it may reduce](0077-footnotes.md) | M6 | implemented |
+| 0078 | [The index: marked terms, collated, page-ranged](0078-index.md) | M6 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),
 and the content-pack authoring guide in [`../docs/pack-authoring.md`](../docs/pack-authoring.md).

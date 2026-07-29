@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M5 complete; M6 through spec 0077.** M0 (headless PDF/X export) is
+**Status: M0–M5 complete; M6 through spec 0078.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -177,6 +177,19 @@ would be a fixpoint inside `flow`, so a footnote is not a fourth derived quantit
 budget did not move. The band cannot oscillate — the flow is forward-only and a discarded reservation
 is discarded — but a *carry* can fail to make progress, so three runtime guards bound it.
 `FORMAT_VERSION` is **8**: loud again, but a note is prose rather than intent and one save deletes it.
+**0078 then shipped the index**, whose derivation, mark and rendering were `Block::Toc`,
+`Run::character` and the tab mechanism — so its only new machinery was **collation** and
+**page-range coalescing**, both pure and both previously absent from the workspace entirely.
+Collation is an in-house four-level rule (`core-model/src/collate.rs`), argued against the real
+crates (`icu_collator` needs Rust 1.86 against the workspace's 1.75 and 34 transitive crates;
+`feruca` costs 10 for a root order that is still not language-tailored); its limits are stated
+non-goals with a lifting path, and the two exceptions a book states for itself — an article list and
+a per-entry `sort_as` — are declared *data*, so the mechanism is not English-shaped. Ranges coalesce
+**folios**, not page indices, so a section boundary never prints `ix–1`. The index takes the contents
+list's cache route (`context_fingerprint` + eviction), not 0076's `MeasureKey`, because there is one
+of it; the fixpoint gained a fourth quantity and still measures 3 passes. `FORMAT_VERSION` is **9**,
+decided by the quiet half of the rule: an older build refuses the index *block* loudly but drops
+every *mark* in silence.
 `TEMPLATE_VERSION` stays 1 throughout.
 M7 is named, not decomposed.
 

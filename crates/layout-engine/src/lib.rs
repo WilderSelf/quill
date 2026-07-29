@@ -17,9 +17,10 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
     builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
-    Color, ComponentLibrary, Document, FolioRun, ListMarker, Margins, MasterPage, MasterStatic,
-    PageOverride, PageSetup, ParagraphStyle, Rect, RunSource, StaticToken, StyleSheet, TextAlign,
-    STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE, UNRESOLVED_REFERENCE,
+    Color, ComponentLibrary, Document, FolioRun, IndexMark, ListMarker, Margins, MasterPage,
+    MasterStatic, NumberFormat, PageOverride, PageSetup, ParagraphStyle, Rect, RunSource,
+    StaticToken, StyleSheet, TextAlign, INDEX_ENTRY_STYLE, INDEX_TITLE_STYLE, STATBLOCK_COMPONENT,
+    TABLE_COMPONENT, TOC_TITLE_STYLE, UNRESOLVED_REFERENCE,
 };
 use quill_text_layout::{
     justify_runs_indented, Alignment, Hyphenator, Line, RunFormat, RunMetrics,
@@ -418,6 +419,154 @@ pub fn heading_index_with_folios(
     out
 }
 
+/// One index term, and the pages it was marked on (spec 0078).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexEntry {
+    /// The term as it prints.
+    pub term: String,
+    /// Zero-based page indices the term was marked on, ascending and deduplicated.
+    ///
+    /// Physical positions, like [`HeadingEntry::page_index`] and for the same reason: this is what a
+    /// destination would target, and it is deliberately **not** what the entry prints.
+    pub pages: Vec<usize>,
+    /// What the entry prints after the term: `iv, 42–45, 47`.
+    ///
+    /// Folios (spec 0073), coalesced (spec 0078). Spec 0073's split falls on the reader's side here
+    /// exactly as it does for a contents entry: an index that says `4` for a page printed `iv`
+    /// sends the reader to a page that does not answer to the number they were given.
+    pub folios: String,
+}
+
+/// The index a document's marked runs produce, collated and page-ranged (spec 0078).
+///
+/// Derived from the **laid-out pages** rather than accumulated during pagination — [`heading_index`]'s
+/// decision, and load-bearing for the same reason: an incremental pass reuses whole pages, so
+/// anything counted while placing goes missing on a reused page, and goes missing precisely when the
+/// document has just been edited.
+///
+/// **A mark's page is the page its own run landed on**, not the first page of its block, and that is
+/// the part worth being exact about. A placed paragraph carries the span map spec 0063 built — which
+/// authored run every stretch of every line came from — so a paragraph cut across a page boundary
+/// (spec 0044) reports a term marked in its last sentence on the page that sentence is actually on.
+/// Falling back to the block's first page would be right for every paragraph that fits a frame and
+/// wrong for exactly the long ones an index is for. The fallback is still there for the case that
+/// has no span at all: a mark on a run whose text is empty, or on a paragraph positioned by tab
+/// stops, which is laid as panel parts and carries no run map.
+///
+/// Returns empty when nothing is marked, and every caller skips the walk in that case, so a document
+/// with no index pays nothing.
+pub fn index_entries(
+    content: &[Block],
+    pages: &[LaidOutPage],
+    template: &impl PageTemplate,
+    ignore_leading: &[String],
+) -> Vec<IndexEntry> {
+    // (block, run index) → mark, in document order. Empty for every document with no marks.
+    let marks: Vec<(BlockId, usize, &IndexMark)> = content
+        .iter()
+        .flat_map(|b| {
+            let id = b.id();
+            b.runs()
+                .iter()
+                .enumerate()
+                .filter_map(move |(i, r)| r.index.as_ref().map(|m| (id, i, m)))
+        })
+        .collect();
+    if marks.is_empty() {
+        return Vec::new();
+    }
+
+    // First page each (block, run) was drawn on, and first page each block was placed on.
+    let mut run_page: BTreeMap<(BlockId, usize), usize> = BTreeMap::new();
+    let mut block_page: BTreeMap<BlockId, usize> = BTreeMap::new();
+    for page in pages {
+        for placed in &page.blocks {
+            let PlacedBlock::Text { source, lines, .. } = placed else {
+                continue;
+            };
+            if !source.is_assigned() {
+                continue;
+            }
+            block_page.entry(*source).or_insert(page.index);
+            for line in lines {
+                for span in &line.spans {
+                    run_page.entry((*source, span.run)).or_insert(page.index);
+                }
+            }
+        }
+    }
+
+    // Term → the mark that decides its filing, plus its pages. Keyed by the *printed* term, so two
+    // marks that print the same thing are one entry however they are spelled in the manifest —
+    // which is what makes "a term marked twice on one page appears once" true by construction
+    // rather than by a later pass. The mark kept is the first in document order that states a
+    // `sort_as`, else the first: an author who files a term two ways has contradicted themselves,
+    // and taking the earlier statement is the only tie-break that does not depend on where in the
+    // book each mention happened to land.
+    let mut grouped: BTreeMap<&str, (&IndexMark, BTreeSet<usize>)> = BTreeMap::new();
+    for (block, run, mark) in &marks {
+        let Some(page) = run_page
+            .get(&(*block, *run))
+            .or_else(|| block_page.get(block))
+            .copied()
+        else {
+            // Marked in a block the pass did not place — deleted, or an image whose asset is
+            // missing. It contributes no page, and a term with no page contributes no entry: the
+            // reader cannot turn to a page that has nothing on it (spec 0076's answer for an
+            // unplaced reference target, at the one other site that asks the question).
+            continue;
+        };
+        let slot = grouped
+            .entry(mark.term.as_str())
+            .or_insert_with(|| (*mark, BTreeSet::new()));
+        if slot.0.sort_as.is_none() && mark.sort_as.is_some() {
+            slot.0 = *mark;
+        }
+        slot.1.insert(page);
+    }
+
+    let mut out: Vec<(quill_core_model::CollationKey, IndexEntry)> = grouped
+        .into_values()
+        .map(|(mark, pages_set)| {
+            let pages: Vec<usize> = pages_set.into_iter().collect();
+            // The **folio**, not the page index, and its numbering rather than its text: coalescing
+            // `ix` with `1` would print a range that does not exist, and the two strings alone
+            // cannot say so (spec 0078).
+            let numbering: Vec<(NumberFormat, u32)> =
+                pages.iter().map(|p| template.folio_number(*p)).collect();
+            (
+                quill_core_model::collation_key(mark, ignore_leading),
+                IndexEntry {
+                    term: mark.term.clone(),
+                    folios: quill_core_model::coalesce_folios(&numbering),
+                    pages,
+                },
+            )
+        })
+        .collect();
+    // The collation is a *total* order (see `quill_core_model::collate`), so this is deterministic
+    // whatever order the marks were found in — which matters, because the marks are found in
+    // document order and an index whose ties broke by first mention would reorder itself when a
+    // paragraph moved.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.into_iter().map(|(_, e)| e).collect()
+}
+
+/// The article list the document's index block declares, or empty (spec 0078).
+///
+/// One function rather than the same `find`/`match` at the three sites that ask — the two fixpoints
+/// and the session's context fingerprint — because the collation an index is *rendered* with and the
+/// collation it is *derived* with must be the same one.
+pub fn index_ignore_leading(content: &[Block]) -> &[String] {
+    content
+        .iter()
+        .find_map(|b| match b {
+            Block::Index { ignore_leading, .. } => Some(ignore_leading.as_slice()),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
 /// What a page's furniture may read off the document's content (spec 0074).
 ///
 /// One field today, and a struct rather than a bare slice for `BlockContext`'s stated reason: the
@@ -635,6 +784,18 @@ pub trait PageTemplate {
     /// move a line break and adds **zero** fixpoint iterations.
     fn folio(&self, page_index: usize) -> String {
         (page_index + 1).to_string()
+    }
+
+    /// The numbering behind [`PageTemplate::folio`] — the format and the number, before either
+    /// becomes text (spec 0078).
+    ///
+    /// An index coalesces page ranges, and that cannot be done on the printed strings: `iv` and `v`
+    /// join and `ix` and `1` do not, and telling those apart means comparing the format and the
+    /// arithmetic. The default matches [`PageTemplate::folio`]'s default exactly, and
+    /// `a_template_folio_is_its_own_numbering_formatted` asserts the two agree for every
+    /// implementation in the workspace — one number, printed one way, whichever question is asked.
+    fn folio_number(&self, page_index: usize) -> (NumberFormat, u32) {
+        (NumberFormat::Decimal, page_index as u32 + 1)
     }
 }
 
@@ -904,6 +1065,12 @@ impl PageTemplate for DocumentTemplate<'_> {
 
     fn folio(&self, page_index: usize) -> String {
         Document::folio_in(&self.derived.borrow().folio_runs, page_index)
+    }
+
+    fn folio_number(&self, page_index: usize) -> (NumberFormat, u32) {
+        // The same `folio_runs` `folio` reads, through the function `folio_in` itself calls, so the
+        // number an index coalesces and the number a page prints cannot be two numbers.
+        Document::folio_number_in(&self.derived.borrow().folio_runs, page_index)
     }
 
     fn section_name(&self, page_index: usize) -> Option<String> {
@@ -1513,6 +1680,9 @@ pub(crate) struct BlockContext<'a> {
     /// Where the headings landed, for a contents block to render from (spec 0041). Empty on the
     /// first pass of the fixpoint, and for every document that has no contents block.
     pub headings: &'a [HeadingEntry],
+    /// The collated index, for an index block to render from (spec 0078). Empty on the first pass
+    /// of the fixpoint, and for every document that marks nothing.
+    pub index: &'a [IndexEntry],
     /// The component definitions this document can resolve (spec 0054): the bundled two, plus
     /// whatever it or its packs supply.
     pub components: &'a ComponentLibrary,
@@ -1771,6 +1941,7 @@ pub(crate) fn measure_block(
         assets,
         styles,
         headings,
+        index,
         components,
         markers,
         resolved,
@@ -1852,6 +2023,9 @@ pub(crate) fn measure_block(
         } => Some(measure_toc(
             title, *max_level, *color, width, styles, headings, metrics,
         )),
+        Block::Index { title, color, .. } => {
+            Some(measure_index(title, *color, width, styles, index, metrics))
+        }
         // The two bundled components are *sugar*: they keep the authored shape a person would
         // rather write by hand, and convert to definition + fields here (spec 0054), so nothing
         // measures a stat block or a table twice.
@@ -2201,6 +2375,149 @@ fn measure_toc(
     )
 }
 
+/// Gap between an index entry's term and its page numbers (spec 0078).
+const INDEX_GAP_PT: f32 = 6.0;
+
+/// Build a back-of-book index from where the marked runs actually landed (spec 0078).
+///
+/// [`measure_toc`]'s shape, deliberately and almost line for line: the entries are *derived* and
+/// never stored, each entry is one tabbed line against one right stop, a term too long for its
+/// column is clipped with an ellipsis rather than wrapped, and the block cuts between entries.
+/// Reusing the shape is the point — an index is a contents list with different entries, and the two
+/// producing different geometry would be two answers to one question.
+///
+/// **Three things differ, and each is a decision.**
+///
+/// - **No dot leader.** A contents list has a dozen long entries and the leader is what carries the
+///   eye across the gap; an index has hundreds of short ones, and a page of dot leaders reads as a
+///   contents list rather than as an index. The right stop stays, because keeping the numbers in one
+///   scannable column is what a right stop is *for*.
+/// - **The number column is measured, not reserved.** A contents entry ends in a page number and
+///   `TOC_NUMBER_COLUMN_PT` is wide enough for any of them; an index entry ends in
+///   `iv, 42–45, 47`, whose width is a property of the entry. So the term is clipped against what
+///   this entry's own folios measure.
+/// - **No `link_page`.** A contents entry points at one page; an index entry points at several, and
+///   a hot area over the whole run of numbers would navigate to whichever one the implementation
+///   picked. Spec 0052's plumbing is per-rectangle, so the honest version is one link per number,
+///   which is a placement change and a named non-goal in spec 0078 rather than a guess made here.
+fn measure_index(
+    title: &str,
+    color: Color,
+    width: f32,
+    styles: &StyleSheet,
+    entries: &[IndexEntry],
+    metrics: &impl RunMetrics,
+) -> (Measured, f32) {
+    let mut parts: Vec<PanelPart> = Vec::new();
+    // Panel-local y of every place this block may be cut: the top of every entry. Item 0's boundary
+    // is rewritten to 0.0 below so the index's own title is absorbed into the first item and can
+    // never be left behind alone — `measure_toc`'s trick, and a panel's top inset before that.
+    let mut boundaries: Vec<f32> = Vec::new();
+    let mut y = 0.0;
+
+    if !title.is_empty() {
+        let style = styles
+            .paragraph
+            .get(INDEX_TITLE_STYLE)
+            .copied()
+            .unwrap_or_default();
+        y += style.space_before_pt;
+        let title_w = metrics.measure_run(title, style.font_size_pt);
+        parts.push(PanelPart {
+            dx_pt: 0.0,
+            dy_pt: y,
+            w_pt: width,
+            ink_dx_pt: 0.0,
+            // Its measured advance, not the frame measure it was given (spec 0069).
+            ink_w_pt: title_w,
+            lines: vec![Line::single_run(title.to_string(), 0.0, 0.0)],
+            color,
+            font_size_pt: style.font_size_pt,
+            leading_pt: style.leading_pt,
+            link_page: None,
+        });
+        y += style.leading_pt + style.space_after_pt;
+    }
+
+    let style = styles
+        .paragraph
+        .get(INDEX_ENTRY_STYLE)
+        .copied()
+        .unwrap_or_default();
+    for entry in entries {
+        // Recorded before the entry's space-above, so a fragment that begins here begins with that
+        // space rather than swallowing it.
+        boundaries.push(y);
+        y += style.space_before_pt;
+
+        let numbers_w = metrics.measure_run(&entry.folios, style.font_size_pt);
+        let term_max = (width - numbers_w - INDEX_GAP_PT).max(1.0);
+        let mut text = entry.term.clone();
+        if metrics.measure_run(&text, style.font_size_pt) > term_max {
+            while !text.is_empty()
+                && metrics.measure_run(&format!("{text}…"), style.font_size_pt) > term_max
+            {
+                text.pop();
+            }
+            text.push('…');
+        }
+
+        let stops = [quill_text_layout::TabStop {
+            position_pt: width,
+            align: quill_text_layout::TabAlign::Right,
+            leader: None,
+        }];
+        let mut line = tab_parts(
+            &format!("{text}\t{}", entry.folios),
+            &stops,
+            0.0,
+            y,
+            style.font_size_pt,
+            style.leading_pt,
+            color,
+            metrics,
+        );
+        parts.append(&mut line);
+        y += style.leading_pt + style.space_after_pt;
+    }
+
+    // Cut between entries (spec 0075), for `measure_toc`'s reason: an entry is one line of
+    // navigation and half of one is not navigation at all. An index is the block that makes this
+    // mechanism unavoidable rather than merely correct — a 500-page book's contents list is three
+    // pages, and its index is longer.
+    let split = (boundaries.len() >= 2).then(|| {
+        let mut items: Vec<f32> = Vec::with_capacity(boundaries.len());
+        for i in 0..boundaries.len() {
+            let start = if i == 0 { 0.0 } else { boundaries[i] };
+            let end = boundaries.get(i + 1).copied().unwrap_or(y);
+            items.push(end - start);
+        }
+        PanelSplit {
+            items,
+            // Nothing is re-stated on a continuation, for `measure_toc`'s reason: a repeated "Index"
+            // reads as a second index rather than as the same one carrying on.
+            repeat_parts: Vec::new(),
+            repeat_decorations: Vec::new(),
+            repeat_h: 0.0,
+            trailing_pt: 0.0,
+            min_items: MIN_ENTRIES_PER_FRAGMENT,
+            preferred: Vec::new(),
+            keep_together: true,
+        }
+    });
+
+    (
+        Measured::Panel {
+            fill: None,
+            stroke: None,
+            parts,
+            decorations: Vec::new(),
+            split,
+        },
+        y,
+    )
+}
+
 /// Flow `content` through a [`Thread`]'s frames, paginating across frames and then pages
 /// (spec 0019 incr. 2). Content fills the first frame top-to-bottom; a block that overflows the
 /// current frame continues into the next frame in the thread, and onto a fresh page — restarting at
@@ -2356,24 +2673,26 @@ fn lay_out_resolved(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> (Vec<LaidOutPage>, FixpointStatus) {
-    let once = |headings: &[HeadingEntry], resolved: &BTreeMap<BlockId, String>| {
-        flow(
-            content,
-            notes,
-            assets,
-            styles,
-            components,
-            headings,
-            resolved,
-            template,
-            metrics,
-            hyphenator,
-            FlowState::start(template),
-            &mut NoCache,
-            None,
-        )
-        .pages
-    };
+    let once =
+        |headings: &[HeadingEntry], index: &[IndexEntry], resolved: &BTreeMap<BlockId, String>| {
+            flow(
+                content,
+                notes,
+                assets,
+                styles,
+                components,
+                headings,
+                index,
+                resolved,
+                template,
+                metrics,
+                hyphenator,
+                FlowState::start(template),
+                &mut NoCache,
+                None,
+            )
+            .pages
+        };
 
     // Three derived quantities, one loop (specs 0072, 0076). Nesting them — settle the sections,
     // then settle the contents inside that — would multiply the pass count rather than add to it,
@@ -2381,6 +2700,12 @@ fn lay_out_resolved(
     // changes the page count, which changes the numbers the contents list prints and the numbers the
     // cross-references print.
     let has_toc = content.iter().any(|b| matches!(b, Block::Toc { .. }));
+    // A fourth derived quantity, riding the same loop for the same arithmetic (spec 0078): an index
+    // is derived from the pages its marked runs landed on, its own length moves the pages it lists,
+    // and it is not independent of the other three — a longer index moves nothing above it, but a
+    // section's opener master moves what page every term is on.
+    let has_index = content.iter().any(|b| matches!(b, Block::Index { .. }));
+    let ignore_leading = index_ignore_leading(content);
     // Empty for every document without a cross-reference, which is what skips the derivation, the
     // comparison and the extra pass outright.
     let targets = quill_core_model::reference_targets(content);
@@ -2393,13 +2718,14 @@ fn lay_out_resolved(
     let numbers = quill_core_model::footnote_numbers(notes);
 
     let mut resolved: BTreeMap<BlockId, String> = numbers.clone();
-    let mut pages = once(&[], &resolved);
+    let mut pages = once(&[], &[], &resolved);
     // Asked once before the loop, so a template that derives nothing answers `false` and the loop
     // exits on its first comparison — one pass, exactly as before, for every document that has
     // neither a contents list, nor a section, nor a cross-reference.
     let mut reassigned = template.reassign(&pages);
 
     let mut headings: Vec<HeadingEntry> = Vec::new();
+    let mut index: Vec<IndexEntry> = Vec::new();
     let mut iterations = 1;
     let converged = loop {
         let next = if has_toc {
@@ -2407,19 +2733,25 @@ fn lay_out_resolved(
         } else {
             Vec::new()
         };
+        let next_index = if has_index {
+            index_entries(content, &pages, template, ignore_leading)
+        } else {
+            Vec::new()
+        };
         // The footnote numbers go back in every pass because the map is one map; they are constant,
         // so they can never be the reason the comparison fails.
         let mut next_refs = reference_folios(&targets, &pages, template);
         next_refs.extend(numbers.iter().map(|(k, v)| (*k, v.clone())));
-        if next == headings && next_refs == resolved && !reassigned {
+        if next == headings && next_index == index && next_refs == resolved && !reassigned {
             break true;
         }
         if iterations >= FIXPOINT_MAX_ITERATIONS {
             break false;
         }
         headings = next;
+        index = next_index;
         resolved = next_refs;
-        pages = once(&headings, &resolved);
+        pages = once(&headings, &index, &resolved);
         reassigned = template.reassign(&pages);
         iterations += 1;
     };
@@ -2938,6 +3270,7 @@ pub(crate) fn flow(
     styles: &StyleSheet,
     components: &ComponentLibrary,
     headings: &[HeadingEntry],
+    index: &[IndexEntry],
     resolved: &BTreeMap<BlockId, String>,
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
@@ -2958,6 +3291,7 @@ pub(crate) fn flow(
         assets: &assets,
         styles,
         headings,
+        index,
         components,
         markers: &markers,
         resolved,
@@ -5587,6 +5921,7 @@ mod tests {
             assets: &assets,
             styles: &styles,
             headings: &[],
+            index: &[],
             components: &components,
             markers: &markers,
             resolved: &BTreeMap::new(),
@@ -8896,6 +9231,7 @@ mod tests {
             style,
             character: named.then(|| "named".to_string()),
             source: Default::default(),
+            index: None,
         };
         // An empty result means "the breaker's own default", which is the contract `run_formats`
         // documents — so the helper spells that out rather than indexing into nothing.
@@ -9009,6 +9345,7 @@ mod tests {
             },
             character: Some("no-such-style".into()),
             source: Default::default(),
+            index: None,
         };
         let fmt = run_formats(std::slice::from_ref(&run), &paragraph, &styles)[0];
         assert_eq!(fmt.size_pt, paragraph.font_size_pt, "the paragraph's size");
@@ -9033,6 +9370,7 @@ mod tests {
                 style: InlineStyle::EMPTY,
                 character: Some(name.into()),
                 source: Default::default(),
+                index: None,
             };
             run_formats(std::slice::from_ref(&run), &paragraph, &styles)[0]
         };
@@ -9063,6 +9401,7 @@ mod tests {
             style: InlineStyle::EMPTY,
             character: Some(quill_core_model::EMPHASIS_STYLE.into()),
             source: Default::default(),
+            index: None,
         };
         let fmt = run_formats(
             std::slice::from_ref(&run),
@@ -9831,6 +10170,7 @@ mod tests {
             assets: &assets,
             styles: &doc.styles,
             headings: &[],
+            index: &[],
             components: &builtin_components(),
             markers: &markers,
             resolved: &quill_core_model::footnote_numbers(&notes),
@@ -9903,6 +10243,7 @@ mod tests {
                 assets: &assets,
                 styles: &doc.styles,
                 headings: &[],
+                index: &[],
                 components: &builtin_components(),
                 markers: &markers,
                 resolved: &quill_core_model::footnote_numbers(&notes),
@@ -9989,6 +10330,7 @@ mod tests {
                 &doc.assets,
                 &doc.styles,
                 &components,
+                &[],
                 &[],
                 &numbers,
                 &template,
@@ -10178,5 +10520,416 @@ mod tests {
                 .all(|b| !matches!(b, PlacedBlock::Rect { .. })),
             "no band separator is drawn for a document with no note"
         );
+    }
+
+    // --- The index (spec 0078) ------------------------------------------------------------------
+
+    /// A body paragraph whose one run marks `term`.
+    fn marked(text: &str, term: &str) -> Block {
+        let mut run = quill_core_model::Run::plain(text);
+        run.index = Some(IndexMark::new(term));
+        Block::body_runs(vec![run], Color::Gray { v: 0.0 })
+    }
+
+    /// A document with an index block, then `blocks`, with ids assigned.
+    fn index_doc(ignore_leading: Vec<String>, blocks: Vec<Block>) -> Document {
+        let mut content: Vec<Block> = vec![Block::Index {
+            id: BlockId::UNASSIGNED,
+            title: "Index".into(),
+            ignore_leading,
+            color: Color::Gray { v: 0.0 },
+        }];
+        content.extend(blocks);
+        let mut doc = doc_with_blocks(content);
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    /// Every index entry as `(term, printed pages)`, read back off the page.
+    ///
+    /// The index block emits its own title, then per entry a term run and a numbers run — the two
+    /// segments of one tabbed line. Read by source id, because an index shares its page with
+    /// whatever precedes it (spec 0041's lesson, found by a failing test then too).
+    fn index_entry_texts(doc: &Document, pages: &[LaidOutPage]) -> Vec<(String, String)> {
+        let id = doc
+            .content
+            .iter()
+            .find(|b| matches!(b, Block::Index { .. }))
+            .map(|b| b.id())
+            .expect("an index block");
+        let texts: Vec<String> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text { lines, source, .. } if *source == id => {
+                    Some(lines[0].text.clone())
+                }
+                _ => None,
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        texts[1..]
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| (c[0].clone(), c[1].clone()))
+            .collect()
+    }
+
+    fn laid_out(doc: &Document) -> (Vec<LaidOutPage>, FixpointStatus) {
+        lay_out_with_fixpoint_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(doc),
+            &MONO,
+            &NoHyphenator,
+        )
+    }
+
+    #[test]
+    fn marked_terms_are_collated_rather_than_byte_ordered() {
+        // The rule the workspace did not have. Every one of these is in a different place under
+        // `BTreeMap<String, _>`: `Zebra` would lead (capitals sort first), `Ale` would follow
+        // `Ålesund` (U+00C5 is past every ASCII letter), and `The Ruined Keep` would file under T.
+        let doc = index_doc(
+            ["A", "An", "The"].iter().map(|s| s.to_string()).collect(),
+            vec![
+                marked("one", "Zebra"),
+                marked("two", "Ålesund"),
+                marked("three", "The Ruined Keep"),
+                marked("four", "apple"),
+                marked("five", "Ale"),
+            ],
+        );
+        let (pages, status) = laid_out(&doc);
+        assert!(status.converged, "{status:?}");
+        let terms: Vec<String> = index_entry_texts(&doc, &pages)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(
+            terms,
+            ["Ale", "Ålesund", "apple", "The Ruined Keep", "Zebra"],
+            "collated, not byte-ordered"
+        );
+    }
+
+    #[test]
+    fn a_term_marked_twice_on_one_page_appears_once() {
+        let doc = index_doc(
+            Vec::new(),
+            vec![
+                marked("first mention", "ravens"),
+                marked("second mention", "ravens"),
+                marked("elsewhere", "sorcery"),
+            ],
+        );
+        let (pages, status) = laid_out(&doc);
+        assert!(status.converged, "{status:?}");
+        let entries = index_entry_texts(&doc, &pages);
+        assert_eq!(entries.len(), 2, "two terms, three marks: {entries:?}");
+        assert_eq!(entries[0].0, "ravens");
+        // One page, printed once — not `1, 1`, and not a range of a page with itself.
+        assert_eq!(entries[0].1, "1");
+    }
+
+    #[test]
+    fn a_marked_term_prints_the_folio_and_follows_repagination() {
+        use quill_core_model::{Folio, NumberFormat, Section};
+
+        // Roman front matter, so the folio and the page index visibly differ, and the assertion
+        // cannot pass against an implementation that printed `page_index + 1`.
+        let mut blocks = many_lines(60);
+        blocks.push(marked("the marked paragraph", "ravens"));
+        let mut doc = index_doc(Vec::new(), blocks);
+        doc.sections = vec![Section {
+            name: "Front matter".into(),
+            start: doc.content[1].id(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        // The template the pages were laid out with, because it is the one that has *derived* the
+        // section's start page; a fresh one would still be answering with the default numbering.
+        let template = DocumentTemplate::new(&doc);
+        let (pages, status) = lay_out_with_fixpoint_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &template,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged, "{status:?}");
+        let before = index_entry_texts(&doc, &pages);
+        assert_eq!(before.len(), 1);
+        let printed = before[0].1.clone();
+        assert!(
+            printed.chars().all(|c| "ivxlcdm".contains(c)),
+            "a roman folio, not an index: {printed}"
+        );
+
+        // Asserted from both sides, on spec 0072's reasoning: a test checking only that the number
+        // changed would pass against an implementation that printed anything at all, and one
+        // checking only the new value would pass against one that printed the document's last page.
+        let marked_id = doc.content.last().expect("the marked block").id();
+        let want = template.folio(
+            pages
+                .iter()
+                .find(|p| {
+                    p.blocks.iter().any(
+                        |b| matches!(b, PlacedBlock::Text { source, .. } if *source == marked_id),
+                    )
+                })
+                .expect("the marked block is placed")
+                .index,
+        );
+        assert_eq!(
+            printed, want,
+            "the entry prints the page it actually landed on"
+        );
+
+        // Insert a page of content above it; the entry must follow.
+        let mut moved = doc.clone();
+        let tail = moved.content.split_off(1);
+        moved.content.extend(many_lines(60));
+        moved.content.extend(tail);
+        moved.assign_missing_block_ids().expect("ids");
+        moved.sections[0].start = moved.content[1].id();
+        let (moved_pages, _) = laid_out(&moved);
+        let after = index_entry_texts(&moved, &moved_pages);
+        assert_ne!(after[0].1, printed, "the folio must move with the content");
+    }
+
+    #[test]
+    fn a_page_range_coalesces_and_stops_at_a_folio_format_change() {
+        use quill_core_model::{Folio, NumberFormat, Section};
+
+        // Five pages' worth of marks on one term, with a section boundary in the middle that
+        // changes the format. Consecutive *page indices* straddle it; consecutive *folios* do not,
+        // so the range must break there. This is the case that looks correct on an arabic-only
+        // document and is wrong the first time someone sets roman front matter.
+        let mut blocks: Vec<Block> = Vec::new();
+        // ~40 lines fill a page at the default setup, so a mark every 40 lines is a mark per page.
+        for _ in 0..6 {
+            blocks.push(marked("mention", "ravens"));
+            blocks.extend(many_lines(40));
+        }
+        let mut doc = index_doc(Vec::new(), blocks);
+        // The body section opens at the fourth marked paragraph, a few pages in.
+        let fourth = doc
+            .content
+            .iter()
+            .filter(|b| matches!(b, Block::Body { runs, .. } if runs[0].index.is_some()))
+            .nth(3)
+            .expect("six marked paragraphs")
+            .id();
+        doc.sections = vec![
+            Section {
+                name: "Front matter".into(),
+                start: doc.content[1].id(),
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::LowerRoman,
+                    restart_at: Some(1),
+                }),
+            },
+            Section {
+                name: "Body".into(),
+                start: fourth,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::Decimal,
+                    restart_at: Some(1),
+                }),
+            },
+        ];
+        let (pages, status) = laid_out(&doc);
+        assert!(status.converged, "{status:?}");
+        let entries = index_entry_texts(&doc, &pages);
+        assert_eq!(entries.len(), 1, "one term: {entries:?}");
+        let printed = &entries[0].1;
+
+        // It coalesces at all...
+        assert!(
+            printed.contains(quill_core_model::INDEX_RANGE_SEPARATOR),
+            "a run of consecutive pages must print as a range: {printed}"
+        );
+        // ...and it breaks at the format change rather than printing a range across it. Every
+        // range in the output has both ends in one numeral system, which is the property that
+        // fails the moment folios are coalesced as strings or as page indices.
+        for part in printed.split(quill_core_model::INDEX_PAGE_SEPARATOR) {
+            let Some((lo, hi)) = part.split_once(quill_core_model::INDEX_RANGE_SEPARATOR) else {
+                continue;
+            };
+            let roman = |s: &str| s.chars().all(|c| "ivxlcdm".contains(c));
+            assert_eq!(
+                roman(lo),
+                roman(hi),
+                "range `{part}` spans a folio format change, in `{printed}`"
+            );
+        }
+        assert!(
+            printed
+                .split(quill_core_model::INDEX_PAGE_SEPARATOR)
+                .count()
+                >= 2,
+            "the section boundary must break the run: {printed}"
+        );
+    }
+
+    #[test]
+    fn a_mark_reports_the_page_its_own_run_landed_on() {
+        // The case "first page of the block" gets wrong, and the one an index is most for: a
+        // paragraph long enough to be cut across a page boundary (spec 0044), marked in a run that
+        // lands on the *second* page. The block's first page is one earlier.
+        let long: String = (0..900).map(|i| format!("word{i} ")).collect::<String>();
+        let mut tail = quill_core_model::Run::plain(" and finally the marked ending.");
+        tail.index = Some(IndexMark::new("ending"));
+        let block = Block::body_runs(
+            vec![quill_core_model::Run::plain(long), tail],
+            Color::Gray { v: 0.0 },
+        );
+        let doc = index_doc(Vec::new(), vec![block]);
+        let (pages, status) = laid_out(&doc);
+        assert!(status.converged, "{status:?}");
+
+        let id = doc.content[1].id();
+        let carrying: Vec<usize> = pages
+            .iter()
+            .filter(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == id))
+            })
+            .map(|p| p.index)
+            .collect();
+        assert!(
+            carrying.len() >= 2,
+            "the fixture must actually split the paragraph, got {carrying:?}"
+        );
+        let entries = index_entry_texts(&doc, &pages);
+        assert_eq!(entries.len(), 1);
+        let first_page_of_block = (carrying[0] + 1).to_string();
+        let last_page_of_block = (carrying[carrying.len() - 1] + 1).to_string();
+        assert_eq!(
+            entries[0].1, last_page_of_block,
+            "the mark is on the paragraph's last run and must report that run's page"
+        );
+        assert_ne!(
+            entries[0].1, first_page_of_block,
+            "reporting the block's first page is the defect this asserts against"
+        );
+    }
+
+    #[test]
+    fn an_index_longer_than_a_frame_splits_and_loses_no_entry() {
+        // Spec 0075's mechanism, over the block it exists most for: a real book's index is longer
+        // than its contents list, and an indivisible panel taller than its frame reaches the branch
+        // that places a block whole and lets it run off the page.
+        let terms: Vec<String> = (0..200).map(|i| format!("term{i:03}")).collect();
+        let blocks: Vec<Block> = terms
+            .iter()
+            .map(|t| marked(&format!("about {t}"), t))
+            .collect();
+        let doc = index_doc(Vec::new(), blocks);
+        let (pages, status) = laid_out(&doc);
+        assert!(status.converged, "the fixpoint must settle: {status:?}");
+
+        let id = doc.content[0].id();
+        let placed: Vec<(usize, String)> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter().map(move |b| (p.index, b)))
+            .filter_map(|(i, b)| match b {
+                PlacedBlock::Text { lines, source, .. } if *source == id => {
+                    Some((i, lines[0].text.clone()))
+                }
+                _ => None,
+            })
+            .filter(|(_, t)| !t.is_empty())
+            .collect();
+        let carrying: BTreeSet<usize> = placed.iter().map(|(p, _)| *p).collect();
+        assert!(
+            carrying.len() >= 2,
+            "a 200-term index must span pages: {carrying:?}"
+        );
+
+        // Conservation: one entry per term, in collated order, nothing dropped or duplicated.
+        let got: Vec<&String> = placed[1..].iter().map(|(_, t)| t).step_by(2).collect();
+        assert_eq!(got.len(), terms.len(), "one entry per term");
+        for (got, want) in got.iter().zip(terms.iter()) {
+            assert_eq!(*got, want);
+        }
+        // The index's own title opens it and is re-stated nowhere.
+        assert_eq!(placed[0].1, "Index");
+        assert_eq!(placed.iter().filter(|(_, t)| t == "Index").count(), 1);
+        // Nothing overruns a frame.
+        let bottom = Frame::full_page(&doc.page_setup).rect.h_pt;
+        for page in &pages {
+            for b in &page.blocks {
+                if let PlacedBlock::Text { frame, .. } = b {
+                    assert!(
+                        frame.y_pt + frame.h_pt <= bottom + 0.01,
+                        "page {} runs past the frame bottom",
+                        page.index
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_with_no_index_lays_out_exactly_as_before() {
+        // The claim every increment here owes: a document without the feature is untouched. Not
+        // "looks the same" — the same page vector, and the same single pass.
+        let doc = doc_with_blocks(many_lines(200));
+        let (pages, status) = laid_out(&doc);
+        assert_eq!(status.iterations, 1, "no extra pass: {status:?}");
+        assert!(status.converged);
+        // The derivation is skipped outright: nothing is marked, so it returns empty without a walk.
+        let template = DocumentTemplate::new(&doc);
+        assert!(index_entries(&doc.content, &pages, &template, &[]).is_empty());
+        // And a marked document with no index block still lays out identically, because the block
+        // is what makes the entries reachable.
+        let mut marked_only = doc.clone();
+        marked_only.content.push(marked("a mention", "ravens"));
+        marked_only.assign_missing_block_ids().expect("ids");
+        let (with_mark, mark_status) = laid_out(&marked_only);
+        assert_eq!(mark_status.iterations, 1, "a mark alone derives nothing");
+        assert_eq!(&with_mark[..pages.len() - 1], &pages[..pages.len() - 1]);
+    }
+
+    #[test]
+    fn a_template_folio_is_its_own_numbering_formatted() {
+        use quill_core_model::{Folio, NumberFormat, Section};
+
+        // The contract `PageTemplate::folio_number` owes `PageTemplate::folio`: one number, printed
+        // one way, whichever question is asked. Without it an index could coalesce a run of pages
+        // whose printed folios say something else entirely.
+        let mut doc = doc_with_blocks(many_lines(200));
+        doc.sections = vec![Section {
+            name: "Front matter".into(),
+            start: doc.content[0].id(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        let (pages, _) = laid_out(&doc);
+        let template = DocumentTemplate::new(&doc);
+        assert!(pages.len() > 2, "the fixture must span pages");
+        for page in &pages {
+            let (format, n) = template.folio_number(page.index);
+            assert_eq!(template.folio(page.index), format.format(n));
+        }
+        // And the parity implementation, whose defaults are the ones every other template inherits.
+        let uniform = UniformTemplate::new(Thread::columns(&doc.page_setup, 1, 0.0));
+        for i in 0..5 {
+            let (format, n) = uniform.folio_number(i);
+            assert_eq!(uniform.folio(i), format.format(n));
+        }
     }
 }

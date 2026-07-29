@@ -382,7 +382,8 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
             | Block::Panel { color, .. }
             | Block::Table { color, .. }
             | Block::Component { color, .. }
-            | Block::Toc { color, .. } => Some(color),
+            | Block::Toc { color, .. }
+            | Block::Index { color, .. } => Some(color),
             Block::Image { .. } => None,
         };
         let Some(color) = color else { continue };
@@ -859,11 +860,42 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
                         bucket.add_run(run);
                     }
                     bucket.add_chars(contributes.chars);
+                    // An index mark's **term** is a fourth path into this collector (spec 0078),
+                    // and it is the first one whose characters are drawn somewhere other than
+                    // where they were authored — which is what makes it a new instance of the
+                    // class rather than a case the three above already cover.
+                    //
+                    // Two independent reasons it cannot ride on `bucket.add_run(&r.text)` above:
+                    //
+                    // 1. **The term need not be in the run's text at all.** It is authored on the
+                    //    mark, so a paragraph about routing can be indexed under "morale" and a
+                    //    normally-set sentence can be filed as "Keep, the Ruined". Nothing in the
+                    //    body text carries those characters.
+                    // 2. **Even when it is, it is in the wrong bucket.** A term marked inside a
+                    //    bold run has its characters in the bold face's subset; the index draws it
+                    //    in the *index's* style, which is the regular face, exactly as a contents
+                    //    entry and a table cell are. So it goes to `everywhere` — the union merged
+                    //    into every bucket — and flags the regular face as used, which is the same
+                    //    treatment the block arms below get and for the same reason.
+                    //
+                    // Unconditional on whether the document actually holds a `Block::Index`, for
+                    // `RunSource::contributes`' stated reason: embedding a few characters nobody
+                    // draws costs a few hundred bytes, and failing to embed one that is drawn is a
+                    // `.notdef` box in a press file.
+                    if let Some(mark) = &r.index {
+                        let marked = mark.contributes();
+                        for run in &marked.runs {
+                            everywhere.add_run(run);
+                        }
+                        everywhere.add_chars(marked.chars);
+                        draws_unattributed_text = true;
+                    }
                 }
             }
             Block::Panel { .. }
             | Block::Table { .. }
             | Block::Toc { .. }
+            | Block::Index { .. }
             | Block::Component { .. } => {
                 everywhere.merge(&other_block_text(doc, block));
                 draws_unattributed_text = true;
@@ -979,6 +1011,26 @@ fn other_block_text(doc: &Document, block: &Block) -> fonts::FaceText {
             let folio = quill_core_model::StaticToken::Page.contributes(doc);
             set.add_chars(folio.chars);
             set.add_chars(['.', '\u{2026}']);
+        }
+        Block::Index { title, .. } => {
+            set.add_run(title);
+            // What an index entry draws that its term does not: the folio alphabet, the two
+            // separators, and the ellipsis a clipped term ends in.
+            //
+            // The folio is asked through `StaticToken::Page` for spec 0076's stated reason and not
+            // a weaker one — there must be exactly **one** answer to what a folio can draw, because
+            // the `{page}` token, a contents entry, a cross-reference and now an index entry are
+            // four ways of printing the same number.
+            //
+            // The separators come from the same two consts the coalescer writes, so a change to
+            // either cannot leave the collector behind: an en dash embedded from a literal here
+            // would be a second statement of what a range looks like. They travel as *runs* rather
+            // than as loose characters because they are knowable exactly (spec 0068).
+            let folio = quill_core_model::StaticToken::Page.contributes(doc);
+            set.add_chars(folio.chars);
+            set.add_run(quill_core_model::INDEX_RANGE_SEPARATOR);
+            set.add_run(quill_core_model::INDEX_PAGE_SEPARATOR);
+            set.add_chars(['\u{2026}']);
         }
         Block::Component { fields, .. } => {
             for value in fields.values() {
@@ -1897,7 +1949,24 @@ mod tests {
     /// (8361..8392 and 8396..8427) — the same four regions, differing in more of their hex digits
     /// than 0076's move happened to. Zero differing bytes outside them, so no content stream, font,
     /// ICC or metadata stream moved.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x7ba0_c24d_bbd9_4dd8;
+    /// Changed again by spec 0078, **identifier-only** a fourth time, and this one had *three*
+    /// candidate causes rather than one — which is why each is named and then ruled out rather than
+    /// the shape being pattern-matched off 0077. `FORMAT_VERSION` became 9; `StyleSheet::default()`
+    /// gained `index-title` and `index-entry` (spec 0041's precedent for `toc-*`, 0066's for
+    /// `list-bullet`, 0077's for `footnote`); and `Run` gained an `index` field. All three are in
+    /// `doc.to_json()` and none of them reaches the page: the sample has no index block and no
+    /// marked run, so `index` is `skip_serializing_if`-omitted from every run, the collector's new
+    /// mark path contributes nothing, `other_block_text`'s new arm is never reached, no entry is
+    /// derived, and the flow takes the single pass it always did. A style nobody names draws
+    /// nothing.
+    ///
+    /// Verified rather than accepted, on the same pair of files the ledger always uses — the sample
+    /// exported against the committed parity ICC on a build of `main` and on this one. **8454 bytes
+    /// both sides**, 128 differing bytes in **4 runs**, and every run inside the XMP
+    /// `DocumentID`/`InstanceID` (offsets 1510..1542 and 1588..1620) or the trailer `/ID`
+    /// (8361..8393 and 8396..8428) — the same four regions 0076 and 0077 moved. Zero differing
+    /// bytes outside them, so no content stream, font, ICC or metadata stream moved.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x9afe_bed8_dc72_2a3e;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2330,6 +2399,7 @@ mod tests {
                     },
                     character: None,
                     source: Default::default(),
+                    index: None,
                 },
             ],
             Color::Gray { v: 0.0 },
@@ -2348,6 +2418,7 @@ mod tests {
                 },
                 character: None,
                 source: Default::default(),
+                index: None,
             }],
             Color::Gray { v: 0.0 },
         ));
@@ -2376,6 +2447,7 @@ mod tests {
                 },
                 character: None,
                 source: Default::default(),
+                index: None,
             }],
             Color::Gray { v: 0.0 },
         ));
@@ -2935,6 +3007,171 @@ mod tests {
         );
     }
 
+    /// An index's characters — the marked terms, the folio alphabet, the range and list separators
+    /// and the clipping ellipsis — are all in the subset (spec 0078).
+    ///
+    /// **A new path, and the first one whose characters are drawn somewhere other than where they
+    /// were authored.** Spec 0074 closed the class for master-static tokens; 0076 found a second
+    /// instance in a body run's generated characters and 0077 a third in a note's prose. An index
+    /// mark is a fourth, and it fails *two* different ways if treated as a case the others cover:
+    ///
+    /// 1. The term is authored on the mark, so it need not appear in the run's text at all — the
+    ///    fixture's terms are spelled with characters no other part of the document uses, which is
+    ///    what makes this an assertion about the new path rather than about `everywhere`.
+    /// 2. Even a term that *does* match its run's text is in the wrong bucket, because the run is
+    ///    bold and the index draws in the regular face. The fixture marks a bold run for exactly
+    ///    that reason.
+    #[test]
+    fn an_index_is_in_the_subset_and_draws_no_notdef() {
+        use quill_core_model::{
+            Block, Folio, IndexMark, InlineStyle, NumberFormat, Run, Section, Weight,
+        };
+
+        let mut doc = Document::sample();
+        doc.assets.clear();
+        doc.content = (0..80)
+            .map(|i| {
+                Block::body(
+                    format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                    Color::Gray { v: 0.0 },
+                )
+            })
+            .collect();
+        doc.content.insert(
+            0,
+            Block::Index {
+                id: quill_core_model::BlockId::UNASSIGNED,
+                title: "Index".into(),
+                ignore_leading: Vec::new(),
+                color: Color::Gray { v: 0.0 },
+            },
+        );
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+
+        // A term whose characters are nowhere in the body text, on a **bold** run, so both failure
+        // modes above are live at once.
+        let first = doc.content[1].id();
+        let mut bold = Run::plain("a passage");
+        bold.style = InlineStyle {
+            weight: Some(Weight::BOLD),
+            ..InlineStyle::EMPTY
+        };
+        bold.index = Some(IndexMark::new("Æthelwulf quærens"));
+        let mut marking = Block::body_runs(vec![bold], Color::Gray { v: 0.0 });
+        marking.set_id(first);
+        doc.content[1] = marking;
+
+        // A second term marked across several consecutive pages, so the entry actually prints a
+        // coalesced range and the en dash is drawn rather than merely embedded.
+        for i in [20usize, 40, 60] {
+            let id = doc.content[i].id();
+            let mut run = Run::plain(format!("paragraph {i} with enough words to occupy a line"));
+            run.index = Some(IndexMark::new("ravens"));
+            let mut block = Block::body_runs(vec![run], Color::Gray { v: 0.0 });
+            block.set_id(id);
+            doc.content[i] = block;
+        }
+        for i in [21usize, 22, 23, 24] {
+            let id = doc.content[i].id();
+            let mut run = Run::plain(format!("paragraph {i} with enough words to occupy a line"));
+            run.index = Some(IndexMark::new("ravens"));
+            let mut block = Block::body_runs(vec![run], Color::Gray { v: 0.0 });
+            block.set_id(id);
+            doc.content[i] = block;
+        }
+
+        // Roman front matter, so the entry prints a roman folio and the digit range that used to be
+        // the whole answer for a derived block is provably not enough.
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: first,
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        doc.master_pages.clear();
+        doc.default_master = None;
+        doc.pages.clear();
+
+        let carried: BTreeSet<char> = doc_chars(&doc);
+        for ch in "Æthelwufqræns".chars() {
+            assert!(carried.contains(&ch), "an index term draws {ch:?}");
+        }
+        for ch in "ivxlcdm".chars() {
+            assert!(
+                carried.contains(&ch),
+                "a roman folio in an index draws {ch:?}"
+            );
+        }
+        for ch in quill_core_model::INDEX_RANGE_SEPARATOR.chars() {
+            assert!(carried.contains(&ch), "a coalesced range draws {ch:?}");
+        }
+        for ch in quill_core_model::INDEX_PAGE_SEPARATOR.chars() {
+            assert!(carried.contains(&ch), "a page list draws {ch:?}");
+        }
+        assert!(
+            carried.contains(&'\u{2026}'),
+            "a clipped term draws an ellipsis"
+        );
+
+        // The bucket half, which is the failure a character-set assertion alone would miss: the
+        // regular face must carry the term even though the only run that mentions it is bold.
+        let faces = collect_doc_faces(&doc);
+        let regular = faces
+            .get(&FaceKey::REGULAR)
+            .expect("the index draws in the regular face");
+        for ch in "Æthelwuf".chars() {
+            assert!(
+                regular.chars().contains(&ch),
+                "the regular face draws the index term but does not carry {ch:?}"
+            );
+        }
+
+        // End to end, which is the half the compiler cannot check: an arm that returns the wrong
+        // characters still builds. Everything the index actually printed must have been collected.
+        let index_id = doc.content[0].id();
+        let pages = lay_out_for_press(&doc, &ExportOptions::default()).expect("press layout");
+        let mut printed = String::new();
+        for page in &pages {
+            for placed in &page.blocks {
+                if let quill_layout_engine::PlacedBlock::Text { source, lines, .. } = placed {
+                    if *source == index_id {
+                        for line in lines {
+                            printed.push_str(&line.text);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            printed.contains("Æthelwulf"),
+            "the fixture must actually print the term, got {printed:?}"
+        );
+        assert!(
+            printed.contains(quill_core_model::INDEX_RANGE_SEPARATOR),
+            "…and a coalesced range, got {printed:?}"
+        );
+        for ch in printed.chars() {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is printed by the index but was never collected"
+            );
+        }
+
+        // And the glyphs really draw: `drawn_gids` panics on any `.notdef`.
+        assert_eq!(drawn_gids(&carried, "Æthelwulf"), 9);
+        assert_eq!(
+            drawn_gids(
+                &carried,
+                &format!("iv{}vii", quill_core_model::INDEX_RANGE_SEPARATOR)
+            ),
+            6
+        );
+    }
+
     /// A `{heading:N}` carries the headings it can *reach* and no others, which is what keeps a
     /// running head from dragging every sub-heading in a 500-page book into the subset.
     #[test]
@@ -2982,6 +3219,7 @@ mod tests {
                     },
                     character: None,
                     source: Default::default(),
+                    index: None,
                 },
                 quill_core_model::Run::plain(" and a tail"),
             ],
@@ -4057,6 +4295,7 @@ mod tests {
                     },
                     character: None,
                     source: Default::default(),
+                    index: None,
                 },
                 quill_core_model::Run::plain(" and ordinary prose again."),
             ],
@@ -4104,6 +4343,7 @@ mod tests {
                     },
                     character: None,
                     source: Default::default(),
+                    index: None,
                 },
             ],
             Color::Gray { v: 0.0 },

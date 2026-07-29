@@ -219,6 +219,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 8 {
         migrate_7_to_8(obj);
     }
+    if found < 9 {
+        migrate_8_to_9(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -346,6 +349,23 @@ fn migrate_6_to_7(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 /// open-and-save deletes every one of them with nothing left in the file to regenerate them from.
 /// Spec 0076 bumped for losing *which block a reference pointed at*; this loses the note.
 fn migrate_7_to_8(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
+
+/// v8 → v9 (spec 0078): a run gains an `index` mark, and the model gains `Block::Index`.
+///
+/// Structurally a no-op for [`migrate_6_to_7`]'s reason: a v8 document marks nothing, which is
+/// exactly what the absent `index` field already means, and writing `"index": null` into every run
+/// of every paragraph in existence would move every manifest's text and its exported `/ID`.
+///
+/// **The bump is the loss half of the rule, a third time, and this one fires on both halves at
+/// once.** A v8 build meeting `Block::Index` refuses the document outright — `Block` is a tagged
+/// enum and `"kind": "index"` is a tag it does not have — which is as loud as a failure gets. But
+/// the marks are not in the index block; they are on the *runs*, where a v8 build drops them
+/// silently as unknown keys, lays the book out with no visible difference anywhere, and deletes the
+/// entire index on the first save. Which terms an author chose to index, and what each files under,
+/// is authored intent in precisely spec 0076's sense: nothing left in the file can regenerate it.
+///
+/// So the two halves point the same way for once, and the one that decides it is the quiet one.
+fn migrate_8_to_9(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 
 /// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
 ///
@@ -680,6 +700,17 @@ mod tests {
             .flat_map(|b| b.runs())
             .all(|r| r.source.note().is_none()));
 
+        // …and a v8 document has a footnote and **marks nothing**: v8 had no `index` field, so
+        // every term it could carry is one nothing in the model can express.
+        let v8 = Document::from_json(V8_FOOTNOTE).expect("v8");
+        assert_eq!(v8.format_version, FORMAT_VERSION);
+        assert_eq!(v8.footnotes.len(), 1);
+        assert!(v8
+            .content
+            .iter()
+            .flat_map(|b| b.runs())
+            .all(|r| r.index.is_none()));
+
         // And the far end of the chain still refuses: v(current + 1) is not a document this build
         // may open, whatever it contains.
         let next = FORMAT_VERSION + 1;
@@ -991,6 +1022,69 @@ mod tests {
 
         let native = V7_REFERENCE.replace(
             "\"format_version\": 7",
+            &format!("\"format_version\": {FORMAT_VERSION}"),
+        );
+        let native = Document::from_json(&native).expect("load as current");
+        assert_eq!(json, native.to_json().expect("save"));
+    }
+
+    /// The v8 fixture: committed **as bytes**, for spec 0047's reason — a fixture the current
+    /// serializer wrote would migrate correctly by construction and prove nothing.
+    const V8_FOOTNOTE: &str = include_str!("../assets/v8-footnote.json");
+
+    #[test]
+    fn a_v8_manifest_migrates_forward_to_v9() {
+        let doc = Document::from_json(V8_FOOTNOTE).expect("a v8 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+
+        // It means what it meant: nothing is marked, and there is no index block, because v8 had
+        // neither.
+        for block in &doc.content {
+            for run in block.runs() {
+                assert!(
+                    run.index.is_none(),
+                    "a v8 run marks nothing: {:?}",
+                    run.text
+                );
+            }
+        }
+        assert!(!doc
+            .content
+            .iter()
+            .any(|b| matches!(b, crate::Block::Index { .. })));
+
+        // …and everything the previous two versions claimed survived the step, which is what this
+        // step must not disturb: the footnote's prose, the anchor, and the cross-reference.
+        assert_eq!(doc.footnotes.len(), 1);
+        assert_eq!(
+            doc.footnotes[0].runs[0].text,
+            "As recorded by the vault's own keepers."
+        );
+        assert_eq!(doc.footnote_blocks().len(), 1);
+        assert_eq!(
+            crate::reference_targets(&doc.content),
+            std::collections::BTreeSet::from([crate::BlockId(1)])
+        );
+        assert_eq!(
+            doc.sections[0].folio.expect("folio").format,
+            crate::NumberFormat::LowerRoman
+        );
+    }
+
+    #[test]
+    fn migrating_a_v8_document_does_not_move_its_exported_identity() {
+        // Spec 0047's hazard, for the fifth time, and the reason `migrate_8_to_9` writes nothing:
+        // defaulting `"index": null` into every run of every paragraph would rewrite the manifest
+        // text of every file quill has written, and the `/ID` is a hash of that text.
+        let migrated = Document::from_json(V8_FOOTNOTE).expect("load");
+        let json = migrated.to_json().expect("save");
+        assert!(
+            !json.contains("\"index\""),
+            "migration must not add `index`: {json}"
+        );
+
+        let native = V8_FOOTNOTE.replace(
+            "\"format_version\": 8",
             &format!("\"format_version\": {FORMAT_VERSION}"),
         );
         let native = Document::from_json(&native).expect("load as current");

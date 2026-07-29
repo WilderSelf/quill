@@ -38,7 +38,7 @@ use quill_text_layout::{Hyphenator, RunMetrics};
 
 use crate::{
     flow, heading_index, measure_block, BlockContext, DocumentTemplate, FixpointStatus, FlowState,
-    HeadingEntry, LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
+    HeadingEntry, IndexEntry, LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
 };
 
 /// What a relayout actually did.
@@ -216,6 +216,8 @@ impl LayoutSession {
         hyphenator: &impl Hyphenator,
     ) -> LayoutResult {
         let has_toc = doc.content.iter().any(|b| matches!(b, Block::Toc { .. }));
+        let has_index = doc.content.iter().any(|b| matches!(b, Block::Index { .. }));
+        let ignore_leading = crate::index_ignore_leading(&doc.content);
         let targets = quill_core_model::reference_targets(&doc.content);
         // Synthesised once per relayout rather than once per fixpoint pass (spec 0077), and empty
         // for every document without a footnote. Their numbers are derived from content order, so
@@ -244,8 +246,20 @@ impl LayoutSession {
         let mut resolved = crate::reference_folios(&targets, &self.pages, template);
         resolved.extend(numbers.iter().map(|(k, v)| (*k, v.clone())));
         let mut headings: Vec<HeadingEntry> = Vec::new();
+        // Seeded from the previous relayout's pages too, for spec 0076's reason and with one extra
+        // consequence worth stating. The *marks* are read from `doc.content`, so a seeded index
+        // already reflects the edit; only the pages the terms are attributed to can be stale, and
+        // the fixpoint's exit condition still compares two consecutive derivations. Without the
+        // seed, `next_index` differs from an empty `index` on the **first** comparison of every
+        // relayout of every indexed document, so an unchanged document costs a second whole-document
+        // pass for ever — the cost 0076 named and removed at the site next door.
+        let mut index: Vec<IndexEntry> = if has_index {
+            crate::index_entries(&doc.content, &self.pages, template, ignore_leading)
+        } else {
+            Vec::new()
+        };
         let mut result = self.pass(
-            doc, &notes, template, &headings, &resolved, metrics, hyphenator,
+            doc, &notes, template, &headings, &index, &resolved, metrics, hyphenator,
         );
         let mut reassigned = template.reassign(&result.pages);
         let mut iterations = 1;
@@ -261,18 +275,24 @@ impl LayoutSession {
             } else {
                 Vec::new()
             };
+            let next_index = if has_index {
+                crate::index_entries(&doc.content, &result.pages, template, ignore_leading)
+            } else {
+                Vec::new()
+            };
             let mut next_refs = crate::reference_folios(&targets, &result.pages, template);
             next_refs.extend(numbers.iter().map(|(k, v)| (*k, v.clone())));
-            if next == headings && next_refs == resolved && !reassigned {
+            if next == headings && next_index == index && next_refs == resolved && !reassigned {
                 break true;
             }
             if iterations >= crate::FIXPOINT_MAX_ITERATIONS {
                 break false;
             }
             headings = next;
+            index = next_index;
             resolved = next_refs;
             result = self.pass(
-                doc, &notes, template, &headings, &resolved, metrics, hyphenator,
+                doc, &notes, template, &headings, &index, &resolved, metrics, hyphenator,
             );
             reassigned = template.reassign(&result.pages);
             measured += result.stats.blocks_measured;
@@ -300,6 +320,7 @@ impl LayoutSession {
         notes: &[Block],
         template: &impl PageTemplate,
         headings: &[HeadingEntry],
+        index: &[IndexEntry],
         resolved: &BTreeMap<BlockId, String>,
         metrics: &impl RunMetrics,
         hyphenator: &impl Hyphenator,
@@ -341,7 +362,7 @@ impl LayoutSession {
         // template derived this pass (spec 0072): the section-driven assignment is not on the
         // document, so a fingerprint over the document alone would call a pass that moved a chapter
         // opener "nothing changed" and hand back the previous iterate's pages.
-        let context = context_fingerprint(doc, headings, template.derived_fingerprint());
+        let context = context_fingerprint(doc, headings, index, template.derived_fingerprint());
         let context_changed = self.primed && context != self.previous_context;
 
         // A contents block is measured from the heading index, and the index is deliberately *not*
@@ -364,7 +385,7 @@ impl LayoutSession {
             let derived: std::collections::BTreeSet<BlockId> = doc
                 .content
                 .iter()
-                .filter(|b| matches!(b, Block::Toc { .. }))
+                .filter(|b| matches!(b, Block::Toc { .. } | Block::Index { .. }))
                 .map(|b| b.id())
                 .collect();
             if !derived.is_empty() {
@@ -466,6 +487,7 @@ impl LayoutSession {
             &doc.styles,
             &doc.component_library(),
             headings,
+            index,
             resolved,
             template,
             metrics,
@@ -732,6 +754,23 @@ fn content_fingerprint(block: &Block) -> u64 {
             eat(title.as_bytes());
             eat(&[*max_level]);
         }
+        Block::Index {
+            title,
+            ignore_leading,
+            ..
+        } => {
+            // An index block has no authored content beyond these two, on the contents list's
+            // reasoning: its entries come from the marks scattered through the rest of the document
+            // and the pages they landed on, which is context (see `context_fingerprint`), not this
+            // block's content. The article list *is* authored and does change what the block
+            // renders — it decides where every entry files — so it belongs here.
+            eat(b"idx");
+            eat(title.as_bytes());
+            for article in ignore_leading {
+                eat(article.as_bytes());
+                eat(&[0xff]);
+            }
+        }
         Block::Table { table, .. } => {
             // Every cell, the header, the widths and the zebra flag: all of them change the
             // measurement, and a key that misses one returns a stale layout (spec 0031).
@@ -825,7 +864,12 @@ fn measured_style(run: &quill_core_model::Run) -> String {
 /// would show up as a document that refuses to re-flow after an edit nobody can see. `Debug` is
 /// derived, so it tracks the struct automatically. It runs once per relayout, against layout that
 /// costs milliseconds.
-fn context_fingerprint(doc: &Document, headings: &[HeadingEntry], derived: u64) -> u64 {
+fn context_fingerprint(
+    doc: &Document,
+    headings: &[HeadingEntry],
+    index: &[IndexEntry],
+    derived: u64,
+) -> u64 {
     // `doc.pages` belongs here for exactly the reason the rest of this list does (spec 0035):
     // reassigning page 7's master changes page 7's geometry without touching a single block, so a
     // fingerprint blind to it would see "nothing changed" and hand back the previous pages.
@@ -841,8 +885,16 @@ fn context_fingerprint(doc: &Document, headings: &[HeadingEntry], derived: u64) 
     // as often as a master page does, which is the company it is keeping here — unlike a
     // cross-reference (spec 0076), of which a book has hundreds and which must therefore go in
     // `MeasureKey` instead.
+    // The collated index belongs here for exactly the reason the resolved heading index does (spec
+    // 0078), and the choice between the two homes was made on the same arithmetic 0076 used and
+    // came out the other way. **There is one index block**, as there is one contents list, so a
+    // changed derivation costs one whole-document reflow and one eviction — where a cross-reference
+    // would have cost a reflow per keystroke and a re-measure of every referring block in the book.
+    // Routing it through `MeasureKey` instead would also have been *wrong* rather than merely
+    // expensive: a `MeasureKey` term is a property of the block being measured, and the index's
+    // entries are derived from marks scattered through every other block in the document.
     let text = format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{derived}",
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{derived}",
         doc.page_setup,
         doc.styles,
         doc.master_pages,
@@ -850,7 +902,8 @@ fn context_fingerprint(doc: &Document, headings: &[HeadingEntry], derived: u64) 
         doc.pages,
         doc.sections,
         doc.components,
-        headings
+        headings,
+        index
     );
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {
@@ -943,6 +996,19 @@ fn note_fingerprint(block: &Block, doc: &Document) -> u64 {
     h
 }
 
+/// **There is deliberately no `mark_fingerprint`** (spec 0078), and the asymmetry with the two
+/// functions above is a result rather than an oversight.
+///
+/// An index mark changes nothing about how its own paragraph sets — the term is drawn by the index
+/// block, elsewhere in the book — so it does not belong in [`MeasureKey`], which is the same
+/// argument `note_fingerprint` makes for a note's text. But unlike a note's text it does not belong
+/// in the per-pass diff either, and that is the part worth recording: the index's entries are
+/// re-derived from `doc.content` on every pass and land in [`context_fingerprint`], so a mark that
+/// changes what the index prints changes the *context* — a whole-document statement — and a mark
+/// that does not change what the index prints needs no reflow at all. A diff term was written,
+/// could not be made to fail by reintroducing its absence, and was removed rather than kept as
+/// machinery nothing can justify. See `specs/0078-index.md`.
+///
 /// Everything about the *styles* a block resolves against that could move its layout.
 ///
 /// `Debug` over the whole resolved `ParagraphStyle` rather than a hand-picked list of fields, for
@@ -1301,6 +1367,7 @@ mod tests {
                         style,
                         character: None,
                         source: Default::default(),
+                        index: None,
                     },
                     Run::plain(" words in it to occupy a line or so of text"),
                 ],
@@ -1979,6 +2046,98 @@ mod tests {
     }
 
     #[test]
+    fn an_index_stays_current_through_the_session() {
+        // Spec 0075's eviction lesson, checked at the second site that owes it rather than assumed.
+        // An index block's entries are *context*, so they are deliberately not in `MeasureKey`; the
+        // first pass of the fixpoint runs with an empty index by construction, and without the
+        // eviction the second pass would serve the first pass's measurement from cache — an index
+        // consisting of nothing but its own title, on every pass, for ever. That is exactly the
+        // defect 0075 found in the contents list, in the one place this increment could reproduce
+        // it.
+        use quill_core_model::{Color, IndexMark};
+
+        let mut doc = doc_of(120);
+        doc.content.insert(
+            0,
+            Block::Index {
+                id: BlockId::UNASSIGNED,
+                title: "Index".into(),
+                ignore_leading: Vec::new(),
+                color: Color::Gray { v: 0.0 },
+            },
+        );
+        for (i, term) in [(30usize, "ravens"), (70, "sorcery")] {
+            let id = doc.content[i].id();
+            let mut run = quill_core_model::Run::plain(format!("paragraph {i} about the subject"));
+            run.index = Some(IndexMark::new(term));
+            doc.content[i] = Block::body_runs(vec![run], INK);
+            doc.content[i].set_id(id);
+        }
+        doc.assign_missing_block_ids().expect("ids");
+
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(
+            first.fixpoint.converged,
+            "must settle: {:?}",
+            first.fixpoint
+        );
+        assert!(
+            first.fixpoint.iterations > 1,
+            "a document with an index block runs the fixpoint"
+        );
+
+        let index_id = doc.content[0].id();
+        let placed = |result: &crate::LayoutResult| -> Vec<String> {
+            result
+                .pages
+                .iter()
+                .flat_map(|p| p.blocks.iter())
+                .filter_map(|b| match b {
+                    crate::PlacedBlock::Text { source, lines, .. } if *source == index_id => {
+                        Some(lines[0].text.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let entries = placed(&first);
+        assert!(
+            entries.contains(&"ravens".to_string()) && entries.contains(&"sorcery".to_string()),
+            "the session must place the entries, not just its own title: {entries:?}"
+        );
+
+        // A relayout of an unchanged indexed document takes exactly **one** pass and measures
+        // nothing. That is what seeding the loop from the previous pages buys (spec 0076's move,
+        // at this site): without it `next_index` differs from an empty seed on the first
+        // comparison of every relayout, and every indexed document pays a second whole-document
+        // pass for ever.
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            again.fixpoint.iterations, 1,
+            "an unchanged indexed document must not re-enter the loop"
+        );
+        assert_eq!(again.stats.blocks_measured, 0, "…and must measure nothing");
+
+        // Re-filing a term reaches the index even though the marked paragraph's *text* has not
+        // changed by one character: the entries are re-derived from the content every pass, and a
+        // changed derivation is a changed context.
+        let id = doc.content[30].id();
+        let mut run = quill_core_model::Run::plain("paragraph 30 about the subject");
+        run.index = Some(IndexMark::new("corvids"));
+        doc.content[30] = Block::body_runs(vec![run], INK);
+        doc.content[30].set_id(id);
+        doc.bump_revision();
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert!(after.fixpoint.converged);
+        let renamed = placed(&after);
+        assert!(
+            renamed.contains(&"corvids".to_string()) && !renamed.contains(&"ravens".to_string()),
+            "re-marking a term must reach the index: {renamed:?}"
+        );
+    }
+
+    #[test]
     fn a_contents_list_stays_current_through_the_session() {
         // Spec 0031's rule applied to *derived* content. Editing a chapter heading must change the
         // contents entry that names it; editing a body paragraph that moves no heading must not
@@ -2180,6 +2339,7 @@ mod tests {
                         style: InlineStyle::EMPTY,
                         character: Some("house-lead".into()),
                         source: Default::default(),
+                        index: None,
                     },
                     Run::plain(" and the rest of a paragraph long enough to occupy a line"),
                 ],
