@@ -257,8 +257,11 @@ impl AppState {
                     // text lives in named fields, and which one a bare string would replace is not
                     // a question this affordance can answer.
                     | Block::Component { .. }
-                    // A contents block's text is generated; there is nothing here to edit.
-                    | Block::Toc { .. } => return EditOutcome::default(),
+                    // A contents block's text is generated; there is nothing here to edit. An
+                    // index's is generated too — from marks that live on other blocks' runs, so a
+                    // bare string here could not even say which term it meant.
+                    | Block::Toc { .. }
+                    | Block::Index { .. } => return EditOutcome::default(),
                 };
                 *block = replacement;
                 block.set_id(id);

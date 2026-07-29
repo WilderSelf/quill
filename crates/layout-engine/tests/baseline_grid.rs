@@ -590,6 +590,7 @@ fn a_larger_run_does_not_move_the_line_it_sits_on() {
                 },
                 character: None,
                 source: Default::default(),
+                index: None,
             },
             Run::plain(" opened in three hundred years"),
         ],

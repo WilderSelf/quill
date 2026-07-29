@@ -341,6 +341,7 @@ fn extract_carries_the_character_styles_a_books_runs_name() {
                 style: InlineStyle::EMPTY,
                 character: Some("house-lead".into()),
                 source: Default::default(),
+                index: None,
             },
             Run::plain(" had not opened in three hundred years."),
         ],

@@ -202,11 +202,47 @@ fn main() {
     }
     assert_eq!(placed, 40, "the fixture must actually carry its references");
 
+    // A back-of-book index, the fourth derived quantity (spec 0078), with two hundred marked terms
+    // scattered through the document — enough that the index itself spans pages, which is the case
+    // that can move what it lists.
+    let mut marked = 0usize;
+    for i in (30..derived.content.len()).step_by(15) {
+        if marked >= 200 {
+            break;
+        }
+        let quill_core_model::Block::Body { .. } = &derived.content[i] else {
+            continue;
+        };
+        let id = derived.content[i].id();
+        let mut run = quill_core_model::Run::plain(
+            "A paragraph that discusses a subject at some length, and is indexed for it.",
+        );
+        run.index = Some(quill_core_model::IndexMark::new(format!(
+            "term{:03}",
+            marked % 120
+        )));
+        derived.content[i] =
+            quill_core_model::Block::body_runs(vec![run], quill_core_model::Color::Gray { v: 0.0 });
+        derived.content[i].set_id(id);
+        marked += 1;
+    }
+    assert_eq!(
+        marked, 200,
+        "the fixture must actually carry its index marks"
+    );
+    derived.content.push(quill_core_model::Block::Index {
+        id: quill_core_model::BlockId::UNASSIGNED,
+        title: "Index".into(),
+        ignore_leading: vec!["A".into(), "An".into(), "The".into()],
+        color: quill_core_model::Color::Gray { v: 0.0 },
+    });
+    derived.assign_missing_block_ids().expect("ids");
+
     let mut fixpoint_session = quill_layout_engine::LayoutSession::new();
     let derived_result = fixpoint_session.relayout(&derived, &HARNESS_METRICS, &NoHyphenator);
     println!(
         "fixpoint: {} pages, {} iterations, converged {}  (contents list + 2 sections + 40 \
-         cross-references)",
+         cross-references + a 120-term index)",
         derived_result.pages.len(),
         derived_result.fixpoint.iterations,
         derived_result.fixpoint.converged

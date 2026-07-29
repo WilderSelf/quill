@@ -15,6 +15,7 @@ pub use quill_components::{
 };
 use serde::{Deserialize, Serialize};
 
+mod collate;
 mod components;
 mod container;
 mod geom;
@@ -24,6 +25,7 @@ mod resolve;
 mod template;
 mod version;
 
+pub use collate::{collation_key, CollationKey};
 pub use components::{
     builtin_components, statblock_definition, table_definition, PANEL_PADDING_PT,
     STATBLOCK_COMPONENT, TABLE_CELL_PADDING_PT, TABLE_COMPONENT,
@@ -46,6 +48,8 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
+/// **9** since spec 0078 gave a [`Run`] an [`IndexMark`] and the model a [`Block::Index`] — the
+/// terms a back-of-book index is built from;
 /// **8** since spec 0077 gave a document [`Footnote`]s — an anchor in the text flow and note text
 /// set in a band at the foot of the frame the anchor lands in;
 /// **7** since spec 0076 gave a [`Run`] a [`RunSource`] — a cross-reference that prints the folio of
@@ -63,11 +67,14 @@ pub type Pt = f32;
 /// and print arabic page numbers through front matter the author set in roman; a build that predates
 /// spec 0076 would drop every `source` and **destroy which block each cross-reference points at**,
 /// unrecoverably, on the first save; and a build that predates spec 0077 would drop `footnotes` and
-/// **destroy every note's prose** — not intent this time but the author's own words. Any of them could
+/// **destroy every note's prose** — not intent this time but the author's own words; and a build that
+/// predates spec 0078 would drop every `index` mark and **destroy the whole index**, which is
+/// authored intent in exactly [`RunSource`]'s sense: which terms an author chose to index, and what
+/// each files under, cannot be recovered from anything left in the file. Any of them could
 /// then save that back over the original.
 /// Refusing to open is the correct outcome; quietly dropping the layout is exactly the silent
 /// corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -361,6 +368,22 @@ pub struct Run {
     /// and every run written before this existed — means `text`.
     #[serde(default, skip_serializing_if = "RunSource::is_authored")]
     pub source: RunSource,
+    /// The term this run puts in the index (spec 0078), or `None` — which is every run written
+    /// before this existed.
+    ///
+    /// **Beside [`Run::source`] rather than a variant of it**, and that is a decision rather than a
+    /// convenience. `RunSource`'s variants are mutually exclusive by construction: a run draws its
+    /// own characters, or a reference's folio, or a footnote's number, and it cannot draw two of
+    /// those at once. A mark is not that kind of thing. "…see the *bestiary* on page 42" is one run
+    /// that is *both* a cross-reference and an index term, and a `RunSource::Index` variant would
+    /// make the model unable to say so. It sits where [`Run::character`] sits, for
+    /// [`Run::character`]'s stated reason: an annotation on a run is not a replacement for what the
+    /// run is.
+    ///
+    /// It is also why a mark contributes to the font subset through its own path rather than
+    /// through [`RunSource::contributes`] — see [`IndexMark::contributes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<IndexMark>,
 }
 
 impl Run {
@@ -371,6 +394,7 @@ impl Run {
             style: InlineStyle::EMPTY,
             character: None,
             source: RunSource::Authored,
+            index: None,
         }
     }
 
@@ -389,6 +413,7 @@ impl Run {
             style: InlineStyle::EMPTY,
             character: None,
             source: RunSource::Reference { target },
+            index: None,
         }
     }
 
@@ -408,8 +433,119 @@ impl Run {
             style: InlineStyle::EMPTY,
             character: None,
             source: RunSource::Footnote { note },
+            index: None,
         }
     }
+}
+
+/// A term this run puts in the index (spec 0078).
+///
+/// The mark is **run-level** because that is the granularity at which a page can be attributed: the
+/// index says which page a term was discussed on, and a page is what a run lands on. It is the slot
+/// spec 0065 established when it put a named character style beside a run's overrides — an
+/// annotation on a stretch of text, orthogonal to how that stretch is set.
+///
+/// The **term is authored rather than taken from the run's text**, and both consequences matter.
+/// An author can index a concept the sentence never names ("morale" on a paragraph about routing),
+/// and can file an inverted heading ("Keep, the Ruined") against text that reads normally. It is
+/// also what makes a mark's characters a *new* font-subset path: a term's letters need not appear
+/// in the run's own text at all, and even when they do, the index draws them in the index's face
+/// rather than the run's — see [`IndexMark::contributes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IndexMark {
+    /// The term as it is printed in the index.
+    pub term: String,
+    /// What the term files under, when that is not the term itself.
+    ///
+    /// The escape hatch every index in publishing has, and the reason the collation rule does not
+    /// have to be clairvoyant: `de Gaulle, Charles` files under `Gaulle`, `1984` under
+    /// `Nineteen Eighty-Four`, `St Albans` under `Saint Albans`. No collator — not this one, not a
+    /// full UCA implementation — can derive any of those, because they are facts about the language
+    /// and about the author's intent rather than about the characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_as: Option<String>,
+}
+
+impl IndexMark {
+    /// A mark that files under its own printed term.
+    pub fn new(term: impl Into<String>) -> IndexMark {
+        IndexMark {
+            term: term.into(),
+            sort_as: None,
+        }
+    }
+
+    /// Everything an index entry built from this mark can draw — what the font-subset collector
+    /// must carry (spec 0078).
+    ///
+    /// A **run**, not loose characters: the term is authored text, knowable exactly before layout,
+    /// so its ligatures are cut into the subset like any other run's (spec 0068). `sort_as`
+    /// contributes nothing, because it is never printed.
+    ///
+    /// This is a *third* instance of the class spec 0074 closed and spec 0076 extended, and it is
+    /// the one where the characters are drawn somewhere other than where they were authored. A
+    /// cross-reference draws inside its own run, so it takes the run's face; an index term is drawn
+    /// by the [`Block::Index`] block, in the index's own style, in the *regular* face — which is why
+    /// the collector puts this contribution where a contents entry's goes rather than in the run's
+    /// bucket.
+    pub fn contributes(&self) -> TokenText {
+        TokenText {
+            runs: vec![self.term.clone()],
+            chars: BTreeSet::new(),
+        }
+    }
+}
+
+/// What separates the two ends of a coalesced page range in an index entry (spec 0078).
+///
+/// An en dash, which is what a range is set with. A const rather than a literal at the two sites
+/// that need it, so the string the coalescer *writes* and the string the font-subset collector
+/// *embeds* cannot drift — the same "one answer" property spec 0076 required of a folio's alphabet.
+pub const INDEX_RANGE_SEPARATOR: &str = "\u{2013}";
+
+/// What separates one page reference from the next in an index entry (spec 0078). One const, both
+/// sites, for [`INDEX_RANGE_SEPARATOR`]'s reason.
+pub const INDEX_PAGE_SEPARATOR: &str = ", ";
+
+/// What a term's pages print as: `iv, 42–45, 47` (spec 0078).
+///
+/// **This coalesces folios, not page indices**, and the distinction is the whole of the function.
+/// Consecutive page *indices* need not be consecutive *folios*: a section boundary can restart the
+/// count (`restart_at`) or change the format, so pages 9 and 10 of a file can print `ix` and `1`.
+/// Joining those into `ix–1` would be a range that does not exist. Each element is therefore the
+/// `(format, number)` behind the printed folio — spec 0073's numbering before it becomes text — and
+/// two entries join a run only when they share a format **and** their numbers are consecutive.
+///
+/// A run of two or more consecutive folios prints as `first–last`. Two is deliberate rather than
+/// three: `42–43` is what an index sets for two adjacent pages, and a rule with a threshold of
+/// three would print `42, 43` beside `42–45` for no reason a reader could see.
+///
+/// Pure over numbers, with no engine coupling at all, which is what the M6 audit predicted for it —
+/// and it is why this is unit-tested against a folio format change directly rather than only
+/// through a laid-out document.
+pub fn coalesce_folios(folios: &[(NumberFormat, u32)]) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < folios.len() {
+        let (format, start) = folios[i];
+        let mut end = i;
+        while end + 1 < folios.len()
+            && folios[end + 1].0 == format
+            && folios[end + 1].1 == folios[end].1.saturating_add(1)
+        {
+            end += 1;
+        }
+        if !out.is_empty() {
+            out.push_str(INDEX_PAGE_SEPARATOR);
+        }
+        out.push_str(&format.format(start));
+        if end > i {
+            out.push_str(INDEX_RANGE_SEPARATOR);
+            out.push_str(&format.format(folios[end].1));
+        }
+        i = end + 1;
+    }
+    out
 }
 
 /// What a cross-reference prints when its target is not in the document (spec 0076).
@@ -770,6 +906,36 @@ pub enum Block {
         max_level: u8,
         color: Color,
     },
+    /// A generated back-of-book index (spec 0078).
+    ///
+    /// Carries no entries, for [`Block::Toc`]'s reason exactly and with the same force: they are
+    /// *derived* from the pages the marked runs actually landed on, which is not known until the
+    /// document is laid out and changes when it is. A stored entry is a page number that was right
+    /// one edit ago, which is worse than none.
+    ///
+    /// What it does carry is the one thing that cannot be derived: the articles this book's language
+    /// ignores at the front of a term.
+    Index {
+        #[serde(default)]
+        id: BlockId,
+        /// Heading shown above the entries. Empty for none.
+        #[serde(default)]
+        title: String,
+        /// Words dropped from the front of a term before it is filed (spec 0078).
+        ///
+        /// **Empty by default, and that is the decision.** An English book states
+        /// `["A", "An", "The"]` and a French one states `["Le", "La", "Les", "L'"]`; quill states
+        /// nothing, because a built-in English list would make the collation a mechanism only an
+        /// English book can use — the shape `CLAUDE.md` calls a defect — and because an article list
+        /// applied to the wrong language files entries where nobody will look for them.
+        ///
+        /// A word here is only an article when the term continues with a space or an apostrophe, so
+        /// `Theatre` is not `The` + `atre`, and the longest match wins so `["A", "An"]` cannot file
+        /// `An Atlas` under `n`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ignore_leading: Vec<String>,
+        color: Color,
+    },
     /// A table — an equipment list, an encounter table, a random table (spec 0039).
     Table {
         #[serde(default)]
@@ -814,7 +980,8 @@ impl Block {
             | Block::Panel { id, .. }
             | Block::Table { id, .. }
             | Block::Component { id, .. }
-            | Block::Toc { id, .. } => *id,
+            | Block::Toc { id, .. }
+            | Block::Index { id, .. } => *id,
         }
     }
 
@@ -826,7 +993,8 @@ impl Block {
             | Block::Panel { id, .. }
             | Block::Table { id, .. }
             | Block::Component { id, .. }
-            | Block::Toc { id, .. } => *id = new,
+            | Block::Toc { id, .. }
+            | Block::Index { id, .. } => *id = new,
         }
     }
 
@@ -898,7 +1066,8 @@ impl Block {
             | Block::Panel { .. }
             | Block::Table { .. }
             | Block::Component { .. }
-            | Block::Toc { .. } => &[],
+            | Block::Toc { .. }
+            | Block::Index { .. } => &[],
         }
     }
 
@@ -912,7 +1081,8 @@ impl Block {
             | Block::Panel { .. }
             | Block::Table { .. }
             | Block::Component { .. }
-            | Block::Toc { .. } => {}
+            | Block::Toc { .. }
+            | Block::Index { .. } => {}
         }
         self
     }
@@ -1360,6 +1530,15 @@ pub fn builtin_character_styles() -> BTreeMap<String, CharacterStyle> {
 /// A generated table of contents' own heading (spec 0041).
 pub const TOC_TITLE_STYLE: &str = "toc-title";
 
+/// A generated index's own heading (spec 0078).
+pub const INDEX_TITLE_STYLE: &str = "index-title";
+/// One index entry — a term and the pages it was marked on.
+///
+/// One style, where a contents list has six. A contents list's levels are the *heading* levels it
+/// mirrors and are therefore given; an index has no such structure to mirror — sub-entries are a
+/// named non-goal in spec 0078 — so a second level here would be a style nothing can select.
+pub const INDEX_ENTRY_STYLE: &str = "index-entry";
+
 /// The style a footnote's text is set in (spec 0077).
 ///
 /// Named and in the default sheet, on spec 0066's precedent for `list-bullet`: a footnote has a
@@ -1609,6 +1788,39 @@ impl Default for StyleSheet {
                 },
             );
         }
+        // Index treatment (spec 0078), on the same principle as the contents list's: an index
+        // dropped into a book should already read as one. Smaller and tighter than a contents
+        // entry, because an index is a long list of short lines and a contents list is a short list
+        // of long ones, and ragged rather than justified for the reason a footnote is — an entry is
+        // one clipped line that never wraps, so there is nothing to justify.
+        paragraph.insert(
+            INDEX_TITLE_STYLE.to_string(),
+            ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
+                list: None,
+                font_size_pt: 18.0,
+                leading_pt: 22.0,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 11.0,
+                indent: Indent::ZERO,
+            },
+        );
+        paragraph.insert(
+            INDEX_ENTRY_STYLE.to_string(),
+            ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
+                list: None,
+                font_size_pt: 9.0,
+                leading_pt: 11.0,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 0.0,
+                indent: Indent::ZERO,
+            },
+        );
         StyleSheet {
             paragraph,
             tabs: BTreeMap::new(),
@@ -1666,7 +1878,8 @@ impl StyleSheet {
             | Block::Panel { .. }
             | Block::Table { .. }
             | Block::Component { .. }
-            | Block::Toc { .. } => return ParagraphStyle::default(),
+            | Block::Toc { .. }
+            | Block::Index { .. } => return ParagraphStyle::default(),
         };
         self.paragraph
             .get(&named)
@@ -2495,13 +2708,27 @@ impl Document {
     /// `{page}` token in a master static, and the contents list, which must agree with it or the
     /// book sends a reader to a page that does not answer to the number beside its title.
     pub fn folio_in(runs: &[FolioRun], page_index: usize) -> String {
+        let (format, number) = Document::folio_number_in(runs, page_index);
+        format.format(number)
+    }
+
+    /// The numbering behind [`Document::folio_in`] — the format and the number, before either
+    /// becomes text (spec 0078).
+    ///
+    /// Page-range coalescing needs both. `iv` and `v` join into a range and `ix` and `1` do not,
+    /// and neither fact is recoverable from the two *strings*: telling them apart means comparing
+    /// the format and the arithmetic, which is exactly what this returns. `folio_in` is one call to
+    /// [`NumberFormat::format`] over it, so there is still one implementation of what a page prints
+    /// and not two.
+    pub fn folio_number_in(runs: &[FolioRun], page_index: usize) -> (NumberFormat, u32) {
         let Some(run) = runs.iter().rev().find(|r| r.first_page <= page_index) else {
             // Unreachable through `folio_runs`, which always emits a run at page 0. Stated rather
             // than `expect`ed because an empty list is a caller's mistake, not a corrupt document,
             // and a folio that vanished is better than a panic in an export.
-            return (page_index + 1).to_string();
+            return (NumberFormat::Decimal, page_index as u32 + 1);
         };
-        run.format.format(
+        (
+            run.format,
             run.start
                 .saturating_add((page_index - run.first_page) as u32),
         )
@@ -3385,6 +3612,75 @@ mod tests {
         let runs = doc.folio_runs(&[Some(1), Some(1)]);
         assert_eq!(runs.len(), 2, "page 0's default, then the one at page 1");
         assert_eq!(runs[1].format, NumberFormat::UpperAlpha);
+    }
+
+    #[test]
+    fn page_ranges_coalesce_into_runs() {
+        use NumberFormat::Decimal;
+        let d = |n: u32| (Decimal, n);
+        assert_eq!(coalesce_folios(&[]), "");
+        assert_eq!(coalesce_folios(&[d(42)]), "42");
+        // Two consecutive pages are a range, not a list: `42–43` is what an index sets.
+        assert_eq!(coalesce_folios(&[d(42), d(43)]), "42\u{2013}43");
+        assert_eq!(
+            coalesce_folios(&[d(42), d(43), d(44), d(45), d(47)]),
+            "42\u{2013}45, 47"
+        );
+        assert_eq!(coalesce_folios(&[d(1), d(3), d(5)]), "1, 3, 5");
+    }
+
+    #[test]
+    fn a_range_never_spans_a_folio_format_change() {
+        // **The case that looks correct on an arabic-only document.** Pages 8 and 9 of the file are
+        // consecutive *indices*; if the second is the first page of a section set in arabic they
+        // print `viii` and `1`, and joining them would print a range that does not exist.
+        use NumberFormat::{Decimal, LowerRoman};
+        assert_eq!(
+            coalesce_folios(&[(LowerRoman, 7), (LowerRoman, 8), (Decimal, 1), (Decimal, 2)]),
+            "vii\u{2013}viii, 1\u{2013}2"
+        );
+        // And a format change alone breaks it, even where the numbers *would* have been
+        // consecutive — `iv` and `5` are not a range whatever the arithmetic says.
+        assert_eq!(coalesce_folios(&[(LowerRoman, 4), (Decimal, 5)]), "iv, 5");
+    }
+
+    #[test]
+    fn a_restart_breaks_a_range_between_consecutive_pages() {
+        // The other half of spec 0073's numbering, and the one a format comparison alone would
+        // miss: same format, consecutive page indices, but the section restarted the count. Pages
+        // printing `9` then `1` are not `9–1`.
+        use NumberFormat::Decimal;
+        assert_eq!(
+            coalesce_folios(&[(Decimal, 8), (Decimal, 9), (Decimal, 1), (Decimal, 2)]),
+            "8\u{2013}9, 1\u{2013}2"
+        );
+    }
+
+    #[test]
+    fn a_folio_is_its_own_numbering_formatted() {
+        // `folio_in` and `folio_number_in` must be one answer, or an index would coalesce a run of
+        // pages whose printed folios said something else. Asserted over a two-run document rather
+        // than a default one, so the roman arm is actually exercised.
+        let runs = vec![
+            FolioRun {
+                first_page: 0,
+                format: NumberFormat::LowerRoman,
+                start: 1,
+            },
+            FolioRun {
+                first_page: 4,
+                format: NumberFormat::Decimal,
+                start: 1,
+            },
+        ];
+        for page in 0..12 {
+            let (format, n) = Document::folio_number_in(&runs, page);
+            assert_eq!(Document::folio_in(&runs, page), format.format(n));
+        }
+        // Including the degenerate empty-list path both share.
+        let (format, n) = Document::folio_number_in(&[], 6);
+        assert_eq!(Document::folio_in(&[], 6), format.format(n));
+        assert_eq!(format.format(n), "7");
     }
 
     #[test]

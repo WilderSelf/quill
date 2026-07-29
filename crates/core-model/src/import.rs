@@ -356,6 +356,9 @@ fn build_runs(text: &str, delims: &[Delim], pairs: &[Pair]) -> Vec<Run> {
             // The importer authors text; markdown has no cross-reference syntax (spec 0076's
             // non-goal), so every imported run draws its own characters.
             source: crate::RunSource::Authored,
+            // Nor an index-mark syntax (spec 0078's non-goal, on the same reasoning): markdown has
+            // no spelling for "this stretch is about X" worth committing the format to.
+            index: None,
         });
     };
 
@@ -869,6 +872,7 @@ max_level: 3
                 Block::Table { .. } => "table",
                 Block::Component { .. } => "component",
                 Block::Toc { .. } => "toc",
+                Block::Index { .. } => "index",
             })
             .collect();
         assert_eq!(kinds, ["heading", "body", "image", "panel", "table", "toc"]);
