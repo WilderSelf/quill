@@ -709,6 +709,19 @@ pub(crate) struct PanelSplit {
     /// sections want different answers, and each definition states its own (spec 0054's
     /// `SplitDef::min_items`).
     pub min_items: usize,
+    /// Item indices a cut would **rather** fall at. Empty means every item is equally good.
+    ///
+    /// Spec 0075. A composite's items are its elements — a row, an attribute pair, one action —
+    /// but a stat block still wants to be cut *between sections*, which is what spec 0046
+    /// promised. Holding the preference separately from the item list is what lets the engine
+    /// keep that promise and still have somewhere to cut when no section boundary fits: the
+    /// largest legal preferred cut wins, and an element boundary is the fallback rather than the
+    /// rule. Before this the two were the same list, so "prefers a section boundary" and "may only
+    /// cut at a section boundary" could not be told apart — and a single section taller than a
+    /// column had no legal cut at all and ran off the page.
+    ///
+    /// Indices are into `items`, and a cut of `k` items is preferred when `k` appears here.
+    pub preferred: Vec<usize>,
     /// Prefer moving whole to the next frame over cutting, when the block would fit there entire
     /// (spec 0046).
     ///
@@ -737,6 +750,22 @@ impl PanelSplit {
 /// defect a reader notices first, and a splitter without it would fix the ragged-foot defect by
 /// introducing a worse one.
 pub(crate) const MIN_LINES_PER_FRAGMENT: usize = 2;
+
+/// The fewest *contents entries* a fragment of a generated contents list may contain (spec 0075).
+///
+/// **Two, and it is the line rule rather than the section rule.** Spec 0046 had to make the minimum
+/// per-variant when it found that demanding two *sections* made the smallest legal cut larger than
+/// a column, so nothing cut and the panel ran off the page. The question that decides the number is
+/// therefore "what is an item here?", and a contents entry is one line: a `{title}\t{number}` tabbed
+/// line that never wraps, by the clipping rule in [`measure_toc`]. A lone entry stranded at the top
+/// of a page is the same widow a lone line is, so it gets the same answer as
+/// [`MIN_LINES_PER_FRAGMENT`].
+///
+/// It is safe here in a way it was not for sections, and the check is arithmetic rather than
+/// faith: the smallest legal fragment is the list's own title plus two entries — about 60 pt in the
+/// bundled styles — against the 378 pt of the narrowest column the `reference` template builds. Two
+/// entries could only price a fragment out of a frame that fits fewer than three lines of type.
+pub(crate) const MIN_ENTRIES_PER_FRAGMENT: usize = 2;
 
 impl Measured {
     /// Distance from this block's flow position `y` down to its **first baseline** (spec 0058), or
@@ -780,6 +809,19 @@ impl Measured {
         }
     }
 
+    /// How many items this measurement may be cut between, without building the list.
+    ///
+    /// [`Self::break_items`] clones a `Vec` and the progress assertions in the flow loop only need
+    /// its length; a count that allocated would make an invariant check cost more than the thing it
+    /// guards.
+    fn item_count(&self) -> Option<usize> {
+        match self {
+            Measured::Text { lines, .. } => Some(lines.len()),
+            Measured::Panel { split, .. } => split.as_ref().map(|s| s.items.len()),
+            Measured::Image { .. } => None,
+        }
+    }
+
     /// The height charged to a fragment before its first item — the space *above* a paragraph,
     /// which belongs to the piece that starts it and to no other.
     fn fragment_lead_pt(&self) -> f32 {
@@ -793,8 +835,14 @@ impl Measured {
 
     /// The largest legal cut whose fragment fits within `avail_pt`, or `None` when no cut is legal.
     ///
-    /// Legal means both sides keep [`MIN_ITEMS_PER_FRAGMENT`] items, so a paragraph of three lines
-    /// or fewer never splits at all.
+    /// Legal means both sides keep [`MIN_LINES_PER_FRAGMENT`] items (or the panel's own
+    /// [`PanelSplit::min_items`]), so a paragraph of three lines or fewer never splits at all.
+    ///
+    /// **A preferred cut beats a larger one** (spec 0075). A stat block's items are its elements but
+    /// its preference is a section boundary, so the largest *preferred* cut that fits wins, and the
+    /// largest cut of any kind is taken only when no preferred one fits. That is the difference
+    /// between "would rather break between sections" and "may only break between sections" — and the
+    /// second is what made a single over-tall section uncuttable, and the panel overflow the page.
     fn cut_fitting(&self, avail_pt: f32) -> Option<usize> {
         let items = self.break_items()?;
         let n = items.len();
@@ -807,7 +855,9 @@ impl Measured {
         // Whatever the fragment must reserve *below* its last item is part of what has to fit, or a
         // cut stat block's panel edge is drawn past the bottom of the frame.
         let trail = self.fragment_trail_pt();
+        let preferred = self.preferred_cuts();
         let mut best = None;
+        let mut best_preferred = None;
         for (i, h) in items.iter().enumerate() {
             used += h;
             if used + trail > avail_pt {
@@ -816,9 +866,25 @@ impl Measured {
             let k = i + 1;
             if k >= min && k <= last_legal {
                 best = Some(k);
+                if preferred.is_none_or(|p| p.contains(&k)) {
+                    best_preferred = Some(k);
+                }
             }
         }
-        best
+        best_preferred.or(best)
+    }
+
+    /// The cuts this value would rather take, or `None` when it has no preference among its items.
+    ///
+    /// See [`PanelSplit::preferred`]. A paragraph has no preference — one line break is as good as
+    /// another — and neither does a table, whose rows are already the unit it wants.
+    fn preferred_cuts(&self) -> Option<&[usize]> {
+        match self {
+            Measured::Panel {
+                split: Some(split), ..
+            } if !split.preferred.is_empty() => Some(&split.preferred),
+            _ => None,
+        }
     }
 
     /// The fewest items either side of a legal cut, which differs by what an "item" is.
@@ -958,6 +1024,16 @@ impl Measured {
                 // prefix folded into its first item exactly as the original's was.
                 let mut tail_items: Vec<f32> = split.items[at..].to_vec();
                 tail_items[0] += split.repeat_h;
+                // The remainder keeps the same preferences, re-based onto its own item list. A
+                // boundary at or before the cut is gone with the items it separated; index 0 of the
+                // remainder is where the continuation starts, and a cut of nothing is not a cut, so
+                // only strictly-later boundaries survive.
+                let tail_preferred: Vec<usize> = split
+                    .preferred
+                    .iter()
+                    .filter(|i| **i > at)
+                    .map(|i| i - at)
+                    .collect();
                 let tail = Measured::Panel {
                     fill: *fill,
                     stroke: *stroke,
@@ -970,6 +1046,7 @@ impl Measured {
                         repeat_h: split.repeat_h,
                         trailing_pt: split.trailing_pt,
                         min_items: split.min_items,
+                        preferred: tail_preferred,
                         keep_together: split.keep_together,
                     }),
                 };
@@ -1454,6 +1531,11 @@ fn measure_toc(
     metrics: &impl RunMetrics,
 ) -> (Measured, f32) {
     let mut parts: Vec<PanelPart> = Vec::new();
+    // Panel-local y of each place this list may be cut: the top of every entry. Item 0's boundary is
+    // rewritten to 0.0 once the walk is done, so the list's own title is absorbed into the first
+    // item and can never be left behind as a fragment of its own — the same trick
+    // `measure_component` uses for a panel's top inset.
+    let mut boundaries: Vec<f32> = Vec::new();
     let mut y = 0.0;
 
     if !title.is_empty() {
@@ -1488,6 +1570,9 @@ fn measure_toc(
             .get(&toc_entry_style_name(h.level))
             .copied()
             .unwrap_or_default();
+        // Recorded before the entry's space-above, so a fragment that begins here begins with that
+        // space rather than swallowing it — the rule `measure_component` states for a section.
+        boundaries.push(y);
         y += style.space_before_pt;
 
         let indent = (h.level.saturating_sub(1)) as f32 * TOC_INDENT_PT;
@@ -1547,16 +1632,55 @@ fn measure_toc(
         y += style.leading_pt + style.space_after_pt;
     }
 
+    // A contents list is cut **between entries** (spec 0075), which is the natural atom for the same
+    // reason a table's is a row and a stat block's a section: an entry is one line of navigation,
+    // and half of one is not navigation at all.
+    //
+    // Spec 0045 made this `None` — "a contents block is deliberately indivisible" — and that was
+    // wrong in a way nothing measured, because every contents fixture in the workspace is a handful
+    // of chapters. A real 500-page book's contents list is three pages, and an indivisible panel
+    // taller than its frame reaches the branch that places a block whole and lets it run off the
+    // page. The fixpoint objection the old comment raised is answered by the fixpoint itself: each
+    // iteration re-measures the *whole* block from the heading index and re-cuts it, so a fragment
+    // is never re-derived from a fragment.
+    //
+    // Nothing here depends on the available height — the entries, their clipping and their leaders
+    // are functions of the measure alone — which is spec 0044's precondition for offering break
+    // opportunities at all, and why `MeasureKey` is untouched.
+    let split = (boundaries.len() >= 2).then(|| {
+        // Item 0 absorbs the list's own title, exactly as a panel's item 0 absorbs its top inset.
+        let mut items: Vec<f32> = Vec::with_capacity(boundaries.len());
+        for i in 0..boundaries.len() {
+            let start = if i == 0 { 0.0 } else { boundaries[i] };
+            let end = boundaries.get(i + 1).copied().unwrap_or(y);
+            items.push(end - start);
+        }
+        PanelSplit {
+            items,
+            // Nothing is re-stated at the top of a continuation. A repeated "Contents" heading would
+            // read as a second contents list rather than as the same one carrying on, which is the
+            // opposite of a table header — there the header is what makes the rows legible.
+            repeat_parts: Vec::new(),
+            repeat_decorations: Vec::new(),
+            repeat_h: 0.0,
+            // No panel edge to close: a contents list draws neither fill nor stroke.
+            trailing_pt: 0.0,
+            min_items: MIN_ENTRIES_PER_FRAGMENT,
+            // Every entry is as good a place to break as any other.
+            preferred: Vec::new(),
+            // A contents list short enough to fit the next frame whole belongs there whole, which is
+            // also exactly the behaviour every existing document gets today.
+            keep_together: true,
+        }
+    });
+
     (
         Measured::Panel {
             fill: None,
             stroke: None,
             parts,
             decorations: Vec::new(),
-            // A contents block is deliberately indivisible: spec 0041's fixpoint regenerates it
-            // whenever page numbers move, and a half-placed contents list would be re-derived
-            // under its own fragments.
-            split: None,
+            split,
         },
         y,
     )
@@ -1963,7 +2087,31 @@ pub(crate) fn flow(
                 let keep_whole = measured.prefers_keep_together() && height <= next_h;
                 if !keep_whole && same_width(frame.rect.w_pt, next_w) {
                     if let Some(k) = measured.cut_fitting(bottom - y) {
-                        if let Some((fragment, fragment_h, _, _)) = measured.split_at(k) {
+                        if let Some((fragment, fragment_h, remainder, _)) = measured.split_at(k) {
+                            // **The progress invariant** (spec 0044, and 0045's narrowed
+                            // `frame_empty` guard rests on it): this loop runs once per frame the
+                            // block spans and is bounded by nothing else. A cut that left an empty
+                            // fragment, or one that did not advance the absolute offset, would spin
+                            // here forever — and a cut whose remainder was empty would place the
+                            // block's tail twice.
+                            //
+                            // Structural until spec 0075, which is the increment that adds new ways
+                            // for a cut to be degenerate: a contents list's entries and a
+                            // composite's elements are both item lists derived somewhere else. 0044
+                            // called these "invariants worth asserting rather than reasoning
+                            // about", so they are asserted — once per cut, which is nothing beside
+                            // the measurement it follows.
+                            let advanced = split_at + k;
+                            assert!(k > 0, "a cut must leave a non-empty fragment behind");
+                            assert!(
+                                remainder.item_count().is_some_and(|n| n > 0),
+                                "a cut must carry a non-empty remainder forward"
+                            );
+                            assert!(
+                                advanced > split_at,
+                                "the absolute item offset must strictly increase across a cut, \
+                                 or the flow loop cannot terminate"
+                            );
                             page.blocks.extend(place_measured(
                                 fragment,
                                 fragment_h,
@@ -1972,7 +2120,7 @@ pub(crate) fn flow(
                                 block.id(),
                                 metrics,
                             ));
-                            split_at += k;
+                            split_at = advanced;
                             cut_taken = true;
                         }
                     }
@@ -1984,7 +2132,19 @@ pub(crate) fn flow(
                 // own page, so the frame is empty, and placing it whole would run it off the bottom
                 // of the book. A cut advances the absolute offset, so progress is guaranteed and the
                 // guard is not required to reach it (spec 0045, extending 0044).
-                if !cut_taken && frame_empty {
+                // `keep_whole` is excluded deliberately (spec 0075). Keep-together declined the cut
+                // *because the block fits the next frame entire*, so the answer is to move it
+                // there — and the empty-frame guard used to override exactly that, placing the
+                // block in a frame it does not fit while a frame that would have held it whole sat
+                // one column away. On the `reference` template that is not a corner case: page 0
+                // gives 378 pt columns and page 1 gives 540 pt ones, so a 440 pt panel prefers to
+                // move, and then overflowed where it stood. It is half of the recorded stat-block
+                // overflow, and the half no amount of finer cutting could have reached.
+                //
+                // Progress is not at risk: `keep_whole` is only true when the block fits the
+                // continuation frame entire, so the next iteration places it. One move, never a
+                // loop.
+                if !cut_taken && frame_empty && !keep_whole {
                     // Cannot be cut and the frame is empty: place it and let it overflow.
                 } else {
                     // Doesn't fit → move on before placing.
@@ -4702,14 +4862,17 @@ mod tests {
     /// 1.2 pt over on the strength of shrink that ragged setting never applies. Every such run was
     /// one line; each is two now, so a group is a little over twice as tall.
     ///
-    /// That moves where spec 0046's *uncuttable* case begins — a section taller than the column
-    /// cannot be cut, so the panel is placed whole and runs off the page. Measured on both builds
-    /// with this exact fixture: **24 fitted and 26 overflowed before; 8 fits and 10 overflows
-    /// now.** The limitation itself is unchanged and is 0046's; the roadmap's open question about
-    /// per-section splitting is where it gets fixed.
+    /// That moved where spec 0046's *uncuttable* case began — a section taller than the column
+    /// could not be cut, so the panel was placed whole and ran off the page. Measured on both
+    /// builds with this exact fixture: **24 fitted and 26 overflowed before spec 0060; 8 fits and
+    /// 10 overflowed after it.**
     ///
-    /// [`a_section_taller_than_its_column_is_placed_whole`] pins the other side of the threshold,
-    /// so the limitation is asserted rather than merely survived.
+    /// **Spec 0075 removed the overflow, and the threshold with it**: at 10 the panel is now cut
+    /// and fits. The constant stays at 8 because the fixture on this side of it is still the one
+    /// that fits *whole*, and the two together are what make the narrow-column assertions cover
+    /// both a placed block and a cut one.
+    /// [`a_section_taller_than_its_column_is_cut_rather_than_overflowing`] is the other side, now
+    /// asserting that it fits.
     const NARROW_COLUMN_SECTIONS: usize = 8;
 
     #[test]
@@ -4761,21 +4924,27 @@ mod tests {
 
     /// The other side of [`NARROW_COLUMN_SECTIONS`]: a section taller than the column it must fit.
     ///
-    /// Spec 0046 cuts a stat block **between sections and nowhere else**, so a single section that
-    /// is itself taller than a frame has no legal cut. The panel is then placed whole and runs off
-    /// the bottom of the page. That is a real defect, not a design choice, and the roadmap's open
-    /// question — "does per-section paragraph splitting inside a stat block ever ship?" — is where
-    /// it gets answered; spec 0044's mechanism exists, wiring it through the composite is the open
-    /// part.
+    /// **This test is spec 0046's inverted, exactly as its own doc comment promised it would be.**
+    /// It used to assert that the panel overflowed — a stat block was cut between sections and
+    /// nowhere else, so a single over-tall section had no legal cut, and the block was placed whole
+    /// and ran off the bottom of the page. Spec 0075 shipped the fix, so the overflow assertion
+    /// becomes an assertion that there is none. The test is rewritten rather than deleted, because
+    /// what it pins is a *threshold*, and a threshold with nothing on either side of it is not
+    /// pinned at all.
     ///
-    /// It is asserted here rather than left silent because a limitation nobody has written down is
-    /// a limitation that gets rediscovered as a bug. **When per-section splitting ships, this test
-    /// inverts**: the overflow assertion becomes an assertion that it does not overflow.
+    /// Two separate changes had to land for this fixture to come out right, and the second was not
+    /// the one the known issue named:
     ///
-    /// What must hold either way, and is asserted unconditionally: **no content is lost.** An
-    /// uncuttable panel is placed badly, never dropped.
+    /// 1. A composite may now be cut **inside** a section, at an element boundary, when no section
+    ///    boundary fits (see [`PanelSplit::preferred`]).
+    /// 2. Keep-together now *moves* the block it declined to cut. This fixture's remainder is
+    ///    440 pt: too tall for page 0's 378 pt columns, comfortable in page 1's 540 pt one — so
+    ///    keep-together suppressed the cut, and the empty-frame guard then placed it where it stood
+    ///    and let it overflow. No amount of finer cutting would have reached that.
+    ///
+    /// What must hold either way, and is asserted unconditionally: **no content is lost.**
     #[test]
-    fn a_section_taller_than_its_column_is_placed_whole() {
+    fn a_section_taller_than_its_column_is_cut_rather_than_overflowing() {
         let t = quill_core_model::Template::by_name("reference").expect("bundled");
         let build = |n: usize| {
             let mut doc = Document::from_template(t);
@@ -4816,9 +4985,8 @@ mod tests {
             }
         }
         assert!(
-            worst > 0.0,
-            "this fixture is meant to be on the *uncuttable* side of the threshold; if it now \
-             fits, per-section splitting has shipped and this test should be inverted"
+            worst <= 0.01,
+            "a section taller than its column must no longer overflow it; worst overrun {worst:.1} pt"
         );
 
         // Content conservation, which holds on both sides of the threshold. Compared against the
@@ -4839,7 +5007,7 @@ mod tests {
         assert!(!reference.is_empty(), "the reference layout placed nothing");
         assert_eq!(
             placed, reference,
-            "an uncuttable panel may be placed badly, never dropped"
+            "a cut panel may be placed badly, never dropped"
         );
     }
 
@@ -4877,14 +5045,21 @@ mod tests {
     }
 
     #[test]
-    fn a_stat_block_of_one_oversized_section_is_placed_whole() {
-        // The uncuttable fallback, at its real boundary. A section is the unit, so a block with a
-        // single section has no legal cut however tall it is: place it and let it overflow, rather
-        // than emit an empty fragment and loop forever.
+    fn a_stat_block_of_one_oversized_run_is_placed_whole() {
+        // The uncuttable fallback, at its real boundary — **and this is spec 0075's named
+        // residual.** After 0075 a composite cuts between its *elements*, not merely between its
+        // sections, so the floor is one element: a single authored run that wraps taller than a
+        // frame still has no legal cut, and is placed whole and allowed to overflow rather than
+        // emit an empty fragment and loop forever.
+        //
+        // Fixing this one needs a cut *inside* a `PanelPart`'s line list — splitting the part,
+        // re-deriving its ink box, and threading run metrics into `Measured::split_at`, which takes
+        // none today. That is a different change from this one and is recorded as a follow-up
+        // rather than half-built here.
         //
         // Two sections would *not* be this case — spec 0046 allows a one-section fragment, so a
         // name and an overview do split. Requiring two sections per fragment instead is what made
-        // the first version of this increment render a panel off the bottom of the page.
+        // the first version of that increment render a panel off the bottom of the page.
         let mut doc = stat_doc();
         doc.content = vec![Block::Panel {
             id: BlockId::UNASSIGNED,
@@ -4908,7 +5083,109 @@ mod tests {
             .flat_map(|p| p.blocks.iter())
             .filter(|b| matches!(b, PlacedBlock::Rect { fill, .. } if *fill == Some(PANEL_FILL())))
             .count();
-        assert_eq!(panels, 1, "one section ⇒ no legal cut ⇒ placed whole");
+        assert_eq!(panels, 1, "one run ⇒ no legal cut ⇒ placed whole");
+    }
+
+    #[test]
+    fn a_cut_falls_inside_a_section_when_no_section_boundary_fits() {
+        // Spec 0075's composite half, and the assertion that separates it from spec 0046's
+        // behaviour rather than restating it. A creature with a name and one enormous actions list
+        // has exactly one section boundary — after the name — and a fragment of just a name is
+        // nowhere near a column. Everything after it has to be cut *inside* the actions section or
+        // not at all, which is precisely what 0046 could not do.
+        //
+        // Asserted by where the seam falls: consecutive `Attack n.` runs landing on different
+        // pages is a cut between two elements of one section, and no arrangement of section
+        // boundaries can produce it.
+        let mut doc = stat_doc();
+        doc.content = vec![Block::Panel {
+            id: BlockId::UNASSIGNED,
+            panel: quill_core_model::Panel {
+                name: "Barrow Wight".into(),
+                overview: vec![],
+                attributes: vec![],
+                details: vec![],
+                actions: (0..120)
+                    .map(|i| format!("Attack {i}. +5 to hit."))
+                    .collect(),
+                reactions: vec![],
+            },
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.assign_missing_block_ids().expect("ids");
+        let id = doc.content[0].id();
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let template = DocumentTemplate::new(&doc);
+
+        // Nothing overruns, on any page. This is the defect itself.
+        for page in &pages {
+            let bottom = template
+                .frames(page.index)
+                .iter()
+                .map(|f| f.rect.y_pt + f.rect.h_pt)
+                .fold(0.0_f32, f32::max);
+            for b in &page.blocks {
+                let (y, h) = match b {
+                    PlacedBlock::Text { frame, .. }
+                    | PlacedBlock::Rect { frame, .. }
+                    | PlacedBlock::Image { frame, .. }
+                    | PlacedBlock::Link { frame, .. } => (frame.y_pt, frame.h_pt),
+                };
+                assert!(
+                    y + h <= bottom + 0.01,
+                    "page {} runs to {:.1}, past {bottom:.1}",
+                    page.index,
+                    y + h
+                );
+            }
+        }
+
+        // The seam is inside the actions section: some `Attack n` is the last run on its page and
+        // `Attack n+1` opens the next.
+        let mut per_page: Vec<Vec<String>> = Vec::new();
+        for page in &pages {
+            let mut runs: Vec<(f32, String)> = page
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    PlacedBlock::Text {
+                        source,
+                        frame,
+                        lines,
+                        ..
+                    } if *source == id => Some((frame.y_pt, lines[0].text.clone())),
+                    _ => None,
+                })
+                .collect();
+            runs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            per_page.push(runs.into_iter().map(|(_, t)| t).collect());
+        }
+        let seams: usize = per_page
+            .windows(2)
+            .filter(|w| {
+                let Some(last) = w[0].last() else {
+                    return false;
+                };
+                let Some(first) = w[1].first() else {
+                    return false;
+                };
+                last.starts_with("Attack") && first.starts_with("Attack")
+            })
+            .count();
+        assert!(
+            seams >= 1,
+            "a cut must fall between two actions when no section boundary can carry it: {per_page:?}"
+        );
+
+        // And conservation, which is the only failure that silently produces a wrong book.
+        let placed: Vec<String> = per_page.concat();
+        let expected: Vec<String> = std::iter::once("Barrow Wight".to_string())
+            .chain((0..120).map(|i| format!("Attack {i}. +5 to hit.")))
+            .collect();
+        assert_eq!(
+            placed, expected,
+            "every run exactly once, in document order"
+        );
     }
 
     #[test]
@@ -5774,6 +6051,169 @@ mod tests {
         let printed = toc_entries(&doc, &pages);
         let actual = heading_index_of(&doc.content, &pages);
         assert_eq!(printed.len(), 3, "one entry per heading: {printed:?}");
+        for (entry, heading) in printed.iter().zip(actual.iter()) {
+            assert_eq!(entry.0, heading.text);
+            assert_eq!(
+                entry.1,
+                (heading.page_index + 1).to_string(),
+                "`{}` prints {} but is on page {}",
+                heading.text,
+                entry.1,
+                heading.page_index + 1
+            );
+        }
+    }
+
+    /// A book with enough chapters that its contents list cannot fit one page.
+    ///
+    /// **Nothing in the workspace exercised this before spec 0075** — every contents fixture is a
+    /// handful of chapters — which is exactly why the defect shipped. A real 500-page book's
+    /// contents list is three pages.
+    fn long_toc_doc(chapters: usize) -> Document {
+        let names: Vec<(u8, String)> = (0..chapters)
+            .map(|i| (1u8, format!("Chapter {i}")))
+            .collect();
+        let refs: Vec<(u8, &str)> = names.iter().map(|(l, n)| (*l, n.as_str())).collect();
+        toc_doc(1, &refs, 3)
+    }
+
+    /// Which page each contents entry landed on, in placement order.
+    fn toc_entry_pages(doc: &Document, pages: &[LaidOutPage]) -> Vec<(usize, String)> {
+        let toc_id = doc
+            .content
+            .iter()
+            .find(|b| matches!(b, Block::Toc { .. }))
+            .map(|b| b.id())
+            .expect("a contents block");
+        pages
+            .iter()
+            .flat_map(|p| p.blocks.iter().map(move |b| (p.index, b)))
+            .filter_map(|(i, b)| match b {
+                PlacedBlock::Text { lines, source, .. } if *source == toc_id => {
+                    Some((i, lines[0].text.clone()))
+                }
+                _ => None,
+            })
+            .filter(|(_, t)| !t.is_empty() && !t.chars().all(|c| c == '.'))
+            .collect()
+    }
+
+    #[test]
+    fn a_contents_list_taller_than_its_frame_is_split_across_pages() {
+        // **The headline of spec 0075.** `measure_toc` returned an indivisible panel, so a contents
+        // list taller than its frame reached the branch that places a block whole and lets it
+        // overflow — silently, in the feature a long book most needs.
+        let doc = long_toc_doc(150);
+        let (pages, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(
+            status.converged,
+            "the fixpoint must still settle: {status:?}"
+        );
+
+        let entries = toc_entry_pages(&doc, &pages);
+        let carrying: std::collections::BTreeSet<usize> = entries.iter().map(|(p, _)| *p).collect();
+        assert!(
+            carrying.len() >= 3,
+            "a 150-chapter contents list must span pages, not one: {carrying:?}"
+        );
+
+        // Nothing lost, nothing duplicated, nothing reordered — the only failure that silently
+        // produces a wrong book. The list's own title opens it, then one entry per chapter in
+        // document order, each with its page number.
+        let texts: Vec<String> = entries.iter().map(|(_, t)| t.clone()).collect();
+        let titles: Vec<&String> = texts[1..].iter().step_by(2).collect();
+        let expected: Vec<String> = (0..150).map(|i| format!("Chapter {i}")).collect();
+        assert_eq!(texts[0], "Contents", "the list opens with its own title");
+        assert_eq!(
+            titles.len(),
+            150,
+            "one entry per chapter, got {}",
+            titles.len()
+        );
+        for (got, want) in titles.iter().zip(expected.iter()) {
+            assert_eq!(*got, want);
+        }
+
+        // The title is re-stated nowhere: a repeated "Contents" would read as a second contents
+        // list rather than the same one carrying on.
+        assert_eq!(
+            texts.iter().filter(|t| *t == "Contents").count(),
+            1,
+            "the list's own title belongs to the first fragment only"
+        );
+
+        // No fragment is a widow. Every page that carries entries carries at least the minimum.
+        for page in &carrying {
+            let n = entries.iter().filter(|(p, _)| p == page).count();
+            // Two runs per entry (title, number), and the first page also carries the list title.
+            let entries_here = if *page == entries[0].0 {
+                (n - 1) / 2
+            } else {
+                n / 2
+            };
+            assert!(
+                entries_here >= MIN_ENTRIES_PER_FRAGMENT,
+                "page {page} carries {entries_here} contents entries, below the minimum"
+            );
+        }
+
+        // And it fits: the defect itself was geometry running off the bottom of the page.
+        let template = DocumentTemplate::new(&doc);
+        for page in &pages {
+            let bottom = template
+                .frames(page.index)
+                .iter()
+                .map(|f| f.rect.y_pt + f.rect.h_pt)
+                .fold(0.0_f32, f32::max);
+            for b in &page.blocks {
+                let (y, h) = match b {
+                    PlacedBlock::Text { frame, .. }
+                    | PlacedBlock::Rect { frame, .. }
+                    | PlacedBlock::Image { frame, .. }
+                    | PlacedBlock::Link { frame, .. } => (frame.y_pt, frame.h_pt),
+                };
+                assert!(
+                    y + h <= bottom + 0.01,
+                    "page {} runs to {:.1}, past the frame bottom {bottom:.1}",
+                    page.index,
+                    y + h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_contents_list_prints_the_pages_the_headings_actually_landed_on() {
+        // The fixpoint, over a contents list that now changes the page count by *pages* rather than
+        // by lines. A contents list that spans three pages pushes every chapter three pages later,
+        // which changes the numbers it prints, which is the loop this feature has always been.
+        // Bounded by `TOC_MAX_ITERATIONS`; this asserts it still settles inside the bound and that
+        // what it settled on is true of the document it produced.
+        let doc = long_toc_doc(150);
+        let (pages, status) = lay_out_with_toc_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &DocumentTemplate::new(&doc),
+            &MONO,
+            &NoHyphenator,
+        );
+        assert!(status.converged, "must settle: {status:?}");
+        assert!(
+            status.iterations <= TOC_MAX_ITERATIONS,
+            "converged is only meaningful inside the bound: {status:?}"
+        );
+
+        let printed = toc_entries(&doc, &pages);
+        let actual = heading_index_of(&doc.content, &pages);
+        assert_eq!(printed.len(), actual.len());
         for (entry, heading) in printed.iter().zip(actual.iter()) {
             assert_eq!(entry.0, heading.text);
             assert_eq!(

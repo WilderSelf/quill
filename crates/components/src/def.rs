@@ -167,15 +167,21 @@ pub struct SectionDef {
     pub repeat: bool,
 }
 
-/// What a component's fragments are made of when it is cut across a frame boundary.
+/// Where a component's cuts would rather fall when it is cut across a frame boundary.
+///
+/// **A preference, not a permission, since spec 0075.** A cut may land between any two elements
+/// whatever this says; the setting chooses which of those the engine takes when more than one fits.
+/// It used to be the item list itself, which meant a component with a single section taller than a
+/// frame had no legal cut at all and was placed whole, overflowing the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitGranularity {
-    /// One item per emitted section — a stat block, whose attributes list is never separated from
-    /// itself.
+    /// Prefer a section boundary — a stat block, whose attributes list stays together whenever a
+    /// section boundary fits. When none does, the cut falls between elements of a section rather
+    /// than nowhere.
     #[default]
     Sections,
-    /// One item per element of the last non-repeated section — a table's rows.
+    /// No preference: every element is as good a break as any other — a table's rows.
     Elements,
     /// Indivisible: the component moves whole or not at all.
     Whole,
@@ -186,9 +192,13 @@ pub enum SplitGranularity {
 pub struct SplitDef {
     #[serde(default)]
     pub granularity: SplitGranularity,
-    /// The fewest items a fragment may contain. One for coarse items (a whole section), two for
-    /// fine ones (a row) — a lone row under a repeated header reads as a mistake, while demanding
-    /// two *sections* can make the smallest legal cut larger than a frame.
+    /// The fewest **elements** a fragment may contain. One for a component whose elements are
+    /// coarse (a section's single run), two for fine ones (a row) — a lone row under a repeated
+    /// header reads as a mistake, while a minimum large enough to price the smallest legal fragment
+    /// above a frame means nothing is cut and the panel runs off the page.
+    ///
+    /// Counted in elements for every granularity since spec 0075, which made the item list the
+    /// elements and the granularity a preference over them.
     #[serde(default = "one")]
     pub min_items: usize,
     /// Prefer moving whole to the next frame over cutting, when the component would fit there

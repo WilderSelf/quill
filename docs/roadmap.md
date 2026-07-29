@@ -20,7 +20,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
-| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **decomposed** into specs 0072–0079; none built |
+| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **decomposed** into specs 0072–0079; **0075 shipped out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
@@ -2632,12 +2632,26 @@ it must not skip are recorded as known issues below. Note the heading index's `t
 `Block::plain_text`, so a running head cannot carry a chapter title's inline runs — state that as a
 non-goal with the residual, or fix it.
 
-#### 0075 a derived or composite block may span frames
+#### 0075 a derived or composite block may span frames — **SHIPPED**
 
-Spec 0044's `\vsplit` wired through the blocks that currently refuse to cut. Closes the contents-list
-overflow, and should be checked against the recorded stat-block known issue — the two share a root
-cause and the test pinning the stat-block case says in as many words that it inverts when the fix
-ships.
+Spec 0044's `\vsplit` wired through the blocks that refused to cut. `specs/0075-blocks-span-frames.md`.
+The contents list cuts between entries (minimum two, the line rule rather than the section rule), a
+composite's items became its *elements* with `SplitGranularity` demoted to a preference over them, and
+the test pinning the stat-block case was rewritten as its own doc comment promised. The progress
+invariants 0044 called "worth asserting rather than reasoning about" are now asserted in the flow
+loop.
+
+Two things it found that the entry did not predict. **Keep-together declined the cut and then let the
+empty-frame guard place the block anyway**, so half the stat-block overflow was never about cutting at
+all — on the `reference` template page 0 gives 378 pt columns and page 1 gives 540 pt ones, so a 440 pt
+panel prefers to move, and then overflowed where it stood. And **a session placed a contents list of
+nothing but its own title**: the entries are derived from the heading index, which is context and
+deliberately outside `MeasureKey`, but nothing evicted the cached measurement when the index moved, so
+the fixpoint's second pass served the first pass's empty list — for ever, in the path the app uses.
+Both fixed in the same increment; the second is why the increment is observable where a user is.
+
+No digest moved: `SAMPLE_EXPORT_DIGEST` and all three `component_parity` sets are unchanged, which is
+the claim that the blast radius was exactly the documents that were broken.
 
 #### 0076 cross-references
 
@@ -2676,35 +2690,16 @@ whose increment ships is deleted in that increment's PR, not left here as a fixe
 defect — which is why the four entries M3 opened with are gone, and why both entries M3 *found* are
 gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in their place.
 
-- **A stat-block section taller than its column cannot be cut, so the panel overflows the page.**
-  Spec 0046 cuts a composite *between sections and nowhere else*, so a single section — a long
-  actions list — that is itself taller than a frame has no legal cut. The panel is placed whole and
-  runs off the bottom. Content is never lost, which is asserted; it is placed badly, which is also
-  asserted (`a_section_taller_than_its_column_is_placed_whole`).
+- **A composite whose single authored *run* wraps taller than a frame is still placed whole and
+  overflows.** Spec 0075's named residual, and the floor of the mechanism rather than a miss: a
+  composite now cuts between its elements, so the smallest thing that can be left behind is one
+  element, and a section consisting of one enormous paragraph is one element.
 
-  Not new, and not spec 0060's doing — but 0060 moved the threshold, so it is now reachable at a
-  quarter of the section count it used to take. Measured on both builds with the same fixture in a
-  `rulebook` column: 24 sections fitted and 26 overflowed before; 8 fits and 10 overflows now. The
-  cause is that forbidding an over-measure ragged line makes each run in a narrow panel wrap to two
-  lines instead of one.
-
-  The fix is the open question below — per-section paragraph splitting inside a composite. Spec
-  0044's `\vsplit` mechanism already exists; wiring it through the composite so a cut may fall
-  *inside* a section when no section boundary fits is the part that does not. Until then the
-  limitation is written down and asserted rather than rediscovered as a bug, and the test that pins
-  it says in as many words that it inverts when the fix ships.
-
-- **A generated contents list taller than its frame overflows the page — the same defect, in the
-  feature a long book most needs.** Found by M6's audit, not by a user, and it ships today.
-  `measure_toc` returns `Measured::Panel { split: None, .. }` with the comment "A contents block is
-  deliberately indivisible", so `break_items` yields `None`, `cut_fitting` yields `None`, and the
-  flow reaches the branch that places a block whole and lets it overflow. **A real 500-page book's
-  contents list is three pages.** Every TOC fixture in the workspace uses a handful of chapters, so
-  nothing exercises it.
-
-  Same root cause as the stat-block entry above — an indivisible `Measured::Panel` in a frame it does
-  not fit — which is why one fix should close both, and why spec 0075 is sequenced before the index:
-  the index would inherit it exactly.
+  Fixing it needs a cut *inside* a `PanelPart`'s line list — splitting the part, re-deriving its ink
+  box (spec 0069), and threading run metrics into `Measured::split_at`, which takes none today. That
+  is a different change from 0075's and was recorded rather than half-built.
+  `a_stat_block_of_one_oversized_run_is_placed_whole` pins it, as its predecessor pinned the case
+  0075 fixed.
 
 - **The font-subset collector hardcodes `{page}` as the only token resolved at layout time.**
   crates/export-pdf/src/lib.rs:866-875 carries digits into every subset because `{page}` becomes a
@@ -2734,9 +2729,16 @@ decided explicitly rather than by accident.
   to one printer, and a persisted preset would go stale inside a file nobody re-opens. The cost is
   that the vendor a book was built for is not recoverable from the book. If that turns out to matter
   in practice, the answer is a non-authoritative hint field, not a binding.
-- Does per-section paragraph splitting inside a stat block ever ship? Spec 0046 breaks between
-  sections only, so a stat block whose single `actions` section overflows a frame still overflows.
-  The mechanism to fix it exists after 0044; wiring it through the composite is the open part.
+- ~~Does per-section paragraph splitting inside a stat block ever ship?~~ **Answered by spec 0075:
+  yes, at element granularity — and the question had the mechanism right and the *diagnosis* half
+  wrong.** A composite's items are now its elements and `SplitGranularity` is a preference over them,
+  so a cut falls between sections whenever one fits and inside a section when none does. But the
+  recorded fixture did not overflow only for want of a finer cut: keep-together declined to cut
+  because the block would fit the next frame entire, and the `frame_empty` guard then placed it where
+  it stood anyway. Two independent causes, one symptom, and the second was invisible to the question.
+  Worth keeping as a shape — **an inherited diagnosis names one cause; the fixture may have two, and
+  the second only appears once the first is fixed and the symptom does not go away.** The residual
+  that is genuinely left is one *run* taller than a frame, which is in known issues above.
 
 Answered by M2's decomposition, kept here as pointers: master statics are pre-placed geometry that
 resolves a style name (moved to the decisions log), and `PageSetup::default()` keeps zero margins

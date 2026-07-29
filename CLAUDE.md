@@ -137,7 +137,13 @@ measured and drawn the same number, and 0070 was not expressible until 0069 sett
 ink. **Spec 0071 then compressed the content streams** — added by a measurement 0068 took rather
 than assumed, and the last stream in the file that was not `FlateDecode`'d: the 500-page synthetic
 export is now 1.31 MB against the 13.76 MB it was *before* 0068, and export size is budget-gated in
-`benches/budgets.toml` rather than unwatched. M6–M7 are named, not decomposed.
+`benches/budgets.toml` rather than unwatched. **M6 is decomposed into specs 0072–0079** (the section
+is the load-bearing gap, and four of its six features are downstream of it). **0075 shipped first and
+out of sequence**, because it was the one M6 increment that fixed defects already shipping rather
+than adding a feature: a contents list taller than its frame overflowed the page, a composite could
+not cut inside a section, and — found while proving the first — a contents list laid out through
+`LayoutSession`, the path the app uses, had *always* been empty but for its own title. M7 is named,
+not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
 `String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the
