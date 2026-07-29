@@ -78,7 +78,17 @@ pub(crate) fn measure_component(
 
     // Absolute panel-local y of each place the component may be cut. Item 0 is rewritten to 0.0
     // once the walk is done, so it absorbs `repeat_h` — the invariant `PanelSplit::items` states.
+    //
+    // **Every element records one** (spec 0075), whatever the granularity. Before this a
+    // `Sections` component recorded one boundary per section, so a component whose single section
+    // was taller than a frame had no legal cut at all and was placed whole, overflowing the page.
+    // The section boundaries are now a *preference* held beside the list rather than the list
+    // itself, so a cut still falls between sections whenever one fits and has somewhere to go when
+    // none does.
     let mut boundaries: Vec<f32> = Vec::new();
+    // Which of those boundaries begins a section — the cuts a `Sections` component would rather
+    // take, as indices into the item list.
+    let mut section_starts: Vec<usize> = Vec::new();
     let mut emitted_section = false;
 
     let by_element = def.split.granularity == SplitGranularity::Elements;
@@ -154,6 +164,7 @@ pub(crate) fn measure_component(
                 // hand item 0 the prefix *alone* and the first row its own item, overfilling every
                 // continuation by exactly one row.
                 if !section.repeat {
+                    section_starts.push(boundaries.len());
                     boundaries.push(y);
                 }
                 if emitted_section {
@@ -163,7 +174,7 @@ pub(crate) fn measure_component(
                 }
                 for (i, row) in rows.iter().enumerate() {
                     let band_top = y;
-                    if i > 0 && by_element && !section.repeat {
+                    if i > 0 && !section.repeat {
                         boundaries.push(band_top);
                     }
                     // A row's height is its tallest cell: a wrapped cell must push the row down,
@@ -220,7 +231,10 @@ pub(crate) fn measure_component(
                     continue;
                 }
                 for (i, text) in runs.iter().enumerate() {
-                    if !section.repeat && (i == 0 || by_element) {
+                    if !section.repeat {
+                        if i == 0 {
+                            section_starts.push(boundaries.len());
+                        }
                         // Recorded before the section's space-above, so a fragment that begins here
                         // begins with that space rather than swallowing it.
                         boundaries.push(y);
@@ -304,6 +318,16 @@ pub(crate) fn measure_component(
                 // same inset it opens with.
                 trailing_pt: padding,
                 min_items: def.split.min_items.max(1),
+                // `Sections` prefers a section boundary and falls back to an element; `Elements`
+                // has no preference among its rows, which is what an empty list means. The item
+                // list is the same either way (spec 0075) — the granularity now chooses where a cut
+                // would rather fall, not where it is allowed to.
+                preferred: if by_element {
+                    Vec::new()
+                } else {
+                    // A cut of `k` items is a cut *before* item `k`, and item 0 is never a cut.
+                    section_starts.into_iter().filter(|k| *k > 0).collect()
+                },
                 keep_together: def.split.keep_together,
             })
         }

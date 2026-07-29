@@ -150,16 +150,21 @@ above it.
 
 ### Splitting
 
-`granularity` says what a fragment is made of when the component is cut across a frame boundary:
+`granularity` says **where a cut would rather fall** when the component is cut across a frame
+boundary. A cut may fall between any two elements whatever the setting (spec 0075); what this
+chooses is which of those the engine prefers:
 
-- `sections` — one item per emitted section. A stat block, whose attributes list is never separated
-  from itself.
-- `elements` — one item per element of a non-repeated section. A table's rows.
+- `sections` — between sections. A stat block, whose attributes list is not separated from itself
+  *when a section boundary fits*. When none does — one enormous actions list, with a frame that
+  cannot hold it — the cut falls between two elements of that section rather than nowhere, which is
+  what used to run the panel off the page.
+- `elements` — no preference; every element is as good a break as any other. A table's rows.
 - `whole` — indivisible; it moves or it does not.
 
-`min_items` is the fewest items a fragment may contain: **one** for coarse items (a whole section)
-and **two** for fine ones (a row). Two *sections* per fragment can make the smallest legal cut larger
-than a frame, at which point nothing is cut and the panel runs off the page.
+`min_items` is the fewest **elements** a fragment may contain: **one** for a component whose
+elements are coarse (a section's single run) and **two** for fine ones (a row). A minimum large
+enough to price the smallest legal fragment above a frame means nothing is cut and the panel runs
+off the page, which is the failure this number is chosen against.
 
 A section marked `"repeat": true` is the prefix every continuation re-states — a table's header row.
 It must come **before every ordinary section**: the interpreter builds the prefix from everything

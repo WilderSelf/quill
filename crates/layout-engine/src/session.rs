@@ -242,6 +242,34 @@ impl LayoutSession {
         let context = context_fingerprint(doc, headings);
         let context_changed = self.primed && context != self.previous_context;
 
+        // A contents block is measured from the heading index, and the index is deliberately *not*
+        // in `MeasureKey` — `content_fingerprint` says why: it is context, and hashing it into the
+        // key would re-measure every contents block whenever any heading moved, even when the
+        // entries it lists did not change.
+        //
+        // Nothing then evicted it, so a cached contents measurement outlived the index it was
+        // derived from. **The fixpoint's second pass served the first pass's list from cache**, and
+        // the first pass runs with an empty index by construction — so every document laid out
+        // through a session placed a contents list consisting of nothing but its own title, on
+        // every pass, for ever. Found by spec 0075, which could not otherwise show a contents list
+        // spanning frames in the path the app actually uses.
+        //
+        // The eviction is exactly as narrow as the derivation: contents blocks only, and only when
+        // the context they derive from moved. That is one re-measure per contents block per pass —
+        // what a derived block costs — and it leaves every other cache entry, and therefore
+        // `incremental_blocks_measured`, alone.
+        if context_changed {
+            let derived: std::collections::BTreeSet<BlockId> = doc
+                .content
+                .iter()
+                .filter(|b| matches!(b, Block::Toc { .. }))
+                .map(|b| b.id())
+                .collect();
+            if !derived.is_empty() {
+                self.cache.retain(|k, _| !derived.contains(&k.block));
+            }
+        }
+
         // The first block whose identity or content differs. Everything before it flowed exactly as
         // it did last time, so the pages containing it are still correct.
         let dirty_from = if !self.primed || context_changed {
@@ -924,6 +952,69 @@ mod tests {
     }
 
     #[test]
+    fn incremental_matches_a_full_relayout_around_a_split_contents_list() {
+        // Spec 0075 gave the contents list break opportunities, so a page boundary can now fall
+        // *inside* one — a checkpoint with `split_at > 0` on a derived block. That is the resume
+        // contract spec 0044 flagged as the hazard, reached by a new route: the contents list is
+        // regenerated from the heading index on every pass, so a stale offset into it would resume
+        // against a different item list and diverge silently.
+        //
+        // The edit is placed after the contents list, where it moves page numbers and therefore
+        // re-derives the very block the checkpoint sits inside.
+        use quill_core_model::Color;
+        let mut doc = doc_of(500);
+        doc.content.insert(
+            0,
+            Block::Toc {
+                id: BlockId::UNASSIGNED,
+                title: "Contents".into(),
+                max_level: 6,
+                color: Color::Gray { v: 0.0 },
+            },
+        );
+        for i in (5..500).step_by(4) {
+            let id = doc.content[i].id();
+            doc.content[i] = Block::heading(1, format!("Chapter number {i}"), INK);
+            doc.content[i].set_id(id);
+        }
+        doc.assign_missing_block_ids().expect("ids");
+
+        let mut probe = LayoutSession::new();
+        let first = probe.relayout(&doc, &MONO, &NoHyphenator);
+        let toc_id = doc.content[0].id();
+        let toc_pages: std::collections::BTreeSet<usize> = first
+            .pages
+            .iter()
+            .filter(|p| {
+                p.blocks.iter().any(
+                    |b| matches!(b, crate::PlacedBlock::Text { source, .. } if *source == toc_id),
+                )
+            })
+            .map(|p| p.index)
+            .collect();
+        assert!(
+            toc_pages.len() >= 2,
+            "the fixture must produce a contents list that straddles a page boundary: {toc_pages:?}"
+        );
+
+        let mut edited = doc.clone();
+        edit(
+            &mut edited,
+            400,
+            "a replacement paragraph of a quite different length, long enough that it too runs \
+             over several lines and rebreaks everything after it",
+        );
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+        let incremental = session.relayout(&edited, &MONO, &NoHyphenator);
+        let full = crate::lay_out(&edited, &MONO, &NoHyphenator);
+        assert_eq!(
+            incremental.pages, full,
+            "incremental diverged from a full layout across a split contents list"
+        );
+    }
+
+    #[test]
     fn a_first_pass_matches_a_full_layout_exactly() {
         // The session must not be a second layout implementation. If incremental and full layout
         // could disagree, the document would look different depending on how you arrived at it.
@@ -1562,6 +1653,30 @@ mod tests {
             "a document with a contents block runs the fixpoint"
         );
         assert_eq!(first.headings.len(), 2);
+
+        // **The entries have to reach the page**, not merely the index. Before spec 0075 this test
+        // asserted only `first.headings`, and a session placed a contents list of nothing but its
+        // own title — the cached measurement outlived the index it came from. An assertion about a
+        // derived value that never looks at what was drawn is the shape of test that lets that
+        // through.
+        let toc_id = doc.content[0].id();
+        let entries: Vec<String> = first
+            .pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                crate::PlacedBlock::Text { source, lines, .. } if *source == toc_id => {
+                    Some(lines[0].text.clone())
+                }
+                _ => None,
+            })
+            .filter(|t| t.starts_with("Chapter"))
+            .collect();
+        assert_eq!(
+            entries,
+            ["Chapter 30", "Chapter 70"],
+            "the session must place the entries, not just index them"
+        );
 
         // Renaming a chapter must reach the contents list.
         let id = doc.content[31].id();
