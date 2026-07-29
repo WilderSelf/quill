@@ -415,6 +415,23 @@ impl LayoutSession {
             page.index = i;
         }
 
+        // Furniture, for every page this pass emits — kept, reflowed and reused-tail alike (spec
+        // 0074). This is where the tail-page reuse defect is actually closed: the block above takes
+        // whole pages from the previous pass verbatim, including their statics, which was only ever
+        // correct while a static was a pure function of `page_index`. A `{section}` or `{heading:N}`
+        // running head is not, so a reused page kept the *previous* chapter's name — a wrong running
+        // head on a printed page, with nothing anywhere to say so.
+        //
+        // Resolving it here rather than trying to work out which reused pages are still valid is
+        // deliberate: the condition is "did any heading at or before this page move", which is every
+        // page below an edit, so the narrow version is the broad one plus a way to get it wrong.
+        // It costs one measured line per static per page and no re-measurement of any block.
+        //
+        // `heading_index` is computed once and used twice — here and in the result — rather than
+        // walked twice.
+        let headings_now = heading_index(doc, &pages);
+        crate::place_statics(template, &mut pages, &headings_now, metrics);
+
         let changed_pages = diff_pages(&previous_pages, &pages);
 
         self.pages = pages.clone();
@@ -429,7 +446,7 @@ impl LayoutSession {
                 iterations: 1,
                 converged: true,
             },
-            headings: heading_index(doc, &pages),
+            headings: headings_now,
             pages,
             stats: LayoutStats {
                 blocks_measured: measured,
@@ -1516,6 +1533,141 @@ mod tests {
             crate::heading_index(&doc, &crate::lay_out(&doc, &MONO, &NoHyphenator)),
             "and the incremental index must equal a full pass's"
         );
+    }
+
+    // ----- spec 0074: a reused page's furniture is derived from content, not from its number -----
+
+    /// A document of two chapters, whose `body` master carries a `{heading:1}` running head.
+    fn doc_with_running_head(chapters: &[&str], lines: usize) -> Document {
+        let margins = Margins {
+            top_pt: 54.0,
+            bottom_pt: 54.0,
+            inside_pt: 54.0,
+            outside_pt: 40.0,
+        };
+        let mut doc = doc_of(0);
+        doc.master_pages = vec![MasterPage {
+            margins: Some(margins),
+            statics: vec![quill_core_model::MasterStatic::text(
+                quill_core_model::Rect {
+                    x_pt: 54.0,
+                    y_pt: 606.0,
+                    w_pt: 338.0,
+                    h_pt: 12.0,
+                },
+                "{heading:1}",
+                INK,
+            )],
+            ..MasterPage::plain("body")
+        }];
+        doc.default_master = Some("body".into());
+        doc.pages.clear();
+        doc.page_setup.margins = margins;
+        doc.content = Vec::new();
+        for (c, name) in chapters.iter().enumerate() {
+            doc.content.push(Block::heading(1, *name, INK));
+            doc.content.extend((0..lines).map(|i| {
+                Block::body(
+                    format!("chapter {c} paragraph {i} with enough words to occupy a line or so"),
+                    INK,
+                )
+            }));
+        }
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    /// What a page's first static prints.
+    fn head_of(page: &crate::LaidOutPage) -> String {
+        match &page.statics[0] {
+            crate::PlacedBlock::Text { lines, .. } => {
+                lines.iter().map(|l| l.text.as_str()).collect::<String>()
+            }
+            other => panic!("expected a text static, got {other:?}"),
+        }
+    }
+
+    /// **The defect spec 0074 had to fix before it could ship, and it was real.**
+    ///
+    /// `pass` reuses whole tail pages verbatim once the flow re-converges, re-asserting nothing but
+    /// `page.index`. That is sound exactly while a static is a pure function of the page number — and
+    /// `LaidOutPage::statics`' own doc comment used to say so. A `{heading:1}` running head is not:
+    /// rename chapter one and every reused page below the edit keeps printing the **old** title, in
+    /// the path the app actually uses, with nothing anywhere to say so. It is spec 0075's shape (a
+    /// derived thing outliving its context) at a site 0075 did not reach.
+    ///
+    /// The rename is chosen not to move a single line break, which is what makes the flow re-converge
+    /// at the very next page and the tail reuse actually happen — asserted, because a fixture that
+    /// quietly stopped reusing pages would pass this test while proving nothing.
+    #[test]
+    fn a_reused_tail_page_carries_the_current_chapters_running_head() {
+        let mut doc = doc_with_running_head(&["The Ruined Keep", "The Deep Road"], 60);
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator);
+        let total = before.pages.len();
+        assert!(total > 3, "need a multi-page document, got {total}");
+        assert_eq!(head_of(&before.pages[0]), "The Ruined Keep");
+
+        // Rename chapter one in place: same id, same one-line height, so nothing repaginates.
+        let id = doc.content[0].id();
+        doc.content[0] = Block::heading(1, "The Sunken Vault", INK);
+        doc.content[0].set_id(id);
+        doc.bump_revision();
+
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(after.pages.len(), total, "the rename must not repaginate");
+        assert!(
+            after.stats.pages_reused > 0,
+            "the fixture must actually reuse pages, or this proves nothing"
+        );
+
+        let second = after.headings[1].page_index;
+        for page in &after.pages {
+            let want = if page.index < second {
+                "The Sunken Vault"
+            } else {
+                "The Deep Road"
+            };
+            assert_eq!(head_of(page), want, "page {}", page.index);
+        }
+
+        // And the strongest form of the same claim: the incremental pages are the cold pass's,
+        // furniture included.
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&doc, &MONO, &NoHyphenator),
+            "a session's pages must equal a full pass's, statics included"
+        );
+    }
+
+    /// The other half: a document whose furniture uses no spec-0074 token is untouched by any of
+    /// this. Same reuse, same statics, and the running head is still the literal string it was.
+    #[test]
+    fn a_literal_running_head_is_unchanged_by_the_statics_post_pass() {
+        let mut doc = doc_with_running_head(&["The Ruined Keep", "The Deep Road"], 60);
+        let quill_core_model::MasterStatic::Text { text, .. } = &mut doc.master_pages[0].statics[0]
+        else {
+            panic!("the fixture's static is text");
+        };
+        *text = "The Ruined Keep — {page}".into();
+
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator);
+        let total = before.pages.len();
+        edit(&mut doc, 5, "a short replacement paragraph");
+        let after = session.relayout(&doc, &MONO, &NoHyphenator);
+
+        assert!(after.stats.pages_reused > 0);
+        for page in &after.pages {
+            assert_eq!(
+                head_of(page),
+                format!("The Ruined Keep — {}", page.index + 1),
+                "page {}",
+                page.index
+            );
+        }
+        assert_eq!(after.pages.len(), total);
     }
 
     #[test]

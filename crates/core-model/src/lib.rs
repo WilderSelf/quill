@@ -1415,9 +1415,10 @@ impl StaticAlign {
 pub enum MasterStatic {
     /// A line of text at a fixed position — a running head, a folio, a footer.
     ///
-    /// `text` may contain `{page}`, replaced with the one-based page number when the page is laid
-    /// out. A token rather than a distinct "folio" variant, so a running head can read
-    /// "The Dungeon — 42" without needing a second element type.
+    /// `text` may contain any [`StaticToken`] — `{page}`, `{section}`, `{heading:N}` — replaced when
+    /// the page is laid out. Tokens rather than distinct "folio" and "running head" variants, so one
+    /// static can read "The Dungeon — 42" without needing a second element type, and so a new
+    /// derived string costs a token rather than a variant every consumer must learn.
     Text {
         /// Where the line sits, relative to the trim box — **as it looks on a recto** when
         /// `mirror` is set.
@@ -1489,8 +1490,142 @@ impl MasterStatic {
     }
 }
 
-/// The page-number token replaced in [`MasterStatic::Text`].
+/// The page-number token replaced in [`MasterStatic::Text`] — see [`StaticToken::Page`].
 pub const PAGE_TOKEN: &str = "{page}";
+
+/// The section-name token (spec 0074) — see [`StaticToken::Section`].
+pub const SECTION_TOKEN: &str = "{section}";
+
+/// The opening of the heading token (spec 0074): `{heading:1}`, `{heading:2}`, …
+///
+/// A prefix rather than a whole spelling because the token carries a level. See
+/// [`StaticToken::Heading`].
+pub const HEADING_TOKEN_PREFIX: &str = "{heading:";
+
+/// Everything a [`StaticToken`] can draw, for the font-subset collector (spec 0074).
+///
+/// Two collections for the reason `FaceText` has two: since spec 0068 the writer draws *shaped*
+/// glyphs, so a token whose resolved value is a knowable string contributes that string as a **run**
+/// — its ligatures are cut into the subset — while a token whose value is arithmetic rather than
+/// authored text can only offer the alphabet it will be written in, one character at a time.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenText {
+    /// Whole strings this token can resolve to.
+    pub runs: Vec<String>,
+    /// Loose characters, where the exact string is not knowable before layout.
+    pub chars: BTreeSet<char>,
+}
+
+/// A token in a [`MasterStatic::Text`] that is resolved when the page is laid out (spec 0074).
+///
+/// **This enum is the one list of layout-time tokens, and that is the point of it.** The font-subset
+/// collector runs *before* layout, so every character a token will become has to be predicted; a
+/// character it misses is a `.notdef` box in a press file with no error anywhere, which is
+/// `CLAUDE.md`'s silent-press-corruption class and which this exact site has been caught by twice
+/// (PR #107, and spec 0073's roman folio). Three properties close it structurally rather than by
+/// remembering:
+///
+/// 1. [`StaticToken::scan`] is the **only** way to find a token in a string, and both the resolver
+///    (`quill_layout_engine::resolve_static_text`) and the collector (`collect_doc_faces`) call it.
+///    A spelling the parser does not know is resolved by nobody, so the two cannot disagree about
+///    what a token *is*.
+/// 2. [`StaticToken::contributes`] is an exhaustive `match`. A new variant does not compile until it
+///    says what characters it can draw.
+/// 3. The resolver's `match` is exhaustive too, so a new variant does not compile there either.
+///
+/// Adding a token therefore fails to build until the collector has been taught about it. There is no
+/// comment to remember and no runtime check to skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StaticToken {
+    /// `{page}` — the page's folio (spec 0073): one-based arabic unless a section says otherwise.
+    Page,
+    /// `{section}` — the [`Section::name`] of the section the page belongs to (spec 0074).
+    Section,
+    /// `{heading:N}` — the text of the last heading of level ≤ `N` at or before this page.
+    ///
+    /// `{heading:1}` is "the current chapter", which is what a running head almost always wants;
+    /// `{heading:2}` follows the sub-section as well, which is what a reference book's verso wants.
+    Heading { level: u8 },
+}
+
+impl StaticToken {
+    /// Every token occurrence in `text`, in order, as (byte range, token).
+    ///
+    /// The single parser. A `{…}` group whose body is not a token this build knows is left alone and
+    /// prints literally — the same posture a dangling master name and a dangling style name already
+    /// have, and the reason an older build's handling of a newer token is *loud* rather than silent.
+    pub fn scan(text: &str) -> Vec<(std::ops::Range<usize>, StaticToken)> {
+        let mut out = Vec::new();
+        let mut cursor = 0;
+        while let Some(open) = text[cursor..].find('{') {
+            let start = cursor + open;
+            let Some(close) = text[start..].find('}') else {
+                break;
+            };
+            let end = start + close + 1;
+            if let Some(token) = StaticToken::parse(&text[start..end]) {
+                out.push((start..end, token));
+            }
+            cursor = end;
+        }
+        out
+    }
+
+    /// One whole `{…}` group, or `None` if it spells no token.
+    fn parse(whole: &str) -> Option<StaticToken> {
+        if whole == PAGE_TOKEN {
+            return Some(StaticToken::Page);
+        }
+        if whole == SECTION_TOKEN {
+            return Some(StaticToken::Section);
+        }
+        let level = whole
+            .strip_prefix(HEADING_TOKEN_PREFIX)?
+            .strip_suffix('}')?
+            .parse()
+            .ok()?;
+        Some(StaticToken::Heading { level })
+    }
+
+    /// Everything this token can draw in `doc` — what the font-subset collector must carry.
+    ///
+    /// Deliberately **not** conditioned on where anything landed, for [`Document::folio_formats`]'s
+    /// reason: a section name is in the set whether or not that section is placed today. Embedding a
+    /// few characters nobody draws costs a few hundred bytes; failing to embed one that is drawn is a
+    /// `.notdef` box in a press file.
+    pub fn contributes(&self, doc: &Document) -> TokenText {
+        match self {
+            // A folio is arithmetic, not authored text: what it will say is not known until the
+            // sections have been placed, so what is carried is the alphabet each configured format
+            // can write (spec 0073).
+            StaticToken::Page => TokenText {
+                runs: Vec::new(),
+                chars: doc
+                    .folio_formats()
+                    .into_iter()
+                    .flat_map(|f| f.alphabet())
+                    .collect(),
+            },
+            // Authored text, and knowable exactly — so it travels as a run and its ligatures are cut
+            // into the subset like any other run's.
+            StaticToken::Section => TokenText {
+                runs: doc.sections.iter().map(|s| s.name.clone()).collect(),
+                chars: BTreeSet::new(),
+            },
+            // Every heading this token could reach. A deeper level is a superset of a shallower one,
+            // so the level really does narrow what is carried.
+            StaticToken::Heading { level } => TokenText {
+                runs: doc
+                    .content
+                    .iter()
+                    .filter(|b| matches!(b, Block::Heading { level: l, .. } if l <= level))
+                    .filter_map(|b| b.plain_text())
+                    .collect(),
+                chars: BTreeSet::new(),
+            },
+        }
+    }
+}
 
 /// A named page template: the geometry and repeating furniture shared by many pages.
 ///
@@ -1959,6 +2094,32 @@ impl Document {
             run.start
                 .saturating_add((page_index - run.first_page) as u32),
         )
+    }
+
+    /// Which section `page_index` belongs to, by name (spec 0074).
+    ///
+    /// `starts` is the same list [`Document::page_assignment`] and [`Document::folio_runs`] take, and
+    /// this is pure over numbers for the same reason they are.
+    ///
+    /// A section runs from its anchor's page until the next section's anchor — the rule spec 0072
+    /// stated when it made a section a *marker* rather than a container — so this is the placed
+    /// section with the greatest start page at or before `page_index`. `None` before the first one:
+    /// a half-title ahead of every section belongs to no section, and a running head there prints
+    /// nothing rather than borrowing chapter one's name.
+    ///
+    /// Two sections on one page collapse to the **later authored** one, which is the precedence
+    /// [`Document::page_assignment`] and [`Document::folio_runs`] already give and for the same
+    /// reason: nothing re-sorts the authored list, so "later in the list" is the only tie-break that
+    /// does not depend on where the anchors happened to land.
+    pub fn section_at(&self, starts: &[Option<usize>], page_index: usize) -> Option<&str> {
+        self.sections
+            .iter()
+            .zip(starts)
+            .filter_map(|(section, start)| Some(((*start)?, section)))
+            .filter(|(start, _)| *start <= page_index)
+            // `max_by_key` yields the *last* of several equal maxima, which is the tie-break above.
+            .max_by_key(|(start, _)| *start)
+            .map(|(_, section)| section.name.as_str())
     }
 
     /// [`Document::folio_in`] against a fresh derivation — see [`Document::folio_runs`].
@@ -2874,6 +3035,111 @@ mod tests {
             doc.folio_formats(),
             BTreeSet::from([NumberFormat::Decimal, NumberFormat::LowerRoman])
         );
+    }
+
+    // --- The layout-time token set (spec 0074) --------------------------------------------------
+
+    /// One parser, and it is the reason the resolver and the font-subset collector cannot disagree
+    /// about what a token is. Both halves are asserted: what it finds, and what it leaves alone.
+    #[test]
+    fn the_token_parser_finds_every_token_and_walks_past_everything_else() {
+        assert_eq!(
+            StaticToken::scan("{section} — {heading:2} — {page}")
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect::<Vec<_>>(),
+            vec![
+                StaticToken::Section,
+                StaticToken::Heading { level: 2 },
+                StaticToken::Page
+            ]
+        );
+
+        // The ranges are what the resolver splices on, so they are part of the contract.
+        let scanned = StaticToken::scan("a{page}b");
+        assert_eq!(scanned, vec![(1..7, StaticToken::Page)]);
+
+        // A group that spells no token is not a token. That is what makes an *older* build meeting a
+        // *newer* token loud rather than silent: it prints `{section}` on the page, visibly wrong,
+        // rather than something plausible and wrong.
+        for text in [
+            "{}",
+            "{pages}",
+            "{Page}",
+            "{heading}",
+            "{heading:}",
+            "{heading:x}",
+            "{heading:1",
+            "no tokens at all",
+            "{heading:999}", // past a u8: not a level this build can mean
+        ] {
+            assert!(
+                StaticToken::scan(text).is_empty(),
+                "{text:?} spells no token"
+            );
+        }
+    }
+
+    /// What each token can draw, which is the collector's whole question. Asked of the document, so
+    /// a book that uses none of this carries nothing extra.
+    #[test]
+    fn a_token_contributes_the_text_it_can_actually_print() {
+        let mut doc = doc_with_a_section();
+        let id = doc.content[0].id();
+        doc.content[0] = Block::heading(1, "The Ruined Keep", Color::Gray { v: 0.0 });
+        doc.content[0].set_id(id);
+
+        // A folio is arithmetic: its alphabet, not a string.
+        let page = StaticToken::Page.contributes(&doc);
+        assert!(page.runs.is_empty());
+        assert!(page.chars.is_superset(&('0'..='9').collect()));
+
+        // A section name and a heading are authored text, and travel as runs so their ligatures are
+        // cut into the subset (spec 0068).
+        assert_eq!(
+            StaticToken::Section.contributes(&doc).runs,
+            vec!["Chapter One".to_string()]
+        );
+        assert_eq!(
+            StaticToken::Heading { level: 1 }.contributes(&doc).runs,
+            vec!["The Ruined Keep".to_string()]
+        );
+        assert!(StaticToken::Section.contributes(&doc).chars.is_empty());
+    }
+
+    /// Which section a page belongs to — pure arithmetic over the start pages, as
+    /// [`Document::folio_runs`] is, and with the same tie-break.
+    #[test]
+    fn a_page_belongs_to_the_last_section_that_opened_at_or_before_it() {
+        let mut doc = doc_with_a_section();
+        doc.sections = vec![
+            Section {
+                name: "Front matter".into(),
+                start: doc.content[0].id(),
+                master: None,
+                folio: None,
+            },
+            Section {
+                name: "Body".into(),
+                start: doc.content[1].id(),
+                master: None,
+                folio: None,
+            },
+        ];
+        let starts = [Some(2), Some(5)];
+
+        // Ahead of every section: no section, and no borrowing of the first one's name.
+        assert_eq!(doc.section_at(&starts, 0), None);
+        assert_eq!(doc.section_at(&starts, 1), None);
+        // A section runs until the next one's anchor.
+        assert_eq!(doc.section_at(&starts, 2), Some("Front matter"));
+        assert_eq!(doc.section_at(&starts, 4), Some("Front matter"));
+        assert_eq!(doc.section_at(&starts, 5), Some("Body"));
+        assert_eq!(doc.section_at(&starts, 500), Some("Body"));
+        // An unplaced section contributes nothing, exactly as it contributes no master assignment.
+        assert_eq!(doc.section_at(&[Some(2), None], 500), Some("Front matter"));
+        // Two on one page: the later authored one wins, as it does for a master and for a folio.
+        assert_eq!(doc.section_at(&[Some(3), Some(3)], 3), Some("Body"));
     }
 
     #[test]

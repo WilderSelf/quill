@@ -18,7 +18,7 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 use quill_core_model::{
     builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
     Color, ComponentLibrary, Document, FolioRun, ListMarker, Margins, MasterPage, MasterStatic,
-    PageOverride, PageSetup, ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN,
+    PageOverride, PageSetup, ParagraphStyle, Rect, StaticToken, StyleSheet, TextAlign,
     STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
 };
 use quill_text_layout::{
@@ -263,9 +263,16 @@ pub struct LaidOutPage {
     pub blocks: Vec<PlacedBlock>,
     /// Content the page's template contributed — running heads, folios, background art.
     ///
-    /// Kept separate from `blocks` rather than merged, for two reasons: it is drawn first (so master
-    /// art sits behind flowed content), and incremental relayout can leave it alone, since it does
-    /// not depend on where the text happened to break.
+    /// Kept separate from `blocks` because it is drawn first, so master art sits behind flowed
+    /// content.
+    ///
+    /// **Until spec 0074 this also said incremental relayout could leave it alone, "since it does
+    /// not depend on where the text happened to break". That is now false and the sentence is
+    /// removed rather than softened.** A `{section}` or `{heading:N}` running head is a function of
+    /// which content landed on the page, so a reused page's furniture can name the *previous*
+    /// chapter — a wrong running head on a printed page, produced silently. Statics are therefore
+    /// resolved by `place_statics` in one post-pass over the finished page vector, for every page,
+    /// reused or not; nothing else may fill this field.
     pub statics: Vec<PlacedBlock>,
 }
 
@@ -411,6 +418,107 @@ pub fn heading_index_with_folios(
     out
 }
 
+/// What a page's furniture may read off the document's content (spec 0074).
+///
+/// One field today, and a struct rather than a bare slice for `BlockContext`'s stated reason: the
+/// list of ambient inputs grew by one with each of specs 0026, 0028 and 0041, and passing them as a
+/// unit means the next addition changes one struct rather than every signature between here and the
+/// template. A cross-reference's resolved page (spec 0076) and a footnote's number (0077) are the
+/// next two things that will want to be here.
+#[derive(Clone, Copy)]
+pub struct StaticContext<'a> {
+    /// Where each heading landed (spec 0040), in document order — the same index a contents block
+    /// renders from, derived from the **final** page vector rather than accumulated during flow.
+    pub headings: &'a [HeadingEntry],
+}
+
+impl StaticContext<'_> {
+    /// The context a template with no content-derived furniture needs.
+    pub const EMPTY: StaticContext<'static> = StaticContext { headings: &[] };
+
+    /// The text of the last heading of level ≤ `level` at or before `page_index` — what
+    /// `{heading:N}` prints.
+    ///
+    /// "At or before" rather than "on", because a chapter's second page is still in that chapter and
+    /// carries no heading of its own. `None` before the first qualifying heading: a running head
+    /// ahead of chapter one prints nothing rather than borrowing a later chapter's name.
+    ///
+    /// A heading that opens a page names that page. That is a real decision rather than a fallout of
+    /// `<=`: the alternative — a page's running head naming the chapter it *came from* until the
+    /// next page — is what some house styles want for a verso, and it is expressible by authoring the
+    /// token on one master rather than by changing this rule.
+    pub fn heading_at(&self, page_index: usize, level: u8) -> Option<&str> {
+        self.headings
+            .iter()
+            .rfind(|h| h.level <= level && h.page_index <= page_index)
+            .map(|h| h.text.as_str())
+    }
+}
+
+/// Replace every layout-time token in a master static's text (spec 0074).
+///
+/// Public because it is the resolver half of the contract [`quill_core_model::StaticToken`]
+/// describes: a [`PageTemplate`] implementation that draws its own furniture should reach for this
+/// rather than write a second parser, because a second parser is a second answer to what a token is.
+///
+/// The `match` below is exhaustive, which is half of what makes adding a token without teaching the
+/// font-subset collector fail to compile — the other half is `StaticToken::contributes`.
+///
+/// A `{…}` group that spells no token is copied through untouched. That is what makes an older build
+/// meeting a newer token **loud**: it prints the literal `{section}` on the page, which is visibly
+/// wrong, rather than printing something plausible and wrong.
+pub fn resolve_static_text(
+    text: &str,
+    page_index: usize,
+    folio: &str,
+    section: Option<&str>,
+    ctx: &StaticContext<'_>,
+) -> String {
+    let tokens = StaticToken::scan(text);
+    if tokens.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (range, token) in tokens {
+        out.push_str(&text[cursor..range.start]);
+        match token {
+            StaticToken::Page => out.push_str(folio),
+            StaticToken::Section => out.push_str(section.unwrap_or_default()),
+            StaticToken::Heading { level } => {
+                out.push_str(ctx.heading_at(page_index, level).unwrap_or_default())
+            }
+        }
+        cursor = range.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Resolve every page's furniture, once, over the finished page vector (spec 0074).
+///
+/// **The one place [`LaidOutPage::statics`] is filled**, and that is the whole structural answer to
+/// the tail-page-reuse defect. Furniture used to be stamped on a page as the flow created it, which
+/// was sound only while a static was a pure function of `page_index`; the incremental session reuses
+/// whole pages verbatim and re-asserts nothing but `page.index`, so a `{heading:1}` running head on
+/// a reused page would have kept naming the chapter that was there before the edit. Running over
+/// every page — reused, kept and reflowed alike — makes that unrepresentable rather than guarded
+/// against.
+///
+/// Costs no extra layout pass: statics are furniture, consume no flow space, and so cannot move a
+/// line break (the M6 audit's finding, and the reason a running head is not a fixpoint).
+pub(crate) fn place_statics(
+    template: &impl PageTemplate,
+    pages: &mut [LaidOutPage],
+    headings: &[HeadingEntry],
+    metrics: &impl RunMetrics,
+) {
+    let ctx = StaticContext { headings };
+    for page in pages.iter_mut() {
+        page.statics = template.statics(page.index, metrics, &ctx);
+    }
+}
+
 /// Supplies the geometry and static content of each page.
 ///
 /// Two things in the pagination loop previously made every page identical: the page-advance branch
@@ -426,14 +534,51 @@ pub trait PageTemplate {
     /// Must be non-empty; a page with nowhere to put content would silently drop it.
     fn frames(&self, page_index: usize) -> Vec<Frame>;
 
-    /// Content the template draws on `page_index`, independent of what flows there.
+    /// Content the template draws on `page_index`.
     ///
     /// `metrics` is the same run-metrics the page's text is broken with. Furniture needs it because
     /// a static can be aligned within its rect (spec 0047), and "centred" is a statement about the
     /// line's measured width — resolving it anywhere else would mean measuring text twice, in two
     /// crates, and hoping the two agree.
-    fn statics(&self, _page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
+    ///
+    /// `ctx` is the **content channel** spec 0074 added: `{heading:N}` names the chapter a page is
+    /// in, which is not a function of the page number. It is a parameter rather than a field on the
+    /// template because the heading index is derived from the laid-out pages — the template is built
+    /// before there are any — and because `BlockContext::headings` is the same channel for the same
+    /// quantity one layer down.
+    ///
+    /// Called by `place_statics` and nowhere else, once per page, *after* the flow. Resolving
+    /// furniture during the flow would have to use the previous pass's heading index, which is stale
+    /// by exactly the amount the pass just changed; resolving it afterwards costs zero extra passes,
+    /// which is sound only because furniture consumes no flow space and so cannot move a line break.
+    fn statics(
+        &self,
+        _page_index: usize,
+        _metrics: &dyn RunMetrics,
+        _ctx: &StaticContext<'_>,
+    ) -> Vec<PlacedBlock> {
         Vec::new()
+    }
+
+    /// The name of the section `page_index` belongs to (spec 0074), or `None`.
+    ///
+    /// On the template for [`PageTemplate::folio`]'s reason, and it is the same shape: the sections'
+    /// start pages are derived by [`PageTemplate::reassign`] and live on the template, so the
+    /// template is the only thing that can answer. The default is `None` — a template that knows
+    /// nothing about sections has no section to name, and `{section}` prints nothing there.
+    fn section_name(&self, _page_index: usize) -> Option<String> {
+        None
+    }
+
+    /// Whether this template's furniture reads the heading index — i.e. uses `{heading:N}`.
+    ///
+    /// Purely a cost question, and it exists because deriving the heading index is a walk over every
+    /// placed block. A document whose masters use no heading token must not pay for one, which is
+    /// what makes "a document using no new token lays out exactly as it did before" a measurable
+    /// claim rather than a hope. Derived from [`quill_core_model::StaticToken::scan`] rather than
+    /// from a hand-kept flag, so it cannot disagree with the resolver about what a token is.
+    fn statics_read_headings(&self) -> bool {
+        false
     }
 
     /// The baseline grid this template's pages are set to (spec 0058), or `None` for none.
@@ -638,10 +783,19 @@ impl PageTemplate for DocumentTemplate<'_> {
             .filter(BaselineGrid::is_usable)
     }
 
-    fn statics(&self, page_index: usize, metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
+    fn statics(
+        &self,
+        page_index: usize,
+        metrics: &dyn RunMetrics,
+        ctx: &StaticContext<'_>,
+    ) -> Vec<PlacedBlock> {
         let Some(master) = self.master(page_index) else {
             return Vec::new();
         };
+        // Resolved once for the page rather than once per static: both read a `RefCell` the flow
+        // loop holds only shared access to, and a master may carry several statics.
+        let folio = self.folio(page_index);
+        let section = self.section_name(page_index);
         master
             .statics
             .iter()
@@ -657,9 +811,13 @@ impl PageTemplate for DocumentTemplate<'_> {
                         align,
                         ..
                     } => {
-                        // The page's folio (spec 0073): one-based arabic unless a section says
-                        // otherwise, which is what every document without folio formats gets.
-                        let resolved = text.replace(PAGE_TOKEN, &self.folio(page_index));
+                        // Every layout-time token at once (spec 0074), through the one parser the
+                        // font-subset collector also reads: `{page}` is the page's folio (spec
+                        // 0073), `{section}` its section's name, `{heading:N}` the chapter it is
+                        // in. A static with no token is returned unchanged, so a document that uses
+                        // none of them resolves to exactly the string it always did.
+                        let resolved =
+                            resolve_static_text(text, page_index, &folio, section.as_deref(), ctx);
                         let ps = style
                             .as_deref()
                             .and_then(|n| self.styles.paragraph.get(n).copied())
@@ -746,6 +904,28 @@ impl PageTemplate for DocumentTemplate<'_> {
 
     fn folio(&self, page_index: usize) -> String {
         Document::folio_in(&self.derived.borrow().folio_runs, page_index)
+    }
+
+    fn section_name(&self, page_index: usize) -> Option<String> {
+        // Off the same `starts` the assignment and the folio runs come from (spec 0072), so a
+        // running head, a chapter opener's master and a roman folio cannot disagree about which page
+        // a section begins on.
+        self.doc
+            .section_at(&self.derived.borrow().starts, page_index)
+            .map(str::to_string)
+    }
+
+    fn statics_read_headings(&self) -> bool {
+        self.doc
+            .master_pages
+            .iter()
+            .flat_map(|m| &m.statics)
+            .any(|s| match s {
+                MasterStatic::Text { text, .. } => StaticToken::scan(text)
+                    .iter()
+                    .any(|(_, t)| matches!(t, StaticToken::Heading { .. })),
+                MasterStatic::Image { .. } => false,
+            })
     }
 
     fn derived_fingerprint(&self) -> u64 {
@@ -2091,6 +2271,24 @@ fn lay_out_resolved(
         reassigned = template.reassign(&pages);
         iterations += 1;
     };
+
+    // Furniture last, once, over the settled page vector (spec 0074) — **not** inside `once`, and
+    // that is the whole reason a content-derived running head costs zero extra passes. A static
+    // consumes no flow space, so resolving it after the flow cannot change the flow; resolving it
+    // *during* the flow would have to read the previous iterate's heading index, and correcting that
+    // would be another pass.
+    //
+    // The index is re-derived from the final pages rather than reusing the loop's `headings`, which
+    // is the index the last pass was laid out *with* and is one iterate stale on a document that
+    // failed to converge. Skipped entirely unless some master actually uses `{heading:N}`, so a
+    // document that does not costs exactly what it cost before this increment.
+    let heads = if template.statics_read_headings() {
+        heading_index_of(content, &pages)
+    } else {
+        Vec::new()
+    };
+    place_statics(template, &mut pages, &heads, metrics);
+
     (
         pages,
         FixpointStatus {
@@ -2259,7 +2457,10 @@ pub(crate) fn flow(
     let mut page = LaidOutPage {
         index: page_index,
         blocks: Vec::new(),
-        statics: template.statics(page_index, metrics),
+        // Left empty here and filled by `place_statics` once the pass is over (spec 0074). A
+        // `{heading:N}` running head is a function of what landed on the page, which the flow does
+        // not know until it has finished laying it out.
+        statics: Vec::new(),
     };
     // Which frame on the current page the cursor is filling.
     let mut frame_idx: usize = start.frame_idx;
@@ -2397,7 +2598,7 @@ pub(crate) fn flow(
                         page = LaidOutPage {
                             index: page_index,
                             blocks: Vec::new(),
-                            statics: template.statics(page_index, metrics),
+                            statics: Vec::new(), // see above: `place_statics` fills these
                         };
                         frame_idx = 0;
                         // Record where the new page begins, so a later edit can resume from here.
@@ -2701,7 +2902,7 @@ mod tests {
     }
     use quill_core_model::{
         Asset, Block, Color, Document, Metadata, PageOverride, PageSetup, Size, StaticAlign,
-        BODY_STYLE,
+        BODY_STYLE, PAGE_TOKEN,
     };
     use quill_text_layout::{Hyphenator, MonospaceRunMetrics, NoHyphenator};
     use quill_text_layout::{BODY_FONT_SIZE_PT, BODY_LINE_HEIGHT_PT};
@@ -3683,7 +3884,12 @@ mod tests {
                 },
             }]
         }
-        fn statics(&self, page_index: usize, _metrics: &dyn RunMetrics) -> Vec<PlacedBlock> {
+        fn statics(
+            &self,
+            page_index: usize,
+            _metrics: &dyn RunMetrics,
+            _ctx: &StaticContext<'_>,
+        ) -> Vec<PlacedBlock> {
             vec![PlacedBlock::Text {
                 run_formats: Vec::new(),
                 run_shifts: Vec::new(),
@@ -7345,6 +7551,219 @@ mod tests {
         );
     }
 
+    // --- Running heads derived from content (spec 0074) -----------------------------------------
+
+    /// `doc_with_folio`'s master, over content that is `chapters` chapters of `lines` body blocks
+    /// each — enough for a chapter boundary to fall inside the document rather than at its edge.
+    fn doc_with_running_head(text: &str, chapters: &[&str], lines: usize) -> Document {
+        let mut content = Vec::new();
+        for (c, name) in chapters.iter().enumerate() {
+            content.push(Block::heading(1, *name, Color::Gray { v: 0.0 }));
+            content.extend(
+                (0..lines).map(|i| Block::body(format!("c{c}l{i}"), Color::Gray { v: 0.0 })),
+            );
+        }
+        let mut doc = doc_with_folio(StaticAlign::Left, false, text);
+        doc.content = content;
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh blocks");
+        doc
+    }
+
+    /// The headline of spec 0074, asserted on the **placed static text**: a running head naming the
+    /// current chapter says one thing before the chapter boundary and another after it.
+    ///
+    /// Both halves are asserted for spec 0072's reason. A test that only checked the second chapter's
+    /// pages would pass against an implementation that printed the *last* heading of the document
+    /// everywhere, and one that only checked the first would pass against one that never updated.
+    #[test]
+    fn a_running_head_names_the_current_chapter_and_changes_at_the_boundary() {
+        let doc = doc_with_running_head("{heading:1}", &["The Ruined Keep", "The Deep Road"], 60);
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+
+        let index = heading_index_of(&doc.content, &pages);
+        assert_eq!(index.len(), 2, "two chapters");
+        let second = index[1].page_index;
+        assert!(
+            second > 0 && second < pages.len(),
+            "want the second chapter to open inside the document, got {second} of {}",
+            pages.len()
+        );
+
+        for page in &pages {
+            let want = if page.index < second {
+                "The Ruined Keep"
+            } else {
+                "The Deep Road"
+            };
+            assert_eq!(static_text(page), want, "page {}", page.index);
+        }
+    }
+
+    /// `{section}` and `{heading:1}` are different questions, so the fixture makes them disagree:
+    /// the section is anchored to a **body** block a third of the way into chapter one, so its start
+    /// page is not the chapter's start page and neither token can be mistaken for the other.
+    ///
+    /// It also pins the two edges the mechanism has. A page ahead of every section belongs to no
+    /// section and prints nothing for `{section}` — it does not borrow the first section's name — and
+    /// `{heading:2}` follows a sub-heading that `{heading:1}` ignores.
+    #[test]
+    fn a_section_name_and_a_chapter_name_are_two_different_strings() {
+        use quill_core_model::Section;
+
+        let mut doc = doc_with_running_head(
+            "[{section}][{heading:1}][{heading:2}]",
+            &["The Ruined Keep"],
+            120,
+        );
+        // A sub-heading well inside the chapter, and a section anchored to a body block after it.
+        // Neither coincides with the chapter's own start.
+        doc.content.insert(
+            60,
+            Block::heading(2, "The Undercroft", Color::Gray { v: 0.0 }),
+        );
+        doc.assign_missing_block_ids()
+            .expect("the inserted heading");
+        let anchor = doc.content[90].id();
+        doc.sections = vec![Section {
+            name: "Part One".into(),
+            start: anchor,
+            master: None,
+            folio: None,
+        }];
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let index = heading_index_of(&doc.content, &pages);
+        let chapter = index[0].page_index;
+        let sub = index[1].page_index;
+        let section = section_starts(&doc, &pages)[0].expect("the section is placed");
+        assert!(
+            chapter < sub && sub < section && section < pages.len(),
+            "the fixture must separate all three: chapter {chapter}, sub-heading {sub}, section \
+             {section}, of {} pages",
+            pages.len()
+        );
+
+        for page in &pages {
+            let want = format!(
+                "[{}][{}][{}]",
+                if page.index >= section {
+                    "Part One"
+                } else {
+                    ""
+                },
+                if page.index >= chapter {
+                    "The Ruined Keep"
+                } else {
+                    ""
+                },
+                if page.index >= sub {
+                    "The Undercroft"
+                } else if page.index >= chapter {
+                    "The Ruined Keep"
+                } else {
+                    ""
+                },
+            );
+            assert_eq!(static_text(page), want, "page {}", page.index);
+        }
+        // And the fixture really does exercise the disagreement, rather than asserting a formula
+        // against itself: at least one page prints a section name and a different chapter name.
+        assert!(
+            pages
+                .iter()
+                .any(|p| static_text(p).starts_with("[Part One][The Ruined Keep]")),
+            "want a page where the two tokens print different strings"
+        );
+    }
+
+    /// What a content-derived running head costs the fixpoint, measured rather than assumed.
+    ///
+    /// Spec 0073 corrected the M6 audit here once already: "furniture consumes no flow space" proves
+    /// a folio cannot move a **line break**, but a *section's* start page is not known until its
+    /// anchor is placed, so a folio still costs one resolving pass. The honest question this
+    /// increment owes is whether a heading-derived running head costs another, and it does not — the
+    /// heading index is derived from the finished page vector by a post-pass, so it is resolved
+    /// against pages that already exist.
+    ///
+    /// Floor and ceiling, in `a_folio_format_costs_the_fixpoint_exactly_one_resolving_pass`'s style:
+    /// a document with a `{heading:1}` running head and no sections takes exactly the one pass a
+    /// document with no tokens at all takes, and adding a section takes exactly the one more that
+    /// section already cost before this increment.
+    #[test]
+    fn a_content_derived_running_head_costs_the_fixpoint_no_extra_pass() {
+        use quill_core_model::Section;
+
+        let passes = |doc: &Document| {
+            lay_out_with_fixpoint_status(
+                &doc.content,
+                &doc.assets,
+                &doc.styles,
+                &DocumentTemplate::new(doc),
+                &MONO,
+                &NoHyphenator,
+            )
+            .1
+        };
+
+        let plain = doc_with_running_head("Chapter", &["The Ruined Keep", "The Deep Road"], 60);
+        let derived = doc_with_running_head(
+            "{section} {heading:1}",
+            &["The Ruined Keep", "The Deep Road"],
+            60,
+        );
+        let mut sectioned = derived.clone();
+        sectioned.sections = vec![Section {
+            name: "Part One".into(),
+            start: sectioned.content[0].id(),
+            master: None,
+            folio: None,
+        }];
+
+        let (base, with_tokens, with_section) =
+            (passes(&plain), passes(&derived), passes(&sectioned));
+        assert!(base.converged && with_tokens.converged && with_section.converged);
+        assert_eq!(base.iterations, 1, "a literal running head derives nothing");
+        assert_eq!(
+            with_tokens.iterations, 1,
+            "a content-derived running head is resolved after the flow, so it costs zero further \
+             passes — this is the audit's 'not a fixpoint', asserted"
+        );
+        assert_eq!(
+            with_section.iterations, 2,
+            "a section still costs its one resolving pass (spec 0073), and the running head adds \
+             nothing to it"
+        );
+    }
+
+    /// A document that uses none of spec 0074's tokens must lay out exactly as it did before, and
+    /// "exactly" is asserted against the rule that shipped rather than against a golden captured
+    /// after the change: every static resolves to its text with `{page}` replaced by the page's
+    /// folio, and nothing else.
+    ///
+    /// The export half of the same claim is `SAMPLE_EXPORT_DIGEST`, which did not move.
+    #[test]
+    fn a_document_using_no_new_token_resolves_exactly_as_before() {
+        for text in [
+            "Folio {page}",
+            "The Ruined Keep",
+            "{page}",
+            "{unknown} {page}",
+        ] {
+            let doc = doc_with_folio(StaticAlign::Left, false, text);
+            let pages = lay_out(&doc, &MONO, &NoHyphenator);
+            assert!(pages.len() >= 3);
+            for page in &pages {
+                assert_eq!(
+                    static_text(page),
+                    text.replace(PAGE_TOKEN, &(page.index + 1).to_string()),
+                    "page {}",
+                    page.index
+                );
+            }
+        }
+    }
+
     /// The x of a page's first static.
     fn static_x(page: &LaidOutPage) -> f32 {
         match &page.statics[0] {
@@ -7689,7 +8108,10 @@ mod tests {
             }
             other => panic!("expected text, got {other:?}"),
         }
-        assert_eq!(pages[0].statics, template.statics(0, &MONO));
+        assert_eq!(
+            pages[0].statics,
+            template.statics(0, &MONO, &StaticContext::EMPTY)
+        );
 
         for (page, expected_left) in [(0usize, 54.0f32), (1, 40.0)] {
             // The text frame: margins mirror across the spread, as they did in v2.
@@ -7701,7 +8123,7 @@ mod tests {
 
             // The folio: unmirrored and left-aligned, so x is the authored 40 on *both* pages —
             // spec 0036's fore-edge inset, preserved exactly.
-            let statics = template.statics(page, &MONO);
+            let statics = template.statics(page, &MONO, &StaticContext::EMPTY);
             match &statics[0] {
                 PlacedBlock::Text { frame, lines, .. } => {
                     assert_eq!(frame.x_pt, 40.0, "page {page} folio");

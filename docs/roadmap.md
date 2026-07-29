@@ -2576,9 +2576,11 @@ page — the same class as spec 0047's verso gutter, which did bump.
 
 **0073 and 0074 next because they are the cheap ones and they prove 0072.** A section nobody can see
 is not obviously right; a roman folio and a running head that names its chapter are what make it
-visible. 0074 also carries two corrections it must not skip: the font-subset collector hardcodes
-`{page}` as the only layout-time token (see known issues), and tail-page reuse assumes statics are a
-pure function of `page_index`, which a content-derived running head makes false.
+visible. 0074 also carried two corrections it was not allowed to skip, and both were real: the
+font-subset collector hardcoded `{page}` as the only layout-time token — now one enum the collector
+and the resolver both read, so a new token does not compile until both know it — and tail-page reuse
+assumed statics are a pure function of `page_index`, which a content-derived running head makes false
+and which was reproducibly printing the previous chapter's name on a reused page.
 
 **0075 before the index and before footnotes, because both inherit a defect that already ships.** A
 derived block is indivisible today, so a contents list taller than its frame overflows the page — and
@@ -2661,13 +2663,39 @@ off `Section`, which only 0072 added, so no older build can be misled" is true o
 **v5** — a v5 build reads `sections` perfectly well, ignores `folio`, and numbers the front matter
 arabic without saying so. The bump is owed to v5.
 
-#### 0074 running heads derived from content
+#### 0074 running heads derived from content — **SHIPPED**
 
-`{section}` and `{heading:1}` beside `{page}`, resolved from spec 0040's heading index. `PAGE_TOKEN`
-becomes a token set and `PageTemplate::statics` needs a content channel. Not a fixpoint. Two things
-it must not skip are recorded as known issues below. Note the heading index's `text` is flattened by
-`Block::plain_text`, so a running head cannot carry a chapter title's inline runs — state that as a
-non-goal with the residual, or fix it.
+`{section}` and `{heading:N}` beside `{page}`, resolved from spec 0040's heading index.
+`specs/0074-running-heads.md`. **Not a fixpoint, and that is now measured rather than asserted**: a
+`{heading:1}` running head converges in exactly one pass, the same as a document with no tokens, and a
+section still costs exactly the one resolving pass 0073 charged. What made it free is that furniture
+is resolved in a **post-pass** over the finished page vector rather than during the flow — resolving
+it during the flow could only read the previous iterate's heading index, and correcting that would
+have been the extra pass.
+
+**The known issue is closed rather than narrowed again**, which is why it is gone from the list below.
+`StaticToken` is one enum with one parser and two exhaustive matches — `contributes` (collector) and
+the resolver — so a fourth variant does not compile until the collector has been taught about it.
+Checked by adding one: `core-model` fails at `contributes` before the resolver is even reached, which
+is why this owes no runtime test for the structural half. The semantic half — an arm that compiles but
+contributes the wrong text — is covered end to end by comparing what the resolver printed on the page
+against what the collector carried.
+
+**The tail-page reuse defect was real.** Rename a chapter without repaginating and the session
+re-converges at the next page, reuses the tail verbatim, and prints the *old* chapter title in its
+running head — spec 0075's shape at a site 0075 did not reach, confirmed by reintroducing it
+(`page 1 · left "The Ruined Keep", right "The Sunken Vault"`) and by the fact that nothing else in the
+suite failed. `LaidOutPage::statics`' doc comment claimed statics "do not depend on where the text
+happened to break"; that sentence is deleted, and the post-pass runs over every page the session
+emits, so a stale running head is unrepresentable rather than guarded against.
+
+**`FORMAT_VERSION` stays 6**, argued rather than skipped: an older build prints the literal `{section}`
+on the page, which is wrong output but *loud*, and the rule turns on silence. Nothing is added to the
+model either — the token is characters inside a `text` string a user can type in any build.
+`SAMPLE_EXPORT_DIGEST` did not move. The residual named as a non-goal: the heading index's `text` is
+flattened by `Block::plain_text`, so **inline emphasis inside a chapter title is dropped in a running
+head, silently** — fixing it would have to change what a contents entry measures and what the PDF
+outline reports, so it is recorded rather than half-built.
 
 #### 0075 a derived or composite block may span frames — **SHIPPED**
 
@@ -2725,7 +2753,9 @@ chapter — which is why 0076's iteration budget has to exist first.
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
 whose increment ships is deleted in that increment's PR, not left here as a fixed-but-still-listed
 defect — which is why the four entries M3 opened with are gone, and why both entries M3 *found* are
-gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in their place.
+gone too: specs 0059 and 0060 shipped them, and why the collector's token entry is gone — spec 0074
+closed it structurally rather than narrowing it a second time. The entries below are what M4 and M6
+found in their place.
 
 - **A composite whose single authored *run* wraps taller than a frame is still placed whole and
   overflows.** Spec 0075's named residual, and the floor of the mechanism rather than a miss: a
@@ -2738,26 +2768,17 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   `a_stat_block_of_one_oversized_run_is_placed_whole` pins it, as its predecessor pinned the case
   0075 fixed.
 
-- **Every token resolved at layout time owes the font-subset collector an entry, and nothing enforces
-  it.** Narrowed by spec 0073 rather than closed, because 0073 fixed the instance and not the class.
+- **A running head drops the inline emphasis inside a chapter title.** Spec 0074's named residual.
+  `HeadingEntry::text` is flattened by `Block::plain_text`, so "The *Ruined* Keep" reaches a
+  `{heading:N}` running head as plain text and the italic is lost, with nothing to say so. Visible on
+  screen, which is the mitigating half.
 
-  The collector runs *before* layout, so any text a token becomes has to be predicted. 0073 replaced
-  the hardcoded `'0'..='9'` with `Document::folio_formats()` → `NumberFormat::alphabet()`, so the
-  folio half is now derived from what the document actually configures and a roman folio no longer
-  prints `.notdef`. It also stopped testing the string literal `"{page}"` instead of `PAGE_TOKEN`,
-  which would have broken digit embedding silently on a rename.
+  Fixing it is not local: the heading index would have to carry `Vec<Run>`, which changes what a
+  contents entry measures and what the PDF outline reports (an outline title is a `String` by PDF's
+  own definition), and a static is measured as one line in one face, so `PlacedBlock::Text`'s
+  `run_formats`/`run_shifts` would have to be derived for furniture that has never had them. Recorded
+  rather than half-built.
 
-  **But the next token has the same problem.** `{section}` (0074) draws a section's authored name; a
-  footnote number, a cross-reference's page and an index page range are three more. Each is characters
-  the collector cannot see, and the failure mode is `.notdef` boxes in a press file with **no error
-  anywhere** — `CLAUDE.md`'s silent-press-corruption class, which this exact function was caught by
-  once already (a master's static text was never collected at all until PR #107, surviving only
-  because "digits usually survived by accident, because a contents list contributes `0`–`9`").
-
-  What would actually close it is a structural answer rather than a fourth special case: the resolver
-  and the collector should read one list of tokens, so adding a token to one without the other does
-  not compile. Worth doing in 0074, which is the increment that turns `PAGE_TOKEN` into a token set
-  and therefore the last cheap moment to do it.
 
 ## Open questions
 

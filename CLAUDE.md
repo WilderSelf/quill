@@ -147,8 +147,16 @@ landed the milestone's load-bearing increment**: a section anchored to a `BlockI
 per-page master assignment rather than replacing it, so a chapter opener survives repagination —
 the defect spec 0035 recorded and could not fix. Master assignment joins the contents list's fixpoint
 (one shared loop, `FIXPOINT_MAX_ITERATIONS`, `converged: false` reported rather than guessed), and
-`FORMAT_VERSION` is **5**, bumped on its own and argued in the spec: an older build would drop
-`sections` and set every chapter opener in the body master, silently. `TEMPLATE_VERSION` stays 1.
+`FORMAT_VERSION` went to **5**, bumped on its own and argued in the spec: an older build would drop
+`sections` and set every chapter opener in the body master, silently. **0073 and 0074 then made the
+section visible** — per-section folio formats and a restart (`FORMAT_VERSION` **6**, owed to v5, which
+reads `sections` and ignores `folio`), then `{section}` and `{heading:N}` running heads beside
+`{page}`. 0074 turned the layout-time tokens into one enum the resolver and the font-subset collector
+both read, so **adding a token without teaching the collector does not compile** — the class behind two
+`.notdef`-in-a-press-file near-misses — and moved furniture to a post-pass over the finished page
+vector, which is what stopped a reused tail page printing the previous chapter's running head.
+`FORMAT_VERSION` stays 6 there: an older build prints the literal `{section}`, which is wrong but
+*loud*, and the bump rule turns on silence. `TEMPLATE_VERSION` stays 1 throughout.
 M7 is named, not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
