@@ -855,36 +855,36 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
     //
     // Statics are placed in the paragraph face (`PageTemplate::statics`), so they go in every
     // bucket, like everything else that does not select a face.
+    //
+    // A **token** in that text is replaced at layout time — after this runs — so whatever it will
+    // become has to be carried whether or not any of those characters appears in the token itself.
+    // A character this misses is a `.notdef` box in a press file with no error anywhere: the
+    // silent-press-corruption class `CLAUDE.md` forbids, and one this very site has been caught by
+    // twice (PR #107, a master's static text that was never collected at all; spec 0073, a roman
+    // folio drawing `i v x l c d m` against a hardcoded `'0'..='9'`).
+    //
+    // Both of those were fixed as *instances*. This is the class: the collector and the resolver
+    // read one token list, through one parser, and `StaticToken::contributes` is an exhaustive
+    // `match`, so a token that reaches the resolver without reaching here does not compile. See
+    // `StaticToken`'s own documentation for the three properties that close it.
+    //
+    // What each token contributes is asked of the document rather than assumed, which is what keeps
+    // this free where the feature is unused: a book with no sections and no `{heading:N}` carries
+    // exactly the digits it always did, so its subset — and therefore its exported bytes — does not
+    // move.
     for master in &doc.master_pages {
         for stat in &master.statics {
             if let quill_core_model::MasterStatic::Text { text, .. } = stat {
                 everywhere.add_run(text);
                 draws_unattributed_text = true;
+                for (_, token) in quill_core_model::StaticToken::scan(text) {
+                    let contributes = token.contributes(doc);
+                    for run in &contributes.runs {
+                        everywhere.add_run(run);
+                    }
+                    everywhere.add_chars(contributes.chars);
+                }
             }
-        }
-    }
-    // `{page}` is replaced at layout time — *after* this runs — so whatever it will become has to
-    // be carried whether or not any of those characters appears in the token itself.
-    //
-    // Until spec 0073 that was the ten digits and nothing else, which stopped being the whole answer
-    // the moment a section could state a folio format: a roman folio draws `i v x l c d m` and an
-    // alpha folio draws letters, and a digit range contains neither. A character this misses is a
-    // `.notdef` box in a press file with no error anywhere — the silent-press-corruption class
-    // `CLAUDE.md` forbids, and one this very site was caught by once already (PR #107, a master's
-    // static text that was never collected at all).
-    //
-    // Asked of the formats the document actually configures rather than of a fixed alphabet, so a
-    // book that states no folio format carries exactly the digits it always did, and its subset —
-    // and therefore its export byte-hash — does not move.
-    //
-    // The token is `PAGE_TOKEN`, not a copy of its spelling. The literal that used to be here would
-    // have gone silently wrong the day the constant was renamed, with no compile error.
-    if doc.master_pages.iter().flat_map(|m| &m.statics).any(|s| {
-        matches!(s, quill_core_model::MasterStatic::Text { text, .. }
-            if text.contains(quill_core_model::PAGE_TOKEN))
-    }) {
-        for format in doc.folio_formats() {
-            everywhere.add_chars(format.alphabet());
         }
     }
 
@@ -2440,6 +2440,187 @@ mod tests {
 
         // And the glyphs really draw. `mmmdccclxxxviii` is the worst case in one string.
         assert_eq!(drawn_gids(&carried, "mmmdccclxxxviii"), 15);
+    }
+
+    /// Spec 0074, and the *class* the known issue named rather than the instance 0073 fixed.
+    ///
+    /// `{section}` and `{heading:N}` draw arbitrary authored text, not an alphabet, so what they
+    /// contribute is the section names and heading texts the document actually contains. A character
+    /// this misses is a `.notdef` box in a press file with no error anywhere — which is why the
+    /// assertion is on the glyphs actually **drawn** (`drawn_gids` panics on any `.notdef`) rather
+    /// than on set membership.
+    ///
+    /// The fixture's strings use characters no content block in the sample uses, so the only route
+    /// into the subset is the token. They are all characters the bundled face really has, so a
+    /// `.notdef` here means the collector missed them rather than the font lacking them, and the
+    /// heading text is carried as a *run* rather than as loose characters for spec 0068's reason: the
+    /// writer draws shaped glyphs, so a running head's ligatures need cutting like any other run's.
+    #[test]
+    fn a_section_name_and_a_chapter_title_are_in_the_subset_and_draw_no_notdef() {
+        use quill_core_model::{Block, MasterPage, MasterStatic, Rect as MRect, Section};
+
+        let section_name = "Æther Ø";
+        let chapter = "Þorn ß Œ Ð";
+
+        let mut doc = Document::sample();
+        doc.content
+            .insert(0, Block::heading(1, chapter, Color::Gray { v: 0.0 }));
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+        doc.sections = vec![Section {
+            name: section_name.into(),
+            start: doc.content[0].id(),
+            master: None,
+            folio: None,
+        }];
+        let base = doc.master_pages.first().cloned();
+        doc.master_pages = vec![MasterPage {
+            name: "body".into(),
+            columns: base.as_ref().map_or(1, |m| m.columns),
+            gutter_pt: base.as_ref().map_or(0.0, |m| m.gutter_pt),
+            margins: base.map(|m| m.margins).unwrap_or_default(),
+            statics: vec![MasterStatic::Text {
+                rect: MRect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 300.0,
+                    h_pt: 12.0,
+                },
+                text: "{section} — {heading:1}".into(),
+                color: Color::Gray { v: 0.0 },
+                style: None,
+                align: Default::default(),
+                mirror: false,
+            }],
+        }];
+
+        let carried: BTreeSet<char> = collect_doc_faces(&doc)
+            .into_values()
+            .flat_map(|t| t.chars())
+            .collect();
+        for ch in section_name.chars().chain(chapter.chars()) {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is drawn in a running head on every page and must be subset"
+            );
+        }
+        assert_eq!(
+            drawn_gids(&carried, section_name),
+            section_name.chars().count()
+        );
+        assert_eq!(drawn_gids(&carried, chapter), chapter.chars().count());
+    }
+
+    /// The property in its general form, and the one a future token has to keep: **every character
+    /// any master static actually prints is in the subset.**
+    ///
+    /// The compiler already makes it impossible to add a `StaticToken` variant without writing its
+    /// `contributes` arm — the `match` is exhaustive — but it cannot check that the arm is *right*,
+    /// and an arm returning nothing would compile. This closes that half end to end: it lays the
+    /// document out through the real press path and compares what the resolver put on the page
+    /// against what the collector carried, so a token that contributes the wrong text fails here even
+    /// though it compiles.
+    ///
+    /// A token added later must be added to this fixture's master static. That is the one manual step
+    /// left, and it is a step whose omission costs coverage rather than correctness.
+    #[test]
+    fn every_character_a_master_static_prints_is_in_the_subset() {
+        use quill_core_model::{Block, MasterPage, MasterStatic, Rect as MRect, Section};
+
+        let mut doc = Document::sample();
+        doc.assets.clear();
+        doc.content = vec![Block::heading(1, "Þorn ß Œ Ð", Color::Gray { v: 0.0 })];
+        doc.content.extend((0..80).map(|i| {
+            Block::body(
+                format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                Color::Gray { v: 0.0 },
+            )
+        }));
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+        doc.sections = vec![Section {
+            name: "Æther Ø".into(),
+            start: doc.content[0].id(),
+            master: None,
+            folio: Some(quill_core_model::Folio {
+                format: quill_core_model::NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        let base = doc.master_pages.first().cloned();
+        doc.master_pages = vec![MasterPage {
+            name: "body".into(),
+            columns: base.as_ref().map_or(1, |m| m.columns),
+            gutter_pt: base.as_ref().map_or(0.0, |m| m.gutter_pt),
+            margins: base.map(|m| m.margins).unwrap_or_default(),
+            // Every token this build knows, in one static.
+            statics: vec![MasterStatic::Text {
+                rect: MRect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 400.0,
+                    h_pt: 12.0,
+                },
+                text: "{section} · {heading:1} · {page}".into(),
+                color: Color::Gray { v: 0.0 },
+                style: None,
+                align: Default::default(),
+                mirror: false,
+            }],
+        }];
+        doc.default_master = Some("body".into());
+        doc.pages.clear();
+
+        let carried: BTreeSet<char> = collect_doc_faces(&doc)
+            .into_values()
+            .flat_map(|t| t.chars())
+            .collect();
+        let pages = lay_out_for_press(&doc, &ExportOptions::default()).expect("press layout");
+        assert!(!pages.is_empty());
+
+        let mut printed = String::new();
+        for page in &pages {
+            for stat in &page.statics {
+                if let quill_layout_engine::PlacedBlock::Text { lines, .. } = stat {
+                    for line in lines {
+                        printed.push_str(&line.text);
+                    }
+                }
+            }
+        }
+        assert!(
+            printed.contains("Æther Ø") && printed.contains("Þorn ß Œ Ð"),
+            "the fixture must actually print both derived strings, got {printed:?}"
+        );
+        for ch in printed.chars() {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is printed by a master static but was never collected"
+            );
+        }
+    }
+
+    /// A `{heading:N}` carries the headings it can *reach* and no others, which is what keeps a
+    /// running head from dragging every sub-heading in a 500-page book into the subset.
+    #[test]
+    fn a_heading_token_carries_only_the_levels_it_can_print() {
+        use quill_core_model::{Block, StaticToken};
+
+        let mut doc = Document::sample();
+        doc.content = vec![
+            Block::heading(1, "Æ chapter", Color::Gray { v: 0.0 }),
+            Block::heading(2, "Þ subsection", Color::Gray { v: 0.0 }),
+        ];
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+
+        let one = StaticToken::Heading { level: 1 }.contributes(&doc);
+        let two = StaticToken::Heading { level: 2 }.contributes(&doc);
+        assert_eq!(one.runs, vec!["Æ chapter".to_string()]);
+        assert_eq!(
+            two.runs,
+            vec!["Æ chapter".to_string(), "Þ subsection".to_string()]
+        );
     }
 
     /// Spec 0064, and the defect an adversarial review of it found: a bold run long enough to fill

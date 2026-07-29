@@ -25,7 +25,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 ```json
 {
-  "format_version": 5,
+  "format_version": 6,
   "metadata": { "title": "The Ruined Keep", "authors": ["Anon"] },
   "page_setup": { "trim": { "w_pt": 468.0, "h_pt": 720.0 }, "bleed_pt": 9.0, "facing_pages": true,
                   "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 } },
@@ -34,7 +34,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
       "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 },
       "statics": [
         { "kind": "text", "rect": { "x_pt": 54.0, "y_pt": 18.0, "w_pt": 378.0, "h_pt": 12.0 },
-          "text": "The Dungeon", "color": { "space": "gray", "v": 0.0 },
+          "text": "{section}", "color": { "space": "gray", "v": 0.0 },
           "style": "folio", "align": "center" },
         { "kind": "text", "rect": { "x_pt": 54.0, "y_pt": 690.0, "w_pt": 378.0, "h_pt": 12.0 },
           "text": "{page}", "color": { "space": "gray", "v": 0.0 },
@@ -69,8 +69,8 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 Margins are `inside`/`outside`, not left/right: a bound book's margins are relative to the spine, so
 the inside margin falls on the left of a recto and the right of a verso. A `MasterPage` names the
-margins, column count, gutter and repeating furniture shared by the pages it governs; `{page}` in a
-static's text resolves to the one-based page number. `default_master` names the master applied to
+margins, column count, gutter and repeating furniture shared by the pages it governs; a static's text
+may carry **tokens** resolved when the page is laid out (below). `default_master` names the master applied to
 the document; an unknown name degrades to the document's own page setup rather than refusing to open
 the file.
 
@@ -128,6 +128,55 @@ Not in this increment, and named rather than forgotten: **"start this section on
 That is a forced page break, which the model has no mechanism for at all, and it is a forward-only
 rule rather than a fixpoint.
 
+## Layout-time tokens in a master static (specs 0029, 0073, 0074)
+
+A text static's `text` is a template, not a literal. Three tokens are replaced when the page is laid
+out, and everything else is printed as written:
+
+| Token | Resolves to |
+|---|---|
+| `{page}` | The page's **folio** — the number printed on it (see Folios below). One-based arabic wherever no section says otherwise, which is what every document got before spec 0073. |
+| `{section}` | The `name` of the section the page belongs to — the last section whose anchor was placed at or before this page. Empty on a page ahead of every section; a half-title does not borrow chapter one's name. |
+| `{heading:N}` | The text of the last heading of level ≤ `N` at or before this page. `{heading:1}` is "the current chapter"; `{heading:2}` follows sub-sections too. Empty before the first qualifying heading. |
+
+So a running head is authored once on the master rather than typed onto a per-page master for every
+chapter, which is what `pages`-based assignment forced before sections existed.
+
+Three consequences worth stating, because each is a decision rather than a detail:
+
+- **`{heading:N}` prints flattened text.** The heading index carries a heading's characters, not its
+  runs, so a chapter titled "The *Ruined* Keep" appears in the running head with the italic lost.
+  Named as a residual by spec 0074 rather than half-fixed.
+- **A `{…}` group that spells no token is printed literally.** That is deliberate: it is the same
+  posture a dangling master name and a dangling style name already have, and it is what makes an
+  older build meeting a newer token *loud* — it prints `{section}` on the page, visibly wrong, rather
+  than something plausible and wrong. It is also why adding a token needs no `format_version` bump:
+  the rule below turns on *silence*.
+- **A template file may carry these tokens**, since it carries master pages. A template has no
+  sections and no content of its own, so what they resolve to is decided by the document the template
+  is used for.
+
+## Folios: what a page prints as its number (spec 0073, v6)
+
+A `Section` may state a `folio`, and it governs the section's **whole run** — every page from its
+opener until the next section that states one — because that is what page numbering is:
+
+```json
+"sections": [ { "name": "Front matter", "start": 1, "folio": { "format": "lower_roman", "restart_at": 1 } } ]
+```
+
+- `format` — `decimal` (the default), `lower_roman`, `upper_roman`, `lower_alpha`, `upper_alpha`.
+  The same `NumberFormat` a list marker uses; there is one roman numeral converter in the workspace,
+  not two.
+- `restart_at` — omit to carry the count on from the page before (what a section that changes only
+  the *format* wants); `1` is the restart a part opener asks for; `n` is the offset a chapter
+  extracted from a larger book needs.
+
+A contents entry prints the folio too, because a list that says `4` for a page printed `iv` sends the
+reader to the wrong page. `/Link` and PDF outline **destinations** keep the physical page index,
+because a destination is a reference to the *n*th page of the file and a viewer resolves it
+positionally. Both are page numbers; they are not the same page number.
+
 ## Master statics: alignment and page parity (spec 0047, v3)
 
 A text static carries two optional fields, both defaulting to the pre-v3 behavior and both omitted
@@ -179,11 +228,13 @@ version changed.
 | 2 → 3 | 0047 | `align` and `mirror` on a text master static | defaults `align` to `left` and `mirror` to `false` on every text static: a v2 static was drawn from its rect's left edge in the same rect on both halves of a spread |
 | 3 → 4 | 0063 | a paragraph's single `text` becomes an ordered list of styled `runs` | **the one migration that is not a structural no-op**: `text` is removed from every `heading` and `body` block and replaced by `runs: [{"text": …}]`. A `toc` title and a panel's fields are not paragraphs and keep their strings. Still a serialization no-op *in effect* — one plain run carries no style object — so a migrated v3 document lays out and exports as it did |
 | 4 → 5 | 0072 | `sections` | defaults `sections` to empty: a v4 document had no sections, and every master assignment it had was positional |
+| 5 → 6 | 0073 | `folio` on a section | defaults `folio` to absent on every section: a v5 document numbered every page arabic from 1, which is what a section stating no folio still means |
 
 A bump is warranted whenever an **older** build would open the document and silently lay it out
 wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
 heads and column geometry; a pre-0047 build would put every verso's folio in the gutter; a pre-0072
-build would drop `sections` and set every chapter opener in the body master. Refusing to open beats
+build would drop `sections` and set every chapter opener in the body master; a pre-0073 build reads
+`sections` perfectly well, ignores `folio`, and numbers the front matter arabic. Refusing to open beats
 any of them, because a half-understood document can be saved back over the original — and the loss
 is worse for authored intent than for derived state: block ids can be regenerated, a section list
 cannot.
@@ -193,6 +244,13 @@ Note what the rule does *not* turn on. Not "did a struct gain a field" — spec 
 build that drops them lays the document out exactly as the author would have got before writing
 them. And not "is the field optional" — every field in the table above is optional too. The question
 is only whether the older build's silence produces a *different book*.
+
+Spec 0074 is the worked example of the rule *not* firing, and it is worth keeping because the
+temptation is real: `{section}` and `{heading:N}` are a genuinely new capability, and a build that
+predates them prints the literal text `{section}` on every page. That is wrong output — and it is
+**loud**, on screen and in the press file, which is the opposite of the condition above. Nothing is
+added to the model, either: the tokens live inside a `text` string a user can type at any time, so no
+version gate could stop them arriving. `format_version` stays **6**.
 
 > **Bumping `FORMAT_VERSION`? Check whether `TEMPLATE_VERSION` is owed one too.** A template file
 > (below) embeds `page_setup`, `styles`, `master_pages` and `pages`. A document bump that changes
