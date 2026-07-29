@@ -26,6 +26,12 @@ which the existing arms already handle: grayscale stays `/DeviceGray`; color is 
 `RgbToCmyk` (including the ≤240% ink clamp, spec 0006) to `/DeviceCMYK`. Alpha is dropped, keeping
 the "no live transparency" invariant.
 
+> **Superseded in part by [spec 0082](0082-image-path.md):** alpha is *composited onto paper white*
+> before conversion rather than dropped. The invariant is unchanged and this spec's `EXPAND` is what
+> makes the fix complete — because `tRNS` becomes an alpha channel here, the two alpha-bearing arms
+> are the only places a keyed PNG can reach, so covering them covers palette keys and grey-level
+> keys with no third case.
+
 The pre-existing `bit_depth != Eight` guard and `ColorType::Indexed` match arm remain as defensive
 fallbacks (unreachable for real inputs once normalization is applied).
 

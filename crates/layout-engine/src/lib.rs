@@ -1319,7 +1319,7 @@ pub fn lay_out_in_frame(
 
 /// An id → [`Asset`] lookup, built once per layout pass. Borrows the document's assets rather than
 /// copying them; layout never outlives the document it is laying out.
-type AssetIndex<'a> = BTreeMap<&'a str, &'a Asset>;
+pub(crate) type AssetIndex<'a> = BTreeMap<&'a str, &'a Asset>;
 
 /// The intrinsic size of a block once broken/measured for a given frame width, plus the payload
 /// needed to place it. Re-computed against each candidate frame the block is tried in, since both

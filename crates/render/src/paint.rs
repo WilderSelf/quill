@@ -289,7 +289,15 @@ pub fn paint_page(
 }
 
 /// The paper colour a page is filled with.
-pub const PAPER: [u8; 3] = [255, 255, 255];
+///
+/// Built from `quill_color::PAPER_SAMPLE` rather than spelled out, so that this and the backdrop an
+/// image's alpha is flattened onto (spec 0082) are provably the same white. Two constants agreeing
+/// today is how screen and press start to drift.
+pub const PAPER: [u8; 3] = [
+    quill_color::PAPER_SAMPLE,
+    quill_color::PAPER_SAMPLE,
+    quill_color::PAPER_SAMPLE,
+];
 
 /// Convert an authored colour to screen sRGB. Re-exported so callers need not reach into
 /// `quill-color` for the one function they want.

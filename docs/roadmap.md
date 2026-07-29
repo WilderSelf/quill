@@ -21,7 +21,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **complete** — specs 0072–0079 shipped plus the closeout **0080**; **0075 went out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature. 0079 closed the feature list by *not* breaking the one-`Document` assumption in four crates: a book composes to one `Document`, and the fixpoint cost the audit feared measures 3 passes and is indifferent to chapter count. 0080 then closed the milestone's one recurring absence — a forced page break, named as a non-goal by 0072, 0073 and 0079 — so a chapter opens a page, and opens it on the recto if the book asks |
-| **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | **decomposed** into specs 0081–0089. **0081 shipped** (every colour that reaches the page is checked, at one exhaustive enumeration); 0082 fixes the two remaining defects the audit found, both in the image path |
+| **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | **decomposed** into specs 0081–0089. **0081 and 0082 shipped** — all four defects the audit found are fixed: every colour that reaches the page is now checked at one exhaustive enumeration, image alpha is composited onto paper instead of discarded, and editing an `Asset` invalidates the blocks that place it |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
 application second.** Game books are the flagship use case; every mechanism must be one a cookbook,
@@ -2970,7 +2970,7 @@ have had the least attention since M0.
 | # | Increment | Size |
 |---|---|---|
 | 0081 | every colour that reaches the page is checked | small |
-| 0082 | what the image path gets wrong | small |
+| 0082 | what the image path gets wrong — **shipped** | small |
 | 0083 | named colours and spot separations | medium |
 | 0084 | image-format breadth | medium |
 | 0085 | frame fitting and transforms | large |
@@ -3078,11 +3078,38 @@ new colour-bearing site fails to compile (`E0004`/`E0027`) until it says what in
 resolved run colours so `quill preflight` cannot report "no findings" about a document `export` will
 refuse. `FORMAT_VERSION` stays 10 (no model surface) and `SAMPLE_EXPORT_DIGEST` did not move.
 
-#### 0082 what the image path gets wrong
+#### 0082 what the image path gets wrong — **shipped**
 
-Closes C and D. The asset-invalidation half is one entry in `context_fingerprint`'s argument list —
-the cheapest correctness fix in the audit — and it matters for M7 specifically, because every fit
-mode, crop and transform makes more of the page geometry a function of asset metadata.
+Closed known issues C and D. Small, and press-correctness rather than a feature — 0075's precedent
+again. **(D) resolved by compositing onto paper white, not by rewording the warning**: the message
+already promised flattening, "flatten" has an established meaning, and dropping alpha is the
+behaviour that produces the black rectangle — but the decisive argument is that the *screen* already
+composites (the page is `PAPER`-filled and the proxy drawn `SrcOver`), so compositing removes a
+screen/press divergence where the other resolution would have ratified it. One definition of what a
+transparent pixel becomes lives in `quill-color` and **both paths call it, at the same point in the
+pipeline** — the one-shaper rule at a fourth site. Ordering is argued: composite (in the source
+space, where alpha is defined) → convert → clamp, which leaves `RgbToCmyk::convert` the single
+ink-clamp chokepoint spec 0006 built. `tRNS` needed no arm of its own, because 0010's `EXPAND` has
+already turned it into one of the two the fix covers. Measured cost on a 12 MP RGBA image: **+23 ms**
+over the widen it replaces, against a 210 ms conversion it feeds. The screen took a fringe defect
+with it — averaging non-premultiplied RGBA mixed the colour under `alpha = 0` into its neighbours.
+Preflight now asks the **decoder** rather than the `has_alpha` declaration (header-only, no image
+data), and the pre-0082 warning sentence is kept byte for byte because compositing made it *true*.
+**`px_w`/`px_h`/`dpi` were checked and found NOT to be the same fix** — the same `read_info()` call
+yields the dimensions, but the field the press check gates on is `dpi`, which is not in a PNG header
+at all, so probing would have moved placed geometry (spec 0009's non-goal) while leaving the
+layout-critical field unchecked.
+
+**(C) went into `content_fingerprint`'s image arm, not `context_fingerprint`** — the audit's "one
+entry in a `format!`" was the right size and the wrong home. It is 0076's arithmetic (a book has
+*hundreds* of assets, so `dirty_from = Some(0)` would reflow 500 pages for one corrected dpi) plus a
+distinction 0076's own sibling supplies: a footnote's text is XOR'd into the per-block diff and kept
+out of `MeasureKey` because it changes where a paragraph fits and not what it measures, whereas
+`image_size` **is** the measurement — so a term that only dirtied the block would let the cache serve
+the stale height straight back. 0078's whole-document route fails both its own tests here: there is
+one index block and hundreds of assets, and an asset's dimensions *are* a property of the block being
+measured. `FORMAT_VERSION` stays 10 (no model surface; `Asset` untouched) and `SAMPLE_EXPORT_DIGEST`
+did not move — the sample places no image.
 
 #### 0083 named colours and spot separations
 
@@ -3140,36 +3167,13 @@ defect — which is why the four entries M3 opened with are gone, and why both e
 gone too: specs 0059 and 0060 shipped them, and why the collector's token entry is gone — spec 0074
 closed it structurally rather than narrowing it a second time, and why the chapter-run-on entry is
 gone — spec 0080 shipped the forced page break all three of its sightings were asking for. The
-entries below are what M4 and M6 found in their place, plus what remains of the four M7's audit
-found — **all of them in the colour and image paths, which have had the least attention since M0**.
-Two are gone already: spec 0081 shipped (A) and (B), the unchecked master static and the unchecked
-character style, and closed both structurally at one exhaustive enumeration rather than narrowing
-each. (C) and (D) are spec 0082, ahead of every M7 feature.
-
-- **(C) Editing an `Asset` invalidates nothing, so a relinked image serves stale pages.**
-  `image_size` reads `px_w`/`px_h`/`dpi`, and those set the placed height and therefore every page
-  break after it. But `content_fingerprint`'s image arm hashes only the id string, `doc.assets` is
-  absent from `context_fingerprint`'s argument list, and `doc.revision` is never consulted — so
-  correcting a dpi or relinking to a differently-shaped file reads as "nothing changed" and
-  `relayout` returns the previous pages verbatim. The three session tests that touch assets all
-  *clear* them; nothing exercises mutation.
-
-  The fix is one entry in a `format!` — the cheapest correctness fix in the audit — and it matters
-  most for M7, because every fit mode, crop and transform makes more of the page geometry a function
-  of asset metadata, and this is the invalidation path all of it flows through.
-
-- **(D) Image alpha is discarded rather than flattened, and the warning text says the opposite.** The
-  preflight string promises the asset "will be flattened to opaque for PDF/X". What happens is that
-  the alpha channel is dropped and the RGB *underneath* it is converted — no composite against white,
-  no matte, no `/SMask`. PNG places no constraint on the colour stored under `alpha = 0` and many
-  encoders write `(0,0,0,0)`, which converts to **solid black**. So a logo with a transparent surround
-  plausibly exports as a black rectangle, in a press file, under a *Warning* whose text asserts the
-  opposite behaviour.
-
-  The behaviour is consistently *described* as "alpha is dropped" in specs 0005, 0007 and 0010, so it
-  is deliberate — but no spec states the resulting colour, no test asserts it, and the string promises
-  compositing. Whichever way 0082 resolves it, the warning text is wrong today. It also only fires
-  when the author sets `has_alpha` by hand.
+entries below are what M4 and M6 found in their place. **None of the four M7's audit found is still
+here** — all of them were in the colour and image paths, which had had the least attention since M0,
+and both increments that fix rather than add ran first. Spec 0081 shipped (A) and (B), the unchecked
+master static and the unchecked character style, closing both structurally at one exhaustive
+enumeration rather than narrowing each; spec 0082 then shipped (C) and (D), the un-invalidated asset
+and the discarded — rather than flattened — image alpha, ahead of every M7 feature and for 0075's
+reason.
 
 - **A composite whose single authored *run* wraps taller than a frame is still placed whole and
   overflows.** Spec 0075's named residual, and the floor of the mechanism rather than a miss: a

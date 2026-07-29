@@ -2554,6 +2554,9 @@ name = "quill-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "flate2",
+ "png",
+ "quill-color",
  "quill-core-model",
  "quill-export-pdf",
  "quill-fonts",

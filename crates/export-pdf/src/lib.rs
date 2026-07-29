@@ -533,16 +533,25 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     }
 
     // Transparency: PDF/X-1a:2001 and PDF/X-3:2002 both forbid live transparency, so export
-    // flattens image alpha to opaque (see `images.rs`). Warn — not fail — when an asset declares
-    // an alpha channel, since the flattened output is still conformant; the author just should
-    // know it happened.
+    // composites image alpha onto white paper (see `images.rs` and spec 0082). Warn — not fail —
+    // since the flattened output is still conformant; the author just should know it happened, and
+    // *what* it happened against, because a logo drawn to sit on a dark ground will not.
+    //
+    // The **file** is what is asked, not the `has_alpha` declaration (spec 0082). The declaration is
+    // author-supplied metadata (spec 0007) and nothing ever checked it, so the warning fired only
+    // when an author had set it by hand — while the flattening happens whenever the pixels say so.
+    // The thing that knows is the decoder, because it is the thing that does the compositing. A
+    // link that does not resolve answers "don't know", and there the declaration is all there is.
     for asset in &doc.assets {
-        if asset.has_alpha {
+        let carries_alpha =
+            images::probe_alpha_at(asset, &opts.asset_root).unwrap_or(asset.has_alpha);
+        if carries_alpha {
             push_warning(
                 &mut report,
                 CheckId::Transparency,
                 format!(
-                    "asset '{}' has an alpha channel; it will be flattened to opaque for PDF/X",
+                    "asset '{}' has an alpha channel; it will be flattened to opaque for PDF/X \
+                     (transparent areas composite onto white paper)",
                     asset.id
                 ),
             );
@@ -1455,6 +1464,142 @@ mod tests {
             .find(|f| f.check == CheckId::Transparency)
             .expect("expected a Transparency finding");
         assert_eq!(finding.severity, Severity::Warning);
+        assert!(report.passed(), "a warning must not fail preflight");
+    }
+
+    // --- Spec 0082: alpha is flattened onto paper, and the warning reports the file --------------
+
+    /// A unique-per-process temp dir, so a stale dir or a concurrent runner cannot collide.
+    fn alpha_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("quill_0082_{name}_{}", std::process::id()))
+    }
+
+    /// A 2x2 RGBA PNG: three transparent pixels storing black underneath, one opaque red.
+    fn transparent_logo_png() -> Vec<u8> {
+        let rgba = [
+            0, 0, 0, 0, // transparent, black underneath — what most encoders write
+            0, 0, 0, 0, //
+            0, 0, 0, 0, //
+            255, 0, 0, 255, // opaque red
+        ];
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().expect("png header");
+            w.write_image_data(&rgba).expect("png data");
+        }
+        out
+    }
+
+    /// A document placing `id` on the page, with the asset declared as the author would.
+    fn doc_placing(id: &str, file: &str, declared_alpha: bool) -> Document {
+        let mut doc = Document::sample();
+        doc.assets = vec![Asset {
+            id: id.into(),
+            path: file.into(),
+            px_w: 2,
+            px_h: 2,
+            dpi: 300.0,
+            line_art: false,
+            has_alpha: declared_alpha,
+        }];
+        doc.content = vec![Block::image(id)];
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    #[test]
+    fn a_transparent_logo_does_not_export_as_a_black_rectangle() {
+        // The defect stated as the press file it produces. Alpha was dropped and the RGB stored
+        // underneath converted, so three quarters of this image reached the page as solid K.
+        let dir = alpha_dir("black_rect");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("logo.png"), transparent_logo_png()).unwrap();
+        let (mut opts, icc) = opts_with_fixed_icc("black_rect");
+        opts.asset_root = dir.clone();
+
+        let mut buf = Vec::new();
+        export(&doc_placing("logo", "logo.png", true), &opts, &mut buf).expect("export");
+        let _ = std::fs::remove_file(&icc);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The image XObject is the only stream in the file that is exactly 2x2x4 CMYK samples.
+        let pixels = crate::stream_read::decoded_streams(&buf)
+            .into_iter()
+            .find(|s| s.len() == 2 * 2 * 4)
+            .expect("an image XObject of four CMYK pixels");
+        for (i, px) in pixels.chunks_exact(4).take(3).enumerate() {
+            assert_eq!(
+                px,
+                [0, 0, 0, 0],
+                "transparent pixel {i} printed ink: {px:?} (solid K is the shipped defect)"
+            );
+        }
+        assert_eq!(
+            &pixels[12..16],
+            &[0, 255, 255, 0],
+            "the opaque pixel is red"
+        );
+    }
+
+    #[test]
+    fn the_transparency_warning_reports_the_file_not_the_declaration() {
+        // The warning only ever fired when the author set `has_alpha` by hand. The decoder is what
+        // knows — it is the thing that does the compositing — so it is what preflight asks.
+        let dir = alpha_dir("declaration");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("logo.png"), transparent_logo_png()).unwrap();
+        let (mut opts, icc) = opts_with_fixed_icc("declaration");
+        opts.asset_root = dir.clone();
+
+        // Declared opaque, but the file carries alpha: the warning must still fire.
+        let undeclared = preflight(&doc_placing("logo", "logo.png", false), &opts);
+        // Declared transparent, but the file has no alpha channel: no warning.
+        std::fs::write(dir.join("flat.png"), {
+            let mut out = Vec::new();
+            let mut enc = png::Encoder::new(&mut out, 2, 2);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[7u8; 12]).unwrap();
+            drop(w);
+            out
+        })
+        .unwrap();
+        let overdeclared = preflight(&doc_placing("flat", "flat.png", true), &opts);
+        let _ = std::fs::remove_file(&icc);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            undeclared
+                .findings
+                .iter()
+                .any(|f| f.check == CheckId::Transparency),
+            "an undeclared alpha channel must still be reported"
+        );
+        assert!(
+            !overdeclared
+                .findings
+                .iter()
+                .any(|f| f.check == CheckId::Transparency),
+            "a declaration the file contradicts must not produce a finding"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_asset_falls_back_to_the_declaration() {
+        // The probe answers "don't know" for a link that does not resolve, and a preflight run
+        // before the art is in place must still say what the author declared.
+        let report = preflight(
+            &doc_placing("gone", "does-not-exist.png", true),
+            &opts_with_icc(),
+        );
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.check == CheckId::Transparency));
         assert!(report.passed(), "a warning must not fail preflight");
     }
 
