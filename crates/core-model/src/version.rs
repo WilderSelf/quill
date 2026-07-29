@@ -210,6 +210,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 5 {
         migrate_4_to_5(obj);
     }
+    if found < 6 {
+        migrate_5_to_6(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -280,6 +283,22 @@ fn migrate_4_to_5(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.entry("sections")
         .or_insert_with(|| serde_json::json!([]));
 }
+
+/// v5 → v6 (spec 0073): a section gains a `folio` — a numeral format and an optional restart.
+///
+/// Structurally a no-op. A v5 section stated no folio, `None` is what that meant, and `None` is
+/// what the field defaults to — so every v5 document is numbered arabic from 1, exactly as the v5
+/// build numbered it. Nothing is written into the object at all: unlike the arms above there is no
+/// container to default, only an absent key on each section, and inserting `"folio": null` would
+/// change the manifest text of every sectioned document and with it its exported `/ID`.
+///
+/// The bump is not a no-op, and the argument is the same shape as spec 0072's one version earlier.
+/// A build that has `sections` but not `folio` — which is to say a build at v5 — opens the document
+/// happily, drops `folio` as an unknown key, and prints `1, 2, 3` through front matter the author
+/// set in roman. That is a different book produced quietly, and it can be saved back over the
+/// original, losing authored intent rather than derived state. `docs/format-spec.md`'s rule turns on
+/// exactly that, and the version gate is the only mechanism that can make the older build refuse.
+fn migrate_5_to_6(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 
 /// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
 ///
@@ -586,6 +605,13 @@ mod tests {
             Some("The Ruined Keep")
         );
 
+        // …and a v5 document has a section, which still states no folio: v5 had no such field, and
+        // an absent one means the arabic numbering that build produced.
+        let v5 = Document::from_json(V5_SECTIONS).expect("v5");
+        assert_eq!(v5.format_version, FORMAT_VERSION);
+        assert_eq!(v5.sections.len(), 1);
+        assert!(v5.sections[0].folio.is_none());
+
         // And the far end of the chain still refuses: v(current + 1) is not a document this build
         // may open, whatever it contains.
         let next = FORMAT_VERSION + 1;
@@ -700,10 +726,77 @@ mod tests {
             "migration must not add `sections`: {json}"
         );
 
-        // And the manifest is byte-identical to the one the same document reaches as a native v5
+        // And the manifest is byte-identical to the one the same document reaches as a native v6
         // read — the migration is lossless in the identity direction, not only in meaning.
-        let native = V4_MASTERS.replace("\"format_version\": 4", "\"format_version\": 5");
-        let native = Document::from_json(&native).expect("load as v5");
+        let native = V4_MASTERS.replace(
+            "\"format_version\": 4",
+            &format!("\"format_version\": {FORMAT_VERSION}"),
+        );
+        let native = Document::from_json(&native).expect("load as current");
+        assert_eq!(json, native.to_json().expect("save"));
+    }
+
+    /// A document written by a v5 build (spec 0073's fixture), committed **as bytes**.
+    ///
+    /// The same reasoning as [`V2_MASTERS`] and [`V4_MASTERS`]: a fixture the current serializer
+    /// produced would migrate correctly by construction and prove nothing. This one is the shape a
+    /// v5 build put on disk — a section anchored to a heading, opening on a chapter master, and no
+    /// folio settings anywhere, because v5 had none.
+    const V5_SECTIONS: &str = include_str!("../assets/v5-sections.json");
+
+    #[test]
+    fn a_v5_manifest_migrates_forward_to_v6() {
+        let doc = Document::from_json(V5_SECTIONS).expect("a v5 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+
+        // It means what it meant: the section it was authored with, still anchored to the same
+        // block and still opening on the same master…
+        assert_eq!(doc.sections.len(), 1);
+        assert_eq!(doc.sections[0].start, doc.content[0].id());
+        assert_eq!(
+            doc.master_in(&doc.page_assignment(&[Some(0)]), 0)
+                .map(|m| m.name.as_str()),
+            Some("chapter-opener")
+        );
+
+        // …and numbered exactly as a v5 build numbered it: arabic, one-based, from page 0. That is
+        // what `folio: None` has to mean, and it is the whole claim that this migration is a no-op.
+        assert!(doc.sections[0].folio.is_none());
+        let runs = doc.folio_runs(&[Some(0)]);
+        assert_eq!(
+            runs,
+            vec![crate::FolioRun {
+                first_page: 0,
+                format: crate::NumberFormat::Decimal,
+                start: 1
+            }]
+        );
+        for page in 0..5 {
+            assert_eq!(doc.folio(&[Some(0)], page), (page + 1).to_string());
+        }
+    }
+
+    #[test]
+    fn migrating_a_v5_document_does_not_move_its_exported_identity() {
+        // Spec 0047's hazard again, and the reason `migrate_5_to_6` writes nothing at all: a
+        // migration that defaulted `folio` into every section would change the manifest text of
+        // every sectioned document in existence, and the `/ID` is a hash of that text.
+        let migrated = Document::from_json(V5_SECTIONS).expect("load");
+        let json = migrated.to_json().expect("save");
+        // Scoped to the sections, for the reason the 2 → 3 test above is scoped to the masters:
+        // `folio` is also the name of the fixture's paragraph style, so a whole-manifest search
+        // would pass for the wrong reason — or here, fail for it.
+        let sections = serde_json::to_string(&migrated.sections).expect("sections");
+        assert!(
+            !sections.contains("\"folio\""),
+            "migration must not add `folio`: {sections}"
+        );
+
+        let native = V5_SECTIONS.replace(
+            "\"format_version\": 5",
+            &format!("\"format_version\": {FORMAT_VERSION}"),
+        );
+        let native = Document::from_json(&native).expect("load as current");
         assert_eq!(json, native.to_json().expect("save"));
     }
 

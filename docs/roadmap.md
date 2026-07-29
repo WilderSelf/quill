@@ -2643,7 +2643,23 @@ runs, all inside the XMP identifiers or the trailer `/ID`); `component_parity` d
 #### 0073 folio formats and restart
 
 Per-section folio format and restart value, through the existing `NumberFormat`. Cheap, and the first
-visible proof of 0072.
+visible proof of 0072. **Shipped.**
+
+**As built.** Two things worth carrying. First, the increment that had to decide *what else* prints a
+page number found the answer splits: the `{page}` token and a **contents entry** print the folio,
+because a contents list is read by someone about to turn to that page, while **`/Link` and PDF
+outline destinations keep the physical page index**, because a destination is a reference to the
+*n*th page of the file and a viewer resolves it positionally. Both are page numbers; they are not the
+same page number, and the line is between what a *reader* is told and what a *machine* is told.
+
+Second, this was the increment that reached the font-subset known issue, and the fix is shaped to
+cost nothing where the feature is unused: the collector asks `Document::folio_formats()` — which
+always includes `Decimal` — rather than assuming an alphabet, so a book that states no folio format
+carries exactly the digits it always did and its export byte-hash does not move. `FORMAT_VERSION`
+went to 6, and the reasoning is worth keeping because the obvious argument is wrong: "the field hangs
+off `Section`, which only 0072 added, so no older build can be misled" is true of **v4** and false of
+**v5** — a v5 build reads `sections` perfectly well, ignores `folio`, and numbers the front matter
+arabic without saying so. The bump is owed to v5.
 
 #### 0074 running heads derived from content
 
@@ -2722,20 +2738,26 @@ gone too: specs 0059 and 0060 shipped them. The entry below is one M4 found in t
   `a_stat_block_of_one_oversized_run_is_placed_whole` pins it, as its predecessor pinned the case
   0075 fixed.
 
-- **The font-subset collector hardcodes `{page}` as the only token resolved at layout time.**
-  crates/export-pdf/src/lib.rs:866-875 carries digits into every subset because `{page}` becomes a
-  number after collection has run. Every *new* such token — `{section}`, a footnote number, a
-  cross-reference's page, an index page range — generates characters the collector has not seen, and
-  the failure mode is `.notdef` boxes in a press file with no error anywhere.
+- **Every token resolved at layout time owes the font-subset collector an entry, and nothing enforces
+  it.** Narrowed by spec 0073 rather than closed, because 0073 fixed the instance and not the class.
 
-  This class has already bitten once here: the same function's comment records that a master's static
-  text was never collected at all until PR #107, and that "digits usually survived by accident,
-  because a contents list contributes `0`–`9`". It is `CLAUDE.md`'s silent-press-corruption class,
-  and M6 introduces four new ways in.
+  The collector runs *before* layout, so any text a token becomes has to be predicted. 0073 replaced
+  the hardcoded `'0'..='9'` with `Document::folio_formats()` → `NumberFormat::alphabet()`, so the
+  folio half is now derived from what the document actually configures and a roman folio no longer
+  prints `.notdef`. It also stopped testing the string literal `"{page}"` instead of `PAGE_TOKEN`,
+  which would have broken digit embedding silently on a rename.
 
-  A smaller defect at the same site, worth fixing with it: the check tests the string literal
-  `"{page}"` rather than importing `quill_core_model::PAGE_TOKEN`, so generalising the constant breaks
-  digit embedding with no compile error.
+  **But the next token has the same problem.** `{section}` (0074) draws a section's authored name; a
+  footnote number, a cross-reference's page and an index page range are three more. Each is characters
+  the collector cannot see, and the failure mode is `.notdef` boxes in a press file with **no error
+  anywhere** — `CLAUDE.md`'s silent-press-corruption class, which this exact function was caught by
+  once already (a master's static text was never collected at all until PR #107, surviving only
+  because "digits usually survived by accident, because a contents list contributes `0`–`9`").
+
+  What would actually close it is a structural answer rather than a fourth special case: the resolver
+  and the collector should read one list of tokens, so adding a token to one without the other does
+  not compile. Worth doing in 0074, which is the increment that turns `PAGE_TOKEN` into a token set
+  and therefore the last cheap moment to do it.
 
 ## Open questions
 

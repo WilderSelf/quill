@@ -1968,6 +1968,7 @@ mod tests {
             name: "Chapter One".into(),
             start: doc.content[filler].id(),
             master: Some("chapter-opener".into()),
+            folio: None,
         }];
         doc
     }
