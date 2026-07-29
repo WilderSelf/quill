@@ -211,6 +211,7 @@ pub fn document_with_blocks(spec: &SynthSpec, block_count: usize) -> Document {
         // re-baseline every budget in the file against a change to the measurement rather than to
         // the engine.
         sections: Vec::new(),
+        footnotes: Vec::new(),
         components: Default::default(),
         requires: Vec::new(),
     };

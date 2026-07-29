@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M5 complete; M6 through spec 0076.** M0 (headless PDF/X export) is
+**Status: M0–M5 complete; M6 through spec 0077.** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -165,7 +165,19 @@ quantity that provably *oscillates* (roman numerals are not monotone in width), 
 exhaustive `contributes` match for the font subset — a body run's generated characters are a new path,
 so they owe 0074's structural treatment rather than a special case. `FORMAT_VERSION` is **7**: the
 older build's output is loud, but `source` is authored intent and is destroyed on save-back, which is
-the half of the rule 0074 did not have to answer to. `TEMPLATE_VERSION` stays 1 throughout.
+the half of the rule 0074 did not have to answer to. **0077 then shipped footnotes**, the milestone's
+riskiest increment and the only one that changes the flow loop: a note band reduces the
+`bottom`/available-height term and *only* that term, so `MeasureKey` gains no height dimension and
+`incremental_blocks_measured` is still 1 — the guard spec 0044 wrote for exactly this. `FlowState`
+grew by one field (a part-set note carried into the next frame's band) and that was the whole of it,
+because a checkpoint only ever sits at a page boundary where the band is empty; the second
+0072-shaped defect was there, in the *flow* rather than in the session. Numbering is
+document-sequential and argued: per-page restart is neither of the engine's two dependency shapes and
+would be a fixpoint inside `flow`, so a footnote is not a fourth derived quantity and the iteration
+budget did not move. The band cannot oscillate — the flow is forward-only and a discarded reservation
+is discarded — but a *carry* can fail to make progress, so three runtime guards bound it.
+`FORMAT_VERSION` is **8**: loud again, but a note is prose rather than intent and one save deletes it.
+`TEMPLATE_VERSION` stays 1 throughout.
 M7 is named, not decomposed.
 
 **Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one

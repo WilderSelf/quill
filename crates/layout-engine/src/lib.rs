@@ -978,8 +978,11 @@ pub fn lay_out(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    lay_out_with_library(
+    lay_out_resolved(
         &doc.content,
+        // Synthesised once per layout rather than once per fixpoint pass, for the component
+        // library's reason (spec 0077). Empty for every document without a footnote.
+        &doc.footnote_blocks(),
         &doc.assets,
         &doc.styles,
         // The document's own definitions shadow the bundled ones (spec 0054). Built here rather
@@ -1520,19 +1523,24 @@ pub(crate) struct BlockContext<'a> {
     /// whole pages, so a counter advanced during placement goes missing on a reused page — and goes
     /// missing exactly when the document was just edited, which is always.
     pub markers: &'a BTreeMap<BlockId, String>,
-    /// What each cross-referenced block's folio currently resolves to, keyed by the **target**
-    /// block (spec 0076). Empty for every document that contains no cross-reference, and on the
-    /// cold path's first pass, where nothing has been placed yet.
+    /// What every run whose characters are generated at layout time currently draws, keyed by the
+    /// **thing the run points at** (specs 0076, 0077).
     ///
-    /// Keyed by target rather than by referring block so the derivation is one walk over the placed
-    /// pages regardless of how many runs point at the same chapter — a book cites its important
-    /// pages many times — and so that two references to one block cannot disagree.
+    /// Two quantities live in one map, and they are disjoint by construction because a document has
+    /// one id space: a cross-referenced block's folio, keyed by the target block; and a footnote's
+    /// number, keyed by the note. Merging them is what lets one resolver, one per-block fingerprint
+    /// and one fixpoint comparison serve both instead of two of each — and the two are not
+    /// independent, since a footnote band moves the page a cross-reference target lands on.
     ///
-    /// A target absent from this map is **unresolved** and draws
+    /// Keyed by referent rather than by referring block so the derivation is one walk regardless of
+    /// how many runs point at the same chapter — a book cites its important pages many times — and
+    /// so that two references to one block cannot disagree.
+    ///
+    /// A referent absent from this map is **unresolved** and draws
     /// [`quill_core_model::UNRESOLVED_REFERENCE`]. That is a state, not an error: it is what the
-    /// first pass of the cold fixpoint sees, and it is what a reference to a deleted block sees for
-    /// ever.
-    pub references: &'a BTreeMap<BlockId, String>,
+    /// first pass of the cold fixpoint sees for a cross-reference, and it is what an anchor naming a
+    /// note the document does not hold sees for ever.
+    pub resolved: &'a BTreeMap<BlockId, String>,
 }
 
 /// Every list item's marker, derived from the blocks in document order (spec 0066).
@@ -1629,19 +1637,20 @@ pub fn reference_folios(
     out
 }
 
-/// Each run's drawn text: its own characters, or what its [`RunSource`] resolves to (spec 0076).
+/// Each run's drawn text: its own characters, or what its [`RunSource`] resolves to (specs 0076,
+/// 0077).
 ///
 /// **The resolver half of the contract [`RunSource`] describes**, and the `match` below is
 /// exhaustive, which is half of what makes adding a run source without teaching the font-subset
 /// collector fail to compile — the other half is `RunSource::contributes`.
 ///
-/// Returns `None` when every run is authored, which is every paragraph in every document that has no
-/// cross-reference. That is not a tidiness: the caller then borrows the runs' own `&str`s exactly as
-/// it did before this existed, so the hot measurement path allocates nothing new and a document
-/// without the feature costs precisely what it cost.
+/// Returns `None` when every run is authored, which is every paragraph in every document that has
+/// neither a cross-reference nor a footnote anchor. That is not a tidiness: the caller then borrows
+/// the runs' own `&str`s exactly as it did before this existed, so the hot measurement path
+/// allocates nothing new and a document without the feature costs precisely what it cost.
 fn resolve_run_texts(
     runs: &[quill_core_model::Run],
-    references: &BTreeMap<BlockId, String>,
+    resolved: &BTreeMap<BlockId, String>,
 ) -> Option<Vec<String>> {
     if runs.iter().all(|r| r.source.is_authored()) {
         return None;
@@ -1650,8 +1659,15 @@ fn resolve_run_texts(
         runs.iter()
             .map(|r| match r.source {
                 RunSource::Authored => r.text.clone(),
-                RunSource::Reference { target } => references
+                // Both generated variants read the one map, keyed by whatever the run points at.
+                // Written as two arms rather than through `RunSource::referent` so that the `match`
+                // is still what fails to compile when a third variant arrives.
+                RunSource::Reference { target } => resolved
                     .get(&target)
+                    .cloned()
+                    .unwrap_or_else(|| UNRESOLVED_REFERENCE.to_string()),
+                RunSource::Footnote { note } => resolved
+                    .get(&note)
                     .cloned()
                     .unwrap_or_else(|| UNRESOLVED_REFERENCE.to_string()),
             })
@@ -1757,7 +1773,7 @@ pub(crate) fn measure_block(
         headings,
         components,
         markers,
-        references,
+        resolved,
     } = *ctx;
     match block {
         Block::Heading { runs, color, .. } | Block::Body { runs, color, .. } => {
@@ -1779,8 +1795,8 @@ pub(crate) fn measure_block(
             // in the paragraph the breaker sees rather than painted over it afterwards. `None` is
             // every paragraph of every document without the feature, and takes the borrowing path
             // this line always took.
-            let resolved = resolve_run_texts(runs, references);
-            let texts: Vec<&str> = match &resolved {
+            let texts_owned = resolve_run_texts(runs, resolved);
+            let texts: Vec<&str> = match &texts_owned {
                 Some(v) => v.iter().map(String::as_str).collect(),
                 None => runs.iter().map(|r| r.text.as_str()).collect(),
             };
@@ -2238,6 +2254,11 @@ pub fn lay_out_with_template(
 /// through them would add a parameter to forty call sites to say "the default" forty times. A
 /// document that carries its own definitions reaches layout through [`lay_out`], which builds the
 /// library from the document.
+///
+/// **Lays out no footnotes**, for the reason [`heading_index_of`] resolves no folios: a bare block
+/// list carries none — they live on the document — so an anchor in one prints
+/// [`quill_core_model::UNRESOLVED_REFERENCE`] rather than a number for a note nobody handed over.
+/// A document reaches layout through [`lay_out`], which passes its own.
 pub fn lay_out_with_library(
     content: &[Block],
     assets: &[Asset],
@@ -2248,7 +2269,14 @@ pub fn lay_out_with_library(
     hyphenator: &impl Hyphenator,
 ) -> (Vec<LaidOutPage>, FixpointStatus) {
     lay_out_resolved(
-        content, assets, styles, components, template, metrics, hyphenator,
+        content,
+        &[],
+        assets,
+        styles,
+        components,
+        template,
+        metrics,
+        hyphenator,
     )
 }
 
@@ -2306,6 +2334,8 @@ pub fn lay_out_with_fixpoint_status(
 ) -> (Vec<LaidOutPage>, FixpointStatus) {
     lay_out_resolved(
         content,
+        // See [`lay_out_with_library`]: a bare block list carries no footnotes.
+        &[],
         assets,
         styles,
         &builtin_components(),
@@ -2318,6 +2348,7 @@ pub fn lay_out_with_fixpoint_status(
 #[allow(clippy::too_many_arguments)]
 fn lay_out_resolved(
     content: &[Block],
+    notes: &[Block],
     assets: &[Asset],
     styles: &StyleSheet,
     components: &ComponentLibrary,
@@ -2325,14 +2356,15 @@ fn lay_out_resolved(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> (Vec<LaidOutPage>, FixpointStatus) {
-    let once = |headings: &[HeadingEntry], references: &BTreeMap<BlockId, String>| {
+    let once = |headings: &[HeadingEntry], resolved: &BTreeMap<BlockId, String>| {
         flow(
             content,
+            notes,
             assets,
             styles,
             components,
             headings,
-            references,
+            resolved,
             template,
             metrics,
             hyphenator,
@@ -2353,8 +2385,15 @@ fn lay_out_resolved(
     // comparison and the extra pass outright.
     let targets = quill_core_model::reference_targets(content);
 
-    let mut references: BTreeMap<BlockId, String> = BTreeMap::new();
-    let mut pages = once(&[], &references);
+    // **A footnote number is not a fourth derived quantity, and that is the numbering decision**
+    // (spec 0077). It is derived from where the anchors sit in `content`, so it is known here,
+    // before the first pass, and never changes across passes — exactly `list_markers`' shape. It
+    // seeds the resolved map rather than joining the loop, so a document whose *only* new feature is
+    // footnotes still converges in one pass.
+    let numbers = quill_core_model::footnote_numbers(notes);
+
+    let mut resolved: BTreeMap<BlockId, String> = numbers.clone();
+    let mut pages = once(&[], &resolved);
     // Asked once before the loop, so a template that derives nothing answers `false` and the loop
     // exits on its first comparison — one pass, exactly as before, for every document that has
     // neither a contents list, nor a section, nor a cross-reference.
@@ -2368,16 +2407,19 @@ fn lay_out_resolved(
         } else {
             Vec::new()
         };
-        let next_refs = reference_folios(&targets, &pages, template);
-        if next == headings && next_refs == references && !reassigned {
+        // The footnote numbers go back in every pass because the map is one map; they are constant,
+        // so they can never be the reason the comparison fails.
+        let mut next_refs = reference_folios(&targets, &pages, template);
+        next_refs.extend(numbers.iter().map(|(k, v)| (*k, v.clone())));
+        if next == headings && next_refs == resolved && !reassigned {
             break true;
         }
         if iterations >= FIXPOINT_MAX_ITERATIONS {
             break false;
         }
         headings = next;
-        references = next_refs;
-        pages = once(&headings, &references);
+        resolved = next_refs;
+        pages = once(&headings, &resolved);
         reassigned = template.reassign(&pages);
         iterations += 1;
     };
@@ -2428,6 +2470,34 @@ pub(crate) struct FlowState {
     pub frame_idx: usize,
     pub y: f32,
     pub frame_empty: bool,
+    /// The footnote this page's first band opens with, part-set (spec 0077), or `None`.
+    ///
+    /// **The only new loop state a footnote adds, and working out that it is the only one is the
+    /// increment's obligation to this type's doc comment.** The band a frame reserves is a function
+    /// of the notes whose anchors were placed *in that frame*, and a checkpoint is only ever taken
+    /// at a page boundary, where the first frame is empty and no anchor has been placed yet — so the
+    /// accrued band height at a checkpoint is always zero and is not state.
+    ///
+    /// What is not zero is a note too tall for the band it was called into: its remainder continues
+    /// at the foot of the next frame (spec 0075's mechanism, over the same item list), and a page
+    /// boundary can fall in the middle of one. Resuming without it would drop the tail of a note and
+    /// give the page back the height the tail was occupying — a different document after an edit
+    /// than after a full pass, which is the exact failure this type's doc comment names.
+    pub note_carry: Option<NoteCarry>,
+}
+
+/// A part-set footnote continuing into the next frame's band (spec 0077).
+///
+/// Absolute item offset into the note's own measurement, exactly as [`FlowState::split_at`] is into
+/// the block's, and interpreted the same way: re-measured at the resumed frame's width and cut
+/// again. Two `Copy` fields, so a checkpoint stays six numbers rather than a measured payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NoteCarry {
+    /// The note's id — its [`Block`] in the synthesised note list.
+    pub note: BlockId,
+    /// How many of its items earlier frames' bands already took. Strictly increases per frame,
+    /// which is what bounds the band (see [`Band::commit`]).
+    pub split_at: usize,
 }
 
 impl FlowState {
@@ -2439,7 +2509,212 @@ impl FlowState {
             frame_idx: 0,
             y: frames_for(template, 0)[0].rect.y_pt,
             frame_empty: true,
+            note_carry: None,
         }
+    }
+}
+
+/// Space between the body's last line and the rule that opens a footnote band (spec 0077).
+pub(crate) const NOTE_RULE_SPACE_ABOVE_PT: f32 = 6.0;
+/// Space between that rule and the first note under it.
+pub(crate) const NOTE_RULE_SPACE_BELOW_PT: f32 = 3.0;
+/// Thickness of the rule. A hairline in points, never in pixels — see [`Stroke::width_pt`].
+pub(crate) const NOTE_RULE_THICKNESS_PT: f32 = 0.5;
+/// How wide the rule is, as a fraction of the frame. A footnote rule is conventionally short.
+pub(crate) const NOTE_RULE_WIDTH_FRACTION: f32 = 0.3;
+/// The most of a frame a footnote band may take before it starts carrying the rest forward.
+///
+/// **Three quarters, and it is a correctness rule rather than a taste one.** The band is at the foot
+/// of the frame the *anchor* lands in, so a band allowed to fill the frame would leave the anchor's
+/// own paragraph nowhere to sit — and the flow's only answer to a block that fits nowhere is to
+/// place it anyway and let it overflow, printing the paragraph over its own note. Capping the band
+/// guarantees the anchor has somewhere to go.
+///
+/// It is a *preference*, not a hard limit: a note with no legal cut inside the cap is cut against
+/// the whole frame instead, and one with no legal cut at all is taken whole and overflows. Progress
+/// never depends on the cap — see [`Band::commit`].
+pub(crate) const NOTE_BAND_MAX_FRACTION: f32 = 0.75;
+
+/// The height a non-empty band spends on its separator, before any note.
+fn note_band_lead_pt() -> f32 {
+    NOTE_RULE_SPACE_ABOVE_PT + NOTE_RULE_THICKNESS_PT + NOTE_RULE_SPACE_BELOW_PT
+}
+
+/// The notes reserved at the foot of the frame currently being filled (spec 0077).
+///
+/// **This is the whole of the mechanism, and what it is *not* is the point.** It reduces the
+/// `bottom`/available-height term the flow loop compares against and nothing else. No block is ever
+/// measured against a height, `MeasureKey` gains no height dimension, and a note is measured exactly
+/// as any other block is — at a frame width, through the same `Measurer`, so it is cached like one.
+/// `Measured::break_items`' rule is that a measurement which depends on the available height must
+/// offer no break opportunities; nothing here makes any measurement depend on one.
+#[derive(Default, Clone)]
+pub(crate) struct Band {
+    /// The note fragments committed to this frame, in the order they will be stacked.
+    items: Vec<BandItem>,
+    /// Total height reserved, including the separator lead. `0.0` when empty, which is what makes a
+    /// document with no footnote see exactly the `bottom` it always saw.
+    height: f32,
+}
+
+#[derive(Clone)]
+struct BandItem {
+    source: BlockId,
+    measured: Measured,
+    height: f32,
+    /// The note's ink, kept beside the measurement so the separator rule above the band is drawn in
+    /// the colour the notes under it are set in — a black rule over CMYK notes would be a second
+    /// answer to what colour this band is.
+    ink: Color,
+}
+
+impl Band {
+    /// How much of the frame's bottom this band has taken.
+    fn height(&self) -> f32 {
+        self.height
+    }
+
+    /// Add note `note` from item `from`, taking as much of it as `frame_h` leaves room for.
+    ///
+    /// Returns the carry: `Some` when the note was cut and its remainder must open the next frame's
+    /// band, `None` when it was taken whole.
+    ///
+    /// **Progress is what the three branches are for.** A cut advances the absolute item offset
+    /// strictly, exactly as spec 0044's does, so the note is consumed within its own item count. The
+    /// third branch — no legal cut fits — takes the note whole and lets it overflow rather than
+    /// carrying nothing forward, which is the only way this could fail to terminate and is the same
+    /// answer the `frame_empty` guard already gives a block too tall for an empty frame. A band may
+    /// therefore exceed its frame, but only by ending the carry, and that is asserted rather than
+    /// reasoned about.
+    ///
+    /// `allow_cut` is `false` for every note but the last one a placement calls for, and for every
+    /// note once a carry already exists. A frame's band may therefore carry **at most one** note
+    /// forward, and it is the last one in the band — without that, two cuts in one frame would
+    /// leave the second overwriting the first and a note would silently disappear.
+    #[allow(clippy::too_many_arguments)]
+    fn commit<M: RunMetrics, H: Hyphenator>(
+        &mut self,
+        note: &Block,
+        from: usize,
+        frame_w: f32,
+        frame_h: f32,
+        allow_cut: bool,
+        ctx: &BlockContext<'_>,
+        measurer: &mut impl Measurer,
+        metrics: &M,
+        hyphenator: &H,
+    ) -> Option<NoteCarry> {
+        let Some((whole, whole_h)) = measurer.measure(note, frame_w, ctx, metrics, hyphenator)
+        else {
+            return None; // a note that cannot be measured is simply not set
+        };
+        let (measured, height) = match whole.split_at(from) {
+            Some((_, _, remainder, remainder_h)) => (remainder, remainder_h),
+            None => (whole, whole_h),
+        };
+        let lead = if self.items.is_empty() {
+            note_band_lead_pt()
+        } else {
+            0.0
+        };
+        // Two rooms, tried in order: the cap, then the whole frame. A note that fits the cap is
+        // taken whole; one that does not is cut at the cap if it legally can; and only if *neither*
+        // works does the frame's full height come into it. That ordering is what keeps a 90%-tall
+        // note from squeezing its own anchor out while still never depending on the cap to
+        // terminate.
+        let cap_room = frame_h * NOTE_BAND_MAX_FRACTION - self.height - lead;
+        let full_room = frame_h - self.height - lead;
+        let cut = |band: &mut Self, room: f32| {
+            let k = measured.cut_fitting(room).filter(|_| allow_cut)?;
+            let (fragment, fragment_h, _, _) = measured
+                .split_at(k)
+                .expect("`cut_fitting` returned an index `split_at` refuses");
+            assert!(
+                k > 0,
+                "a footnote cut must advance the note's item offset, or the band cannot terminate"
+            );
+            band.push(lead, note.id(), fragment, fragment_h);
+            Some(NoteCarry {
+                note: note.id(),
+                split_at: from + k,
+            })
+        };
+        let carry = if height <= cap_room {
+            self.push(lead, note.id(), measured.clone(), height);
+            None
+        } else if let Some(c) = cut(self, cap_room) {
+            Some(c)
+        } else if height <= full_room {
+            self.push(lead, note.id(), measured.clone(), height);
+            None
+        } else if let Some(c) = cut(self, full_room) {
+            Some(c)
+        } else {
+            // No legal cut fits the frame at all. Take it whole and overflow, which ends the carry
+            // — the only branch that can leave the band taller than its frame, and the only reason
+            // this cannot fail to make progress.
+            self.push(lead, note.id(), measured.clone(), height);
+            None
+        };
+        assert!(
+            self.height <= frame_h || carry.is_none(),
+            "a footnote band that overruns its frame must not also carry forward, or the flow \
+             cannot make progress"
+        );
+        carry
+    }
+
+    fn push(&mut self, lead: f32, source: BlockId, measured: Measured, height: f32) {
+        self.height += lead + height;
+        let ink = match &measured {
+            Measured::Text { color, .. } => *color,
+            Measured::Panel { parts, .. } => {
+                parts.first().map_or(Color::Gray { v: 0.0 }, |p| p.color)
+            }
+            Measured::Image { .. } => Color::Gray { v: 0.0 },
+        };
+        self.items.push(BandItem {
+            source,
+            measured,
+            height,
+            ink,
+        });
+    }
+
+    /// Emit the band's placed geometry at the foot of `frame`, and empty it for the next frame.
+    ///
+    /// Into `LaidOutPage::blocks` rather than `statics`, because a note is *content*: it consumes
+    /// flow space, it carries the note's own [`BlockId`], and `preflight_pages` walks blocks, so a
+    /// note gets the safe-area and ink checks every other placed thing gets for free.
+    fn flush(&mut self, page: &mut LaidOutPage, frame: &Frame, metrics: &impl RunMetrics) {
+        if self.items.is_empty() {
+            self.height = 0.0;
+            return;
+        }
+        let mut y = frame.rect.y_pt + frame.rect.h_pt - self.height + NOTE_RULE_SPACE_ABOVE_PT;
+        page.blocks.push(PlacedBlock::Rect {
+            frame: Rect {
+                x_pt: frame.rect.x_pt,
+                y_pt: y,
+                w_pt: frame.rect.w_pt * NOTE_RULE_WIDTH_FRACTION,
+                h_pt: NOTE_RULE_THICKNESS_PT,
+            },
+            fill: Some(self.items[0].ink),
+            stroke: None,
+        });
+        y += NOTE_RULE_THICKNESS_PT + NOTE_RULE_SPACE_BELOW_PT;
+        for item in std::mem::take(&mut self.items) {
+            page.blocks.extend(place_measured(
+                item.measured,
+                item.height,
+                frame,
+                y,
+                item.source,
+                metrics,
+            ));
+            y += item.height;
+        }
+        self.height = 0.0;
     }
 }
 
@@ -2526,6 +2801,129 @@ pub(crate) struct Resync<'a> {
     pub last_dirty: usize,
 }
 
+/// Which footnotes a placement calls for, in the order they are anchored (spec 0077).
+///
+/// Read off the **measurement**, not the block, so a block that was cut across a frame boundary
+/// attributes each anchor to the fragment its line actually landed in — which is what makes "an
+/// anchor and its note are on the same page" true rather than usually true. A line's spans name the
+/// runs it is made of, and a run names its note.
+///
+/// A measurement with no lines to attribute by — a tabbed paragraph measures as a panel, and is
+/// indivisible — falls back to the block's runs: it is placed whole, so every note it calls belongs
+/// to the frame it lands in.
+fn notes_in(measured: &Measured, block: &Block) -> Vec<BlockId> {
+    let runs = block.runs();
+    if runs.iter().all(|r| r.source.note().is_none()) {
+        return Vec::new();
+    }
+    let mut out: Vec<BlockId> = Vec::new();
+    let add = |id: BlockId, out: &mut Vec<BlockId>| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+    match measured {
+        Measured::Text { lines, .. } => {
+            for line in lines {
+                for span in &line.spans {
+                    if let Some(id) = runs.get(span.run).and_then(|r| r.source.note()) {
+                        add(id, &mut out);
+                    }
+                }
+            }
+        }
+        Measured::Image { .. } | Measured::Panel { .. } => {
+            for id in runs.iter().filter_map(|r| r.source.note()) {
+                add(id, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// The band this frame would have if `ids` were committed to it — **without committing them**.
+///
+/// The fit check has to know the reserved height before it knows whether the block fits, and the
+/// block only fits if the height is reserved: the circularity is broken by reserving on a *copy* and
+/// keeping it only when the placement is taken. Reserving against the block's whole set of notes and
+/// then committing only the fragment's is conservative in the safe direction — a fragment can end up
+/// with more room than was reserved, never less.
+#[allow(clippy::too_many_arguments)]
+fn reserve<M: RunMetrics, H: Hyphenator>(
+    band: &Band,
+    carry: Option<NoteCarry>,
+    ids: &[BlockId],
+    notes: &BTreeMap<BlockId, &Block>,
+    frame: &Frame,
+    ctx: &BlockContext<'_>,
+    measurer: &mut impl Measurer,
+    metrics: &M,
+    hyphenator: &H,
+) -> (Band, Option<NoteCarry>) {
+    let mut trial = band.clone();
+    let mut out = carry;
+    for (i, id) in ids.iter().enumerate() {
+        let Some(note) = notes.get(id) else {
+            // An anchor naming a note the document does not hold. The anchor still prints — it
+            // prints `[?]` — and there is nothing to reserve.
+            continue;
+        };
+        let allow_cut = out.is_none() && i + 1 == ids.len();
+        if let Some(c) = trial.commit(
+            note,
+            0,
+            frame.rect.w_pt,
+            frame.rect.h_pt,
+            allow_cut,
+            ctx,
+            measurer,
+            metrics,
+            hyphenator,
+        ) {
+            out = Some(c);
+        }
+    }
+    (trial, out)
+}
+
+/// Open a frame's band with whatever note the previous frame carried forward (spec 0077).
+#[allow(clippy::too_many_arguments)]
+fn open_band<M: RunMetrics, H: Hyphenator>(
+    carry: Option<NoteCarry>,
+    notes: &BTreeMap<BlockId, &Block>,
+    frame: &Frame,
+    ctx: &BlockContext<'_>,
+    measurer: &mut impl Measurer,
+    metrics: &M,
+    hyphenator: &H,
+) -> (Band, Option<NoteCarry>) {
+    let mut band = Band::default();
+    let Some(c) = carry else {
+        return (band, None);
+    };
+    let Some(note) = notes.get(&c.note) else {
+        return (band, None);
+    };
+    let next = band.commit(
+        note,
+        c.split_at,
+        frame.rect.w_pt,
+        frame.rect.h_pt,
+        true,
+        ctx,
+        measurer,
+        metrics,
+        hyphenator,
+    );
+    if let Some(n) = next {
+        assert!(
+            n.split_at > c.split_at,
+            "a carried footnote must take at least one item per frame, or the flow cannot terminate"
+        );
+    }
+    (band, next)
+}
+
 /// The pagination loop, resumable from `start`.
 ///
 /// Extracted from `lay_out_with_template` so the one-shot path and the incremental session run
@@ -2535,11 +2933,12 @@ pub(crate) struct Resync<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flow(
     content: &[Block],
+    notes: &[Block],
     assets: &[Asset],
     styles: &StyleSheet,
     components: &ComponentLibrary,
     headings: &[HeadingEntry],
-    references: &BTreeMap<BlockId, String>,
+    resolved: &BTreeMap<BlockId, String>,
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
@@ -2552,13 +2951,16 @@ pub(crate) fn flow(
     // in an art-heavy document, which is precisely the workload this engine exists for (spec 0026).
     let assets: AssetIndex<'_> = assets.iter().map(|a| (a.id.as_str(), a)).collect();
     let markers = list_markers(content, styles);
+    // id → note block, for the same reason `assets` is an index: an anchor resolves its note once
+    // per placement attempt. Empty for every document without a footnote.
+    let note_index: BTreeMap<BlockId, &Block> = notes.iter().map(|b| (b.id(), b)).collect();
     let ctx = BlockContext {
         assets: &assets,
         styles,
         headings,
         components,
         markers: &markers,
-        references,
+        resolved,
     };
     let grid = template.baseline_grid().filter(BaselineGrid::is_usable);
 
@@ -2582,6 +2984,18 @@ pub(crate) fn flow(
     // now per frame so an oversized block is placed rather than skipped through every frame/page.
     let mut frame_empty = start.frame_empty;
     checkpoints.push(start);
+    // The notes reserved at the foot of the frame being filled, and the one note (if any) whose
+    // remainder the *next* frame's band opens with (spec 0077). Both are empty for every document
+    // without a footnote, and an empty band reduces nothing.
+    let (mut band, mut carry) = open_band(
+        start.note_carry,
+        &note_index,
+        &frames[frame_idx],
+        &ctx,
+        measurer,
+        metrics,
+        hyphenator,
+    );
 
     for (offset, block) in content[start.block_idx..].iter().enumerate() {
         let block_idx = start.block_idx + offset;
@@ -2622,7 +3036,33 @@ pub(crate) fn flow(
                     y = grid.snap_down(y + off) - off;
                 }
             }
-            let bottom = frame.rect.y_pt + frame.rect.h_pt;
+            // **The one place a footnote touches the flow** (spec 0077): the frame's bottom, and
+            // nothing else. The notes this placement would call for are reserved on a *copy* of the
+            // band, because the block only fits if the space is reserved and the space is only
+            // reserved if the block fits — the copy is kept when the placement is taken and thrown
+            // away when it is not. No block is measured against a height anywhere in here, and
+            // `MeasureKey` gains no height dimension: a note is measured at a frame *width*, through
+            // the same `Measurer`, exactly as any other block is.
+            //
+            // `wanted` is empty for every block in every document without a footnote, and an empty
+            // reservation leaves `bottom` the number it has always been.
+            let wanted = notes_in(&measured, block);
+            let (trial, trial_carry) = if wanted.is_empty() {
+                (band.clone(), carry)
+            } else {
+                reserve(
+                    &band,
+                    carry,
+                    &wanted,
+                    &note_index,
+                    &frame,
+                    &ctx,
+                    measurer,
+                    metrics,
+                    hyphenator,
+                )
+            };
+            let bottom = frame.rect.y_pt + frame.rect.h_pt - trial.height();
 
             if y + height > bottom {
                 // Fill this frame with as much of the block as legally fits before moving on
@@ -2635,6 +3075,34 @@ pub(crate) fn flow(
                 // works (spec 0046). Splitting a stat block that would have fitted the next column
                 // intact is a worse page than moving it — which is the keep-together spec 0038
                 // promised — while a paragraph is the opposite case and must still be cut.
+                //
+                // `next_h` is the next frame's *unreduced* height, and a carried note will have
+                // taken part of it before this block ever reaches it (spec 0077). Comparing against
+                // a height that will no longer exist is how keep-together would move a panel into a
+                // frame it does not fit. Skipped entirely when nothing is carried, so no document
+                // without a footnote sees a different number.
+                let next_h = match carry {
+                    None => next_h,
+                    Some(_) => {
+                        let next = Frame {
+                            rect: Rect {
+                                w_pt: next_w,
+                                h_pt: next_h,
+                                ..frame.rect
+                            },
+                        };
+                        let (opened, _) = open_band(
+                            carry,
+                            &note_index,
+                            &next,
+                            &ctx,
+                            measurer,
+                            metrics,
+                            hyphenator,
+                        );
+                        next_h - opened.height()
+                    }
+                };
                 let keep_whole = measured.prefers_keep_together() && height <= next_h;
                 if !keep_whole && same_width(frame.rect.w_pt, next_w) {
                     if let Some(k) = measured.cut_fitting(bottom - y) {
@@ -2663,6 +3131,27 @@ pub(crate) fn flow(
                                 "the absolute item offset must strictly increase across a cut, \
                                  or the flow loop cannot terminate"
                             );
+                            // Reserve for real, against the notes the **fragment** actually holds
+                            // rather than the whole block's — the anchors in the remainder travel
+                            // with it into the next frame, and their notes with them. That is what
+                            // makes "an anchor and its note are on the same page" hold across a cut
+                            // and not merely usually.
+                            if !wanted.is_empty() {
+                                let taken = notes_in(&fragment, block);
+                                let (b, c) = reserve(
+                                    &band,
+                                    carry,
+                                    &taken,
+                                    &note_index,
+                                    &frame,
+                                    &ctx,
+                                    measurer,
+                                    metrics,
+                                    hyphenator,
+                                );
+                                band = b;
+                                carry = c;
+                            }
                             page.blocks.extend(place_measured(
                                 fragment,
                                 fragment_h,
@@ -2695,10 +3184,23 @@ pub(crate) fn flow(
                 // Progress is not at risk: `keep_whole` is only true when the block fits the
                 // continuation frame entire, so the next iteration places it. One move, never a
                 // loop.
-                if !cut_taken && frame_empty && !keep_whole {
+                //
+                // The guard asks whether the **committed** band leaves any room, not the
+                // prospective one (spec 0077). A frame whose band is already full — a carried note
+                // that took the whole of it — has nowhere to put the block, and forcing it in there
+                // would print the block over the note. Moving on is safe because it is bounded:
+                // a carry takes at least one item of its note per frame, so it is consumed within
+                // that note's own item count and the band cannot stay full for ever. What the guard
+                // still does, unchanged, is place a block whose *own* notes are what it cannot fit
+                // beside — it overflows, loudly, rather than looping.
+                let band_leaves_room = band.height() < frame.rect.h_pt;
+                if !cut_taken && frame_empty && !keep_whole && band_leaves_room {
                     // Cannot be cut and the frame is empty: place it and let it overflow.
                 } else {
-                    // Doesn't fit → move on before placing.
+                    // Doesn't fit → move on before placing. The band belongs to the frame being
+                    // left, so it is set at its foot now; the frame moved into opens a fresh one
+                    // with whatever this one carried forward.
+                    band.flush(&mut page, &frame, metrics);
                     if frame_idx + 1 < frames.len() {
                         frame_idx += 1; // next frame on this page
                     } else {
@@ -2721,6 +3223,7 @@ pub(crate) fn flow(
                             frame_idx: 0,
                             y: frames[0].rect.y_pt,
                             frame_empty: true,
+                            note_carry: carry,
                         };
                         checkpoints.push(at_boundary);
 
@@ -2740,12 +3243,28 @@ pub(crate) fn flow(
                             }
                         }
                     }
+                    let (b, c) = open_band(
+                        carry,
+                        &note_index,
+                        &frames[frame_idx],
+                        &ctx,
+                        measurer,
+                        metrics,
+                        hyphenator,
+                    );
+                    band = b;
+                    carry = c;
                     y = frames[frame_idx].rect.y_pt;
                     frame_empty = true;
                     continue; // re-measure against the frame it moved into
                 }
             }
 
+            // The placement is taken, so the reservation it was checked against becomes the frame's
+            // real band. Nothing else in the loop writes `band`, which is what keeps a reservation
+            // that was thrown away from leaving a hole at the foot of a frame.
+            band = trial;
+            carry = trial_carry;
             page.blocks.extend(place_measured(
                 measured,
                 height,
@@ -2760,6 +3279,49 @@ pub(crate) fn flow(
         }
     }
 
+    // Drain whatever the last frame carried forward (spec 0077). A note called near the end of a
+    // document can be taller than the space left for it, and there is no block after it to advance
+    // the frame — so the flow adds the frames the note still needs itself, rather than dropping its
+    // tail. Bounded by the note's own item count: `open_band` asserts that each frame takes at least
+    // one item, so this runs at most once per remaining item.
+    while carry.is_some() {
+        band.flush(&mut page, &frames[frame_idx], metrics);
+        if frame_idx + 1 < frames.len() {
+            frame_idx += 1;
+        } else {
+            pages.push(page);
+            page_index += 1;
+            frames = frames_for(template, page_index);
+            page = LaidOutPage {
+                index: page_index,
+                blocks: Vec::new(),
+                statics: Vec::new(),
+            };
+            frame_idx = 0;
+            checkpoints.push(FlowState {
+                block_idx: content.len(),
+                split_at: 0,
+                page_index,
+                frame_idx: 0,
+                y: frames[0].rect.y_pt,
+                frame_empty: true,
+                note_carry: carry,
+            });
+        }
+        let (b, c) = open_band(
+            carry,
+            &note_index,
+            &frames[frame_idx],
+            &ctx,
+            measurer,
+            metrics,
+            hyphenator,
+        );
+        band = b;
+        carry = c;
+    }
+    // The last frame's band, before the last page is emitted.
+    band.flush(&mut page, &frames[frame_idx], metrics);
     // Always emit the last (possibly empty) page so callers receive >= 1 page.
     pages.push(page);
     FlowResult {
@@ -3696,6 +4258,7 @@ mod tests {
             default_master: None,
             pages: Vec::new(),
             sections: Vec::new(),
+            footnotes: Vec::new(),
         };
         // Give the blocks ids, as a loaded document would have (spec 0026).
         doc.assign_missing_block_ids().expect("fresh blocks");
@@ -3787,6 +4350,7 @@ mod tests {
             default_master: None,
             pages: Vec::new(),
             sections: Vec::new(),
+            footnotes: Vec::new(),
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -5025,7 +5589,7 @@ mod tests {
             headings: &[],
             components: &components,
             markers: &markers,
-            references: &BTreeMap::new(),
+            resolved: &BTreeMap::new(),
         };
         measure_block(block, width, &ctx, &MONO, &NoHyphenator)
             .expect("the fixtures all measure")
@@ -9027,5 +9591,592 @@ mod tests {
             "the last iterate printed {printed_here:?}"
         );
         assert_eq!(landed, 7, "…while the target is on the page printed `viii`");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Footnotes (spec 0077)
+    // ---------------------------------------------------------------------------------------
+
+    /// Lay a document out through the path that carries its footnotes — what [`lay_out`] does,
+    /// with the fixpoint status the tests need.
+    fn lay_out_noted(doc: &Document) -> (Vec<LaidOutPage>, FixpointStatus) {
+        let template = DocumentTemplate::new(doc);
+        lay_out_resolved(
+            &doc.content,
+            &doc.footnote_blocks(),
+            &doc.assets,
+            &doc.styles,
+            &doc.component_library(),
+            &template,
+            &MONO,
+            &NoHyphenator,
+        )
+    }
+
+    /// A document of `before` filler lines, then a paragraph carrying one footnote anchor.
+    ///
+    /// Returns the document, the anchoring block's id and the note's id.
+    fn noted_doc(before: usize, note_text: &str) -> (Document, BlockId, BlockId) {
+        use quill_core_model::{Footnote, Run};
+        let ink = Color::Gray { v: 0.0 };
+        let mut content = many_lines(before);
+        content.push(Block::body_runs(
+            vec![Run::plain("anchored"), Run::footnote(BlockId(1))],
+            ink,
+        ));
+        let mut doc = doc_with_blocks(content);
+        // The anchor names a note id that does not exist yet, so it is patched after the notes are
+        // given ids — which is exactly what an editor would do the other way round.
+        doc.footnotes = vec![Footnote::plain(note_text, ink)];
+        doc.assign_missing_block_ids().expect("ids");
+        let note = doc.footnotes[0].id;
+        let anchor = doc.content.last().expect("anchor").id();
+        if let Some(Block::Body { runs, .. }) = doc.content.last_mut() {
+            runs[1] = Run::footnote(note);
+        }
+        (doc, anchor, note)
+    }
+
+    /// **The defining property.** Asserted across a *sweep* of the page boundary rather than at one
+    /// filler count, because the interesting case is the one where reserving the band is what pushed
+    /// the anchor onto the next page — and where that happens depends on arithmetic a metrics change
+    /// could move. A sweep tests the property; a single count tests one arrangement of it.
+    #[test]
+    fn an_anchor_and_its_note_land_on_the_same_page() {
+        let mut pushed = 0;
+        for before in 45..58 {
+            let (doc, anchor, note) = noted_doc(before, "a note at the foot of the page");
+            let (pages, status) = lay_out_noted(&doc);
+            assert!(status.converged, "{status:?}");
+            let a = page_of(&pages, anchor).expect("the anchor is placed");
+            let n = page_of(&pages, note).expect("the note is placed");
+            assert_eq!(
+                a, n,
+                "before={before}: the anchor is on page {a} and its note on page {n}"
+            );
+            // Without a band, 54 lines fill a page here; with one, fewer do. Count the fillers that
+            // the band moved onto the next page, so a change that quietly stopped reserving
+            // anything fails this rather than passing every equality above.
+            if a > 0 {
+                pushed += 1;
+            }
+        }
+        assert!(
+            pushed >= 2,
+            "the sweep must cross the page boundary or it is asserting nothing; {pushed} of 13 \
+             put the anchor past page 0"
+        );
+    }
+
+    /// The band really does take height off the frame, stated as the difference it makes rather
+    /// than as an absolute — the number would move with the metrics, the *difference* is the
+    /// mechanism.
+    #[test]
+    fn the_note_band_reduces_the_frame_and_nothing_else() {
+        let (noted, _, _) = noted_doc(52, "a note at the foot of the page");
+        let mut bare = noted.clone();
+        bare.footnotes.clear();
+        if let Some(Block::Body { runs, .. }) = bare.content.last_mut() {
+            runs.truncate(1);
+        }
+
+        let (with, _) = lay_out_noted(&noted);
+        let (without, _) = lay_out_noted(&bare);
+        assert!(
+            with.len() > without.len(),
+            "reserving a band must cost the document space: {} pages with, {} without",
+            with.len(),
+            without.len()
+        );
+        // And a document with no note reserves nothing: the band is `0.0`, so `bottom` is the
+        // number it has always been.
+        assert!(bare.footnote_blocks().is_empty());
+    }
+
+    /// The band's height is *reserved*, not merely drawn: no body block may reach into it. This is
+    /// the direct statement of what reducing `bottom` buys, and it is the assertion that fails if a
+    /// later change draws the band without taking the height off the frame.
+    #[test]
+    fn no_body_block_reaches_into_the_note_band() {
+        let notes: BTreeSet<BlockId> = {
+            let (doc, _, _) = noted_doc(52, "a note at the foot of the page");
+            let (pages, _) = lay_out_noted(&doc);
+            let ids: BTreeSet<BlockId> = doc.footnote_blocks().iter().map(Block::id).collect();
+            check_no_overlap(&pages, &ids);
+            ids
+        };
+        assert_eq!(notes.len(), 1);
+
+        // …and over the sweep, so it is a property of the mechanism rather than of one arrangement.
+        for before in 45..58 {
+            let (doc, _, _) = noted_doc(before, "a note at the foot of the page");
+            let (pages, _) = lay_out_noted(&doc);
+            let ids: BTreeSet<BlockId> = doc.footnote_blocks().iter().map(Block::id).collect();
+            check_no_overlap(&pages, &ids);
+        }
+    }
+
+    /// Every page's body ink must end above the band its notes occupy.
+    ///
+    /// The band's top is derived from the notes actually placed rather than from the separator
+    /// rule, because a stat block draws `PlacedBlock::Rect`s of its own and the two are
+    /// indistinguishable by variant.
+    fn check_no_overlap(pages: &[LaidOutPage], notes: &BTreeSet<BlockId>) {
+        for page in pages {
+            let top = page
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    PlacedBlock::Text { source, frame, .. } if notes.contains(source) => {
+                        Some(frame.y_pt)
+                    }
+                    _ => None,
+                })
+                .fold(f32::INFINITY, f32::min);
+            if !top.is_finite() {
+                continue;
+            }
+            let rule = top - NOTE_RULE_SPACE_BELOW_PT - NOTE_RULE_THICKNESS_PT;
+            for placed in &page.blocks {
+                if let PlacedBlock::Text { source, frame, .. } = placed {
+                    if notes.contains(source) {
+                        continue;
+                    }
+                    assert!(
+                        frame.y_pt + frame.h_pt <= rule + 0.01,
+                        "page {}: body ink ends at {} but the note band opens at {rule}",
+                        page.index,
+                        frame.y_pt + frame.h_pt
+                    );
+                }
+            }
+        }
+    }
+
+    /// A composite among the footnotes. A stat block would rather move whole than be cut, and the
+    /// height it compares itself against is the *next* frame's — which a carried note will have
+    /// taken part of before the block ever reaches it. Whatever it decides, it may not end up drawn
+    /// over a band.
+    #[test]
+    fn a_keep_together_composite_never_lands_on_top_of_a_band() {
+        use quill_core_model::{Footnote, Panel, Run};
+        let ink = Color::Gray { v: 0.0 };
+        for words in [400usize, 900, 1600] {
+            let mut content = many_lines(6);
+            content.push(Block::body_runs(
+                vec![Run::plain("a claim"), Run::footnote(BlockId(1))],
+                ink,
+            ));
+            content.push(Block::Panel {
+                id: BlockId::UNASSIGNED,
+                panel: Panel {
+                    name: "Cave Bear".into(),
+                    attributes: vec![("AC".into(), "13".into()), ("HP".into(), "42".into())],
+                    overview: (0..12).map(|i| format!("overview line {i}")).collect(),
+                    details: (0..12).map(|i| format!("detail line {i}")).collect(),
+                    actions: (0..12).map(|i| format!("action line {i}")).collect(),
+                    reactions: Vec::new(),
+                },
+                color: ink,
+            });
+            content.extend(many_lines(40));
+            let mut doc = doc_with_blocks(content);
+            doc.footnotes = vec![Footnote::plain("word ".repeat(words), ink)];
+            doc.assign_missing_block_ids().expect("ids");
+            let note = doc.footnotes[0].id;
+            if let Some(Block::Body { runs, .. }) = doc.content.get_mut(6) {
+                runs[1] = Run::footnote(note);
+            }
+
+            let (pages, status) = lay_out_noted(&doc);
+            assert!(status.converged, "{status:?}");
+            let ids: BTreeSet<BlockId> = doc.footnote_blocks().iter().map(Block::id).collect();
+            check_no_overlap(&pages, &ids);
+            assert!(
+                page_of(&pages, doc.content[7].id()).is_some(),
+                "words={words}: the composite must still be placed"
+            );
+        }
+    }
+
+    /// Spec 0075's mechanism, over a note. Conservation is the assertion that matters: the lines
+    /// placed across every page, in order, are exactly the lines one unsplit measurement produces.
+    #[test]
+    fn a_note_too_tall_for_its_band_splits_across_pages_and_loses_nothing() {
+        let long = "word ".repeat(1400);
+        let (doc, _, note) = noted_doc(10, &long);
+        let (pages, status) = lay_out_noted(&doc);
+        assert!(status.converged, "{status:?}");
+
+        let on: Vec<usize> = pages
+            .iter()
+            .filter(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == note))
+            })
+            .map(|p| p.index)
+            .collect();
+        assert!(
+            on.len() >= 2,
+            "the fixture exists to make the note span frames; it is on {on:?}"
+        );
+
+        // The unsplit line list, measured the same way the flow measures it.
+        let notes = doc.footnote_blocks();
+        let frame = DocumentTemplate::new(&doc).frames(0)[0];
+        let markers = BTreeMap::new();
+        let assets = AssetIndex::new();
+        let ctx = BlockContext {
+            assets: &assets,
+            styles: &doc.styles,
+            headings: &[],
+            components: &builtin_components(),
+            markers: &markers,
+            resolved: &quill_core_model::footnote_numbers(&notes),
+        };
+        let (whole, _) = measure_block(&notes[0], frame.rect.w_pt, &ctx, &MONO, &NoHyphenator)
+            .expect("measured");
+        let Measured::Text { lines: want, .. } = whole else {
+            panic!("a note is a paragraph")
+        };
+
+        let mut got: Vec<String> = Vec::new();
+        for page in &pages {
+            for placed in &page.blocks {
+                if let PlacedBlock::Text { source, lines, .. } = placed {
+                    if *source == note {
+                        got.extend(lines.iter().map(|l| l.text.clone()));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            got,
+            want.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
+            "every line of the note, once, in order"
+        );
+    }
+
+    /// Two notes called by **one** paragraph, both too tall to sit whole in what is left of the
+    /// band. Only one of them may be carried forward, and it must be the last — otherwise the
+    /// second cut overwrites the first carry and the first note's tail is silently lost.
+    ///
+    /// Swept over several note lengths, because which of the two ends up needing the cut depends on
+    /// arithmetic a metrics change could move; the property is that **nothing is lost**, whichever
+    /// one it is.
+    #[test]
+    fn two_notes_in_one_paragraph_lose_nothing_between_them() {
+        use quill_core_model::{Footnote, Run};
+        let ink = Color::Gray { v: 0.0 };
+        for words in [700usize, 800, 900, 1000] {
+            let mut content = many_lines(4);
+            content.push(Block::body_runs(
+                vec![
+                    Run::plain("two claims"),
+                    Run::footnote(BlockId(1)),
+                    Run::plain(" and another"),
+                    Run::footnote(BlockId(2)),
+                ],
+                ink,
+            ));
+            content.extend(many_lines(40));
+            let mut doc = doc_with_blocks(content);
+            doc.footnotes = vec![
+                Footnote::plain(format!("alpha {}", "word ".repeat(words)), ink),
+                Footnote::plain(format!("beta {}", "word ".repeat(words)), ink),
+            ];
+            doc.assign_missing_block_ids().expect("ids");
+            let (a, b) = (doc.footnotes[0].id, doc.footnotes[1].id);
+            if let Some(Block::Body { runs, .. }) = doc.content.get_mut(4) {
+                runs[1] = Run::footnote(a);
+                runs[3] = Run::footnote(b);
+            }
+
+            let (pages, status) = lay_out_noted(&doc);
+            assert!(status.converged, "{status:?}");
+            let notes = doc.footnote_blocks();
+            let frame = DocumentTemplate::new(&doc).frames(0)[0];
+            let markers = BTreeMap::new();
+            let assets = AssetIndex::new();
+            let ctx = BlockContext {
+                assets: &assets,
+                styles: &doc.styles,
+                headings: &[],
+                components: &builtin_components(),
+                markers: &markers,
+                resolved: &quill_core_model::footnote_numbers(&notes),
+            };
+            for note in &notes {
+                let (whole, _) =
+                    measure_block(note, frame.rect.w_pt, &ctx, &MONO, &NoHyphenator).expect("m");
+                let Measured::Text { lines: want, .. } = whole else {
+                    panic!("a note is a paragraph")
+                };
+                let mut got: Vec<String> = Vec::new();
+                for page in &pages {
+                    for placed in &page.blocks {
+                        if let PlacedBlock::Text { source, lines, .. } = placed {
+                            if *source == note.id() {
+                                got.extend(lines.iter().map(|l| l.text.clone()));
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    got,
+                    want.iter().map(|l| l.text.clone()).collect::<Vec<_>>(),
+                    "words={words}: every line of {:?}, once, in order",
+                    note.id()
+                );
+            }
+        }
+    }
+
+    /// A note whose remainder is taller than a whole frame carries through several frames, and
+    /// terminates. **This is the fixture for the progress bound**: a band that grew without
+    /// consuming its note would page for ever, and `open_band`'s assertion is what says so.
+    #[test]
+    fn a_note_taller_than_a_frame_is_consumed_one_frame_at_a_time() {
+        let long = "word ".repeat(4000);
+        let (doc, _, note) = noted_doc(2, &long);
+        let (pages, status) = lay_out_noted(&doc);
+        assert!(status.converged, "{status:?}");
+        let bands: Vec<usize> = pages
+            .iter()
+            .filter(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == note))
+            })
+            .map(|p| p.index)
+            .collect();
+        assert!(
+            bands.len() >= 4,
+            "the fixture must span several frames to exercise the carry; it spans {bands:?}"
+        );
+        // Consecutive, and it ends: a carry that failed to advance would either loop for ever
+        // (caught by the assertion in `open_band`) or leave a gap here.
+        for w in bands.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "the carry must take the very next frame");
+        }
+    }
+
+    /// **The resume contract, for the state a footnote adds.** Spec 0044 asserts that resuming from
+    /// a checkpoint whose `split_at > 0` reproduces a full pass; a page that *opens* in the middle
+    /// of a note owes the same assertion, and it is the reason `FlowState` grew a field.
+    ///
+    /// Written against `flow` directly rather than through a session, because the session chooses
+    /// its own resume point and would have to be coaxed into choosing this one — which would make
+    /// the test about the choice rather than about the contract.
+    #[test]
+    fn resuming_from_a_checkpoint_inside_a_carried_note_reproduces_a_full_pass() {
+        // Filler *after* the anchor as well as before it, so the note is carried across page
+        // boundaries the main loop takes rather than only across the ones the end-of-content drain
+        // adds. Both paths record a checkpoint; only this fixture reaches the first.
+        let long = "word ".repeat(3000);
+        let (mut doc, _, _) = noted_doc(2, &long);
+        doc.content.extend(many_lines(200));
+        doc.assign_missing_block_ids().expect("ids");
+        let notes = doc.footnote_blocks();
+        let numbers = quill_core_model::footnote_numbers(&notes);
+        let template = DocumentTemplate::new(&doc);
+        let components = doc.component_library();
+        let run = |start: FlowState| {
+            flow(
+                &doc.content,
+                &notes,
+                &doc.assets,
+                &doc.styles,
+                &components,
+                &[],
+                &numbers,
+                &template,
+                &MONO,
+                &NoHyphenator,
+                start,
+                &mut NoCache,
+                None,
+            )
+        };
+
+        let full = run(FlowState::start(&template));
+        let carried: Vec<usize> = full
+            .checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.note_carry.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !carried.is_empty(),
+            "the fixture exists to record a checkpoint inside a note; it recorded none"
+        );
+
+        for i in &carried {
+            let resumed = run(full.checkpoints[*i]);
+            assert_eq!(
+                resumed.pages,
+                full.pages[*i..],
+                "resuming at page {i} — whose band opens with {:?} — must reproduce the full pass",
+                full.checkpoints[*i].note_carry
+            );
+        }
+    }
+
+    /// The fragment case, and the one a coarser implementation gets wrong: a paragraph is cut across
+    /// a page boundary and its anchor is in the **remainder**, so the note belongs to the second
+    /// page and not to the first.
+    #[test]
+    fn a_note_follows_its_anchor_into_the_frame_the_anchor_lands_in() {
+        use quill_core_model::{Footnote, Run};
+        let ink = Color::Gray { v: 0.0 };
+        // One paragraph tall enough to be cut, with the anchor as its last run.
+        let mut content = many_lines(50);
+        content.push(Block::body_runs(
+            vec![Run::plain("body ".repeat(200)), Run::footnote(BlockId(1))],
+            ink,
+        ));
+        let mut doc = doc_with_blocks(content);
+        doc.footnotes = vec![Footnote::plain("the note", ink)];
+        doc.assign_missing_block_ids().expect("ids");
+        let note = doc.footnotes[0].id;
+        let para = doc.content.last().expect("para").id();
+        let anchor_run = 1usize;
+        if let Some(Block::Body { runs, .. }) = doc.content.last_mut() {
+            runs[anchor_run] = Run::footnote(note);
+        }
+
+        let (pages, status) = lay_out_noted(&doc);
+        assert!(status.converged, "{status:?}");
+
+        // The paragraph really is cut.
+        let on: Vec<usize> = pages
+            .iter()
+            .filter(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| matches!(b, PlacedBlock::Text { source, .. } if *source == para))
+            })
+            .map(|p| p.index)
+            .collect();
+        assert!(
+            on.len() >= 2,
+            "the fixture must split the paragraph: {on:?}"
+        );
+
+        // The page the anchor's *line* landed on, found through the spans rather than by looking
+        // for the number's characters — "1" appears in filler text too.
+        let anchor_page = pages
+            .iter()
+            .find(|p| {
+                p.blocks.iter().any(|b| match b {
+                    PlacedBlock::Text { source, lines, .. } if *source == para => lines
+                        .iter()
+                        .any(|l| l.spans.iter().any(|s| s.run == anchor_run)),
+                    _ => false,
+                })
+            })
+            .map(|p| p.index)
+            .expect("the anchor run is drawn somewhere");
+        assert_eq!(
+            page_of(&pages, note),
+            Some(anchor_page),
+            "the note belongs to the fragment its anchor is in, not to the block's first page"
+        );
+        assert!(
+            anchor_page > on[0],
+            "the fixture exists to put the anchor in the *remainder*: it is on page \
+             {anchor_page} and the paragraph starts on {}",
+            on[0]
+        );
+    }
+
+    /// Numbering is document-sequential and derived from where the **anchors** are, not from the
+    /// order of `Document::footnotes` — which is what makes the list an unordered store.
+    #[test]
+    fn footnotes_are_numbered_by_anchor_order_not_by_list_order() {
+        use quill_core_model::{Footnote, Run};
+        let ink = Color::Gray { v: 0.0 };
+        let mut doc = doc_with_blocks(vec![
+            Block::body_runs(vec![Run::plain("first"), Run::footnote(BlockId(1))], ink),
+            Block::body_runs(vec![Run::plain("second"), Run::footnote(BlockId(2))], ink),
+        ]);
+        doc.footnotes = vec![Footnote::plain("BETA", ink), Footnote::plain("ALPHA", ink)];
+        doc.assign_missing_block_ids().expect("ids");
+        let (beta, alpha) = (doc.footnotes[0].id, doc.footnotes[1].id);
+        // The *second* note in the list is anchored first.
+        if let Block::Body { runs, .. } = &mut doc.content[0] {
+            runs[1] = Run::footnote(alpha);
+        }
+        if let Block::Body { runs, .. } = &mut doc.content[1] {
+            runs[1] = Run::footnote(beta);
+        }
+
+        let numbers = doc.footnote_numbers();
+        assert_eq!(numbers.get(&alpha).map(String::as_str), Some("1"));
+        assert_eq!(numbers.get(&beta).map(String::as_str), Some("2"));
+
+        let (pages, _) = lay_out_noted(&doc);
+        assert_eq!(printed(&pages, doc.content[0].id()), "first1");
+        assert_eq!(printed(&pages, doc.content[1].id()), "second2");
+        assert!(printed(&pages, alpha).starts_with("1. ALPHA"));
+        assert!(printed(&pages, beta).starts_with("2. BETA"));
+    }
+
+    /// An anchor naming a note the document does not hold prints the marker rather than a number
+    /// nothing answers to — spec 0076's posture, at the site that inherits it. And the notes that
+    /// *are* there stay numbered without a hole.
+    #[test]
+    fn an_anchor_with_no_note_prints_a_visible_marker() {
+        use quill_core_model::{Footnote, Run};
+        let ink = Color::Gray { v: 0.0 };
+        let mut doc = doc_with_blocks(vec![
+            Block::body_runs(vec![Run::plain("a"), Run::footnote(BlockId(999_999))], ink),
+            Block::body_runs(vec![Run::plain("b"), Run::footnote(BlockId(1))], ink),
+        ]);
+        doc.footnotes = vec![Footnote::plain("real", ink)];
+        doc.assign_missing_block_ids().expect("ids");
+        let real = doc.footnotes[0].id;
+        if let Block::Body { runs, .. } = &mut doc.content[1] {
+            runs[1] = Run::footnote(real);
+        }
+        let (pages, status) = lay_out_noted(&doc);
+        assert!(status.converged, "{status:?}");
+        // Against the literal, not the constant: a test written as `format!("a{UNRESOLVED}")` is a
+        // formula checked against itself and would pass just as happily if the marker became "".
+        assert_eq!(printed(&pages, doc.content[0].id()), "a[?]");
+        assert_eq!(
+            printed(&pages, doc.content[1].id()),
+            "b1",
+            "the note that exists is still number one"
+        );
+    }
+
+    /// A document with no footnote takes the identical path: the notes list is empty, the band is
+    /// never non-empty, and the pages are the ones the no-footnote entry point produces.
+    #[test]
+    fn a_document_with_no_footnote_lays_out_exactly_as_before() {
+        let doc = doc_with_blocks(many_lines(200));
+        assert!(doc.footnote_blocks().is_empty());
+        let (noted, status) = lay_out_noted(&doc);
+        assert_eq!(status.iterations, 1, "no extra pass");
+        let template = DocumentTemplate::new(&doc);
+        let (bare, _) = lay_out_with_fixpoint_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &template,
+            &MONO,
+            &NoHyphenator,
+        );
+        assert_eq!(noted, bare, "the footnote path must be a no-op without one");
+        assert!(
+            noted
+                .iter()
+                .flat_map(|p| &p.blocks)
+                .all(|b| !matches!(b, PlacedBlock::Rect { .. })),
+            "no band separator is drawn for a document with no note"
+        );
     }
 }

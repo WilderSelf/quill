@@ -216,6 +216,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 7 {
         migrate_6_to_7(obj);
     }
+    if found < 8 {
+        migrate_7_to_8(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -327,6 +330,22 @@ fn migrate_5_to_6(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 /// original, and the loss is worse for authored intent than for derived state. Loudness mitigates
 /// the proof; it does not undo the deletion.
 fn migrate_6_to_7(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
+
+/// v7 → v8 (spec 0077): a document gains `footnotes`, and a run's `source` gains a footnote anchor.
+///
+/// Structurally a no-op for [`migrate_6_to_7`]'s reason: a v7 document has no notes and every run
+/// draws its own text, which is what the absent list and the defaulted `RunSource::Authored` already
+/// mean. Writing `"footnotes": []` into every document in existence would move its manifest text and
+/// its exported `/ID` for a statement the absence already makes.
+///
+/// **The bump is the strongest case the rule has had, and it is the *loss* half again — not the
+/// silence half.** A v7 build opening a v8 document drops `source` and prints the anchor's stored
+/// `text`, which is `[?]`: the page is visibly unfinished exactly where a note was called, which is
+/// spec 0074's condition for the rule not firing. But `footnotes` is not intent this time, it is
+/// **prose** — the author's own sentences, in a list a v7 build does not know exists — and one
+/// open-and-save deletes every one of them with nothing left in the file to regenerate them from.
+/// Spec 0076 bumped for losing *which block a reference pointed at*; this loses the note.
+fn migrate_7_to_8(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 
 /// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
 ///
@@ -650,6 +669,17 @@ mod tests {
             .flat_map(|b| b.runs())
             .all(|r| r.source.is_authored()));
 
+        // …and a v7 document has a cross-reference and **no footnotes**: v7 had no such list, so
+        // every anchor it could carry is one nothing in the model can express.
+        let v7 = Document::from_json(V7_REFERENCE).expect("v7");
+        assert_eq!(v7.format_version, FORMAT_VERSION);
+        assert!(v7.footnotes.is_empty());
+        assert!(v7
+            .content
+            .iter()
+            .flat_map(|b| b.runs())
+            .all(|r| r.source.note().is_none()));
+
         // And the far end of the chain still refuses: v(current + 1) is not a document this build
         // may open, whatever it contains.
         let next = FORMAT_VERSION + 1;
@@ -710,6 +740,21 @@ mod tests {
             crate::reference_targets(&doc.content),
             std::collections::BTreeSet::from([doc.content[2].id()]),
             "the documented reference must name the image the example ships"
+        );
+
+        // And a footnote (spec 0077): the anchor's stored `text` is the marker, the note is in its
+        // own list, and the number it prints is derived rather than written down.
+        assert_eq!(
+            doc.content[3].plain_text().as_deref(),
+            Some("The keep is older than the town[?].")
+        );
+        assert_eq!(doc.footnotes.len(), 1);
+        assert_eq!(
+            doc.footnote_numbers()
+                .get(&doc.footnotes[0].id)
+                .map(String::as_str),
+            Some("1"),
+            "the documented anchor must actually name the documented note"
         );
 
         // A master with both spec-0047 fields exercised.
@@ -895,6 +940,57 @@ mod tests {
 
         let native = V6_FOLIO.replace(
             "\"format_version\": 6",
+            &format!("\"format_version\": {FORMAT_VERSION}"),
+        );
+        let native = Document::from_json(&native).expect("load as current");
+        assert_eq!(json, native.to_json().expect("save"));
+    }
+
+    /// A document written by a v7 build (spec 0077's fixture), committed **as bytes**.
+    ///
+    /// The same reasoning as every fixture above it: one the current serializer produced would
+    /// migrate correctly by construction and prove nothing. This one is the shape a v7 build put on
+    /// disk — a cross-reference with its `source` object, roman front matter and a `{page}` static —
+    /// because a cross-reference is the newest thing v7 could hold and the thing this step must not
+    /// disturb.
+    const V7_REFERENCE: &str = include_str!("../assets/v7-reference.json");
+
+    #[test]
+    fn a_v7_manifest_migrates_forward_to_v8() {
+        let doc = Document::from_json(V7_REFERENCE).expect("a v7 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+
+        // It means what it meant: no footnotes, and no anchor, because v7 had neither.
+        assert!(doc.footnotes.is_empty());
+        assert!(doc.footnote_blocks().is_empty());
+        assert!(doc.footnote_numbers().is_empty());
+
+        // …and its cross-reference survived the step, which is the previous version's claim and the
+        // one this step must not disturb.
+        assert_eq!(
+            crate::reference_targets(&doc.content),
+            std::collections::BTreeSet::from([crate::BlockId(1)])
+        );
+        assert_eq!(
+            doc.sections[0].folio.expect("folio").format,
+            crate::NumberFormat::LowerRoman
+        );
+    }
+
+    #[test]
+    fn migrating_a_v7_document_does_not_move_its_exported_identity() {
+        // Spec 0047's hazard, for the fourth time, and the reason `migrate_7_to_8` writes nothing:
+        // defaulting `"footnotes": []` into every document would rewrite the manifest text of every
+        // file quill has written, and the `/ID` is a hash of that text.
+        let migrated = Document::from_json(V7_REFERENCE).expect("load");
+        let json = migrated.to_json().expect("save");
+        assert!(
+            !json.contains("\"footnotes\""),
+            "migration must not add `footnotes`: {json}"
+        );
+
+        let native = V7_REFERENCE.replace(
+            "\"format_version\": 7",
             &format!("\"format_version\": {FORMAT_VERSION}"),
         );
         let native = Document::from_json(&native).expect("load as current");

@@ -104,8 +104,8 @@ struct MeasureKey {
     /// would serve stale ordinals from the cache — the exact failure spec 0041 records for anything
     /// derived from position.
     marker: u64,
-    /// The text this block's cross-references currently resolve to, hashed (spec 0076). `0` — and
-    /// therefore the key this block has always had — when it contains none.
+    /// The text this block's **generated** runs currently resolve to, hashed (specs 0076, 0077).
+    /// `0` — and therefore the key this block has always had — when it contains none.
     ///
     /// **This is the increment's design decision, and it is a decision about where *not* to put
     /// it.** A cross-reference is derived from where its target landed, so it is context rather than
@@ -123,7 +123,11 @@ struct MeasureKey {
     /// it had and is served from cache. It also owes no eviction, which is spec 0075's lesson — a
     /// changed derivation produces a different key rather than an entry that has to be found and
     /// dropped.
-    references: u64,
+    /// Spec 0077 puts a second quantity through the identical mechanism rather than inventing one:
+    /// a footnote number is derived from where the anchors sit in document order, so it is context
+    /// exactly as a list marker is, and a note inserted at the front of a book renumbers every
+    /// anchor after it without changing one character of their text.
+    generated: u64,
     /// Style fingerprint: size, leading, alignment and the surrounding space all change the result.
     style: u64,
 }
@@ -213,6 +217,12 @@ impl LayoutSession {
     ) -> LayoutResult {
         let has_toc = doc.content.iter().any(|b| matches!(b, Block::Toc { .. }));
         let targets = quill_core_model::reference_targets(&doc.content);
+        // Synthesised once per relayout rather than once per fixpoint pass (spec 0077), and empty
+        // for every document without a footnote. Their numbers are derived from content order, so
+        // they are known here and are constant across the loop's passes — a footnote is not a fourth
+        // derived quantity and costs the fixpoint nothing.
+        let notes = doc.footnote_blocks();
+        let numbers = quill_core_model::footnote_numbers(&notes);
 
         // The pages this relayout started from. Intermediate iterations overwrite `self.pages`, so
         // the caller's `changed_pages` has to be measured against where the *document* was before
@@ -231,9 +241,12 @@ impl LayoutSession {
         // It is sound because it only moves the loop's starting point: the exit condition still
         // compares two consecutive derivations, and the map that ships is always derived from the
         // pages that ship.
-        let mut references = crate::reference_folios(&targets, &self.pages, template);
+        let mut resolved = crate::reference_folios(&targets, &self.pages, template);
+        resolved.extend(numbers.iter().map(|(k, v)| (*k, v.clone())));
         let mut headings: Vec<HeadingEntry> = Vec::new();
-        let mut result = self.pass(doc, template, &headings, &references, metrics, hyphenator);
+        let mut result = self.pass(
+            doc, &notes, template, &headings, &resolved, metrics, hyphenator,
+        );
         let mut reassigned = template.reassign(&result.pages);
         let mut iterations = 1;
         // Work counters accumulate across the whole relayout; the page counts below stay the final
@@ -248,16 +261,19 @@ impl LayoutSession {
             } else {
                 Vec::new()
             };
-            let next_refs = crate::reference_folios(&targets, &result.pages, template);
-            if next == headings && next_refs == references && !reassigned {
+            let mut next_refs = crate::reference_folios(&targets, &result.pages, template);
+            next_refs.extend(numbers.iter().map(|(k, v)| (*k, v.clone())));
+            if next == headings && next_refs == resolved && !reassigned {
                 break true;
             }
             if iterations >= crate::FIXPOINT_MAX_ITERATIONS {
                 break false;
             }
             headings = next;
-            references = next_refs;
-            result = self.pass(doc, template, &headings, &references, metrics, hyphenator);
+            resolved = next_refs;
+            result = self.pass(
+                doc, &notes, template, &headings, &resolved, metrics, hyphenator,
+            );
             reassigned = template.reassign(&result.pages);
             measured += result.stats.blocks_measured;
             from_cache += result.stats.blocks_from_cache;
@@ -277,27 +293,45 @@ impl LayoutSession {
     }
 
     /// One incremental pass with a fixed contents index.
+    #[allow(clippy::too_many_arguments)]
     fn pass(
         &mut self,
         doc: &Document,
+        notes: &[Block],
         template: &impl PageTemplate,
         headings: &[HeadingEntry],
-        references: &BTreeMap<BlockId, String>,
+        resolved: &BTreeMap<BlockId, String>,
         metrics: &impl RunMetrics,
         hyphenator: &impl Hyphenator,
     ) -> LayoutResult {
-        // The diff is over content **and** what each block's cross-references currently print (spec
-        // 0076). Without the second term a pass whose references moved but whose text did not would
-        // see "nothing changed" and hand back the previous pages — spec 0075's shape, in the one
-        // place this increment could reintroduce it. Folded into the same `u64` rather than added as
-        // a third tuple element because the diff only ever asks whether two entries differ.
+        // The diff is over content, what each block's generated runs currently print, and the text
+        // of the notes it anchors (specs 0076, 0077).
+        //
+        // Without the second term a pass whose references moved but whose text did not would see
+        // "nothing changed" and hand back the previous pages — spec 0075's shape, in the one place
+        // 0076 could reintroduce it.
+        //
+        // The third term exists because a footnote's **text is not in `content`**: editing a note
+        // changes the band the frame its anchor lands in reserves, and a diff that walked only the
+        // blocks would call that "nothing changed". The obvious home would be
+        // `context_fingerprint` — and it is the wrong one for exactly 0076's reason: a changed
+        // context sets `dirty_from = Some(0)`, so editing one note in a book with hundreds would
+        // reflow the whole document. Per-block, it dirties the paragraph that anchors the note and
+        // nothing else. It is deliberately **not** in `MeasureKey`: a note's text does not change
+        // what its anchor's paragraph *measures*, only where the paragraph fits, so hashing it into
+        // the key would re-break a paragraph that has not moved.
+        //
+        // All three are folded into the same `u64` rather than added as tuple elements, because the
+        // diff only ever asks whether two entries differ.
         let current: Vec<(BlockId, u64)> = doc
             .content
             .iter()
             .map(|b| {
                 (
                     b.id(),
-                    content_fingerprint(b) ^ reference_fingerprint(b, references),
+                    content_fingerprint(b)
+                        ^ generated_fingerprint(b, resolved)
+                        ^ note_fingerprint(b, doc),
                 )
             })
             .collect();
@@ -427,11 +461,12 @@ impl LayoutSession {
 
         let result = flow(
             &doc.content,
+            notes,
             &doc.assets,
             &doc.styles,
             &doc.component_library(),
             headings,
-            references,
+            resolved,
             template,
             metrics,
             hyphenator,
@@ -604,8 +639,8 @@ impl Measurer for CachingMeasurer<'_> {
             width_bits: width.to_bits(),
             marker: marker_fingerprint(ctx.markers.get(&block.id())),
             // Off the same `ctx` the measurement itself resolves from, so the key and the
-            // measurement cannot disagree about what a reference says.
-            references: reference_fingerprint(block, ctx.references),
+            // measurement cannot disagree about what a generated run says.
+            generated: generated_fingerprint(block, ctx.resolved),
             style: style_fingerprint(self.styles, block),
         };
         if let Some(hit) = self.cache.get(&key) {
@@ -836,16 +871,16 @@ fn marker_fingerprint(marker: Option<&String>) -> u64 {
     h
 }
 
-/// Hash of what this block's cross-references currently print (spec 0076).
+/// Hash of what this block's generated runs currently print (specs 0076, 0077).
 ///
-/// `0` for a block with no cross-reference — a distinguished value rather than a hash of nothing, so
+/// `0` for a block with no generated run — a distinguished value rather than a hash of nothing, so
 /// that every block in every document without the feature keeps the exact [`MeasureKey`] it had and
 /// its cached measurement is untouched. That is the whole perf claim, stated as one branch.
 ///
 /// The runs' resolved values in run order, so two references to the same target in one paragraph are
 /// not confused with one, and so a target whose folio is *absent* — unresolved — hashes differently
 /// from one that resolves to the empty string.
-fn reference_fingerprint(block: &Block, references: &BTreeMap<BlockId, String>) -> u64 {
+fn generated_fingerprint(block: &Block, resolved: &BTreeMap<BlockId, String>) -> u64 {
     let runs = block.runs();
     if runs.iter().all(|r| r.source.is_authored()) {
         return 0;
@@ -858,14 +893,52 @@ fn reference_fingerprint(block: &Block, references: &BTreeMap<BlockId, String>) 
         }
     };
     for run in runs {
-        let Some(target) = run.source.target() else {
+        let Some(referent) = run.source.referent() else {
             continue;
         };
-        match references.get(&target) {
+        match resolved.get(&referent) {
             Some(folio) => eat(folio.as_bytes()),
             None => eat(quill_core_model::UNRESOLVED_REFERENCE.as_bytes()),
         }
         eat(&[0xff]);
+    }
+    h
+}
+
+/// Hash of the text of the notes this block anchors (spec 0077).
+///
+/// `0` — the key the block has always had — for a block with no footnote anchor, which is every
+/// block in every document without the feature. Hashed in note-anchor order, so moving an anchor
+/// within the paragraph changes it.
+///
+/// A note the document does not hold hashes as its absence, so *adding* the missing note dirties the
+/// paragraph that called it.
+fn note_fingerprint(block: &Block, doc: &Document) -> u64 {
+    let runs = block.runs();
+    if runs.iter().all(|r| r.source.note().is_none()) {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for id in runs.iter().filter_map(|r| r.source.note()) {
+        match doc.footnotes.iter().find(|f| f.id == id) {
+            Some(note) => {
+                for run in &note.runs {
+                    eat(run.text.as_bytes());
+                    eat(format!("{:?}", run.style).as_bytes());
+                    eat(run.character.as_deref().unwrap_or("").as_bytes());
+                    eat(&[0xff]);
+                }
+                eat(format!("{:?}|{:?}", note.color, note.style).as_bytes());
+            }
+            None => eat(b"\x00missing"),
+        }
+        eat(&[0xfe]);
     }
     h
 }
@@ -2459,6 +2532,167 @@ mod tests {
             "an unchanged document must not re-measure, references included"
         );
         assert_eq!(again.fixpoint.iterations, 1, "and must not iterate");
+    }
+
+    // ----- spec 0077: footnotes on the incremental path -----------------------------------------
+
+    /// A document of `n` paragraphs, three of which anchor a footnote — one early, one in the
+    /// middle, one late — so that an edit above the middle one moves it without moving the first.
+    fn noted_doc(n: usize) -> (Document, Vec<BlockId>) {
+        use quill_core_model::{Footnote, Run};
+        let mut doc = doc_of(n);
+        doc.footnotes = (0..3)
+            .map(|i| {
+                Footnote::plain(
+                    format!("note {i}, with a sentence in it long enough to wrap once or twice"),
+                    INK,
+                )
+            })
+            .collect();
+        doc.assign_missing_block_ids().expect("ids");
+        let notes: Vec<BlockId> = doc.footnotes.iter().map(|f| f.id).collect();
+        for (i, at) in [10usize, 150, 300].into_iter().enumerate() {
+            let id = doc.content[at].id();
+            let mut b = Block::body_runs(
+                vec![
+                    Run::plain("a paragraph that calls a note"),
+                    Run::footnote(notes[i]),
+                ],
+                INK,
+            );
+            b.set_id(id);
+            doc.content[at] = b;
+        }
+        (doc, notes)
+    }
+
+    /// **The parity assertion this increment owes**, and the reason `FlowState` grew: the session
+    /// resumes from a checkpoint, and a checkpoint that did not carry the part-set note would give
+    /// the resumed page back the height the note's tail was occupying.
+    #[test]
+    fn the_session_and_the_cold_path_agree_about_footnotes() {
+        let (doc, _) = noted_doc(400);
+        let mut session = LayoutSession::new();
+        let result = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(
+            result.pages,
+            crate::lay_out(&doc, &MONO, &NoHyphenator),
+            "page for page, before any edit"
+        );
+
+        let long = "an edited paragraph with a great many more words in it than the one it \
+                    replaced had, so that it occupies more than a page on its own and every page \
+                    below it moves down. "
+            .repeat(30);
+        let mut edited = doc.clone();
+        edit(&mut edited, 100, &long);
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert!(after.stats.pages_reused > 0, "the fixture must reuse pages");
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&edited, &MONO, &NoHyphenator),
+            "…and page for page across an edit that moved two of the three notes"
+        );
+    }
+
+    /// A note that splits across a page boundary is the case a checkpoint can actually sit inside,
+    /// so it gets its own parity assertion rather than riding on the one above.
+    #[test]
+    fn the_session_agrees_with_the_cold_path_over_a_note_that_spans_pages() {
+        use quill_core_model::{Footnote, Run};
+        let mut doc = doc_of(120);
+        doc.footnotes = vec![Footnote::plain("word ".repeat(2000), INK)];
+        doc.assign_missing_block_ids().expect("ids");
+        let note = doc.footnotes[0].id;
+        let id = doc.content[60].id();
+        let mut b = Block::body_runs(
+            vec![Run::plain("calls a long note"), Run::footnote(note)],
+            INK,
+        );
+        b.set_id(id);
+        doc.content[60] = b;
+
+        let cold = crate::lay_out(&doc, &MONO, &NoHyphenator);
+        let spans = cold
+            .iter()
+            .filter(|p| {
+                p.blocks.iter().any(
+                    |b| matches!(b, crate::PlacedBlock::Text { source, .. } if *source == note),
+                )
+            })
+            .count();
+        assert!(spans >= 2, "the fixture must span pages: {spans}");
+
+        let mut session = LayoutSession::new();
+        assert_eq!(session.relayout(&doc, &MONO, &NoHyphenator).pages, cold);
+
+        let mut edited = doc.clone();
+        edit(
+            &mut edited,
+            10,
+            &"a much longer paragraph here. ".repeat(40),
+        );
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&edited, &MONO, &NoHyphenator),
+            "resuming across a page boundary inside a note must reproduce a full pass"
+        );
+    }
+
+    /// Editing a note's *text* is an edit. The note is not in `content`, so nothing in the block
+    /// diff would see it without the third fingerprint term — and the session would hand back the
+    /// previous pages with the previous note on them.
+    #[test]
+    fn editing_a_notes_text_re_lays_the_document() {
+        let (doc, _) = noted_doc(400);
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+
+        let mut edited = doc.clone();
+        edited.footnotes[1].runs = vec![quill_core_model::Run::plain(
+            "a completely different note, and a much longer \
+                 one, long enough that the band it reserves is taller than the one it replaces",
+        )];
+        edited.bump_revision();
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&edited, &MONO, &NoHyphenator),
+            "a note edit must reach the pages"
+        );
+        assert!(
+            !after.changed_pages.is_empty(),
+            "…and must be reported as a change"
+        );
+        // Proportional to the edit, not to the book: the blocks above the anchor keep their cached
+        // measurements. This is why the term is in the per-block diff and not in
+        // `context_fingerprint`.
+        assert!(
+            after.stats.pages_reused > 0,
+            "a note edit must not reflow the whole document, reused {}",
+            after.stats.pages_reused
+        );
+    }
+
+    /// A document with no footnote must be untouched by any of it, incremental behaviour included.
+    #[test]
+    fn a_document_with_no_footnote_measures_exactly_what_it_did() {
+        let doc = doc_of(400);
+        assert!(doc.footnote_blocks().is_empty());
+        let mut session = LayoutSession::new();
+        session.relayout(&doc, &MONO, &NoHyphenator);
+        let mut edited = doc.clone();
+        edit(
+            &mut edited,
+            200,
+            "a paragraph with one word changed in it, and nothing else at all",
+        );
+        let after = session.relayout(&edited, &MONO, &NoHyphenator);
+        assert_eq!(
+            after.stats.blocks_measured, 1,
+            "editing one paragraph must re-break exactly one block"
+        );
     }
 
     #[test]

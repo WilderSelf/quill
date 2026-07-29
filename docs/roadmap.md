@@ -2760,13 +2760,60 @@ save-back — which 0074's second half, "nothing is added to the model", does no
 `SAMPLE_EXPORT_DIGEST` moved and is classified identifier-only (8454 bytes both sides, 128 bytes in
 4 runs, all inside the XMP identifiers or the trailer `/ID`).
 
-#### 0077 footnotes
+#### 0077 footnotes — **SHIPPED**
 
-A second flow with an anchor in the first. The note band reduces the `bottom`/avail term and must not
-reach measurement, or the measurement cache becomes wrong rather than merely slow. `FlowState` grows,
-so every checkpoint and re-convergence path moves with it. Spec 0044's progress invariant is
-structural rather than asserted today, and a note band that grows each time its reference moves is a
-new way for the loop to fail to make progress — this increment owes it a runtime guard.
+A second flow with an anchor in the first. `specs/0077-footnotes.md`. The band reduces the
+`bottom`/avail term and **only** that term: `MeasureKey` gained `generated` (a rename of 0076's
+`references`) and no height dimension, `incremental_blocks_measured` is still 1, and a note is
+measured at a frame *width*, through the same `Measurer`, exactly as any other block is. The entry
+predicted the sharp constraint correctly; what it did not predict is that `continuation_frame`
+returns the *unreduced* next height and `keep_whole` compares against it, so a composite could
+decline a cut on the strength of a height a carried note will already have spent.
+
+**`FlowState` grew by exactly one field, and working out that it is one was the work.** The accrued
+band height is *not* state: a checkpoint is only taken at a page boundary, where the first frame is
+empty and no anchor has been placed, so it is re-derived rather than carried. What is state is a note
+too tall for its band, whose remainder continues at the foot of the next frame and which a page
+boundary can fall inside — `note_carry: Option<NoteCarry>`, an absolute item offset exactly as
+`split_at` is. There **was** a second defect of spec 0072's shape, and it is in the flow rather than
+in the session: dropping `note_carry` from the checkpoint leaves every session parity test green,
+because the session picks its own resume point and need not pick one inside a note. The contract is
+that resuming from *any* checkpoint reproduces a full pass, so the test is written against `flow` and
+the contract rather than against the chooser.
+
+**Numbering is document-sequential, and the decision is argued rather than defaulted.** Per-page
+restart is neither of the engine's two dependency shapes — the page is unknown before the flow and
+the number's width moves a line break, so it cannot be applied after — and it would be a fixpoint
+*inside* `flow` that `FIXPOINT_MAX_ITERATIONS` cannot bound. Document-sequential is exactly
+`list_markers`-shaped, so `layout.fixpoint_iterations` did not move: a footnote is not a fourth
+derived quantity. Per-page restart is a named non-goal with its cost written down.
+
+**The oscillation the entry names cannot happen, and that is proved structurally rather than
+asserted.** The flow is forward-only: a band is committed only for a placement that is *taken*, so a
+frame the anchor left keeps none of its reservation, and the quantity that would have to oscillate is
+discarded rather than carried. What genuinely can fail to make progress is the **carry**, which 0044's
+assertions do not reach — they bound a cut of the block, and a band that grew each time its note moved
+would page for ever without any block offset failing to advance. Three runtime guards bound it: a cut
+must advance the note's offset, a frame opening with a carry must take at least one item, and a band
+that overruns its frame must not also carry forward. A frame may carry at most one note, and it must
+be the last in the band, or a second cut overwrites the first and a note silently disappears — which
+a two-note fixture catches. A carry left at the end of the content is drained rather than dropped.
+
+**The font subset is both halves at once.** The anchor is 0076's path exactly (a `RunSource` variant,
+so `E0004` before a test was written); the note's *text* is a new site, because it is not in
+`content` — closed the same way, by having the collector walk `Document::footnote_blocks`, the very
+list the engine measures. A note number contributes `NumberFormat::Decimal`'s alphabet and
+deliberately **not** `folio_formats()`: one answer per question, and tying them would let roman front
+matter change what a footnote can print. No latent defect turned up this time, unlike 0076's audit.
+
+`FORMAT_VERSION` is **8**, and it is the two-halves rule again: a v7 build prints `[?]` and the notes
+visibly vanish (loud), but `footnotes` is not intent, it is **prose**, and one open-and-save deletes
+it unrecoverably. `TEMPLATE_VERSION` stays 1 — `StyleSheet` gains a default `footnote` entry, which is
+a value in an existing map rather than a change of shape. `SAMPLE_EXPORT_DIGEST` moved and is
+identifier-only (8454 bytes both sides, 124 bytes in 8 runs, all inside the XMP identifiers or the
+trailer `/ID`); `component_parity` did not move. The residual named rather than half-built: a
+page-spanning footnote *area* on a multi-column page, which is not in any frame and so is not
+something the flow can reserve.
 
 #### 0078 the index
 
