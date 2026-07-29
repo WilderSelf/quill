@@ -20,7 +20,9 @@
 
 use std::path::{Path, PathBuf};
 
-use quill_core_model::{page_geom, Block, BlockId, Document, LoadError, Template, Tpub};
+use quill_core_model::{
+    page_geom, Block, BlockId, Book, BookNote, Document, LoadError, Template, Tpub,
+};
 use quill_fonts::FontFamily;
 use quill_layout_engine::{LaidOutPage, LayoutSession, LayoutStats};
 use quill_render::{paint_page, PaintOp, PopulateReport, ProxyCache};
@@ -86,6 +88,24 @@ impl AppState {
     pub fn open(path: &Path) -> Result<AppState, LoadError> {
         let opened = Tpub::open_into(path, &path.with_extension("tpub.d"))?;
         Ok(AppState::from_document(opened.document, opened.asset_root))
+    }
+
+    /// Open a `.qbook` book (spec 0079), extracting alongside it.
+    ///
+    /// `AppState` still holds exactly **one** `Document`, and that is the point: a book composes to
+    /// one before the app sees it, so nothing in the editor — the session, the viewport, the proxy
+    /// cache, the edit path — learns a second shape. The composition's notes are returned rather
+    /// than swallowed, because each is a decision made on the author's behalf.
+    ///
+    /// Deliberately a *load* path and not a save path: writing a chapter back out of a composed book
+    /// would have to undo the id rebasing, which is a different piece of work and is a named
+    /// non-goal of spec 0079.
+    pub fn open_book(path: &Path) -> Result<(AppState, Vec<BookNote>), LoadError> {
+        let opened = Book::open_into(path, &path.with_extension("qbook.d"))?;
+        Ok((
+            AppState::from_document(opened.composed.document, opened.asset_root),
+            opened.composed.notes,
+        ))
     }
 
     /// Open the built-in sample, for a first run with no file.
@@ -308,6 +328,46 @@ mod tests {
             .collect();
         doc.assign_missing_block_ids().unwrap();
         doc
+    }
+
+    /// Spec 0079: the app opens a book and still holds exactly one document.
+    #[test]
+    fn opening_a_book_gives_the_shell_one_document() {
+        let dir = std::env::temp_dir().join(format!("quill-appbook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let mut chapters = Vec::new();
+        for i in 0..2 {
+            let doc = doc_of(30);
+            Tpub::write(&doc, &dir.join(format!("ch{i}.tpub")), &[]).expect("write");
+            chapters.push(doc);
+        }
+        let book = Book {
+            book_version: quill_core_model::BOOK_VERSION,
+            metadata: Default::default(),
+            requires: Vec::new(),
+            chapters: (0..2)
+                .map(|i| quill_core_model::BookChapter {
+                    path: format!("ch{i}.tpub"),
+                    name: format!("Chapter {i}"),
+                    folio: None,
+                    master: None,
+                })
+                .collect(),
+        };
+        std::fs::write(dir.join("b.qbook"), book.to_json().expect("json")).expect("write book");
+
+        let (state, notes) = AppState::open_book(&dir.join("b.qbook")).expect("open");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(
+            state.document().content.len(),
+            chapters.iter().map(|c| c.content.len()).sum::<usize>(),
+            "one document, holding every chapter's blocks"
+        );
+        assert!(state.page_count() > 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn state_of(n: usize) -> AppState {

@@ -20,7 +20,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
-| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **decomposed** into specs 0072–0079; **0075 shipped out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature |
+| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **complete** — specs 0072–0079 shipped; **0075 went out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature. 0079 closed it by *not* breaking the one-`Document` assumption in four crates: a book composes to one `Document`, and the fixpoint cost the audit feared measures 3 passes and is indifferent to chapter count |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
@@ -2497,6 +2497,8 @@ six features turned out to be priced wrongly in both directions.
 | 0078 | the index | medium |
 | 0079 | a book | large |
 
+All eight shipped; the milestone is complete.
+
 ### What the audit found
 
 **The load-bearing gap is the section, and the code has been saying so since M2.**
@@ -2822,13 +2824,67 @@ rendering are `Block::Toc`, `Run::character` and the tab mechanism respectively.
 real decision**: no dependency in the workspace sorts text, and `Cargo.toml`'s rule is that every
 dependency is permissive with a note saying which spec brought it in.
 
-#### 0079 a book
+#### 0079 a book — **SHIPPED**
 
-Multiple documents, shared styles, continuous pagination. Breaks the one-`Document` assumption in four
-crates. A fourth version chain beside `FORMAT_VERSION`/`TEMPLATE_VERSION`/`PACK_VERSION`, for which
-`version.rs` has two deliberately-alike gates as a template. The fixpoint spans documents: a book's
-contents list names headings from chapters it does not contain, so each iteration re-lays every
-chapter — which is why 0076's iteration budget has to exist first.
+Several `.tpub` chapters composed into one press file. `specs/0079-book.md`.
+
+**A book is a new artifact and `Document` did not grow a chapter list** — and the second half of that
+decision is what made the increment shippable: `Book::compose` is a **pure function to one
+`Document`**, so the four one-`Document` assumptions the audit named are not broken, they are never
+reached. `export`, `AppState`, `OpenedTpub` and `LayoutSession` are all untouched, and the argument is
+that those are the paths tested against every increment since M0 — a second N-document code path
+would give the press file a route nothing else in the repository exercises. `AppState::open_book` and
+the CLI's `.qbook` branch are six lines each because of it, and `quill preflight`, `quill export` and
+`quill render` all take a book with no book-shaped variant of anything.
+
+It does **not** make a book cheaper, and that was checked rather than assumed. The audit's arithmetic
+(iterations × chapters) is the same either way, expressed as passes over one long document rather
+than as passes over N short ones. What composition buys is that the cost lands on the code path the
+harness already measures. **`layout.book_fixpoint_iterations` measures 3 — the same as the
+single-document fixpoint — and `layout.book_chapter_ratio` measures 1.0**: ten chapters and five
+chapters *of the same total size* take the same number of passes, so a book is linear in its page
+count and indifferent to how many files it was authored in. The fear was 80 chapter layouts per
+relayout; the measurement is 3 book layouts.
+
+Four things worth carrying:
+
+- **There is no page-number offset anywhere, and that is what makes a stale folio unrepresentable.**
+  The brief for the increment observed that an offset is an input to `{page}` and so must live in
+  `context_fingerprint` or the whole book goes stale — 0075 and 0077's shape. Composition makes the
+  offset a `Section` carrying a `Folio` on the composed document, and `doc.sections` has been in
+  `context_fingerprint` since 0072. The alternative (a `BookTemplate` wrapping `DocumentTemplate`
+  with an offset field) would have put it where `derived_fingerprint` returns `0`, and would have had
+  to grow a new fingerprint term to be correct. **Not adding the term was worth more than the code it
+  would have taken.**
+- **A cross-reference into another chapter is not expressible, and rebasing makes that structural
+  rather than hazardous.** A `BlockId` is unique within a document, so chapter 1's block 12 and
+  chapter 3's block 12 are both block 12 — a book-wide reference map over unrebased ids would resolve
+  one against the other whenever they collided, silently, in a press file. Rebasing shifts a
+  chapter's ids *and* its references by the same offset, so a reference always means the block it
+  meant, and no id an author could write in a standalone chapter reaches out of it. What a
+  same-chapter reference gains is the right number: "see page 42" becomes "see page 187" when the
+  chapter is bound in.
+- **A book's fonts covering every chapter is not a new path to the collector**, and that is a
+  *result* of the composition decision rather than a claim — the collector walks one `Document` that
+  holds every chapter's content, masters and folio formats. So 0074's structural treatment is owed
+  nothing here, unlike in 0076, 0077 and 0078, each of which did find a new path. Asserted anyway,
+  with a character that appears only in the last chapter.
+- **`FORMAT_VERSION` stays 9**, and the rule does not fire for a reason neither half has had before:
+  there is no document to be wrong about. `BOOK_VERSION` is 1, gated by a `migrate_book` written arm
+  for arm with `migrate_template` and `migrate_pack` — the fourth version chain, and `version.rs`
+  already said why it must not be a fourth *shape*. `SAMPLE_EXPORT_DIGEST` did not move, and a
+  single-document export is asserted byte-identical from outside the crate, in the same process that
+  has just composed a book.
+
+**The residual is named rather than half-built: a chapter does not start on a new page.** The model
+has no forced page break anywhere — specs 0072 and 0073 both named it a non-goal for exactly this
+reason — so chapter 2 begins on the page chapter 1 ended on. The numbering is still continuous and
+correct, and the contents list still sends a reader to the right page; what is missing is the recto
+opener, and with it the chapter-opener master landing on a page that no longer carries the previous
+chapter's tail. It is in known issues below. Also out of scope and stated: editing a book back out to
+its chapters (a save path, needing the id rebase undone), and a per-chapter incremental session —
+which would be *less* incremental than what shipped, since one session resumes from the edited
+chapter's checkpoint and reuses every page before it.
 
 ## Known issues
 
@@ -2849,6 +2905,19 @@ found in their place.
   is a different change from 0075's and was recorded rather than half-built.
   `a_stat_block_of_one_oversized_run_is_placed_whole` pins it, as its predecessor pinned the case
   0075 fixed.
+
+- **A chapter of a book does not start on a new page.** Spec 0079's named residual, and the milestone's
+  third sighting of the same absence: the model has no **forced page break** anywhere, which specs
+  0072 and 0073 each named as a non-goal when they met it. So a composed book numbers continuously and
+  correctly, its contents list sends a reader to the right page, and chapter 2 nevertheless begins
+  halfway down the page chapter 1 ended on — which also means a chapter-opener master is applied to a
+  page still carrying the previous chapter's tail.
+
+  Fixing it is a **flow-loop** change of spec 0077's risk class, not a composition one: the flow would
+  have to advance the page before a marked block when the current page is not empty, which touches
+  `FlowState`, the checkpoint/resume contract, fragmentation and the `frame_empty` guard at once. It
+  is also the mechanism "start this section on the next recto" needs, so it is one increment serving
+  three recorded requests rather than a patch for this one.
 
 - **A running head drops the inline emphasis inside a chapter title.** Spec 0074's named residual.
   `HeadingEntry::text` is flattened by `Block::plain_text`, so "The *Ruined* Keep" reaches a
