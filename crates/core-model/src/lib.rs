@@ -46,7 +46,8 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
-/// **6** since spec 0073 gave a [`Section`] a [`Folio`]; **5** since spec 0072 gave a document
+/// **7** since spec 0076 gave a [`Run`] a [`RunSource`] — a cross-reference that prints the folio of
+/// the page its target landed on; **6** since spec 0073 gave a [`Section`] a [`Folio`]; **5** since spec 0072 gave a document
 /// [`Section`]s; **4** since spec 0063 replaced a paragraph's
 /// `text` with styled `runs`; **3** since spec 0047 gave [`MasterStatic::Text`] an alignment and
 /// page-parity mirroring; **2** since spec 0030 added master pages and margins. Each bump is
@@ -57,11 +58,13 @@ pub type Pt = f32;
 /// that predates spec 0047 would draw every static left-aligned in an unmirrored rect, putting the
 /// folio in the gutter on every verso; a build that predates spec 0072 would drop `sections` and
 /// set every chapter opener in the body master; a build that predates spec 0073 would drop `folio`
-/// and print arabic page numbers through front matter the author set in roman. Any of them could
+/// and print arabic page numbers through front matter the author set in roman; a build that predates
+/// spec 0076 would drop every `source` and **destroy which block each cross-reference points at**,
+/// unrecoverably, on the first save. Any of them could
 /// then save that back over the original.
 /// Refusing to open is the correct outcome; quietly dropping the layout is exactly the silent
 /// corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -351,6 +354,10 @@ pub struct Run {
     /// beside a block's fields: a name is not an override, it is what the overrides apply *to*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<String>,
+    /// Where this run's *characters* come from (spec 0076). [`RunSource::Authored`] — the default,
+    /// and every run written before this existed — means `text`.
+    #[serde(default, skip_serializing_if = "RunSource::is_authored")]
+    pub source: RunSource,
 }
 
 impl Run {
@@ -360,6 +367,132 @@ impl Run {
             text: text.into(),
             style: InlineStyle::EMPTY,
             character: None,
+            source: RunSource::Authored,
+        }
+    }
+
+    /// A cross-reference: a run that prints the **folio** of the page `target` was placed on
+    /// (spec 0076) — "see page 42", surviving repagination.
+    ///
+    /// `text` is set to [`UNRESOLVED_REFERENCE`] and is never read by layout. That is deliberate on
+    /// two counts. It is not a *cache* of the last resolved number, for spec 0041's reason: a stored
+    /// page number is stale the moment anything is edited, and one that was right an edit ago is
+    /// worse than none. And it is what a build that predates this spec — which drops `source` as an
+    /// unknown key — prints, so such a build shows the same visible failure this one shows for a
+    /// reference it cannot resolve, rather than a plausible wrong number.
+    pub fn reference(target: BlockId) -> Run {
+        Run {
+            text: UNRESOLVED_REFERENCE.into(),
+            style: InlineStyle::EMPTY,
+            character: None,
+            source: RunSource::Reference { target },
+        }
+    }
+}
+
+/// What a cross-reference prints when its target is not in the document (spec 0076).
+///
+/// **A visible failure, not an empty string.** A cross-reference is *content*, in the text flow, so
+/// the two silent options are both worse than this one: rendering nothing leaves "see page ." in a
+/// finished-looking sentence, and refusing to open the document loses a whole book to one dangling
+/// id — the outcome spec 0072 rejected for a section anchor, and for the same reason. `CLAUDE.md`'s
+/// rule is to prefer a visible failure over silent press-corruption, and this is what visible looks
+/// like in running text: it survives to the proof, where it reads as unfinished rather than as
+/// finished.
+///
+/// It is also why [`RunSource::contributes`] carries these characters into the font subset. A marker
+/// that renders as three `.notdef` boxes is a *less* legible failure than the one it replaces.
+pub const UNRESOLVED_REFERENCE: &str = "[?]";
+
+/// Every block a cross-reference in `content` points at (spec 0076).
+///
+/// A `&[Block]` rather than a `&Document` because the layout fixpoint holds content and a template,
+/// not a document — the same reason [`StaticToken`]'s siblings in `quill_layout_engine` come in
+/// both shapes. Empty for every document that has no cross-reference, which is what lets the
+/// derivation, the extra fixpoint comparison and the whole cost of this feature be skipped outright.
+pub fn reference_targets(content: &[Block]) -> BTreeSet<BlockId> {
+    content
+        .iter()
+        .flat_map(|b| b.runs())
+        .filter_map(|r| r.source.target())
+        .collect()
+}
+
+/// Where a [`Run`]'s characters come from (spec 0076).
+///
+/// **This enum is to a body run what [`StaticToken`] is to a master static, and for the same
+/// reason.** A run whose text is generated at layout time is a second instance of the class spec
+/// 0074 closed: the font-subset collector runs *before* layout, so every character such a run can
+/// draw has to be predicted, and a character it misses is a `.notdef` box in a press file with no
+/// error anywhere. Spec 0074 closed that for furniture with one enum and two exhaustive matches; a
+/// cross-reference is a **new path** — it is content, in the flow, resolved per instance rather than
+/// per page — so it owes the same structural treatment rather than a special case:
+///
+/// 1. [`RunSource::contributes`] is an exhaustive `match`, and it lives here in `core-model` beside
+///    the enum, so a new variant cannot exist anywhere in the workspace without saying what
+///    characters it can draw.
+/// 2. The resolver — `quill_layout_engine::resolve_run_texts` — matches exhaustively too, so a new
+///    variant does not compile there either.
+/// 3. There is one answer to "what can a folio draw": [`Document::folio_formats`], which
+///    [`StaticToken::Page`] already asks. A cross-reference does not get a second one.
+///
+/// The currency is [`TokenText`] for the same reason: the collector has one way to absorb a
+/// contribution, and two producers that each have to be exhaustive in order to compile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunSource {
+    /// The run draws its own [`Run::text`]. Every run written before spec 0076.
+    #[default]
+    Authored,
+    /// The run draws the folio of the page `target` was placed on — "see page 42".
+    ///
+    /// The **folio** (spec 0073), not the page index: this is a number a *reader* is told, and a
+    /// reference that says `4` for a page printed `iv` sends them to the wrong page. That is the
+    /// same split 0073 drew between a contents entry and a `/Link` destination.
+    ///
+    /// The target is any [`BlockId`], not just a heading's. Nothing about the mechanism is
+    /// heading-specific — `section_starts` already anchors to any placed variant that carries an
+    /// identity — and "see the table on page 42" is the same sentence as "see the chapter on page
+    /// 42". Restricting it to headings would be a structure-shaped mechanism where a general one
+    /// costs nothing, which is the test `CLAUDE.md` applies to every new type and field.
+    Reference { target: BlockId },
+}
+
+impl RunSource {
+    /// Whether this run draws its own text — the default, and what `skip_serializing_if` asks.
+    pub fn is_authored(&self) -> bool {
+        matches!(self, RunSource::Authored)
+    }
+
+    /// The block this run refers to, if any.
+    pub fn target(&self) -> Option<BlockId> {
+        match self {
+            RunSource::Authored => None,
+            RunSource::Reference { target } => Some(*target),
+        }
+    }
+
+    /// Everything this run can draw in `doc` — what the font-subset collector must carry.
+    ///
+    /// Exhaustive by construction; see the type's documentation for why that is the point of it.
+    /// Deliberately not conditioned on where anything landed, for [`StaticToken::contributes`]'s
+    /// reason: embedding a few characters nobody draws costs a few hundred bytes, and failing to
+    /// embed one that is drawn is a `.notdef` box in a press file.
+    pub fn contributes(&self, doc: &Document) -> TokenText {
+        match self {
+            RunSource::Authored => TokenText::default(),
+            // A folio is arithmetic, so what is knowable before layout is the alphabet each
+            // configured format can write — the same question, asked of the same function, that
+            // `StaticToken::Page` asks. The unresolved marker *is* knowable exactly, so it travels
+            // as a run and its characters are cut into the subset like any other run's.
+            RunSource::Reference { .. } => TokenText {
+                runs: vec![UNRESOLVED_REFERENCE.to_string()],
+                chars: doc
+                    .folio_formats()
+                    .into_iter()
+                    .flat_map(|f| f.alphabet())
+                    .collect(),
+            },
         }
     }
 }
@@ -610,6 +743,23 @@ impl Block {
                 Some(runs.iter().map(|r| r.text.as_str()).collect())
             }
             _ => None,
+        }
+    }
+
+    /// The block's styled runs, or an empty slice for a block that has none.
+    ///
+    /// The two flowed-text variants are the only ones that carry runs; a panel's sections, a table's
+    /// cells and a component's fields are strings. Added by spec 0076 so that "every run in the
+    /// document" — which is what the cross-reference derivation and the font-subset collector both
+    /// ask — is one function rather than a `match` copied into each of them.
+    pub fn runs(&self) -> &[Run] {
+        match self {
+            Block::Heading { runs, .. } | Block::Body { runs, .. } => runs,
+            Block::Image { .. }
+            | Block::Panel { .. }
+            | Block::Table { .. }
+            | Block::Component { .. }
+            | Block::Toc { .. } => &[],
         }
     }
 
@@ -3167,6 +3317,122 @@ mod tests {
         assert_eq!(bare, Folio::default());
         assert_eq!(bare.format, NumberFormat::Decimal);
         assert_eq!(bare.restart_at, None);
+    }
+
+    // --- Cross-references (spec 0076) ---------------------------------------------------------
+
+    #[test]
+    fn a_cross_reference_round_trips_and_stays_out_of_the_manifest_when_absent() {
+        // Spec 0053's lesson, and the empty case is every document in existence: an authored run
+        // must not write a `source` key, because doing so would move the `/ID` of every file quill
+        // has ever written.
+        let plain = Document::sample();
+        let json = plain.to_json().expect("save");
+        assert!(
+            !json.contains("\"source\""),
+            "an authored run must not write `source`: {json}"
+        );
+        assert_eq!(Document::from_json(&json).expect("load"), plain);
+
+        let mut doc = Document::sample();
+        let target = doc.content[0].id();
+        doc.content.push(Block::body_runs(
+            vec![
+                Run::plain("See page "),
+                Run::reference(target),
+                Run::plain("."),
+            ],
+            Color::Gray { v: 0.0 },
+        ));
+        doc.assign_missing_block_ids().expect("ids");
+        let json = doc.to_json().expect("save");
+        let back = Document::from_json(&json).expect("load");
+        assert_eq!(
+            back, doc,
+            "a document with a cross-reference must equal itself"
+        );
+        assert_eq!(
+            back.content.last().expect("the referring block").runs()[1]
+                .source
+                .target(),
+            Some(target)
+        );
+
+        // And a reference to a block that is not in the document round-trips as readily: a dangling
+        // target is a state the model can hold, not an error it refuses.
+        let mut dangling = Document::sample();
+        dangling.content = vec![Block::body_runs(
+            vec![Run::reference(BlockId(999))],
+            Color::Gray { v: 0.0 },
+        )];
+        dangling.assign_missing_block_ids().expect("ids");
+        assert_eq!(
+            Document::from_json(&dangling.to_json().expect("save")).expect("load"),
+            dangling
+        );
+    }
+
+    #[test]
+    fn a_reference_run_stores_the_marker_rather_than_a_page_number() {
+        // Spec 0041's rule, applied to a run: what a reference resolves to is derived, never stored.
+        // A stored number is stale the moment anything is edited, and one that was right an edit ago
+        // is worse than none — and it is what an older build would print, plausibly and wrongly.
+        let run = Run::reference(BlockId(7));
+        assert_eq!(run.text, UNRESOLVED_REFERENCE);
+        assert!(!run.source.is_authored());
+        assert_eq!(run.source.target(), Some(BlockId(7)));
+        assert_eq!(Run::plain("x").source.target(), None);
+    }
+
+    #[test]
+    fn what_a_cross_reference_can_draw_is_the_folio_alphabet_and_the_marker() {
+        // The structural half of spec 0074's mechanism, at its second site: `contributes` is what
+        // the font-subset collector reads, and it is an exhaustive match, so a run source that
+        // reaches the resolver without reaching the collector does not compile.
+        let mut doc = Document::sample();
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: doc.content[0].id(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        let carried = RunSource::Reference {
+            target: doc.content[0].id(),
+        }
+        .contributes(&doc);
+        assert_eq!(carried.runs, vec![UNRESOLVED_REFERENCE.to_string()]);
+        for ch in "ivxlcdm0123456789".chars() {
+            assert!(carried.chars.contains(&ch), "{ch:?} must be carried");
+        }
+        // There is one answer to what a folio can draw, and both askers get it.
+        assert_eq!(carried.chars, StaticToken::Page.contributes(&doc).chars);
+
+        // An authored run contributes nothing, which is what keeps every existing document's subset
+        // — and therefore its exported bytes — exactly where it was.
+        assert_eq!(RunSource::Authored.contributes(&doc), TokenText::default());
+    }
+
+    #[test]
+    fn reference_targets_are_collected_once_per_block_referred_to() {
+        let mut doc = Document::sample();
+        let a = doc.content[0].id();
+        doc.content.push(Block::body_runs(
+            vec![Run::reference(a), Run::plain(" and "), Run::reference(a)],
+            Color::Gray { v: 0.0 },
+        ));
+        doc.content.push(Block::body_runs(
+            vec![Run::reference(a)],
+            Color::Gray { v: 0.0 },
+        ));
+        doc.assign_missing_block_ids().expect("ids");
+        assert_eq!(reference_targets(&doc.content), BTreeSet::from([a]));
+        assert!(
+            reference_targets(&Document::sample().content).is_empty(),
+            "and a document with none skips the derivation outright"
+        );
     }
 
     #[test]

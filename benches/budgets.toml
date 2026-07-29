@@ -55,6 +55,30 @@ incremental_pages_reflowed = 260.0
 # invalidated wholesale, a height dimension leaking into `MeasureKey`, or fragmentation
 # re-measuring a block once per fragment.
 incremental_blocks_measured = 2.0
+# Layout passes the fixpoint takes over a document carrying **every** derived quantity at once: the
+# 500-page synthetic document with a generated contents list, two sections with folio formats, and
+# forty cross-references. Measures 3.
+#
+# The gap the M6 audit found and assigned to spec 0076. `FIXPOINT_MAX_ITERATIONS` *bounds* the loop
+# at 8 and nothing *measured* it, and each derived quantity a document gains can add passes — a
+# pass being a whole-document flow, so this multiplies the most expensive thing the engine does.
+# `layout.scaling_ratio` above cannot catch it: that measures the shape of one pass, and the growth
+# here is in the number of passes.
+#
+# **Checked with `check_exact`, like the other counters.** An iteration count is deterministic — the
+# same document takes the same passes on every machine — so the runner variance `tolerance_factor`
+# exists for does not apply, and applying it would put the limit at 8, which *is* the cap. A gate
+# that can only fire on a document already reporting `converged: false` is the unreachable-limit
+# trap spec 0051 recorded, and it would be guarding nothing: non-convergence is reported loudly by
+# `FixpointStatus` and needs no budget line.
+#
+# It measures 3 — place, resolve everything the first pass could not know, agree — and is pinned at
+# 4, one pass of headroom, on the same posture as every other counter here: a blowup detector, not a
+# micro-regression detector. What it catches is a derived quantity that settles against a *stale*
+# one and so needs a pass per quantity rather than a pass in total, which is the failure the audit
+# named and which would show as 5 and upward. Spec 0079's book-level pagination is the next thing
+# that will test it.
+fixpoint_iterations = 4
 # The same edit as a fraction of a full layout pass. Stated as a ratio against a pass measured in
 # the same run, so it does not drift with runner speed.
 # There is deliberately no wall-clock budget for the incremental edit. Isolating it means

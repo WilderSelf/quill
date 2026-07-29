@@ -213,6 +213,9 @@ pub fn migrate(value: &mut serde_json::Value) -> Result<(), LoadError> {
     if found < 6 {
         migrate_5_to_6(obj);
     }
+    if found < 7 {
+        migrate_6_to_7(obj);
+    }
 
     obj.insert("format_version".into(), FORMAT_VERSION.into());
     Ok(())
@@ -299,6 +302,31 @@ fn migrate_4_to_5(obj: &mut serde_json::Map<String, serde_json::Value>) {
 /// original, losing authored intent rather than derived state. `docs/format-spec.md`'s rule turns on
 /// exactly that, and the version gate is the only mechanism that can make the older build refuse.
 fn migrate_5_to_6(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
+
+/// v6 → v7 (spec 0076): a run gains a `source` — a cross-reference to a block, printed as that
+/// block's folio.
+///
+/// Structurally a no-op, and written as one for the same reason [`migrate_5_to_6`] is: every run a
+/// v6 document carries draws its own `text`, which is exactly what the defaulted
+/// `RunSource::Authored` means. Nothing is inserted into the object, because inserting
+/// `"source": {"kind": "authored"}` into every run of every paragraph would rewrite the manifest
+/// text of every document in existence and move its exported `/ID` with it.
+///
+/// The bump is not a no-op, and this one's argument differs in shape from 0072's and 0073's, which
+/// is why it is worth stating rather than pattern-matching. A v6 build opening a v7 document does
+/// **not** fail silently on the page: it drops `source`, prints the run's stored `text` — which is
+/// `[?]`, the unresolved marker — and the book is visibly unfinished wherever a reference was. By
+/// spec 0074's reading that loudness is exactly the condition under which the rule does *not* fire.
+///
+/// What fires it is the other half of 0074's argument, which is false here. 0074 added nothing to
+/// the model — `{section}` is characters inside a string a user can type in any build — so no
+/// version gate could have helped. `source` **is** model, it is authored intent (which block the
+/// author pointed at), it is not regenerable from anything left in the file, and a v6 build that
+/// opens and saves destroys every one of them permanently. `docs/format-spec.md` states the loss
+/// half of the rule in as many words: a half-understood document can be saved back over the
+/// original, and the loss is worse for authored intent than for derived state. Loudness mitigates
+/// the proof; it does not undo the deletion.
+fn migrate_6_to_7(_obj: &mut serde_json::Map<String, serde_json::Value>) {}
 
 /// v2 → v3 (spec 0047): a text master static gains `align` and `mirror`.
 ///
@@ -612,6 +640,16 @@ mod tests {
         assert_eq!(v5.sections.len(), 1);
         assert!(v5.sections[0].folio.is_none());
 
+        // …and a v6 document has runs, every one of which draws its own text: v6 had no notion of
+        // a run whose characters are generated at layout time.
+        let v6 = Document::from_json(V6_FOLIO).expect("v6");
+        assert_eq!(v6.format_version, FORMAT_VERSION);
+        assert!(v6
+            .content
+            .iter()
+            .flat_map(|b| b.runs())
+            .all(|r| r.source.is_authored()));
+
         // And the far end of the chain still refuses: v(current + 1) is not a document this build
         // may open, whatever it contains.
         let next = FORMAT_VERSION + 1;
@@ -662,10 +700,16 @@ mod tests {
         );
 
         // Styled runs (spec 0063/0064) reach the example too — it is the manifest someone copies,
-        // and a `text` key has not been a paragraph since v4.
+        // and a `text` key has not been a paragraph since v4. So does a cross-reference (spec
+        // 0076), whose stored `text` is the unresolved marker rather than a page number.
         assert_eq!(
             doc.content[1].plain_text().as_deref(),
-            Some("A dank corridor stretches into darkness.")
+            Some("A dank corridor stretches into darkness; see page [?].")
+        );
+        assert_eq!(
+            crate::reference_targets(&doc.content),
+            std::collections::BTreeSet::from([doc.content[2].id()]),
+            "the documented reference must name the image the example ships"
         );
 
         // A master with both spec-0047 fields exercised.
@@ -794,6 +838,63 @@ mod tests {
 
         let native = V5_SECTIONS.replace(
             "\"format_version\": 5",
+            &format!("\"format_version\": {FORMAT_VERSION}"),
+        );
+        let native = Document::from_json(&native).expect("load as current");
+        assert_eq!(json, native.to_json().expect("save"));
+    }
+
+    /// A document written by a v6 build (spec 0076's fixture), committed **as bytes**.
+    ///
+    /// The same reasoning as [`V2_MASTERS`], [`V4_MASTERS`] and [`V5_SECTIONS`]: a fixture the
+    /// current serializer produced would migrate correctly by construction and prove nothing. This
+    /// one is the shape a v6 build put on disk — roman front matter, a `{page}` static, and a
+    /// paragraph of several runs one of which is italic, because runs are what gained a field.
+    const V6_FOLIO: &str = include_str!("../assets/v6-folio.json");
+
+    #[test]
+    fn a_v6_manifest_migrates_forward_to_v7() {
+        let doc = Document::from_json(V6_FOLIO).expect("a v6 manifest must still load");
+        assert_eq!(doc.format_version, FORMAT_VERSION);
+
+        // It means what it meant: every run draws its own text, which is what a build with no
+        // notion of a cross-reference could produce.
+        for block in &doc.content {
+            for run in block.runs() {
+                assert!(
+                    run.source.is_authored(),
+                    "a v6 run has no source: {:?}",
+                    run.text
+                );
+            }
+        }
+        assert!(
+            crate::reference_targets(&doc.content).is_empty(),
+            "so the document has no cross-reference at all"
+        );
+        // …and its folio settings survived the step, which is the previous version's claim and the
+        // one this step must not disturb.
+        assert_eq!(
+            doc.sections[0].folio.expect("folio").format,
+            crate::NumberFormat::LowerRoman
+        );
+        assert_eq!(doc.folio(&[Some(0)], 3), "iv");
+    }
+
+    #[test]
+    fn migrating_a_v6_document_does_not_move_its_exported_identity() {
+        // Spec 0047's hazard, for the third time, and the reason `migrate_6_to_7` writes nothing:
+        // defaulting `source` into every run would rewrite the manifest text of every document in
+        // existence, and the `/ID` is a hash of that text.
+        let migrated = Document::from_json(V6_FOLIO).expect("load");
+        let json = migrated.to_json().expect("save");
+        assert!(
+            !json.contains("\"source\""),
+            "migration must not add `source`: {json}"
+        );
+
+        let native = V6_FOLIO.replace(
+            "\"format_version\": 6",
             &format!("\"format_version\": {FORMAT_VERSION}"),
         );
         let native = Document::from_json(&native).expect("load as current");

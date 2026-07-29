@@ -2718,12 +2718,47 @@ Both fixed in the same increment; the second is why the increment is observable 
 No digest moved: `SAMPLE_EXPORT_DIGEST` and all three `component_parity` sets are unchanged, which is
 the claim that the blast radius was exactly the documents that were broken.
 
-#### 0076 cross-references
+#### 0076 cross-references — **SHIPPED**
 
-"See page 42" that survives repagination. The design problem is the cache: per-block resolved-value
-fingerprints in `MeasureKey`, **not** `context_fingerprint`, for the reason above. Owes a bounded
-fixpoint with a `converged: false` report, following `TOC_MAX_ITERATIONS`'s precedent, and owes
-`benches/budgets.toml` a line that counts fixpoint iterations — the gap the audit found.
+"See page 42" that survives repagination. `specs/0076-cross-references.md`. A `Run` gains a
+`RunSource`, and the resolved value goes in **`MeasureKey`**, not `context_fingerprint` — spec 0066's
+`marker` at scale. The claim is measured rather than argued, and the fixture is what makes it a
+statement about the design: references to *two* targets, one above a mid-document edit and one below
+it, so the two candidate designs are distinguishable at all. An edit that moves pages re-measures the
+edited block plus the three whose reference text changed — 4 of 400 — where the `context_fingerprint`
+route measures 6 and reuses 0 pages. The wrong design is *correct*; it is just proportional to the
+book rather than to the edit, which is why only a counter could tell them apart.
+
+**The fixpoint-iteration budget landed here as assigned**: `layout.fixpoint_iterations`, fed by a
+bench over the 500-page synthetic document carrying all three derived quantities at once. It measures
+3 and is pinned at 4, `check_exact` — with `tolerance_factor` the limit would be 8, which *is*
+`FIXPOINT_MAX_ITERATIONS`, so the gate could only fire on a document already reporting
+`converged: false`. Spec 0051's unreachable-limit lesson.
+
+Three things worth carrying. **The oscillation is real and constructible**, which spec 0075 could not
+manage: a cross-reference is the first derived quantity genuinely *in the flow*, and roman numerals
+are not monotone in width (`viii` is wider than `ix`), so a reference into roman-numbered pages pushes
+its own target back and forth across a page boundary for ever. Decimal cannot — a wider reference
+pushes its target later and a later page has a wider number, which only grows. **The session had to
+take the optimisation 0072 declined**: seeding the loop from the previous relayout's pages rather than
+restarting underived, or every relayout of every referring document pays a second whole-document pass.
+And **the font subset was a new path, so it got the class treatment rather than a special case** —
+`RunSource::contributes` is a second exhaustive match in `core-model`, `TokenText` is the shared
+currency, and there is one answer to what a folio can draw (`StaticToken::Page`), asserted by
+comparing the two contributions. That audit turned up a **latent instance of the same defect**: a
+contents entry has printed the folio since 0073 while the collector still contributed `'0'..='9'`, so
+a book with roman front matter and a contents list but no `{page}` static would have set its own
+contents list in `.notdef` boxes. Reproduced with a failing test, then fixed through the one answer.
+
+An unresolvable reference prints `[?]` — a decision argued against 0072's precedent rather than
+inherited from it: a dangling section anchor may be dropped because furniture is recoverable and
+visible, but a cross-reference is content in the text flow, so rendering nothing leaves "see page ."
+in a sentence that reads as finished. `FORMAT_VERSION` went to **7**, and this is the case where the
+two halves of the bump rule split: an older build prints `[?]`, which is *loud* (0074's condition for
+the rule not firing), but `source` is model, is authored intent, and is destroyed unrecoverably on
+save-back — which 0074's second half, "nothing is added to the model", does not cover.
+`SAMPLE_EXPORT_DIGEST` moved and is classified identifier-only (8454 bytes both sides, 128 bytes in
+4 runs, all inside the XMP identifiers or the trailer `/ID`).
 
 #### 0077 footnotes
 

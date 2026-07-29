@@ -829,14 +829,29 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
                         r.style.weight.map_or(base.weight, |w| w.0),
                         r.style.italic.unwrap_or(base.italic),
                     );
-                    out.entry(face).or_default().add_run(&r.text);
+                    let bucket = out.entry(face).or_default();
+                    bucket.add_run(&r.text);
+                    // A run whose characters are generated at layout time — a cross-reference, spec
+                    // 0076 — draws something this collector cannot read off `r.text`, which runs
+                    // *before* layout. This is the same class the master-static tokens below are in,
+                    // at a second site, so it gets the same structural answer rather than a special
+                    // case: `RunSource::contributes` is an exhaustive `match` in `core-model`, so a
+                    // run source that reaches the resolver without reaching here does not compile.
+                    //
+                    // Into this run's own bucket rather than into `everywhere`, because a body run
+                    // *does* select a face: a cross-reference inside a bold run is set bold.
+                    let contributes = r.source.contributes(doc);
+                    for run in &contributes.runs {
+                        bucket.add_run(run);
+                    }
+                    bucket.add_chars(contributes.chars);
                 }
             }
             Block::Panel { .. }
             | Block::Table { .. }
             | Block::Toc { .. }
             | Block::Component { .. } => {
-                everywhere.merge(&other_block_text(block));
+                everywhere.merge(&other_block_text(doc, block));
                 draws_unattributed_text = true;
             }
             Block::Image { .. } => {}
@@ -906,7 +921,7 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
 /// cell and a component's field are all drawn through the same shaped-glyph writer as a paragraph
 /// is, so their ligatures need to be in the subset for exactly the same reason. Attribution is
 /// unchanged — this all still goes into every used bucket, because nothing here selects a face.
-fn other_block_text(block: &Block) -> fonts::FaceText {
+fn other_block_text(doc: &Document, block: &Block) -> fonts::FaceText {
     let mut set = fonts::FaceText::default();
     match block {
         Block::Panel { panel, .. } => {
@@ -938,7 +953,17 @@ fn other_block_text(block: &Block) -> fonts::FaceText {
         }
         Block::Toc { title, .. } => {
             set.add_run(title);
-            set.add_chars('0'..='9');
+            // A contents entry prints the **folio** (spec 0073), which is arabic only until a
+            // section says otherwise — this said `'0'..='9'` and nothing else, so a book with roman
+            // front matter and a contents list would have set its own entries as `.notdef` boxes
+            // unless some master happened to carry a `{page}` token. Found by spec 0076 while
+            // auditing every site that draws characters generated at layout time.
+            //
+            // Asked through `StaticToken::Page` rather than by reaching for `folio_formats` here,
+            // because there must be exactly one answer to what a folio can draw: the `{page}` token,
+            // a contents entry and a cross-reference are three ways of printing the same number.
+            let folio = quill_core_model::StaticToken::Page.contributes(doc);
+            set.add_chars(folio.chars);
             set.add_chars(['.', '\u{2026}']);
         }
         Block::Component { fields, .. } => {
@@ -1830,7 +1855,20 @@ mod tests {
     /// `DocumentID`/`InstanceID` (offsets 1494..1644) or the trailer `/ID` (8355..8430). Zero
     /// differing bytes outside those regions, so no content stream, font, ICC or metadata stream
     /// moved.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0xa7cb_8fee_2ca9_9602;
+    ///
+    /// Changed again by spec 0076, and it is the **identifier-only** template again, for spec
+    /// 0072's reason exactly: `FORMAT_VERSION` became 7, so `doc.to_json()` differs by one character
+    /// and the `/ID` hashed from it moves. Nothing spec 0076 added reaches the sample's page — every
+    /// one of its runs is `RunSource::Authored`, which `skip_serializing_if` keeps out of the
+    /// manifest entirely, so the document has no cross-reference, contributes nothing extra to the
+    /// subset, and takes the same single flow pass it always did.
+    ///
+    /// Verified rather than accepted, on the same pair of files the ledger always uses. **8454 bytes
+    /// both sides**, 128 differing bytes in **4 runs**, and every run inside the XMP
+    /// `DocumentID`/`InstanceID` (offsets 1510..1541 and 1588..1619) or the trailer `/ID`
+    /// (8361..8392 and 8396..8427). Zero differing bytes outside those regions, so no content
+    /// stream, font, ICC or metadata stream moved.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x93d9_f5e7_700d_dd08;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2262,6 +2300,7 @@ mod tests {
                         ..quill_core_model::InlineStyle::EMPTY
                     },
                     character: None,
+                    source: Default::default(),
                 },
             ],
             Color::Gray { v: 0.0 },
@@ -2279,6 +2318,7 @@ mod tests {
                     ..quill_core_model::InlineStyle::EMPTY
                 },
                 character: None,
+                source: Default::default(),
             }],
             Color::Gray { v: 0.0 },
         ));
@@ -2306,6 +2346,7 @@ mod tests {
                     ..quill_core_model::InlineStyle::EMPTY
                 },
                 character: None,
+                source: Default::default(),
             }],
             Color::Gray { v: 0.0 },
         ));
@@ -2600,6 +2641,171 @@ mod tests {
         }
     }
 
+    /// A latent instance of the same class, found by spec 0076 while auditing every site that draws
+    /// layout-time characters, and fixed by it.
+    ///
+    /// Spec 0073 made a **contents entry** print the folio rather than the page index — a reader
+    /// about to turn to a page needs the number printed on it — but the collector's contribution for
+    /// a `Block::Toc` still said `'0'..='9'`, which was the whole answer only while every folio was
+    /// arabic. So a book with roman front matter and a contents list, but no `{page}` static
+    /// anywhere, would have set every roman numeral in its own contents list as a `.notdef` box.
+    ///
+    /// The fix is the same one property 3 of `RunSource`'s documentation states: there is **one**
+    /// answer to "what can a folio draw", and both the contents list and the reference ask it
+    /// through `StaticToken::Page`.
+    #[test]
+    fn a_contents_entry_carries_the_folio_alphabet_it_will_print() {
+        use quill_core_model::{Block, BlockId, Folio, NumberFormat, Section};
+
+        let mut doc = Document::sample();
+        doc.assets.clear();
+        doc.content = vec![Block::Toc {
+            id: BlockId::UNASSIGNED,
+            title: "Contents".into(),
+            max_level: 6,
+            color: Color::Gray { v: 0.0 },
+        }];
+        doc.content.extend((0..80).map(|i| {
+            Block::body(
+                format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                Color::Gray { v: 0.0 },
+            )
+        }));
+        doc.content
+            .push(Block::heading(1, "Chapter", Color::Gray { v: 0.0 }));
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: doc.content[0].id(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        doc.master_pages.clear();
+        doc.default_master = None;
+        doc.pages.clear();
+
+        let carried: BTreeSet<char> = doc_chars(&doc);
+        for ch in "ivxlcdm".chars() {
+            assert!(
+                carried.contains(&ch),
+                "a contents entry into roman-numbered pages draws {ch:?}"
+            );
+        }
+    }
+
+    /// Spec 0076, and the *second instance* of the class spec 0074 closed for furniture.
+    ///
+    /// A cross-reference's characters are generated at layout time, exactly as a `{page}` token's
+    /// are — but it is a body **run**, not a master static, so it reaches the collector by a
+    /// different path and would have been a special case rather than an instance if `RunSource`
+    /// were not an enum whose `contributes` is exhaustive.
+    ///
+    /// Note what this fixture deliberately does *not* have: a `{page}` static anywhere. So nothing
+    /// but the reference itself can put a roman numeral in the subset, and the assertion is about
+    /// the new path rather than about the one 0073 already fixed.
+    #[test]
+    fn a_cross_reference_is_in_the_subset_and_draws_no_notdef() {
+        use quill_core_model::{Block, Folio, NumberFormat, Run, Section};
+
+        let mut doc = Document::sample();
+        doc.assets.clear();
+        doc.content = (0..80)
+            .map(|i| {
+                Block::body(
+                    format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                    Color::Gray { v: 0.0 },
+                )
+            })
+            .collect();
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+        let target = doc.content[70].id();
+        let first = doc.content[0].id();
+        let mut referring = Block::body_runs(
+            vec![
+                Run::plain("See page "),
+                Run::reference(target),
+                Run::plain(", and see page "),
+                // The unresolvable case draws the marker, and the marker's characters are generated
+                // at layout time too — forget them and a *broken* reference renders as three
+                // `.notdef` boxes, which is a less legible failure than the one it replaces.
+                Run::reference(quill_core_model::BlockId(999_999)),
+                Run::plain("."),
+            ],
+            Color::Gray { v: 0.0 },
+        );
+        referring.set_id(first);
+        doc.content[0] = referring;
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: first,
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        doc.master_pages.clear();
+        doc.default_master = None;
+        doc.pages.clear();
+
+        let carried: BTreeSet<char> = doc_chars(&doc);
+        for ch in "ivxlcdm".chars() {
+            assert!(
+                carried.contains(&ch),
+                "a cross-reference into roman-numbered pages draws {ch:?}"
+            );
+        }
+        for ch in quill_core_model::UNRESOLVED_REFERENCE.chars() {
+            assert!(
+                carried.contains(&ch),
+                "an unresolvable cross-reference draws {ch:?}"
+            );
+        }
+
+        // End to end, which is the half the compiler cannot check: an arm that returns the wrong
+        // characters still builds. Compare what the resolver actually printed on the page against
+        // what the collector carried.
+        let pages = lay_out_for_press(&doc, &ExportOptions::default()).expect("press layout");
+        let mut printed = String::new();
+        for page in &pages {
+            for placed in &page.blocks {
+                if let quill_layout_engine::PlacedBlock::Text { source, lines, .. } = placed {
+                    if *source == first {
+                        for line in lines {
+                            printed.push_str(&line.text);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            printed.contains(quill_core_model::UNRESOLVED_REFERENCE),
+            "the fixture must actually print the marker, got {printed:?}"
+        );
+        assert!(
+            printed.chars().any(|c| "ivxlcdm".contains(c)),
+            "…and a roman folio, got {printed:?}"
+        );
+        for ch in printed.chars() {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is printed by a cross-reference but was never collected"
+            );
+        }
+
+        // And the glyphs really draw: `drawn_gids` panics on any `.notdef`.
+        assert_eq!(drawn_gids(&carried, "mmmdccclxxxviii"), 15);
+        assert_eq!(
+            drawn_gids(&carried, quill_core_model::UNRESOLVED_REFERENCE),
+            3
+        );
+    }
+
     /// A `{heading:N}` carries the headings it can *reach* and no others, which is what keeps a
     /// running head from dragging every sub-heading in a 500-page book into the subset.
     #[test]
@@ -2646,6 +2852,7 @@ mod tests {
                         ..quill_core_model::InlineStyle::EMPTY
                     },
                     character: None,
+                    source: Default::default(),
                 },
                 quill_core_model::Run::plain(" and a tail"),
             ],
@@ -3720,6 +3927,7 @@ mod tests {
                         ..quill_core_model::InlineStyle::EMPTY
                     },
                     character: None,
+                    source: Default::default(),
                 },
                 quill_core_model::Run::plain(" and ordinary prose again."),
             ],
@@ -3766,6 +3974,7 @@ mod tests {
                         ..quill_core_model::InlineStyle::EMPTY
                     },
                     character: None,
+                    source: Default::default(),
                 },
             ],
             Color::Gray { v: 0.0 },

@@ -353,6 +353,9 @@ fn build_runs(text: &str, delims: &[Delim], pairs: &[Pair]) -> Vec<Run> {
             text: std::mem::take(buf),
             style: InlineStyle::EMPTY,
             character,
+            // The importer authors text; markdown has no cross-reference syntax (spec 0076's
+            // non-goal), so every imported run draws its own characters.
+            source: crate::RunSource::Authored,
         });
     };
 

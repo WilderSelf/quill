@@ -25,7 +25,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 ```json
 {
-  "format_version": 6,
+  "format_version": 7,
   "metadata": { "title": "The Ruined Keep", "authors": ["Anon"] },
   "page_setup": { "trim": { "w_pt": 468.0, "h_pt": 720.0 }, "bleed_pt": 9.0, "facing_pages": true,
                   "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 } },
@@ -55,6 +55,8 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
     { "kind": "body", "id": 2,
       "runs": [ { "text": "A dank corridor stretches into " },
                 { "text": "darkness", "style": { "italic": true } },
+                { "text": "; see page " },
+                { "text": "[?]", "source": { "kind": "reference", "target": 3 } },
                 { "text": "." } ],
       "color": { "space": "cmyk", "c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0 } },
     { "kind": "image", "id": 3, "asset": "map1" }
@@ -177,6 +179,43 @@ reader to the wrong page. `/Link` and PDF outline **destinations** keep the phys
 because a destination is a reference to the *n*th page of the file and a viewer resolves it
 positionally. Both are page numbers; they are not the same page number.
 
+## Cross-references: "see page 42" (spec 0076, v7)
+
+A **run** may say where its characters come from. `source` is absent on every authored run — which is
+every run written before v7 — and a run that carries one draws something generated at layout time
+instead of its own `text`:
+
+```json
+{ "text": "[?]", "source": { "kind": "reference", "target": 3 } }
+```
+
+- `target` — the `id` of the block being referred to. **Any block**, not only a heading: "see the
+  table on page 42" is the same sentence as "see the chapter on page 42", and the anchor mechanism
+  is general for free.
+- What it prints is the **folio** of the page that block landed on — the number a reader is told, on
+  the same split spec 0073 drew for a contents entry. A `/Link` destination still carries the page
+  *index*.
+- `text` is **not** a cached page number and is never read while laying out. A stored number is stale
+  the moment anything is edited, which is spec 0041's rule for a contents list applied to a run. It
+  holds the unresolved marker below, so a build that does not understand `source` prints the same
+  thing this one prints for a reference it cannot resolve.
+
+**A target that is not in the document prints `[?]`.** That is a decision, and it is deliberately
+*not* the posture a dangling section anchor or a dangling master name gets. Those lose furniture,
+which is recoverable and visible by comparison across pages; a cross-reference is **content, in the
+text flow**, so rendering nothing would leave "see page ." in a sentence that reads as finished.
+Refusing to open the document was the other option, and it loses a whole book to one stale id —
+which spec 0072 already rejected. A marker survives to the proof and reads as unfinished, which is
+what `CLAUDE.md`'s "prefer a visible failure" means for running text.
+
+**A cross-reference is genuinely in the flow, so layout iterates over it.** "See page 142" is three
+digits where "see page 42" is two, so its width moves a line break, which moves a page, which moves
+the number. It joins the same bounded fixpoint the contents list and the sections run in, and a
+document that will not settle reports `converged: false` and ships its last iterate rather than
+presenting a guess as settled. Unlike a folio, this one really can oscillate: roman numerals are not
+monotone in width (`viii` is wider than `ix`), so a reference into roman-numbered pages can push its
+own target back and forth across a page boundary for ever.
+
 ## Master statics: alignment and page parity (spec 0047, v3)
 
 A text static carries two optional fields, both defaulting to the pre-v3 behavior and both omitted
@@ -229,6 +268,7 @@ version changed.
 | 3 → 4 | 0063 | a paragraph's single `text` becomes an ordered list of styled `runs` | **the one migration that is not a structural no-op**: `text` is removed from every `heading` and `body` block and replaced by `runs: [{"text": …}]`. A `toc` title and a panel's fields are not paragraphs and keep their strings. Still a serialization no-op *in effect* — one plain run carries no style object — so a migrated v3 document lays out and exports as it did |
 | 4 → 5 | 0072 | `sections` | defaults `sections` to empty: a v4 document had no sections, and every master assignment it had was positional |
 | 5 → 6 | 0073 | `folio` on a section | defaults `folio` to absent on every section: a v5 document numbered every page arabic from 1, which is what a section stating no folio still means |
+| 6 → 7 | 0076 | `source` on a run — a cross-reference to a block | defaults `source` to `authored` on every run: a v6 run drew its own `text`, which is what an absent `source` still means. Nothing is written into the manifest, for the reason 5 → 6 writes nothing |
 
 A bump is warranted whenever an **older** build would open the document and silently lay it out
 wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
@@ -238,6 +278,16 @@ build would drop `sections` and set every chapter opener in the body master; a p
 any of them, because a half-understood document can be saved back over the original — and the loss
 is worse for authored intent than for derived state: block ids can be regenerated, a section list
 cannot.
+
+**Spec 0076 is the case where the two halves of the rule split, and it is worth stating because the
+first half does not fire.** A pre-0076 build meeting a cross-reference prints the run's stored
+`text` — the `[?]` marker — so the book is *visibly* unfinished wherever a reference was, which is
+the loud condition spec 0074's entry below turns on. What decides it is the second half: `source` is
+model, it is authored intent (which block the author pointed at), it cannot be regenerated from
+anything left in the file, and an older build that opens and saves destroys every reference in the
+document permanently. 0074's other half — "nothing is added to the model, so no version gate could
+have helped" — is false here. Loudness mitigates the proof; it does not undo the deletion.
+`format_version` is **7**.
 
 Note what the rule does *not* turn on. Not "did a struct gain a field" — spec 0035's `pages`, spec
 0054's `components` and spec 0056's `requires` were all additive without a bump, because an older
