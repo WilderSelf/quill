@@ -25,7 +25,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 5,
   "metadata": { "title": "The Ruined Keep", "authors": ["Anon"] },
   "page_setup": { "trim": { "w_pt": 468.0, "h_pt": 720.0 }, "bleed_pt": 9.0, "facing_pages": true,
                   "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 } },
@@ -43,14 +43,19 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
     { "name": "chapter-opener", "columns": 1, "gutter_pt": 0.0, "statics": [] }
   ],
   "default_master": "body",
-  "pages": [ { "master": "chapter-opener" }, {} ],
+  "pages": [ {}, {} ],
+  "sections": [ { "name": "The Ruined Keep", "start": 1, "master": "chapter-opener" } ],
   "styles": { "paragraph": {
     "body": { "font_size_pt": 10.0, "leading_pt": 12.0, "align": "justified" },
     "folio": { "font_size_pt": 9.0, "leading_pt": 12.0, "align": "left" } } },
   "content": [
-    { "kind": "heading", "id": 1, "level": 1, "text": "The Ruined Keep",
+    { "kind": "heading", "id": 1, "level": 1,
+      "runs": [ { "text": "The Ruined Keep" } ],
       "color": { "space": "gray", "v": 0.0 } },
-    { "kind": "body", "id": 2, "text": "A dank corridor stretches into darkness.",
+    { "kind": "body", "id": 2,
+      "runs": [ { "text": "A dank corridor stretches into " },
+                { "text": "darkness", "style": { "italic": true } },
+                { "text": "." } ],
       "color": { "space": "cmyk", "c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0 } },
     { "kind": "image", "id": 3, "asset": "map1" }
   ],
@@ -78,8 +83,50 @@ manifest entirely when empty, so a document that never assigns a master reads ex
 before spec 0035 — which is why this addition needed no `format_version` bump.
 
 Because assignment is positional, content that pushes the book by a page slides every subsequent
-assignment. That is the accepted trade for M2; anchoring a master to the chapter it opens is
-recorded as an open question in `docs/roadmap.md`.
+assignment. That was the accepted trade for M2, and spec 0072 removes it — see below.
+
+## Sections (spec 0072, v5)
+
+A **section** is a named division of the document anchored to the block that opens it:
+
+```json
+"sections": [ { "name": "The Ruined Keep", "start": 1, "master": "chapter-opener" } ]
+```
+
+- `name` — what the section is called. Authored rather than taken from the anchor's text, because a
+  running head ("The Ruined Keep") and a chapter opener ("Chapter One: The Ruined Keep") are
+  routinely different strings.
+- `start` — the `id` of the block the section opens with. Any block, not only a heading.
+- `master` — optional; the master applied to the section's **opening page**.
+
+A section does not replace the `pages` list: it **generates** it. Each layout pass reads the page
+each anchor was placed on, and synthesises the same `Vec<PageOverride>` described above from those
+page numbers, overlaid on whatever the document authored positionally. Resolution is unchanged —
+`pages[i]`, else `default_master`, else the document's page setup — so a section is an *authoring
+surface* over the representation the format already had.
+
+That is what makes the assignment survive repagination: a block id is stable across every edit that
+does not delete the block, so inserting a chapter in front of another moves the second chapter's
+opener with it, where a positional entry would stay on the page number it names. Where a section and
+a positional entry claim the same page, the section wins — it is the one that tracked the content.
+
+Two consequences worth stating:
+
+- **Master assignment is part of the layout fixpoint.** A section's opener master changes that
+  page's margins and column count, which changes where later content falls, which can move the
+  anchor. Layout therefore iterates — sharing the contents list's loop and its bound (8 passes) —
+  and reports whether it settled rather than presenting the last iterate as an answer.
+- **A section is a marker, not a container.** It does not own its blocks; there is no tree, and a
+  section runs until the next section's anchor. An anchor naming a block the document does not
+  contain is not an error: the section is simply not placed, on the same principle a dangling master
+  name falls through rather than failing.
+
+A template file carries no sections and cannot: it has no content, therefore no block ids to anchor
+to. This is why `TEMPLATE_VERSION` did not move when `format_version` became 5.
+
+Not in this increment, and named rather than forgotten: **"start this section on the next recto"**.
+That is a forced page break, which the model has no mechanism for at all, and it is a forward-only
+rule rather than a fixpoint.
 
 ## Master statics: alignment and page parity (spec 0047, v3)
 
@@ -121,25 +168,38 @@ whatever this build did not understand.
 ### The migrations
 
 Each step brings a manifest forward exactly one version and falls through to the next, so a
-document written by any released build reaches the current types in one load. Both migrations so far
-are structurally no-ops — every field they add is `serde(default)` and the default is what the older
-version *meant* — and both are written out anyway, so the chain reads as a record of what each
+document written by any released build reaches the current types in one load. All but one are
+structurally no-ops — every field they add is `serde(default)` and the default is what the older
+version *meant* — and they are written out anyway, so the chain reads as a record of what each
 version changed.
 
 | From → to | Spec | What changed | Migration |
 |---|---|---|---|
 | 1 → 2 | 0030 | `page_setup.margins`, `master_pages`, `default_master` | defaults `margins` to zero on every edge and `master_pages` to empty: a v1 document had no margins and no masters |
 | 2 → 3 | 0047 | `align` and `mirror` on a text master static | defaults `align` to `left` and `mirror` to `false` on every text static: a v2 static was drawn from its rect's left edge in the same rect on both halves of a spread |
+| 3 → 4 | 0063 | a paragraph's single `text` becomes an ordered list of styled `runs` | **the one migration that is not a structural no-op**: `text` is removed from every `heading` and `body` block and replaced by `runs: [{"text": …}]`. A `toc` title and a panel's fields are not paragraphs and keep their strings. Still a serialization no-op *in effect* — one plain run carries no style object — so a migrated v3 document lays out and exports as it did |
+| 4 → 5 | 0072 | `sections` | defaults `sections` to empty: a v4 document had no sections, and every master assignment it had was positional |
 
 A bump is warranted whenever an **older** build would open the document and silently lay it out
 wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
-heads and column geometry; a pre-0047 build would put every verso's folio in the gutter. Refusing to
-open beats either, because a half-understood document can be saved back over the original.
+heads and column geometry; a pre-0047 build would put every verso's folio in the gutter; a pre-0072
+build would drop `sections` and set every chapter opener in the body master. Refusing to open beats
+any of them, because a half-understood document can be saved back over the original — and the loss
+is worse for authored intent than for derived state: block ids can be regenerated, a section list
+cannot.
+
+Note what the rule does *not* turn on. Not "did a struct gain a field" — spec 0035's `pages`, spec
+0054's `components` and spec 0056's `requires` were all additive without a bump, because an older
+build that drops them lays the document out exactly as the author would have got before writing
+them. And not "is the field optional" — every field in the table above is optional too. The question
+is only whether the older build's silence produces a *different book*.
 
 > **Bumping `FORMAT_VERSION`? Check whether `TEMPLATE_VERSION` is owed one too.** A template file
 > (below) embeds `page_setup`, `styles`, `master_pages` and `pages`. A document bump that changes
 > the serialized shape of any of those four changes every template file as well, and the template
 > format has its own version and its own migration chain. Spec 0047's 2 → 3 was exactly such a bump.
+> Spec 0072's 4 → 5 was checked against this and is **not**: it adds a field to the document beside
+> those four and changes none of them, and a template cannot carry a section anyway.
 
 ## Template files (spec 0053)
 
@@ -284,6 +344,11 @@ out to this syntax is also a non-goal.
 
 - `#` … `######` followed by a space — a heading of that level. `#1` is a word, not a heading.
 - Blank-line-separated runs of text — a body paragraph; newlines inside one are soft.
+- `**bold**` / `__bold__` and `*italic*` / `_italic_` inside a heading or a paragraph (spec 0064) —
+  a run set in the family's bold or italic face. They nest: `***both***` is bold italic, and
+  `**bold with *italic* inside**` is what it reads as. An **unmatched** delimiter is literal, so
+  `2*d6` and `a_b_c` are the text they look like: an opener must be followed by text and a closer
+  preceded by it, `_` does not pair inside a word, and a pair is always the same character.
 - `![alt](asset-id)` — an image block referencing a linked asset by id.
 - `:::panel` … `:::` — a titled record of named sections, one `key: value` per line, where `key` is
   `name`, `overview`, `detail`, `action`, `reaction`, or `attr` (whose value is `name = value`).

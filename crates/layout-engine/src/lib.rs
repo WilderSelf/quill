@@ -6,6 +6,7 @@
 //! crates compile and the export pipeline has something to consume. Uses `quill-text-layout`
 //! for line breaking.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod component;
@@ -16,9 +17,9 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
     builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
-    Color, ComponentLibrary, Document, ListMarker, Margins, MasterPage, MasterStatic, PageSetup,
-    ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT, TABLE_COMPONENT,
-    TOC_TITLE_STYLE,
+    Color, ComponentLibrary, Document, ListMarker, Margins, MasterPage, MasterStatic, PageOverride,
+    PageSetup, ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT,
+    TABLE_COMPONENT, TOC_TITLE_STYLE,
 };
 use quill_text_layout::{
     justify_runs_indented, Alignment, Hyphenator, Line, RunFormat, RunMetrics,
@@ -327,6 +328,41 @@ pub fn heading_index_of(content: &[Block], pages: &[LaidOutPage]) -> Vec<Heading
     out
 }
 
+/// The page each of `doc`'s sections opens on (spec 0072), parallel to [`Document::sections`].
+///
+/// `None` where the anchor block is not in the page vector at all — it was deleted, or the id names
+/// nothing. That is not an error: the section contributes no assignment and the pages it would have
+/// governed keep the document's default, which is the same posture a dangling master name gets.
+///
+/// Derived from the **laid-out pages** for exactly the reason [`heading_index`] is, and the reason
+/// is load-bearing rather than stylistic: an incremental pass reuses whole pages, so a start
+/// accumulated during pagination would be missing for every section on a reused page — precisely
+/// when the document has just been edited. A block placed on more than one page (spec 0044 can split
+/// one) reports its **first**, because a section starts where its opener starts.
+pub fn section_starts(doc: &Document, pages: &[LaidOutPage]) -> Vec<Option<usize>> {
+    let mut first: BTreeMap<BlockId, usize> = BTreeMap::new();
+    for page in pages {
+        for placed in &page.blocks {
+            // Every variant that carries an identity, not just `Text`: a section may be anchored to
+            // an image, a table or a stat block as readily as to a heading, and a composite's parts
+            // all carry the composite's id. `Rect` is furniture within a block and has none.
+            let source = match placed {
+                PlacedBlock::Text { source, .. }
+                | PlacedBlock::Image { source, .. }
+                | PlacedBlock::Link { source, .. } => *source,
+                PlacedBlock::Rect { .. } => BlockId::UNASSIGNED,
+            };
+            if source.is_assigned() {
+                first.entry(source).or_insert(page.index);
+            }
+        }
+    }
+    doc.sections
+        .iter()
+        .map(|s| first.get(&s.start).copied())
+        .collect()
+}
+
 /// Supplies the geometry and static content of each page.
 ///
 /// Two things in the pagination loop previously made every page identical: the page-advance branch
@@ -359,6 +395,36 @@ pub trait PageTemplate {
     /// and every ungridded document — is unchanged.
     fn baseline_grid(&self) -> Option<BaselineGrid> {
         None
+    }
+
+    /// Re-derive whatever this template computes from where content actually landed (spec 0072),
+    /// returning **whether the derivation changed**.
+    ///
+    /// A section is anchored to a block, so the page it opens on is not known until the document has
+    /// been laid out — and the master it puts on that page changes column count and margins, which
+    /// changes where every later block falls, which can move the section. So this joins the fixpoint
+    /// the contents list already runs: lay out, re-derive, and stop when nothing moves. Returning
+    /// `false` is what ends the loop, so a template that derives nothing costs exactly zero extra
+    /// passes — which is why the default is `false` and why every document without sections or a
+    /// contents list still takes one pass.
+    ///
+    /// Takes `&self` because the flow loop only ever holds a shared reference to its template;
+    /// [`DocumentTemplate`] keeps its derived state behind a `RefCell` rather than every caller
+    /// threading `&mut` through forty call sites for a capability one implementation has.
+    fn reassign(&self, _pages: &[LaidOutPage]) -> bool {
+        false
+    }
+
+    /// A fingerprint of everything [`PageTemplate::reassign`] derived, or `0` if nothing.
+    ///
+    /// The incremental session's `context_fingerprint` is what stops a stale page being reused, and
+    /// it hashes the *document*. A derived assignment is not on the document — it is on the template
+    /// — so without this a fixpoint iteration that changed the assignment but nothing else would
+    /// look to the session like "nothing changed", and it would hand back the previous iterate's
+    /// pages. That is exactly the shape of defect spec 0075 found in the contents list, in the one
+    /// place it could recur.
+    fn derived_fingerprint(&self) -> u64 {
+        0
     }
 }
 
@@ -395,10 +461,33 @@ impl PageTemplate for UniformTemplate {
 /// different master to page 0 (a chapter opener, a title page) than to the body. Resolution itself
 /// lives on [`Document::master_for`] so the engine and the model cannot disagree about which master
 /// a page has.
+///
+/// Since spec 0072 the assignment it resolves against is not necessarily the document's authored
+/// one: a [`Section`] is anchored to a block, and the page that block lands on is only known once
+/// the document has been laid out. [`PageTemplate::reassign`] is where that derivation happens, and
+/// `assignment` below is what it produces. Before the first pass — and for every document without
+/// sections — it is `doc.pages`, unchanged.
 pub struct DocumentTemplate<'a> {
     doc: &'a Document,
     page_setup: &'a PageSetup,
     styles: &'a StyleSheet,
+    /// What the sections derived, and the assignment synthesised from it.
+    ///
+    /// Behind a `RefCell` because the flow loop holds `&dyn PageTemplate`: the alternative is `&mut`
+    /// at every call site in the crate for a capability one implementation has. Borrows are taken
+    /// for the length of one field read and never held across a call back into the template, so
+    /// there is no re-entrancy to get wrong.
+    derived: RefCell<Derived>,
+}
+
+/// What a [`DocumentTemplate`] derives from a laid-out document (spec 0072).
+#[derive(Debug, Clone, PartialEq)]
+struct Derived {
+    /// Page each section starts on, parallel to `doc.sections`; `None` when the anchor block is not
+    /// in the document or was not placed.
+    starts: Vec<Option<usize>>,
+    /// The per-page assignment synthesised from `starts` — see [`Document::page_assignment`].
+    assignment: Vec<PageOverride>,
 }
 
 impl<'a> DocumentTemplate<'a> {
@@ -407,12 +496,19 @@ impl<'a> DocumentTemplate<'a> {
             doc,
             page_setup: &doc.page_setup,
             styles: &doc.styles,
+            // Nothing has been laid out yet, so no section has a start and the assignment is the
+            // authored one. A document with no sections never leaves this state.
+            derived: RefCell::new(Derived {
+                starts: vec![None; doc.sections.len()],
+                assignment: doc.pages.clone(),
+            }),
         }
     }
 
     /// The master governing `page_index`, or none.
     fn master(&self, page_index: usize) -> Option<&'a MasterPage> {
-        self.doc.master_for(page_index)
+        self.doc
+            .master_in(&self.derived.borrow().assignment, page_index)
     }
 
     /// The margins in effect on `page_index`: the master's if it sets them, else the document's.
@@ -550,6 +646,42 @@ impl PageTemplate for DocumentTemplate<'_> {
                 }
             })
             .collect()
+    }
+
+    /// Re-derive the per-page assignment from where the section anchors actually landed (spec 0072).
+    ///
+    /// Two lines of work and one comparison: read the starts off the page vector, synthesise the
+    /// assignment from them, and report whether the *starts* moved. The comparison is on the starts
+    /// rather than on the assignment because that is the quantity the fixpoint is over — two
+    /// different sets of starts can synthesise the same assignment (a section that names no master
+    /// contributes nothing), and reporting "changed" for one of those would iterate for no reason.
+    fn reassign(&self, pages: &[LaidOutPage]) -> bool {
+        let starts = section_starts(self.doc, pages);
+        let mut derived = self.derived.borrow_mut();
+        if starts == derived.starts {
+            return false;
+        }
+        derived.assignment = self.doc.page_assignment(&starts);
+        derived.starts = starts;
+        true
+    }
+
+    fn derived_fingerprint(&self) -> u64 {
+        // `Debug`-derived, on the same reasoning as `session::context_fingerprint`: a hand-written
+        // walk stops covering a field the moment one is added, and the symptom is a stale page
+        // presented as a current one.
+        let starts = self.derived.borrow();
+        if starts.starts.is_empty() {
+            // Nothing derived, so the trait's `0` — a document with no sections is byte-for-byte
+            // the document it was before this increment, incremental behaviour included.
+            return 0;
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in format!("{:?}", starts.starts).as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
     }
 }
 
@@ -1729,10 +1861,10 @@ pub fn lay_out_with_template(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    lay_out_with_toc_status(content, assets, styles, template, metrics, hyphenator).0
+    lay_out_with_fixpoint_status(content, assets, styles, template, metrics, hyphenator).0
 }
 
-/// [`lay_out_with_toc_status`] over an explicit component library (spec 0054).
+/// [`lay_out_with_fixpoint_status`] over an explicit component library (spec 0054).
 ///
 /// The frame-level entry points above deliberately do not take one: a frame primitive lays out the
 /// *bundled* components, which is what every one of its callers wants, and threading a library
@@ -1747,49 +1879,64 @@ pub fn lay_out_with_library(
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
-) -> (Vec<LaidOutPage>, TocStatus) {
+) -> (Vec<LaidOutPage>, FixpointStatus) {
     lay_out_resolved(
         content, assets, styles, components, template, metrics, hyphenator,
     )
 }
 
-/// How the table-of-contents fixpoint resolved (spec 0041).
+/// How the layout fixpoint resolved (spec 0041, generalised by spec 0072).
+///
+/// Named for the fixpoint rather than for the contents list since spec 0072, because there are now
+/// two derived quantities in it — the contents list's page numbers and the sections' start pages —
+/// and a status called `toc` at every call site would be wrong at half of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TocStatus {
-    /// Layout passes run. `1` when the document has no contents block at all.
+pub struct FixpointStatus {
+    /// Layout passes run. `1` when the document derives nothing from its own layout.
     pub iterations: usize,
-    /// Whether the page numbers settled. `false` means the cap was reached and the **last iterate**
-    /// was returned: a laid-out document with nothing missing, whose contents may disagree with a
-    /// page number by one. The caller can see it rather than being told a guess converged.
+    /// Whether the derived quantities settled. `false` means the cap was reached and the **last
+    /// iterate** was returned: a laid-out document with nothing missing, whose contents may disagree
+    /// with a page number by one, or whose chapter opener may be on the wrong page. The caller can
+    /// see it rather than being told a guess converged.
     pub converged: bool,
 }
 
-/// The most layout passes a contents fixpoint may take before giving up.
+/// The most layout passes the fixpoint may take before giving up.
 ///
 /// A bound is not optional. A contents entry can push a heading onto the next page, whose longer
 /// number lengthens the entry, which pushes the heading further — or shortens it and pulls the
 /// heading back, forever. Spec 0031 recorded unbounded "reflow until state matches" as the way a
 /// pathological document hangs; a contents list is the case that actually oscillates.
-pub const TOC_MAX_ITERATIONS: usize = 8;
+///
+/// Spec 0072 puts a second quantity under the same bound, and it oscillates far more readily than
+/// the contents list does: a section's opener master changes the margins of the page the section
+/// starts on, which can push the anchor onto the next page, where the same master then applies and
+/// gives the previous page its capacity back. The bound is shared rather than per-quantity because
+/// the cost that matters is the number of **full-document passes**, and one budget over the loop is
+/// the only thing that bounds it. See spec 0076 for the counter the bench file is owed.
+pub const FIXPOINT_MAX_ITERATIONS: usize = 8;
 
-/// [`lay_out_with_template`], reporting how the contents fixpoint resolved.
+/// [`lay_out_with_template`], reporting how the layout fixpoint resolved.
 ///
 /// A table of contents lists page numbers, its own length changes where every later page break
 /// falls, and that changes the numbers it lists. So layout runs to a fixpoint: lay out, read where
 /// the headings landed, regenerate the entries, lay out again, and stop when the index stops
 /// changing.
 ///
-/// Documents without a contents block take exactly one pass — the loop is not merely skipped in
-/// spirit, it is not entered, so nothing about the cost or the behaviour of every other document
-/// changes.
-pub fn lay_out_with_toc_status(
+/// Since spec 0072 a second quantity rides the same loop: a section is anchored to a block, so its
+/// start page is read off the laid-out pages, and the master it puts there changes that page's
+/// margins and column count — which can move the anchor. See [`PageTemplate::reassign`].
+///
+/// Documents that derive neither take exactly one pass. The loop is entered but exits on its first
+/// comparison, so nothing about the cost or the behaviour of every other document changes.
+pub fn lay_out_with_fixpoint_status(
     content: &[Block],
     assets: &[Asset],
     styles: &StyleSheet,
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
-) -> (Vec<LaidOutPage>, TocStatus) {
+) -> (Vec<LaidOutPage>, FixpointStatus) {
     lay_out_resolved(
         content,
         assets,
@@ -1810,7 +1957,7 @@ fn lay_out_resolved(
     template: &impl PageTemplate,
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
-) -> (Vec<LaidOutPage>, TocStatus) {
+) -> (Vec<LaidOutPage>, FixpointStatus) {
     let once = |headings: &[HeadingEntry]| {
         flow(
             content,
@@ -1828,34 +1975,40 @@ fn lay_out_resolved(
         .pages
     };
 
+    // Two derived quantities, one loop (spec 0072). Nesting them — settle the sections, then settle
+    // the contents inside that — would multiply the pass count rather than add to it, and a pass is
+    // a whole-document flow. They are also not independent: a section's opener master changes the
+    // page count, which changes the numbers the contents list prints.
+    let has_toc = content.iter().any(|b| matches!(b, Block::Toc { .. }));
+
     let mut pages = once(&[]);
-    if !content.iter().any(|b| matches!(b, Block::Toc { .. })) {
-        return (
-            pages,
-            TocStatus {
-                iterations: 1,
-                converged: true,
-            },
-        );
-    }
+    // Asked once before the loop, so a template that derives nothing answers `false` and the loop
+    // exits on its first comparison — one pass, exactly as before, for every document that has
+    // neither a contents list nor a section.
+    let mut reassigned = template.reassign(&pages);
 
     let mut headings: Vec<HeadingEntry> = Vec::new();
     let mut iterations = 1;
     let converged = loop {
-        let next = heading_index_of(content, &pages);
-        if next == headings {
+        let next = if has_toc {
+            heading_index_of(content, &pages)
+        } else {
+            Vec::new()
+        };
+        if next == headings && !reassigned {
             break true;
         }
-        if iterations >= TOC_MAX_ITERATIONS {
+        if iterations >= FIXPOINT_MAX_ITERATIONS {
             break false;
         }
         headings = next;
         pages = once(&headings);
+        reassigned = template.reassign(&pages);
         iterations += 1;
     };
     (
         pages,
-        TocStatus {
+        FixpointStatus {
             iterations,
             converged,
         },
@@ -3144,6 +3297,7 @@ mod tests {
             master_pages: Vec::new(),
             default_master: None,
             pages: Vec::new(),
+            sections: Vec::new(),
         };
         // Give the blocks ids, as a loaded document would have (spec 0026).
         doc.assign_missing_block_ids().expect("fresh blocks");
@@ -3234,6 +3388,7 @@ mod tests {
             master_pages: Vec::new(),
             default_master: None,
             pages: Vec::new(),
+            sections: Vec::new(),
         };
 
         let pages = lay_out(&doc, &MONO, &NoHyphenator);
@@ -5835,7 +5990,7 @@ mod tests {
         // claim, and a tolerance would let the two arithmetics drift apart by a hair each time
         // either is touched, which is how an equivalence quietly stops being one.
         let doc = toc_levels_doc();
-        let (pages, status) = lay_out_with_toc_status(
+        let (pages, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -5886,7 +6041,7 @@ mod tests {
         // be. They move because spec 0069 settled that `w_pt` is ink, which makes the mechanism's
         // values the correct ones and the hand-rolled columns the defect.
         let doc = toc_levels_doc();
-        let (pages, status) = lay_out_with_toc_status(
+        let (pages, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6038,7 +6193,7 @@ mod tests {
         // first-pass contents list against first-pass numbers would agree with itself while being
         // wrong about the document.
         let doc = toc_doc(2, &[(1, "Alpha"), (1, "Beta"), (1, "Gamma")], 60);
-        let (pages, status) = lay_out_with_toc_status(
+        let (pages, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6104,7 +6259,7 @@ mod tests {
         // list taller than its frame reached the branch that places a block whole and lets it
         // overflow — silently, in the feature a long book most needs.
         let doc = long_toc_doc(150);
-        let (pages, status) = lay_out_with_toc_status(
+        let (pages, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6194,10 +6349,10 @@ mod tests {
         // The fixpoint, over a contents list that now changes the page count by *pages* rather than
         // by lines. A contents list that spans three pages pushes every chapter three pages later,
         // which changes the numbers it prints, which is the loop this feature has always been.
-        // Bounded by `TOC_MAX_ITERATIONS`; this asserts it still settles inside the bound and that
+        // Bounded by `FIXPOINT_MAX_ITERATIONS`; this asserts it still settles inside the bound and that
         // what it settled on is true of the document it produced.
         let doc = long_toc_doc(150);
-        let (pages, status) = lay_out_with_toc_status(
+        let (pages, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6207,7 +6362,7 @@ mod tests {
         );
         assert!(status.converged, "must settle: {status:?}");
         assert!(
-            status.iterations <= TOC_MAX_ITERATIONS,
+            status.iterations <= FIXPOINT_MAX_ITERATIONS,
             "converged is only meaningful inside the bound: {status:?}"
         );
 
@@ -6231,7 +6386,7 @@ mod tests {
     fn the_fixpoint_settles_in_few_passes() {
         // "It converged" as a measured claim rather than an assertion of faith.
         let doc = toc_doc(2, &[(1, "Alpha"), (1, "Beta")], 40);
-        let (_, status) = lay_out_with_toc_status(
+        let (_, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6251,7 +6406,7 @@ mod tests {
     fn a_document_without_a_contents_block_takes_exactly_one_pass() {
         // The loop must not be entered at all, so no other document pays for this feature.
         let doc = doc_with_blocks(many_lines(200));
-        let (_, status) = lay_out_with_toc_status(
+        let (_, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6266,7 +6421,7 @@ mod tests {
     #[test]
     fn max_level_omits_deeper_headings() {
         let doc = toc_doc(2, &[(1, "One"), (2, "Two"), (3, "Three")], 5);
-        let (pages, _) = lay_out_with_toc_status(
+        let (pages, _) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6284,7 +6439,7 @@ mod tests {
     fn a_page_number_is_right_aligned_to_the_measure() {
         // Geometry, not appearance: a 1-digit and a 3-digit page must end in the same column.
         let doc = toc_doc(1, &[(1, "Alpha"), (1, "Beta")], 200);
-        let (pages, _) = lay_out_with_toc_status(
+        let (pages, _) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -6317,7 +6472,7 @@ mod tests {
     #[test]
     fn a_contents_list_with_no_headings_is_just_its_title() {
         let doc = toc_doc(2, &[], 0);
-        let (pages, status) = lay_out_with_toc_status(
+        let (pages, status) = lay_out_with_fixpoint_status(
             &doc.content,
             &doc.assets,
             &doc.styles,
@@ -7588,5 +7743,216 @@ mod tests {
             !fmt.italic,
             "the house definition replaces the built-in rather than merging with it"
         );
+    }
+
+    // --- Sections (spec 0072) -----------------------------------------------------------------
+
+    /// The two masters a chapter opener needs: a deep top margin on the opener, an ordinary one on
+    /// the body. Deliberately differing in *margins* rather than in columns, because the margin is
+    /// what changes a page's capacity and therefore what puts the assignment in the fixpoint.
+    fn opener_and_body() -> Vec<MasterPage> {
+        vec![
+            MasterPage {
+                name: "chapter-opener".into(),
+                margins: Some(Margins {
+                    top_pt: 216.0,
+                    bottom_pt: 54.0,
+                    inside_pt: 54.0,
+                    outside_pt: 54.0,
+                }),
+                columns: 1,
+                gutter_pt: 0.0,
+                statics: Vec::new(),
+            },
+            MasterPage {
+                name: "body".into(),
+                margins: Some(Margins {
+                    top_pt: 54.0,
+                    bottom_pt: 54.0,
+                    inside_pt: 54.0,
+                    outside_pt: 54.0,
+                }),
+                columns: 1,
+                gutter_pt: 0.0,
+                statics: Vec::new(),
+            },
+        ]
+    }
+
+    /// `filler` one-line paragraphs, then the block a section is anchored to, then a little more.
+    ///
+    /// The anchor is a **body** block, not a heading: a section anchors to a `BlockId`, and nothing
+    /// about the mechanism is specific to headings. Anchoring the fixture to a paragraph is what
+    /// asserts that.
+    fn sectioned_doc(filler: usize) -> Document {
+        let mut content = many_lines(filler);
+        content.push(Block::body(
+            "the chapter opens here",
+            Color::Gray { v: 0.0 },
+        ));
+        content.extend(many_lines(4));
+        let mut doc = doc_with_blocks(content);
+        doc.master_pages = opener_and_body();
+        doc.default_master = Some("body".into());
+        doc.assign_missing_block_ids().expect("ids");
+        let anchor = doc.content[filler].id();
+        doc.sections = vec![quill_core_model::Section {
+            name: "Chapter One".into(),
+            start: anchor,
+            master: Some("chapter-opener".into()),
+        }];
+        doc
+    }
+
+    /// Lay a document out through its own template, keeping the template so its settled derivation
+    /// can be asked about afterwards.
+    fn lay_out_sectioned(doc: &Document) -> (Vec<LaidOutPage>, FixpointStatus, Vec<Option<usize>>) {
+        let template = DocumentTemplate::new(doc);
+        let (pages, status) = lay_out_with_fixpoint_status(
+            &doc.content,
+            &doc.assets,
+            &doc.styles,
+            &template,
+            &MONO,
+            &NoHyphenator,
+        );
+        let starts = section_starts(doc, &pages);
+        (pages, status, starts)
+    }
+
+    /// The y the first block on `page` was placed at — where that page's text frame begins.
+    fn top_of(pages: &[LaidOutPage], page: usize) -> f32 {
+        match &pages[page].blocks[0] {
+            PlacedBlock::Text { frame, .. } => frame.y_pt,
+            other => panic!("expected text on page {page}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_section_puts_its_master_on_the_page_its_anchor_landed_on() {
+        let doc = sectioned_doc(50);
+        let (pages, status, starts) = lay_out_sectioned(&doc);
+        assert!(status.converged, "must settle: {status:?}");
+        let start = starts[0].expect("the anchor is in the document, so it was placed");
+        assert!(
+            start > 0,
+            "the fixture exists to put the chapter past page 0, got {start}"
+        );
+        assert_eq!(top_of(&pages, start), 216.0, "the opener's top margin");
+        assert_eq!(top_of(&pages, 0), 54.0, "and every other page is body");
+    }
+
+    #[test]
+    fn a_section_survives_repagination_and_a_positional_assignment_does_not() {
+        // **The defect spec 0035 recorded and could not fix**, asserted directly and from both
+        // sides. `pages[i]` addresses page `i`, so inserting content that pushes the book slides
+        // every assignment off the content it was authored for; an anchor does not move, because a
+        // `BlockId` is not a position.
+        let doc = sectioned_doc(50);
+        let (_, _, starts) = lay_out_sectioned(&doc);
+        let before = starts[0].expect("placed");
+
+        // The edit: content inserted *before* the section.
+        let mut edited = doc.clone();
+        let inserted: Vec<Block> = many_lines(40);
+        edited.content.splice(0..0, inserted);
+        edited.assign_missing_block_ids().expect("ids");
+        let (pages, status, starts) = lay_out_sectioned(&edited);
+        let after = starts[0].expect("placed");
+        assert!(status.converged, "must settle: {status:?}");
+        assert!(
+            after > before,
+            "the insert must move the chapter: {before} -> {after}"
+        );
+
+        // The master went with it, and did not stay behind.
+        assert_eq!(
+            top_of(&pages, after),
+            216.0,
+            "the opener is on the page the chapter now opens on"
+        );
+        assert_eq!(
+            top_of(&pages, before),
+            54.0,
+            "and no longer on the page it used to open on"
+        );
+
+        // The same document expressed the spec-0035 way — a positional entry for the page the
+        // chapter opened on before the edit — gets this wrong, which is why sections exist.
+        let mut positional = edited.clone();
+        positional.sections.clear();
+        positional.pages = vec![PageOverride::default(); before + 1];
+        positional.pages[before].master = Some("chapter-opener".into());
+        let (pages, _, _) = lay_out_sectioned(&positional);
+        assert_eq!(
+            top_of(&pages, before),
+            216.0,
+            "the positional entry stayed on the page it names"
+        );
+        assert_ne!(
+            top_of(&pages, after),
+            216.0,
+            "…which is not where the chapter is any more"
+        );
+    }
+
+    #[test]
+    fn a_section_whose_anchor_is_gone_assigns_nothing() {
+        let mut doc = sectioned_doc(50);
+        doc.sections[0].start = BlockId(9999);
+        let (pages, status, starts) = lay_out_sectioned(&doc);
+        assert_eq!(starts, vec![None]);
+        assert!(status.converged);
+        // Every page is the document default: losing the furniture beats refusing the document.
+        for page in 0..pages.len() {
+            assert_eq!(top_of(&pages, page), 54.0, "page {page}");
+        }
+    }
+
+    #[test]
+    fn a_document_with_no_sections_takes_exactly_one_pass() {
+        // The claim that this increment costs every other document nothing. A second pass would be
+        // a doubling of layout work for every book in existence.
+        let doc = doc_with_blocks(many_lines(60));
+        let (_, status, _) = lay_out_sectioned(&doc);
+        assert_eq!(status.iterations, 1);
+        assert!(status.converged);
+
+        // And a settling sectioned document costs exactly one extra pass: derive, re-lay, agree.
+        let (_, status, _) = lay_out_sectioned(&sectioned_doc(50));
+        assert_eq!(status.iterations, 2);
+        assert!(status.converged);
+    }
+
+    #[test]
+    fn a_section_assignment_that_will_not_settle_stops_at_the_cap() {
+        // The oscillation is real rather than contrived, and it is *why* master assignment has to be
+        // bounded: the opener's deep top margin shrinks the page the chapter opens on, which pushes
+        // the anchor onto the next page, where the same master then applies and gives the previous
+        // page its capacity back. The anchor sits exactly in the band between the two capacities.
+        //
+        // The requirement is that it terminates and says so — a guess presented as settled is worse
+        // than a document that admits it is one page out.
+        let doc = sectioned_doc(40);
+        let (pages, status, _) = lay_out_sectioned(&doc);
+        assert!(
+            !status.converged,
+            "this fixture is chosen to oscillate; if it settles the fixture has stopped \
+             testing the bound: {status:?}"
+        );
+        assert_eq!(status.iterations, FIXPOINT_MAX_ITERATIONS);
+
+        // And the last iterate is a whole document, not a half-laid-out one: every block placed.
+        let placed: BTreeSet<BlockId> = pages
+            .iter()
+            .flat_map(|p| p.blocks.iter())
+            .filter_map(|b| match b {
+                PlacedBlock::Text { source, .. } => Some(*source),
+                _ => None,
+            })
+            .collect();
+        for block in &doc.content {
+            assert!(placed.contains(&block.id()), "{:?} was dropped", block.id());
+        }
     }
 }

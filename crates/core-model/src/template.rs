@@ -211,6 +211,10 @@ impl Document {
             master_pages: template.master_pages.clone(),
             default_master: template.default_master.clone(),
             pages: template.pages.clone(),
+            // A template has no content, so it has no blocks and therefore no anchors: a section
+            // (spec 0072) is not something a template file can carry, which is also why
+            // `TEMPLATE_VERSION` did not move when `FORMAT_VERSION` did.
+            sections: Vec::new(),
             components: Default::default(),
             requires: Vec::new(),
         };

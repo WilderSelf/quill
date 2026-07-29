@@ -1788,7 +1788,21 @@ mod tests {
     ///
     /// PDF/X-1a:2001 is unaffected. `FlateDecode` is PDF 1.2, the header stays `%PDF-1.3`, and the
     /// same filter was already on this file's image XObjects and font programs.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0xc1b5_3543_e96c_8692;
+    ///
+    /// Changed again by spec 0072, and back to the **identifier-only** template spec 0030, 0038,
+    /// 0039, 0041, 0047 and 0048 are the precedents for. `FORMAT_VERSION` became 5, so
+    /// `doc.to_json()` differs by one character and the `/ID` hashed from it moves. Nothing spec
+    /// 0072 added reaches the sample's page: it has no sections, so its `sections` list is empty and
+    /// `skip_serializing_if` keeps it out of the manifest entirely, and its template derives nothing
+    /// and takes the same single flow pass it always did.
+    ///
+    /// Verified rather than accepted, on the same pair of files the ledger always uses — the sample
+    /// exported against the committed parity ICC on a build of `main` and on this one. **8454 bytes
+    /// both sides**, 124 differing bytes in 8 runs, and every run inside the XMP
+    /// `DocumentID`/`InstanceID` (offsets 1494..1644) or the trailer `/ID` (8355..8430). Zero
+    /// differing bytes outside those regions, so no content stream, font, ICC or metadata stream
+    /// moved.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x5810_4341_1ad5_8fb6;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
