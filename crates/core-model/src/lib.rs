@@ -46,7 +46,8 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
-/// **5** since spec 0072 gave a document [`Section`]s; **4** since spec 0063 replaced a paragraph's
+/// **6** since spec 0073 gave a [`Section`] a [`Folio`]; **5** since spec 0072 gave a document
+/// [`Section`]s; **4** since spec 0063 replaced a paragraph's
 /// `text` with styled `runs`; **3** since spec 0047 gave [`MasterStatic::Text`] an alignment and
 /// page-parity mirroring; **2** since spec 0030 added master pages and margins. Each bump is
 /// deliberate even though the new fields are all `serde(default)` and an older manifest therefore
@@ -55,10 +56,12 @@ pub type Pt = f32;
 /// entirely and produce a document without its running heads, folios or column geometry; a build
 /// that predates spec 0047 would draw every static left-aligned in an unmirrored rect, putting the
 /// folio in the gutter on every verso; a build that predates spec 0072 would drop `sections` and
-/// set every chapter opener in the body master. Either could then save that back over the original.
+/// set every chapter opener in the body master; a build that predates spec 0073 would drop `folio`
+/// and print arabic page numbers through front matter the author set in roman. Any of them could
+/// then save that back over the original.
 /// Refusing to open is the correct outcome; quietly dropping the layout is exactly the silent
 /// corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -822,9 +825,17 @@ pub enum ListMarker {
 }
 
 /// How an ordinal is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Built by spec 0066 for a list item's marker and reused unchanged by spec 0073 for a section's
+/// folio: "the third page of the front matter is written `iii`" and "the third item of this list is
+/// written `iii`" are the same question, and a second numeral implementation would be a second
+/// answer to it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NumberFormat {
+    #[default]
     Decimal,
     LowerAlpha,
     UpperAlpha,
@@ -843,6 +854,47 @@ impl NumberFormat {
             NumberFormat::LowerRoman => roman(n).to_lowercase(),
             NumberFormat::UpperRoman => roman(n),
         }
+    }
+
+    /// Every character this format can ever produce, for any ordinal (spec 0073).
+    ///
+    /// This exists because of the font subset. A folio is resolved at *layout* time, so the
+    /// characters it draws are not in the document's text and the collector cannot see them — and a
+    /// character missing from a subset is a `.notdef` box in a press file with no error anywhere,
+    /// which is `CLAUDE.md`'s silent-press-corruption class. The collector carried a hardcoded
+    /// `'0'..='9'` because arabic was the only folio there was; a roman one draws seven letters it
+    /// has never seen.
+    ///
+    /// Derived by **running the formatter** over ordinals that exercise every symbol it has, rather
+    /// than by a second hand-written table beside [`NumberFormat::format`]. A table would be a
+    /// second statement of the same fact, free to disagree with the first — spec 0013's rule that
+    /// the validator must read the field the writer emits, applied to glyphs. The fallbacks are
+    /// covered by the same trick: `0` and an out-of-range ordinal are written in decimal by
+    /// `format` itself, so asking it for those two is what pulls the digits in for roman and alpha
+    /// without this function having to know that they do it.
+    pub fn alphabet(self) -> BTreeSet<char> {
+        let mut out: BTreeSet<char> = BTreeSet::new();
+        // `0`, and a value past every format's expressible range. Whatever each format does with
+        // them — a literal `"0"`, a decimal fallback, or a very long alpha run — is by definition
+        // something it can produce.
+        for n in [0, 1_234_567_890] {
+            out.extend(self.format(n).chars());
+        }
+        match self {
+            // 3888 = MMMDCCCLXXXVIII: all seven roman symbols in one number.
+            NumberFormat::LowerRoman | NumberFormat::UpperRoman => {
+                out.extend(self.format(3888).chars())
+            }
+            // One full turn of the bijective base-26 wheel — `a`..`z` / `A`..`Z`. Every longer
+            // ordinal is written with those same 26 letters.
+            NumberFormat::LowerAlpha | NumberFormat::UpperAlpha => {
+                for n in 1..=26 {
+                    out.extend(self.format(n).chars());
+                }
+            }
+            NumberFormat::Decimal => {}
+        }
+        out
     }
 }
 
@@ -1541,6 +1593,58 @@ pub struct Section {
     /// *next* section's opener) and is left for whoever needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master: Option<String>,
+    /// How this section's pages are numbered (spec 0073), or `None` to carry on exactly as the
+    /// pages before it were numbered.
+    ///
+    /// Unlike [`Section::master`] this governs the section's **whole run** — every page from its
+    /// opener until the next section that states one — because that is what page numbering is. A
+    /// format that applied to one page would number the first page of the front matter `i` and the
+    /// second `2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folio: Option<Folio>,
+}
+
+/// How a [`Section`]'s pages are numbered (spec 0073).
+///
+/// The two halves of what a book actually needs: roman front matter and arabic body is a *format*
+/// change, and a part opener that starts the count again is a *restart*. They are independent —
+/// appendix pages that keep counting from the body but are written `A-1`-style would be a format
+/// change with no restart — so they are two fields rather than one enum.
+///
+/// The numerals themselves are [`NumberFormat`]'s, unchanged from spec 0066.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Folio {
+    /// The numerals this section's folios are written in. Defaults to [`NumberFormat::Decimal`],
+    /// which is what every page was written in before this existed.
+    #[serde(default)]
+    pub format: NumberFormat,
+    /// The number this section's **first page** carries.
+    ///
+    /// `None` continues the count from the page before, which is what a section that only changes
+    /// the *format* wants. `Some(1)` is the restart a part opener asks for; `Some(n)` is the offset
+    /// a chapter extracted from a larger book needs, and is the shape spec 0079's book-level
+    /// pagination will read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_at: Option<u32>,
+}
+
+/// One stretch of pages numbered by a single rule (spec 0073).
+///
+/// The derived form of the folio settings scattered across [`Document::sections`]: a document is a
+/// sequence of runs, each beginning at a page and carrying a format and the number that page shows.
+/// Every folio in the run is `start + (page - first_page)`, which is why this is a *range*
+/// description rather than a per-page table — a 500-page book has two or three of these.
+///
+/// It is also exactly the shape PDF's `/PageLabels` number tree wants, which is not a coincidence:
+/// both answer "from this page onward, count like this".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolioRun {
+    /// Zero-based index of the first page this run governs.
+    pub first_page: usize,
+    /// How the numbers in this run are written.
+    pub format: NumberFormat,
+    /// The number shown on `first_page`.
+    pub start: u32,
 }
 
 /// The whole document.
@@ -1775,6 +1879,112 @@ impl Document {
             pages[*start].master = Some(master.clone());
         }
         pages
+    }
+
+    /// The page-numbering runs this document's sections produce (spec 0073).
+    ///
+    /// `starts` is the same list [`Document::page_assignment`] takes: `starts[i]` is the page
+    /// `sections[i]`'s anchor was placed on, or `None` if it was not placed. Pure, and takes numbers
+    /// rather than pages, for the same reason that one does — the derivation is testable without
+    /// laying anything out.
+    ///
+    /// The result always begins with a run at page 0, so **every page has a rule** and a document
+    /// with no sections gets exactly the arabic 1-based numbering it had before this existed. A
+    /// section that states no [`Folio`] starts no run: it is a division of the document, not of the
+    /// pagination, and a chapter opener does not restart the page numbers.
+    ///
+    /// Ordered by **page**, not by the author's section order, because a run is a statement about a
+    /// stretch of the book. Two sections placed on the same page collapse to one run and the later
+    /// one wins — the same precedence [`Document::page_assignment`] gives a master, and for the same
+    /// reason: nothing re-sorts the authored list, so "later in the list" is the only tie-break that
+    /// does not depend on where the anchors happened to land.
+    pub fn folio_runs(&self, starts: &[Option<usize>]) -> Vec<FolioRun> {
+        // Page 0 onwards, arabic from 1: the pre-0073 rule, and the rule for every page ahead of the
+        // first section that states a folio.
+        let mut runs = vec![FolioRun {
+            first_page: 0,
+            format: NumberFormat::Decimal,
+            start: 1,
+        }];
+
+        let mut stated: Vec<(usize, Folio)> = self
+            .sections
+            .iter()
+            .zip(starts)
+            .filter_map(|(s, start)| Some(((*start)?, s.folio?)))
+            .collect();
+        // Stable, so two sections on one page stay in the author's order and the later one is
+        // applied last.
+        stated.sort_by_key(|(page, _)| *page);
+
+        for (page, folio) in stated {
+            // What this page would have shown had the section said nothing — which is what
+            // `restart_at: None` means, and it has to be read off the run in force *here* rather
+            // than from a running counter, because a run is arithmetic rather than a walk.
+            let previous = runs.last().expect("a run at page 0 always exists");
+            let continued = previous
+                .start
+                .saturating_add((page.saturating_sub(previous.first_page)) as u32);
+            let run = FolioRun {
+                first_page: page,
+                format: folio.format,
+                start: folio.restart_at.unwrap_or(continued),
+            };
+            // A second section on the same page replaces the first's run rather than adding an
+            // empty one, so the list stays strictly increasing and `folio_in` can take the last
+            // run that starts at or before a page.
+            if previous.first_page == page {
+                let last = runs.len() - 1;
+                runs[last] = run;
+            } else {
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
+    /// The folio printed on `page_index` — the string a reader sees on the page (spec 0073).
+    ///
+    /// The one place a page number becomes text. Everything that prints one goes through here: the
+    /// `{page}` token in a master static, and the contents list, which must agree with it or the
+    /// book sends a reader to a page that does not answer to the number beside its title.
+    pub fn folio_in(runs: &[FolioRun], page_index: usize) -> String {
+        let Some(run) = runs.iter().rev().find(|r| r.first_page <= page_index) else {
+            // Unreachable through `folio_runs`, which always emits a run at page 0. Stated rather
+            // than `expect`ed because an empty list is a caller's mistake, not a corrupt document,
+            // and a folio that vanished is better than a panic in an export.
+            return (page_index + 1).to_string();
+        };
+        run.format.format(
+            run.start
+                .saturating_add((page_index - run.first_page) as u32),
+        )
+    }
+
+    /// [`Document::folio_in`] against a fresh derivation — see [`Document::folio_runs`].
+    pub fn folio(&self, starts: &[Option<usize>], page_index: usize) -> String {
+        Document::folio_in(&self.folio_runs(starts), page_index)
+    }
+
+    /// Every numeral format a folio in this document can be written in (spec 0073).
+    ///
+    /// For the font subset, and it is deliberately **not** conditioned on where the sections landed:
+    /// a format is in the set if any section states it, whether or not that section is placed today.
+    /// Embedding seven roman letters nobody draws costs a few hundred bytes; failing to embed one
+    /// that is drawn is a `.notdef` box in a press file.
+    ///
+    /// [`NumberFormat::Decimal`] is always present, because the pages ahead of the first section
+    /// that states a folio are numbered in it — and because that is what keeps every existing
+    /// document's subset, and therefore its exported bytes, exactly where they were.
+    pub fn folio_formats(&self) -> BTreeSet<NumberFormat> {
+        let mut out = BTreeSet::from([NumberFormat::Decimal]);
+        out.extend(
+            self.sections
+                .iter()
+                .filter_map(|s| s.folio)
+                .map(|f| f.format),
+        );
+        out
     }
 
     /// Look up a block by identity.
@@ -2368,6 +2578,7 @@ mod tests {
             name: "Chapter One".into(),
             start: anchor,
             master: Some("opener".into()),
+            folio: None,
         }];
         doc
     }
@@ -2473,10 +2684,223 @@ mod tests {
             // A block id that is not in the document — the anchor was deleted, or never existed.
             start: BlockId(999),
             master: None,
+            folio: None,
         }];
         let back = Document::from_json(&empty.to_json().expect("save")).expect("load");
         assert_eq!(back, empty, "a document with no blocks still round-trips");
         assert_eq!(back.page_assignment(&[None]), Vec::new());
+    }
+
+    // --- Folio formats and restart (spec 0073) ------------------------------------------------
+
+    /// Roman front matter, arabic body — the derivation, as arithmetic, with nothing laid out.
+    #[test]
+    fn a_section_numbers_its_own_run_of_pages() {
+        let mut doc = doc_with_two_masters();
+        let front = doc.content[0].id();
+        let body = doc.content[1].id();
+        doc.sections = vec![
+            Section {
+                name: "Front matter".into(),
+                start: front,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::LowerRoman,
+                    restart_at: Some(1),
+                }),
+            },
+            Section {
+                name: "Body".into(),
+                start: body,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::Decimal,
+                    restart_at: Some(1),
+                }),
+            },
+        ];
+
+        // Front matter on pages 0..4, body from page 4.
+        let starts = [Some(0), Some(4)];
+        let folios: Vec<String> = (0..8).map(|p| doc.folio(&starts, p)).collect();
+        assert_eq!(
+            folios,
+            ["i", "ii", "iii", "iv", "1", "2", "3", "4"],
+            "the body restarts at 1 and the front matter counts in roman"
+        );
+    }
+
+    #[test]
+    fn a_section_that_states_no_restart_keeps_counting() {
+        // A format change without a restart: the appendix keeps the book's count and only changes
+        // how it is written. This is why `format` and `restart_at` are two fields.
+        let mut doc = doc_with_two_masters();
+        let appendix = doc.content[1].id();
+        doc.sections = vec![Section {
+            name: "Appendix".into(),
+            start: appendix,
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::UpperRoman,
+                restart_at: None,
+            }),
+        }];
+        let starts = [Some(3)];
+        assert_eq!(doc.folio(&starts, 2), "3");
+        assert_eq!(
+            doc.folio(&starts, 3),
+            "IV",
+            "page 3 was going to be `4`, and it is still the fourth page"
+        );
+        assert_eq!(doc.folio(&starts, 4), "V");
+    }
+
+    #[test]
+    fn a_document_with_no_sections_is_numbered_exactly_as_it_was() {
+        // The case every existing document is in, asserted rather than assumed: arabic, one-based,
+        // from page 0 — the single expression `{page}` resolved to before this increment.
+        let doc = Document::sample();
+        assert_eq!(
+            doc.folio_runs(&[]),
+            vec![FolioRun {
+                first_page: 0,
+                format: NumberFormat::Decimal,
+                start: 1
+            }]
+        );
+        for page in 0..200 {
+            assert_eq!(doc.folio(&[], page), (page + 1).to_string());
+        }
+
+        // And a section that states no folio is not a numbering statement at all: it divides the
+        // document, not the pagination.
+        let sectioned = doc_with_a_section();
+        assert_eq!(sectioned.folio_runs(&[Some(2)]), doc.folio_runs(&[]));
+    }
+
+    #[test]
+    fn an_unplaced_section_numbers_nothing_and_a_collision_takes_the_later_one() {
+        let mut doc = doc_with_two_masters();
+        let a = doc.content[0].id();
+        let b = doc.content[1].id();
+        doc.sections = vec![
+            Section {
+                name: "Deleted anchor".into(),
+                start: a,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::LowerRoman,
+                    restart_at: Some(1),
+                }),
+            },
+            Section {
+                name: "Part two".into(),
+                start: b,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::UpperAlpha,
+                    restart_at: Some(1),
+                }),
+            },
+        ];
+
+        // An anchor that was not placed contributes no run — the posture a dangling master name
+        // already has.
+        assert_eq!(doc.folio(&[None, Some(1)], 0), "1");
+        assert_eq!(doc.folio(&[None, Some(1)], 1), "A");
+
+        // Both on the same page: one run, the later section's, so the list stays one rule per page.
+        let runs = doc.folio_runs(&[Some(1), Some(1)]);
+        assert_eq!(runs.len(), 2, "page 0's default, then the one at page 1");
+        assert_eq!(runs[1].format, NumberFormat::UpperAlpha);
+    }
+
+    #[test]
+    fn the_subset_alphabet_covers_everything_the_formatter_can_produce() {
+        // The font-subset guarantee, proved against the formatter rather than against a table:
+        // sweep every ordinal a book could plausibly reach (and the two fallback cases) and assert
+        // no character comes out that `alphabet()` did not promise. A missing character here is a
+        // `.notdef` box in a press file.
+        for format in [
+            NumberFormat::Decimal,
+            NumberFormat::LowerAlpha,
+            NumberFormat::UpperAlpha,
+            NumberFormat::LowerRoman,
+            NumberFormat::UpperRoman,
+        ] {
+            let alphabet = format.alphabet();
+            for n in (0..5000).chain([9999, 100_000, u32::MAX]) {
+                for ch in format.format(n).chars() {
+                    assert!(
+                        alphabet.contains(&ch),
+                        "{format:?} writes {n} as {:?}, and {ch:?} is not in its alphabet",
+                        format.format(n)
+                    );
+                }
+            }
+        }
+
+        // And the alphabets are what a reader would expect, so a mistake in the sweep above cannot
+        // pass by being empty.
+        assert!(NumberFormat::LowerRoman
+            .alphabet()
+            .is_superset(&"ivxlcdm".chars().collect()));
+        assert!(NumberFormat::UpperRoman
+            .alphabet()
+            .is_superset(&"IVXLCDM".chars().collect()));
+        assert!(NumberFormat::LowerAlpha
+            .alphabet()
+            .is_superset(&('a'..='z').collect()));
+        assert_eq!(
+            NumberFormat::Decimal.alphabet(),
+            ('0'..='9').collect(),
+            "decimal is the ten digits and nothing else"
+        );
+    }
+
+    #[test]
+    fn the_formats_in_use_always_include_decimal() {
+        // Decimal is unconditional because the pages ahead of the first section are numbered in it
+        // — and because that is what keeps every existing document's subset where it was.
+        let doc = Document::sample();
+        assert_eq!(doc.folio_formats(), BTreeSet::from([NumberFormat::Decimal]));
+
+        let mut doc = doc_with_a_section();
+        doc.sections[0].folio = Some(Folio {
+            format: NumberFormat::LowerRoman,
+            restart_at: Some(1),
+        });
+        assert_eq!(
+            doc.folio_formats(),
+            BTreeSet::from([NumberFormat::Decimal, NumberFormat::LowerRoman])
+        );
+    }
+
+    #[test]
+    fn a_folio_round_trips_and_stays_out_of_the_manifest_when_absent() {
+        let mut doc = doc_with_a_section();
+        assert!(
+            !doc.to_json().expect("save").contains("\"folio\""),
+            "a section that states no folio must not write the key"
+        );
+
+        doc.sections[0].folio = Some(Folio {
+            format: NumberFormat::LowerRoman,
+            restart_at: Some(1),
+        });
+        let back = Document::from_json(&doc.to_json().expect("save")).expect("load");
+        assert_eq!(back, doc);
+        assert_eq!(
+            back.sections[0].folio.expect("folio").format,
+            NumberFormat::LowerRoman
+        );
+
+        // And the default is expressible without either key, because a `Folio` is what a section
+        // that changes only the restart wants too.
+        let bare: Folio = serde_json::from_str("{}").expect("an empty folio object");
+        assert_eq!(bare, Folio::default());
+        assert_eq!(bare.format, NumberFormat::Decimal);
+        assert_eq!(bare.restart_at, None);
     }
 
     #[test]

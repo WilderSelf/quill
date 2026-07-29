@@ -863,15 +863,29 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
             }
         }
     }
-    // `{page}` is replaced with a page number at layout time, so the digits have to be carried
-    // whether or not any of them appears in the token itself.
-    if doc
-        .master_pages
-        .iter()
-        .flat_map(|m| &m.statics)
-        .any(|s| matches!(s, quill_core_model::MasterStatic::Text { text, .. } if text.contains("{page}")))
-    {
-        everywhere.add_chars('0'..='9');
+    // `{page}` is replaced at layout time — *after* this runs — so whatever it will become has to
+    // be carried whether or not any of those characters appears in the token itself.
+    //
+    // Until spec 0073 that was the ten digits and nothing else, which stopped being the whole answer
+    // the moment a section could state a folio format: a roman folio draws `i v x l c d m` and an
+    // alpha folio draws letters, and a digit range contains neither. A character this misses is a
+    // `.notdef` box in a press file with no error anywhere — the silent-press-corruption class
+    // `CLAUDE.md` forbids, and one this very site was caught by once already (PR #107, a master's
+    // static text that was never collected at all).
+    //
+    // Asked of the formats the document actually configures rather than of a fixed alphabet, so a
+    // book that states no folio format carries exactly the digits it always did, and its subset —
+    // and therefore its export byte-hash — does not move.
+    //
+    // The token is `PAGE_TOKEN`, not a copy of its spelling. The literal that used to be here would
+    // have gone silently wrong the day the constant was renamed, with no compile error.
+    if doc.master_pages.iter().flat_map(|m| &m.statics).any(|s| {
+        matches!(s, quill_core_model::MasterStatic::Text { text, .. }
+            if text.contains(quill_core_model::PAGE_TOKEN))
+    }) {
+        for format in doc.folio_formats() {
+            everywhere.add_chars(format.alphabet());
+        }
     }
 
     if draws_unattributed_text {
@@ -1644,6 +1658,20 @@ mod tests {
     ///
     /// If a spec deliberately changes export output, update this constant *in that spec's commit*,
     /// having confirmed the new bytes are the intended ones.
+    ///
+    /// Changed by spec 0073: `FORMAT_VERSION` became 6, so the manifest text the `/ID` is hashed
+    /// from gained a character and nothing else. Identifier-only, verified rather than accepted —
+    /// exported against the committed parity ICC before and after, **8454 bytes both sides**, 128
+    /// differing bytes, **64 inside the XMP `DocumentID`/`InstanceID` and 64 inside the trailer
+    /// `/ID`, with none outside either**. No content, font or metadata stream moved. The sample
+    /// states no section, so it prints the arabic folios it always printed; `folio_formats()` always
+    /// includes `Decimal`, which is what keeps a document with no folio format carrying exactly the
+    /// digits it did before and its subset unmoved.
+    ///
+    /// Previously changed by spec 0072 in the same way, for the same reason (`FORMAT_VERSION` 5):
+    /// 8454 bytes both sides, 124 differing bytes, 62 in the XMP identifiers and 62 in the trailer
+    /// `/ID`, none outside.
+    ///
     /// Changed by spec 0047: `FORMAT_VERSION` became 3, so `doc.to_json()` changed and with it the
     /// document identifier. The sample has no masters, so nothing this spec added reaches its page;
     /// only the version stamp in the manifest text the identifier is hashed from moved. Verified
@@ -1802,7 +1830,7 @@ mod tests {
     /// `DocumentID`/`InstanceID` (offsets 1494..1644) or the trailer `/ID` (8355..8430). Zero
     /// differing bytes outside those regions, so no content stream, font, ICC or metadata stream
     /// moved.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x5810_4341_1ad5_8fb6;
+    const SAMPLE_EXPORT_DIGEST: u64 = 0xa7cb_8fee_2ca9_9602;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2341,6 +2369,77 @@ mod tests {
         for d in '0'..='9' {
             assert!(carried.contains(&d), "a folio needs its digits");
         }
+    }
+
+    /// Spec 0073, and the known issue it was the first increment to reach: the collector carried
+    /// `'0'..='9'` for `{page}` and nothing else, which stopped being the whole answer the moment a
+    /// section could state a folio format.
+    ///
+    /// A roman folio draws `i v x l c d m`; a digit range contains none of them, so page `iv` of the
+    /// front matter would have printed as four `.notdef` boxes in a press file with **no error
+    /// anywhere**. That is the class this very function was already caught by once (PR #107), and it
+    /// is why the collector now asks the document which formats it configures instead of assuming.
+    ///
+    /// Asserted on the glyphs actually drawn rather than on set membership, because since spec 0068
+    /// the writer draws shaped glyphs — `drawn_gids` panics on any `.notdef`, which is the real
+    /// question.
+    #[test]
+    fn a_roman_folio_is_in_the_subset_and_draws_no_notdef() {
+        use quill_core_model::{
+            Folio, MasterPage, MasterStatic, NumberFormat, Rect as MRect, Section,
+        };
+
+        let mut doc = Document::sample();
+        let base = doc.master_pages.first().cloned();
+        doc.master_pages = vec![MasterPage {
+            name: "front".into(),
+            columns: base.as_ref().map_or(1, |m| m.columns),
+            gutter_pt: base.as_ref().map_or(0.0, |m| m.gutter_pt),
+            margins: base.map(|m| m.margins).unwrap_or_default(),
+            statics: vec![MasterStatic::Text {
+                rect: MRect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 200.0,
+                    h_pt: 12.0,
+                },
+                text: quill_core_model::PAGE_TOKEN.into(),
+                color: Color::Gray { v: 0.0 },
+                style: None,
+                align: Default::default(),
+                mirror: false,
+            }],
+        }];
+        doc.sections = vec![Section {
+            name: "Front matter".into(),
+            start: doc.content.first().map(|b| b.id()).unwrap_or_default(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+
+        let carried: BTreeSet<char> = collect_doc_faces(&doc)
+            .into_values()
+            .flat_map(|t| t.chars())
+            .collect();
+
+        // Every symbol lower-roman can write. `3888` is `mmmdccclxxxviii` — all seven at once.
+        for ch in "ivxlcdm".chars() {
+            assert!(
+                carried.contains(&ch),
+                "a lower-roman folio draws {ch:?}, so it must be subset"
+            );
+        }
+        // The digits stay: `folio_formats` always includes `Decimal`, because a document's pages are
+        // arabic wherever no section says otherwise.
+        for d in '0'..='9' {
+            assert!(carried.contains(&d), "the body is still arabic");
+        }
+
+        // And the glyphs really draw. `mmmdccclxxxviii` is the worst case in one string.
+        assert_eq!(drawn_gids(&carried, "mmmdccclxxxviii"), 15);
     }
 
     /// Spec 0064, and the defect an adversarial review of it found: a bold run long enough to fill

@@ -81,6 +81,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0070 | [The generated contents list is a tabbed paragraph](0070-contents-list-through-tabs.md) | M5 | implemented |
 | 0071 | [Content streams are `FlateDecode`'d](0071-compress-content-streams.md) | M5 | implemented |
 | 0072 | [The section: an anchor the model does not have](0072-sections.md) | M6 | implemented |
+| 0073 | [Folio formats and restart](0073-folio-formats.md) | M6 | implemented |
 | 0075 | [A derived or composite block may span frames](0075-blocks-span-frames.md) | M6 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),

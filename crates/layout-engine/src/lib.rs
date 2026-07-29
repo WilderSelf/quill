@@ -17,9 +17,9 @@ pub use session::{LayoutResult, LayoutSession, LayoutStats};
 
 use quill_core_model::{
     builtin_components, toc_entry_style_name, Asset, BaselineGrid, Block, BlockId, CharacterStyle,
-    Color, ComponentLibrary, Document, ListMarker, Margins, MasterPage, MasterStatic, PageOverride,
-    PageSetup, ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN, STATBLOCK_COMPONENT,
-    TABLE_COMPONENT, TOC_TITLE_STYLE,
+    Color, ComponentLibrary, Document, FolioRun, ListMarker, Margins, MasterPage, MasterStatic,
+    PageOverride, PageSetup, ParagraphStyle, Rect, StyleSheet, TextAlign, PAGE_TOKEN,
+    STATBLOCK_COMPONENT, TABLE_COMPONENT, TOC_TITLE_STYLE,
 };
 use quill_text_layout::{
     justify_runs_indented, Alignment, Hyphenator, Line, RunFormat, RunMetrics,
@@ -275,9 +275,23 @@ pub struct HeadingEntry {
     pub id: BlockId,
     pub level: u8,
     pub text: String,
-    /// Zero-based page index. A table of contents prints `page_index + 1`, the same one-based
-    /// number [`MasterStatic`]'s `{page}` token resolves to.
+    /// Zero-based page index — the heading's *physical* position in the document.
+    ///
+    /// This is what a link or a bookmark destination targets, and it is deliberately **not** what a
+    /// contents list prints. Since spec 0073 those are two different numbers: page 3 of a book whose
+    /// front matter is roman is the fourth page of the file and prints `iv`.
     pub page_index: usize,
+    /// What the page the heading landed on actually prints (spec 0073) — its folio.
+    ///
+    /// The string a contents list shows, so that the number beside a chapter title is the number a
+    /// reader will find printed on the page it sends them to. `(page_index + 1).to_string()` for
+    /// every document that states no folio format, which is the pre-0073 behaviour exactly.
+    ///
+    /// Filled by whoever has the numbering to hand: [`heading_index`] resolves it from the document,
+    /// and the layout fixpoint — which holds a template rather than a document — resolves it through
+    /// [`PageTemplate::folio`]. Both call [`Document::folio_in`], so there is one implementation of
+    /// what a folio says and two ways of reaching it, not two answers.
+    pub folio: String,
 }
 
 /// Which page each heading landed on, in document order.
@@ -294,12 +308,27 @@ pub struct HeadingEntry {
 /// rule rather than a precaution: a TOC entry and a bookmark both mean "where does this start".
 ///
 /// Master furniture is skipped: it carries [`BlockId::UNASSIGNED`] and is not content.
+/// Each entry's `folio` is resolved from the document's own sections (spec 0073), so a caller
+/// holding a `Document` — the incremental session, the PDF outline — gets the printed number
+/// without re-deriving the numbering itself.
 pub fn heading_index(doc: &Document, pages: &[LaidOutPage]) -> Vec<HeadingEntry> {
-    heading_index_of(&doc.content, pages)
+    let mut out = heading_index_of(&doc.content, pages);
+    // The same `starts` the template derived, from the same page vector, through the same public
+    // function — see `HeadingEntry::folio`. Computed once for the whole index rather than per entry.
+    let runs = doc.folio_runs(&section_starts(doc, pages));
+    for entry in &mut out {
+        entry.folio = Document::folio_in(&runs, entry.page_index);
+    }
+    out
 }
 
 /// [`heading_index`] over a bare block list, for callers that have no `Document` — the TOC fixpoint
 /// (spec 0041) runs inside `lay_out_with_template`, which takes content rather than a document.
+///
+/// Every entry's `folio` is the **default** numbering, arabic and one-based, because a block list
+/// carries no sections to say otherwise. A caller whose document has folio formats must resolve
+/// them: the fixpoint does it through [`PageTemplate::folio`], and [`heading_index`] does it from
+/// the document.
 pub fn heading_index_of(content: &[Block], pages: &[LaidOutPage]) -> Vec<HeadingEntry> {
     let mut seen: BTreeSet<BlockId> = BTreeSet::new();
     let mut out = Vec::new();
@@ -322,6 +351,7 @@ pub fn heading_index_of(content: &[Block], pages: &[LaidOutPage]) -> Vec<Heading
                 level: *level,
                 text: text.clone(),
                 page_index: page.index,
+                folio: (page.index + 1).to_string(),
             });
         }
     }
@@ -361,6 +391,24 @@ pub fn section_starts(doc: &Document, pages: &[LaidOutPage]) -> Vec<Option<usize
         .iter()
         .map(|s| first.get(&s.start).copied())
         .collect()
+}
+
+/// [`heading_index_of`] with each entry's folio resolved through the template (spec 0073).
+///
+/// What the layout fixpoint uses. It holds a `&impl PageTemplate` and no `Document`, so the
+/// numbering has to come from the template — and it must, because a contents list that printed
+/// `4` beside a chapter whose page prints `iv` sends the reader to a page that does not answer to
+/// the number they were given.
+pub fn heading_index_with_folios(
+    content: &[Block],
+    pages: &[LaidOutPage],
+    template: &impl PageTemplate,
+) -> Vec<HeadingEntry> {
+    let mut out = heading_index_of(content, pages);
+    for entry in &mut out {
+        entry.folio = template.folio(entry.page_index);
+    }
+    out
 }
 
 /// Supplies the geometry and static content of each page.
@@ -426,6 +474,23 @@ pub trait PageTemplate {
     fn derived_fingerprint(&self) -> u64 {
         0
     }
+
+    /// What `page_index` prints as its page number — its **folio** (spec 0073).
+    ///
+    /// The default is `page_index + 1`: arabic, one-based, which is the single expression `{page}`
+    /// resolved to before this existed and is what every template that knows nothing about sections
+    /// still answers.
+    ///
+    /// On the template rather than passed alongside it, for the reason [`PageTemplate::frames`] is:
+    /// numbering is page geometry in the same sense margins are — a property of the page, decided by
+    /// whatever governs pages. It is also what lets the layout fixpoint, which holds a template and
+    /// not a document, print the same number in a contents list that the folio prints on the page.
+    ///
+    /// A folio consumes no flow space (it is furniture, `LaidOutPage::statics`), so this can never
+    /// move a line break and adds **zero** fixpoint iterations.
+    fn folio(&self, page_index: usize) -> String {
+        (page_index + 1).to_string()
+    }
 }
 
 /// A template that gives every page the same frames and no static content.
@@ -488,6 +553,13 @@ struct Derived {
     starts: Vec<Option<usize>>,
     /// The per-page assignment synthesised from `starts` — see [`Document::page_assignment`].
     assignment: Vec<PageOverride>,
+    /// The page numbering synthesised from `starts` (spec 0073) — see [`Document::folio_runs`].
+    ///
+    /// Held beside the assignment rather than recomputed per page because both are derived from the
+    /// same `starts` by the same `reassign`, and a second derivation site is a second thing that can
+    /// disagree. It is re-derived wholesale every pass, so it caches nothing across a change and
+    /// owes spec 0075's eviction nothing.
+    folio_runs: Vec<FolioRun>,
 }
 
 impl<'a> DocumentTemplate<'a> {
@@ -501,6 +573,7 @@ impl<'a> DocumentTemplate<'a> {
             derived: RefCell::new(Derived {
                 starts: vec![None; doc.sections.len()],
                 assignment: doc.pages.clone(),
+                folio_runs: doc.folio_runs(&vec![None; doc.sections.len()]),
             }),
         }
     }
@@ -584,8 +657,9 @@ impl PageTemplate for DocumentTemplate<'_> {
                         align,
                         ..
                     } => {
-                        // One-based, because that is what a reader sees printed on a page.
-                        let resolved = text.replace(PAGE_TOKEN, &(page_index + 1).to_string());
+                        // The page's folio (spec 0073): one-based arabic unless a section says
+                        // otherwise, which is what every document without folio formats gets.
+                        let resolved = text.replace(PAGE_TOKEN, &self.folio(page_index));
                         let ps = style
                             .as_deref()
                             .and_then(|n| self.styles.paragraph.get(n).copied())
@@ -662,8 +736,16 @@ impl PageTemplate for DocumentTemplate<'_> {
             return false;
         }
         derived.assignment = self.doc.page_assignment(&starts);
+        // Both derivations move together, off the one `starts` (spec 0073). The folio does *not*
+        // get its own comparison: it cannot move a line break, so a pass in which only the numbering
+        // changed has nothing left to settle.
+        derived.folio_runs = self.doc.folio_runs(&starts);
         derived.starts = starts;
         true
+    }
+
+    fn folio(&self, page_index: usize) -> String {
+        Document::folio_in(&self.derived.borrow().folio_runs, page_index)
     }
 
     fn derived_fingerprint(&self) -> u64 {
@@ -1708,7 +1790,10 @@ fn measure_toc(
         y += style.space_before_pt;
 
         let indent = (h.level.saturating_sub(1)) as f32 * TOC_INDENT_PT;
-        let number = (h.page_index + 1).to_string();
+        // The **folio**, not the page index (spec 0073): what the page the heading landed on
+        // actually prints. `link_page` below still carries `h.page_index`, because a destination is
+        // a physical page reference and a printed number is not.
+        let number = h.folio.clone();
 
         // Title, clipped to the space before the number column. A long chapter name is truncated
         // with an ellipsis rather than wrapped: a contents list is scanned, and a two-line entry
@@ -1991,7 +2076,7 @@ fn lay_out_resolved(
     let mut iterations = 1;
     let converged = loop {
         let next = if has_toc {
-            heading_index_of(content, &pages)
+            heading_index_with_folios(content, &pages, template)
         } else {
             Vec::new()
         };
@@ -7117,6 +7202,149 @@ mod tests {
         doc
     }
 
+    /// What a page's first static actually prints.
+    fn static_text(page: &LaidOutPage) -> String {
+        match &page.statics[0] {
+            PlacedBlock::Text { lines, .. } => {
+                lines.iter().map(|l| l.text.as_str()).collect::<String>()
+            }
+            other => panic!("expected a text static, got {other:?}"),
+        }
+    }
+
+    /// Spec 0073's headline, asserted on the **placed static text** rather than on
+    /// `Document::folio` — the intermediate is unit-tested in `core-model`, and what matters here is
+    /// that the number a reader sees printed on the page is the one the section asked for.
+    ///
+    /// Roman front matter, then a body that restarts at arabic 1. The restart is the part that
+    /// cannot be faked by an offset: page 3 of the file prints `1`, not `4`.
+    #[test]
+    fn roman_front_matter_gives_way_to_a_body_that_restarts_at_arabic_one() {
+        use quill_core_model::{Folio, NumberFormat, Section};
+
+        let mut doc = doc_with_folio(StaticAlign::Left, false, PAGE_TOKEN);
+        // Two anchors: the first block, and one far enough in to open a later page.
+        let front = doc.content[0].id();
+        let body = doc.content[60].id();
+        doc.sections = vec![
+            Section {
+                name: "Front matter".into(),
+                start: front,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::LowerRoman,
+                    restart_at: Some(1),
+                }),
+            },
+            Section {
+                name: "Body".into(),
+                start: body,
+                master: None,
+                folio: Some(Folio {
+                    format: NumberFormat::Decimal,
+                    restart_at: Some(1),
+                }),
+            },
+        ];
+
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        let starts = section_starts(&doc, &pages);
+        let body_start = starts[1].expect("the body section is placed");
+        assert!(
+            body_start > 0 && body_start < pages.len(),
+            "want the body to open on a later page, got {body_start} of {}",
+            pages.len()
+        );
+
+        // The front matter counts in lower roman from i.
+        for (n, page) in pages.iter().take(body_start).enumerate() {
+            let want = NumberFormat::LowerRoman.format(n as u32 + 1);
+            assert_eq!(static_text(page), want, "front matter page {}", page.index);
+        }
+        // And the body restarts at 1 — the assertion an offset cannot satisfy.
+        for (n, page) in pages.iter().skip(body_start).enumerate() {
+            assert_eq!(
+                static_text(page),
+                (n + 1).to_string(),
+                "body page {}",
+                page.index
+            );
+        }
+    }
+
+    /// The other half, and the one that protects every existing document: a document that states no
+    /// section prints exactly what it printed before this spec — arabic, one-based, on every page.
+    #[test]
+    fn a_document_with_no_sections_prints_the_folios_it_always_did() {
+        let doc = doc_with_folio(StaticAlign::Left, false, PAGE_TOKEN);
+        assert!(doc.sections.is_empty());
+        let pages = lay_out(&doc, &MONO, &NoHyphenator);
+        assert!(pages.len() >= 3, "want a multi-page document");
+        for page in &pages {
+            assert_eq!(static_text(page), (page.index + 1).to_string());
+        }
+    }
+
+    /// What a folio format costs the fixpoint, asserted rather than assumed — and the first draft of
+    /// this test asserted the wrong thing, which is worth writing down.
+    ///
+    /// "A folio is furniture, so it consumes no flow space, so it cannot cost an iteration" conflates
+    /// two claims. It cannot move a **line break** — true, and it is why this converges instead of
+    /// oscillating. But a section's start page is not known until its anchor has been *placed*, so
+    /// pass 1 necessarily prints the default folios and pass 2 is what prints the section's. The
+    /// second pass is resolution, not instability, and no third is needed because the corrected
+    /// folios move nothing.
+    ///
+    /// So the real invariant is a floor and a ceiling: a document with no sections still costs
+    /// exactly one pass, and adding a folio-only section costs exactly one more — never two.
+    #[test]
+    fn a_folio_format_costs_the_fixpoint_exactly_one_resolving_pass() {
+        use quill_core_model::{Folio, NumberFormat, Section};
+
+        let plain = doc_with_folio(StaticAlign::Left, false, PAGE_TOKEN);
+        let base = lay_out_with_fixpoint_status(
+            &plain.content,
+            &plain.assets,
+            &plain.styles,
+            &DocumentTemplate::new(&plain),
+            &MONO,
+            &NoHyphenator,
+        )
+        .1;
+
+        let mut sectioned = plain.clone();
+        sectioned.sections = vec![Section {
+            name: "Front matter".into(),
+            start: sectioned.content[0].id(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::UpperRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        let with = lay_out_with_fixpoint_status(
+            &sectioned.content,
+            &sectioned.assets,
+            &sectioned.styles,
+            &DocumentTemplate::new(&sectioned),
+            &MONO,
+            &NoHyphenator,
+        )
+        .1;
+
+        assert!(base.converged && with.converged);
+        assert_eq!(
+            base.iterations, 1,
+            "a document that derives nothing still takes exactly one pass"
+        );
+        assert_eq!(
+            with.iterations,
+            base.iterations + 1,
+            "one pass to place the anchor, one to print the folios that follow from it — and no \
+             more, because a folio moves nothing"
+        );
+    }
+
     /// The x of a page's first static.
     fn static_x(page: &LaidOutPage) -> f32 {
         match &page.statics[0] {
@@ -7800,6 +8028,7 @@ mod tests {
             name: "Chapter One".into(),
             start: anchor,
             master: Some("chapter-opener".into()),
+            folio: None,
         }];
         doc
     }

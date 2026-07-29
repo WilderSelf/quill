@@ -1,0 +1,55 @@
+{
+  "format_version": 5,
+  "metadata": {
+    "title": "A v5 book with a section",
+    "authors": ["Anon"]
+  },
+  "page_setup": {
+    "trim": { "w_pt": 432.0, "h_pt": 648.0 },
+    "bleed_pt": 9.0,
+    "facing_pages": true,
+    "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 }
+  },
+  "content": [
+    { "kind": "heading", "id": 1, "level": 1,
+      "runs": [{ "text": "The Ruined Keep" }],
+      "color": { "space": "gray", "v": 0.0 } },
+    { "kind": "body", "id": 2,
+      "runs": [{ "text": "one two three four five six seven eight nine ten" }],
+      "color": { "space": "gray", "v": 0.0 } }
+  ],
+  "assets": [],
+  "fonts_embeddable": true,
+  "revision": 0,
+  "next_block_id": 3,
+  "master_pages": [
+    {
+      "name": "chapter-opener",
+      "margins": { "top_pt": 216.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 },
+      "columns": 1,
+      "gutter_pt": 0.0,
+      "statics": []
+    },
+    {
+      "name": "body",
+      "margins": { "top_pt": 54.0, "bottom_pt": 54.0, "inside_pt": 54.0, "outside_pt": 40.0 },
+      "columns": 1,
+      "gutter_pt": 0.0,
+      "statics": [
+        {
+          "kind": "text",
+          "rect": { "x_pt": 54.0, "y_pt": 606.0, "w_pt": 338.0, "h_pt": 12.0 },
+          "text": "{page}",
+          "color": { "space": "gray", "v": 0.0 },
+          "style": "folio",
+          "align": "outside",
+          "mirror": true
+        }
+      ]
+    }
+  ],
+  "default_master": "body",
+  "sections": [
+    { "name": "The Ruined Keep", "start": 1, "master": "chapter-opener" }
+  ]
+}
