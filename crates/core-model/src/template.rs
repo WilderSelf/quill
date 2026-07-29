@@ -215,6 +215,7 @@ impl Document {
             // (spec 0072) is not something a template file can carry, which is also why
             // `TEMPLATE_VERSION` did not move when `FORMAT_VERSION` did.
             sections: Vec::new(),
+            footnotes: Vec::new(),
             components: Default::default(),
             requires: Vec::new(),
         };

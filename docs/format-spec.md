@@ -25,7 +25,7 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
 
 ```json
 {
-  "format_version": 7,
+  "format_version": 8,
   "metadata": { "title": "The Ruined Keep", "authors": ["Anon"] },
   "page_setup": { "trim": { "w_pt": 468.0, "h_pt": 720.0 }, "bleed_pt": 9.0, "facing_pages": true,
                   "margins": { "top_pt": 36.0, "bottom_pt": 36.0, "inside_pt": 54.0, "outside_pt": 36.0 } },
@@ -59,10 +59,19 @@ is **parsed by a test**, so it cannot drift from what the reader accepts):
                 { "text": "[?]", "source": { "kind": "reference", "target": 3 } },
                 { "text": "." } ],
       "color": { "space": "cmyk", "c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0 } },
-    { "kind": "image", "id": 3, "asset": "map1" }
+    { "kind": "image", "id": 3, "asset": "map1" },
+    { "kind": "body", "id": 4,
+      "runs": [ { "text": "The keep is older than the town" },
+                { "text": "[?]", "source": { "kind": "footnote", "note": 5 } },
+                { "text": "." } ],
+      "color": { "space": "gray", "v": 0.0 } }
+  ],
+  "footnotes": [
+    { "id": 5, "runs": [ { "text": "So the parish rolls claim." } ],
+      "color": { "space": "gray", "v": 0.0 } }
   ],
   "revision": 0,
-  "next_block_id": 4,
+  "next_block_id": 6,
   "assets": [ { "id": "map1", "path": "assets/map1.png", "px_w": 1500, "px_h": 1200, "dpi": 300.0 } ]
 }
 ```
@@ -216,6 +225,47 @@ presenting a guess as settled. Unlike a folio, this one really can oscillate: ro
 monotone in width (`viii` is wider than `ix`), so a reference into roman-numbered pages can push its
 own target back and forth across a page boundary for ever.
 
+## Footnotes (spec 0077, v8)
+
+A footnote is an **anchor** in the text flow and note text set in a band at the foot of the frame the
+anchor landed in. The note is not in `content` — putting it there would set it inline, which is the
+thing a footnote exists not to do — so a document gains a second list:
+
+```json
+"footnotes": [ { "id": 5, "runs": [ { "text": "So the parish rolls claim." } ],
+                 "color": { "space": "gray", "v": 0.0 } } ]
+```
+
+and a run may name one, through the same `source` field a cross-reference uses:
+
+```json
+{ "text": "[?]", "source": { "kind": "footnote", "note": 5 } }
+```
+
+- **`footnotes` is a store, not a second content sequence.** Order in the list is *not* the
+  numbering, so re-ordering it changes nothing a reader sees. A note nothing anchors is not an error
+  and is simply not placed, on the same principle a dangling section anchor is not placed.
+- **Ids are one space.** A footnote's `id` comes from the same `next_block_id` counter the blocks
+  use, and a footnote sharing an id with a block is refused at load exactly as two blocks sharing one
+  are.
+- **Numbering is document-sequential and decimal**, derived from the order the *anchors* appear in
+  `content`: 1, 2, 3… assigned the first time an anchor names a note. It is knowable before anything
+  is laid out, which is what keeps a footnote out of the layout fixpoint entirely — a page-restarting
+  number would not be, since the page is not known until the flow has run and the number's width
+  changes where the anchor's paragraph breaks. Per-page restart is a named non-goal in
+  `specs/0077-footnotes.md`, with what it would cost.
+- **The anchor's `text` is not a cached number**, for the reason a cross-reference's is not. It holds
+  the unresolved marker, so an anchor naming a note the document does not hold prints `[?]` — and so
+  does a build that does not understand `source`.
+- **A note is set in the `footnote` paragraph style** unless it names another. The style is in the
+  default sheet, so a document gets a conventional treatment without authoring one; a sheet that does
+  not define it falls through to `body`, which is what a renamed style already does.
+- **A long note splits across pages.** The remainder continues at the foot of the next frame, through
+  the same mechanism a paragraph splits by.
+- **The band is per *frame*, not per page.** On a two-column page a note sits at the foot of the
+  column its anchor is in. A footnote area spanning the columns of a page is a named non-goal: it is
+  not in any frame, and the flow reserves space in frames.
+
 ## Master statics: alignment and page parity (spec 0047, v3)
 
 A text static carries two optional fields, both defaulting to the pre-v3 behavior and both omitted
@@ -269,6 +319,7 @@ version changed.
 | 4 → 5 | 0072 | `sections` | defaults `sections` to empty: a v4 document had no sections, and every master assignment it had was positional |
 | 5 → 6 | 0073 | `folio` on a section | defaults `folio` to absent on every section: a v5 document numbered every page arabic from 1, which is what a section stating no folio still means |
 | 6 → 7 | 0076 | `source` on a run — a cross-reference to a block | defaults `source` to `authored` on every run: a v6 run drew its own `text`, which is what an absent `source` still means. Nothing is written into the manifest, for the reason 5 → 6 writes nothing |
+| 7 → 8 | 0077 | `footnotes`, and a `footnote` anchor on a run's `source` | defaults `footnotes` to empty: a v7 document had no notes, and no run could name one. Nothing is written into the manifest, for the reason 6 → 7 writes nothing |
 
 A bump is warranted whenever an **older** build would open the document and silently lay it out
 wrongly, even when the new fields are optional. A pre-0030 build would drop a document's running
@@ -288,6 +339,13 @@ anything left in the file, and an older build that opens and saves destroys ever
 document permanently. 0074's other half — "nothing is added to the model, so no version gate could
 have helped" — is false here. Loudness mitigates the proof; it does not undo the deletion.
 `format_version` is **7**.
+
+**Spec 0077 is the same split, and the loss half is heavier still.** A pre-0077 build meeting a
+footnote prints `[?]` where the anchor was and drops `footnotes` as an unknown key, so the notes
+visibly vanish — loud, again, on the first half of the rule. What fires it is that `footnotes` is not
+derived state and not even intent: it is **prose**, the author's own sentences, and one open-and-save
+deletes every one of them with nothing left in the file to regenerate them from. 0076 bumped for
+losing which block a reference pointed at; this loses the note. `format_version` is **8**.
 
 Note what the rule does *not* turn on. Not "did a struct gain a field" — spec 0035's `pages`, spec
 0054's `components` and spec 0056's `requires` were all additive without a bump, because an older

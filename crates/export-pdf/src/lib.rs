@@ -815,7 +815,21 @@ fn collect_doc_faces(doc: &Document) -> BTreeMap<FaceKey, fonts::FaceText> {
     let mut everywhere = fonts::FaceText::from_chars([' ', '-']);
     let mut draws_unattributed_text = false;
 
-    for block in &doc.content {
+    // The document's blocks, and then the blocks its **footnotes** are set as (spec 0077).
+    //
+    // A note is not in `content`, so a collector that walked `content` alone would embed no subset
+    // for a word that appears only in a note — the same `.notdef`-in-a-press-file class this site
+    // has now been caught by three times (PR #107, spec 0073, spec 0076). It is a *new site* rather
+    // than a new class: what a note draws is a `Block::Body`'s runs, and the number that opens it is
+    // a `RunSource::Footnote` run, so it goes through the identical arm and the identical
+    // `contributes` currency.
+    //
+    // The blocks come from `Document::footnote_blocks` — the same function the layout engine
+    // measures — so the collector cannot disagree with the engine about what a note is made of.
+    // Empty for every document without a footnote, which is what keeps this free where the feature
+    // is unused.
+    let notes = doc.footnote_blocks();
+    for block in doc.content.iter().chain(notes.iter()) {
         match block {
             Block::Heading { runs, .. } | Block::Body { runs, .. } => {
                 let style = doc.styles.resolve(block);
@@ -1868,7 +1882,22 @@ mod tests {
     /// `DocumentID`/`InstanceID` (offsets 1510..1541 and 1588..1619) or the trailer `/ID`
     /// (8361..8392 and 8396..8427). Zero differing bytes outside those regions, so no content
     /// stream, font, ICC or metadata stream moved.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x93d9_f5e7_700d_dd08;
+    ///
+    /// Changed again by spec 0077, **identifier-only** a third time — but this one had two candidate
+    /// causes rather than one, so it is worth naming both. `FORMAT_VERSION` became 8, and
+    /// `StyleSheet::default()` gained a `footnote` entry (spec 0066's precedent for `list-bullet`):
+    /// both are in `doc.to_json()` and neither reaches the page. The sample has no footnote and no
+    /// anchor, so `footnotes` is `skip_serializing_if`-omitted, `footnote_blocks()` is empty, the
+    /// collector's new walk contributes nothing, no band reserves anything, and the flow takes the
+    /// single pass it always did. A style nobody names draws nothing.
+    ///
+    /// Verified rather than accepted, on the same pair of files the ledger always uses. **8454 bytes
+    /// both sides**, 124 differing bytes in **8 runs**, and every run inside the XMP
+    /// `DocumentID`/`InstanceID` (offsets 1510..1541 and 1588..1619) or the trailer `/ID`
+    /// (8361..8392 and 8396..8427) — the same four regions, differing in more of their hex digits
+    /// than 0076's move happened to. Zero differing bytes outside them, so no content stream, font,
+    /// ICC or metadata stream moved.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x7ba0_c24d_bbd9_4dd8;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2800,6 +2829,106 @@ mod tests {
 
         // And the glyphs really draw: `drawn_gids` panics on any `.notdef`.
         assert_eq!(drawn_gids(&carried, "mmmdccclxxxviii"), 15);
+        assert_eq!(
+            drawn_gids(&carried, quill_core_model::UNRESOLVED_REFERENCE),
+            3
+        );
+    }
+
+    /// A footnote's characters — the note's prose, its number, and the marker an anchor with no note
+    /// prints — are all in the subset (spec 0077).
+    ///
+    /// **The site is new, not the class.** A note is not in `doc.content`, so a collector that
+    /// walked the content alone would embed no glyph for a word that appears only in a note; the
+    /// answer is that the collector walks `Document::footnote_blocks` — the very list the layout
+    /// engine measures — so what a note is made of has one definition, not two. The number itself is
+    /// a `RunSource::Footnote` run, so it rides spec 0076's exhaustive `contributes` unchanged.
+    ///
+    /// The note's prose is deliberately spelled with characters no other part of the document uses,
+    /// which is what makes this an assertion about the new walk rather than about `everywhere`.
+    #[test]
+    fn a_footnote_is_in_the_subset_and_draws_no_notdef() {
+        use quill_core_model::{Block, Footnote, Run};
+
+        let mut doc = Document::sample();
+        doc.assets.clear();
+        doc.content = (0..30)
+            .map(|i| {
+                Block::body(
+                    format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                    Color::Gray { v: 0.0 },
+                )
+            })
+            .collect();
+        doc.footnotes = vec![Footnote::plain("Æthelred quæstio", Color::Gray { v: 0.0 })];
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+        let note = doc.footnotes[0].id;
+        let first = doc.content[0].id();
+        let mut anchoring = Block::body_runs(
+            vec![
+                Run::plain("a claim"),
+                Run::footnote(note),
+                Run::plain(" and one with no note"),
+                // An anchor whose note is missing draws the marker, and the marker's characters are
+                // generated at layout time too.
+                Run::footnote(quill_core_model::BlockId(999_999)),
+            ],
+            Color::Gray { v: 0.0 },
+        );
+        anchoring.set_id(first);
+        doc.content[0] = anchoring;
+        doc.master_pages.clear();
+        doc.default_master = None;
+        doc.pages.clear();
+
+        let carried: BTreeSet<char> = doc_chars(&doc);
+        for ch in "Æthelrdquæsio".chars() {
+            assert!(carried.contains(&ch), "a note's own prose draws {ch:?}");
+        }
+        for ch in '0'..='9' {
+            assert!(carried.contains(&ch), "a footnote number draws {ch:?}");
+        }
+        for ch in quill_core_model::FOOTNOTE_NUMBER_SUFFIX.chars() {
+            assert!(carried.contains(&ch), "a note's number suffix draws {ch:?}");
+        }
+        for ch in quill_core_model::UNRESOLVED_REFERENCE.chars() {
+            assert!(carried.contains(&ch), "an anchor with no note draws {ch:?}");
+        }
+
+        // End to end, which is the half the compiler cannot check: an arm that returns the wrong
+        // characters still builds. Everything the resolver printed — in the flow *and* in the band —
+        // must have been collected.
+        let pages = lay_out_for_press(&doc, &ExportOptions::default()).expect("press layout");
+        let mut printed = String::new();
+        for page in &pages {
+            for placed in &page.blocks {
+                if let quill_layout_engine::PlacedBlock::Text { source, lines, .. } = placed {
+                    if *source == first || *source == note {
+                        for line in lines {
+                            printed.push_str(&line.text);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            printed.contains(quill_core_model::UNRESOLVED_REFERENCE),
+            "the fixture must actually print the marker, got {printed:?}"
+        );
+        assert!(
+            printed.contains("Æthelred"),
+            "…and the note itself, got {printed:?}"
+        );
+        for ch in printed.chars() {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is printed by a footnote but was never collected"
+            );
+        }
+
+        // And the glyphs really draw: `drawn_gids` panics on any `.notdef`.
+        assert_eq!(drawn_gids(&carried, "1. Æthelred"), 11);
         assert_eq!(
             drawn_gids(&carried, quill_core_model::UNRESOLVED_REFERENCE),
             3

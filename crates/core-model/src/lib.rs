@@ -46,6 +46,8 @@ pub type Pt = f32;
 
 /// The current `.tpub` manifest format version.
 ///
+/// **8** since spec 0077 gave a document [`Footnote`]s — an anchor in the text flow and note text
+/// set in a band at the foot of the frame the anchor lands in;
 /// **7** since spec 0076 gave a [`Run`] a [`RunSource`] — a cross-reference that prints the folio of
 /// the page its target landed on; **6** since spec 0073 gave a [`Section`] a [`Folio`]; **5** since spec 0072 gave a document
 /// [`Section`]s; **4** since spec 0063 replaced a paragraph's
@@ -60,11 +62,12 @@ pub type Pt = f32;
 /// set every chapter opener in the body master; a build that predates spec 0073 would drop `folio`
 /// and print arabic page numbers through front matter the author set in roman; a build that predates
 /// spec 0076 would drop every `source` and **destroy which block each cross-reference points at**,
-/// unrecoverably, on the first save. Any of them could
+/// unrecoverably, on the first save; and a build that predates spec 0077 would drop `footnotes` and
+/// **destroy every note's prose** — not intent this time but the author's own words. Any of them could
 /// then save that back over the original.
 /// Refusing to open is the correct outcome; quietly dropping the layout is exactly the silent
 /// corruption `CLAUDE.md` forbids.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// 0.125 inch expressed in points — the DriveThruRPG-required bleed on outside edges.
 pub const DEFAULT_BLEED_PT: Pt = 9.0;
@@ -388,6 +391,25 @@ impl Run {
             source: RunSource::Reference { target },
         }
     }
+
+    /// A footnote anchor: a run that prints the **number** of the note `note` (spec 0077).
+    ///
+    /// `text` is [`UNRESOLVED_REFERENCE`] for [`Run::reference`]'s reasons, and one more that is
+    /// specific to this variant: an anchor whose note is not in the document has no number, and a
+    /// number is what the reader uses to find the note. Printing nothing would leave a sentence
+    /// ending in a raised space.
+    ///
+    /// The anchor is **not** superscripted here. That is a character style
+    /// ([`Run::character`]), and picking a raise and a size at this level would be picking them
+    /// without knowing the paragraph's — see the non-goals in `specs/0077-footnotes.md`.
+    pub fn footnote(note: BlockId) -> Run {
+        Run {
+            text: UNRESOLVED_REFERENCE.into(),
+            style: InlineStyle::EMPTY,
+            character: None,
+            source: RunSource::Footnote { note },
+        }
+    }
 }
 
 /// What a cross-reference prints when its target is not in the document (spec 0076).
@@ -456,6 +478,18 @@ pub enum RunSource {
     /// 42". Restricting it to headings would be a structure-shaped mechanism where a general one
     /// costs nothing, which is the test `CLAUDE.md` applies to every new type and field.
     Reference { target: BlockId },
+    /// The run draws the **number** of footnote `note` (spec 0077).
+    ///
+    /// Two runs in the workspace carry this variant, and deliberately the same one: the *anchor*
+    /// in the text flow, and the number that opens the *note* itself at the foot of the frame —
+    /// see [`Document::footnote_blocks`]. One variant means one resolver, one contribution to the
+    /// font subset, and no way for the two to print different numbers.
+    ///
+    /// The number is **document-sequential**, derived from the order the anchors appear in
+    /// `content`, which makes it exactly the shape of a list marker (spec 0066): known before any
+    /// page exists, and context rather than content. Per-page restart is a named non-goal; see the
+    /// spec.
+    Footnote { note: BlockId },
 }
 
 impl RunSource {
@@ -467,8 +501,31 @@ impl RunSource {
     /// The block this run refers to, if any.
     pub fn target(&self) -> Option<BlockId> {
         match self {
+            RunSource::Authored | RunSource::Footnote { .. } => None,
+            RunSource::Reference { target } => Some(*target),
+        }
+    }
+
+    /// The footnote this run numbers, if any.
+    pub fn note(&self) -> Option<BlockId> {
+        match self {
+            RunSource::Authored | RunSource::Reference { .. } => None,
+            RunSource::Footnote { note } => Some(*note),
+        }
+    }
+
+    /// The thing this run's drawn characters are derived from — a reference's target, a footnote's
+    /// note — or `None` for an authored run.
+    ///
+    /// One accessor rather than two call sites asking `target().or(note())`, because the resolved
+    /// map is keyed by *whatever the run points at*: a cross-reference's target block and a
+    /// footnote both have a [`BlockId`], and merging them into one map is what lets one fingerprint
+    /// and one resolver serve both.
+    pub fn referent(&self) -> Option<BlockId> {
+        match self {
             RunSource::Authored => None,
             RunSource::Reference { target } => Some(*target),
+            RunSource::Footnote { note } => Some(*note),
         }
     }
 
@@ -493,6 +550,88 @@ impl RunSource {
                     .flat_map(|f| f.alphabet())
                     .collect(),
             },
+            // A footnote number is arithmetic too, so again only the alphabet is knowable — and
+            // there is exactly one answer to what a footnote number can draw, because there is
+            // exactly one numbering: document-sequential decimal (see [`footnote_number`]). It is
+            // deliberately *not* asked of `folio_formats`: a folio and a note number are two
+            // different quantities that happen to be numbers, and tying the note's alphabet to the
+            // book's page numbering would make a roman front matter change what a footnote can
+            // print. The unresolved marker travels as a run for the reason above.
+            RunSource::Footnote { .. } => TokenText {
+                runs: vec![UNRESOLVED_REFERENCE.to_string()],
+                chars: NumberFormat::Decimal.alphabet(),
+            },
+        }
+    }
+}
+
+/// What footnote `n` prints — the **one** answer, asked by the resolver and by the font-subset
+/// collector alike (spec 0077).
+///
+/// Decimal and document-sequential. A function rather than an inline `to_string` so that
+/// [`RunSource::contributes`]' alphabet and the resolver cannot drift: whatever this can produce is
+/// what [`NumberFormat::Decimal`] can write.
+pub fn footnote_number(n: u32) -> String {
+    NumberFormat::Decimal.format(n)
+}
+
+/// What separates a note's number from its text at the foot of the frame (spec 0077).
+///
+/// Authored characters rather than generated ones — knowable exactly — so it travels as a *run* of
+/// the synthesised note block and its ligatures are cut into the subset like any other run's. It is
+/// **not** part of what [`RunSource::Footnote`] resolves to, because the anchor in the flow prints
+/// the number alone.
+pub const FOOTNOTE_NUMBER_SUFFIX: &str = ". ";
+
+/// What each note prints, keyed by note id (spec 0077).
+///
+/// Takes the *synthesised note blocks* — [`Document::footnote_blocks`]' output — rather than the
+/// content, so that there is exactly **one** statement of the numbering rule in the workspace and
+/// one statement of which notes exist. `footnote_blocks` decides both (anchor order, skipping a note
+/// the document does not hold); this only counts.
+///
+/// Derived from content order and known before anything is laid out, which is the numbering
+/// decision — see [`Document::footnote_numbers`].
+pub fn footnote_numbers(notes: &[Block]) -> BTreeMap<BlockId, String> {
+    notes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id(), footnote_number(i as u32 + 1)))
+        .collect()
+}
+
+/// A note set at the foot of the frame its anchor lands in (spec 0077).
+///
+/// **It is not in `content`**, and that is the whole of the model change: a footnote is a *second
+/// flow*, entered from a [`RunSource::Footnote`] run in the first. Putting the note text in
+/// `content` would set it inline where the anchor is, which is the thing a footnote exists not to
+/// do.
+///
+/// It carries runs rather than a `String` for [`Block::Body`]'s reason — a note may emphasise a
+/// word, and may itself carry a cross-reference. It carries an id because the anchor has to be able
+/// to name it and because the placed note reports that id as its `source`, which is what makes the
+/// "anchor and note on the same page" property assertable from a page vector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Footnote {
+    #[serde(default)]
+    pub id: BlockId,
+    /// The note's text, as one or more styled runs.
+    pub runs: Vec<Run>,
+    /// The note's ink. A run may override it.
+    pub color: Color,
+    /// Overrides the structural default ([`FOOTNOTE_STYLE`]). `None` is the common case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+}
+
+impl Footnote {
+    /// A note of plain text in the document's ink, with no id yet.
+    pub fn plain(text: impl Into<String>, color: Color) -> Footnote {
+        Footnote {
+            id: BlockId::UNASSIGNED,
+            runs: vec![Run::plain(text)],
+            color,
+            style: None,
         }
     }
 }
@@ -1221,6 +1360,16 @@ pub fn builtin_character_styles() -> BTreeMap<String, CharacterStyle> {
 /// A generated table of contents' own heading (spec 0041).
 pub const TOC_TITLE_STYLE: &str = "toc-title";
 
+/// The style a footnote's text is set in (spec 0077).
+///
+/// Named and in the default sheet, on spec 0066's precedent for `list-bullet`: a footnote has a
+/// conventional treatment (smaller, tighter, ragged) that a document should get without authoring
+/// it, and a house style that wants a different one edits the entry rather than every note.
+///
+/// A [`Footnote`] that names a style the sheet does not hold falls through to `body` like any other
+/// block — a renamed style costs the note its treatment, not the author the note.
+pub const FOOTNOTE_STYLE: &str = "footnote";
+
 /// A bulleted list item (spec 0066).
 pub const LIST_BULLET_STYLE: &str = "list-bullet";
 /// A numbered list item.
@@ -1329,6 +1478,24 @@ impl Default for StyleSheet {
                 },
             );
         }
+        // Footnote treatment (spec 0077). Smaller and tighter than the body, ragged rather than
+        // justified — a note is short and its measure is the column's, so justifying two lines of
+        // it is the defect that makes a footnote look broken. Space above is zero: the band already
+        // separates it, and space above the first note would be charged inside the band.
+        paragraph.insert(
+            FOOTNOTE_STYLE.to_string(),
+            ParagraphStyle {
+                weight: Weight::REGULAR,
+                italic: false,
+                list: None,
+                font_size_pt: 8.0,
+                leading_pt: 10.0,
+                align: TextAlign::Left,
+                space_before_pt: 0.0,
+                space_after_pt: 2.0,
+                indent: Indent::ZERO,
+            },
+        );
         // Stat-block treatment (spec 0038). Built in rather than left to the author, because the
         // point of a first-class component is that dropping one in produces something that already
         // looks like a stat block. Restyling the whole book is still one edit — these three names.
@@ -1986,6 +2153,17 @@ pub struct Document {
     /// `docs/format-spec.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<Section>,
+    /// The document's footnotes (spec 0077), in no particular order.
+    ///
+    /// Order here is *not* the numbering: a note is numbered by where its **anchor** appears in
+    /// `content`, so re-ordering this list changes nothing a reader sees. That is what makes the
+    /// list an unordered store rather than a second content sequence to keep in step.
+    ///
+    /// A note nothing anchors is not an error and is not placed — the same posture a dangling
+    /// section anchor gets. An empty list is exactly the pre-0077 behaviour; it is **not** why
+    /// `FORMAT_VERSION` moved, which is that an older build drops this list and destroys the notes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub footnotes: Vec<Footnote>,
     /// Component definitions this document carries beyond the bundled two (spec 0054).
     ///
     /// Keyed by definition name. Additive and defaulted, so a v3 manifest written before component
@@ -2046,6 +2224,7 @@ impl Document {
             default_master: None,
             pages: Vec::new(),
             sections: Vec::new(),
+            footnotes: Vec::new(),
             components: Default::default(),
             requires: Vec::new(),
         };
@@ -2080,8 +2259,16 @@ impl Document {
     /// them would break whichever external reference was pointing at the block that got moved.
     pub fn assign_missing_block_ids(&mut self) -> Result<(), LoadError> {
         let mut seen: BTreeSet<u64> = BTreeSet::new();
-        for block in &self.content {
-            let id = block.id();
+        // Footnotes share the one id space (spec 0077): an anchor names a note by `BlockId`, the
+        // placed note reports that id as its `source`, and the resolved-text map that serves both a
+        // cross-reference's target and a note's number is keyed by it. Two of them colliding would
+        // be the same silent wrong-layout this function already refuses for two blocks.
+        for id in self
+            .content
+            .iter()
+            .map(Block::id)
+            .chain(self.footnotes.iter().map(|f| f.id))
+        {
             if id.is_assigned() && !seen.insert(id.0) {
                 return Err(LoadError::DuplicateBlockId(id.0));
             }
@@ -2098,8 +2285,82 @@ impl Document {
                 next += 1;
             }
         }
+        for note in &mut self.footnotes {
+            if !note.id.is_assigned() {
+                note.id = BlockId(next);
+                next += 1;
+            }
+        }
         self.next_block_id = next;
         Ok(())
+    }
+
+    /// What each footnote's anchor prints, keyed by note id (spec 0077).
+    ///
+    /// **Derived from `content` order, before anything is laid out** — which is the whole of the
+    /// numbering decision. A number that restarted per page would not be knowable here (the page is
+    /// not known until the flow runs) and would feed back into the flow through the anchor run's
+    /// width, so it would need a fixpoint *inside* `flow`. Document-sequential is exactly
+    /// [`crate::ListSpec`]'s shape instead: one walk over the blocks, in order, assigning 1, 2, 3…
+    /// to each distinct note the first time an anchor names it. See `specs/0077-footnotes.md` for
+    /// the argument and for what per-page restart would cost.
+    ///
+    /// A note in [`Document::footnotes`] that no anchor names gets no number and is not placed. An
+    /// anchor naming a note the document does not hold is numbered anyway — it is a real anchor in
+    /// real prose — and its note is simply missing; the anchor is what tells the reader so.
+    ///
+    /// Empty for every document without a footnote, which is what lets the whole feature be skipped.
+    pub fn footnote_numbers(&self) -> BTreeMap<BlockId, String> {
+        footnote_numbers(&self.footnote_blocks())
+    }
+
+    /// Each anchored footnote as the [`Block`] that is measured and placed for it (spec 0077).
+    ///
+    /// **One synthesis site, read by both the layout engine and the font-subset collector**, which
+    /// is the structural half of this increment's answer to spec 0074's class. The note's number is
+    /// a [`RunSource::Footnote`] run — the same variant the anchor carries, so the two cannot print
+    /// different numbers — followed by an authored [`FOOTNOTE_NUMBER_SUFFIX`] run and the note's own
+    /// runs. A collector that walks these blocks therefore carries every character a note draws
+    /// without knowing anything about footnotes.
+    ///
+    /// The block takes the note's id, so a placed note reports it as its `source` and "the anchor
+    /// and its note landed on the same page" is a question a page vector can answer.
+    ///
+    /// Only notes an anchor names **and** that the document actually holds are returned, in
+    /// document order — the order they are numbered in, which is also the order a frame's band
+    /// stacks them in. An anchor whose note is missing is therefore absent from
+    /// [`footnote_numbers`] and prints [`UNRESOLVED_REFERENCE`]: a visible failure, and the notes
+    /// that *are* there stay numbered 1, 2, 3 without a hole.
+    pub fn footnote_blocks(&self) -> Vec<Block> {
+        let mut out = Vec::new();
+        for block in &self.content {
+            for run in block.runs() {
+                let Some(id) = run.source.note() else {
+                    continue;
+                };
+                if out.iter().any(|b: &Block| b.id() == id) {
+                    continue;
+                }
+                let Some(note) = self.footnotes.iter().find(|f| f.id == id) else {
+                    continue;
+                };
+                let mut runs = Vec::with_capacity(note.runs.len() + 2);
+                runs.push(Run::footnote(id));
+                runs.push(Run::plain(FOOTNOTE_NUMBER_SUFFIX));
+                runs.extend(note.runs.iter().cloned());
+                out.push(Block::Body {
+                    id,
+                    runs,
+                    color: note.color,
+                    style: Some(
+                        note.style
+                            .clone()
+                            .unwrap_or_else(|| FOOTNOTE_STYLE.to_string()),
+                    ),
+                });
+            }
+        }
+        out
     }
 
     /// The master page governing `page_index` (spec 0035).
@@ -3317,6 +3578,169 @@ mod tests {
         assert_eq!(bare, Folio::default());
         assert_eq!(bare.format, NumberFormat::Decimal);
         assert_eq!(bare.restart_at, None);
+    }
+
+    // --- Footnotes (spec 0077) -----------------------------------------------------------------
+
+    #[test]
+    fn a_footnote_round_trips_and_stays_out_of_the_manifest_when_absent() {
+        // Spec 0053's lesson again, and the empty case is every document in existence: a document
+        // with no note must not write a `footnotes` key, because doing so would move the `/ID` of
+        // every file quill has ever written.
+        let plain = Document::sample();
+        let json = plain.to_json().expect("save");
+        assert!(
+            !json.contains("\"footnotes\""),
+            "a document with no note must not write `footnotes`: {json}"
+        );
+
+        let mut doc = Document::sample();
+        doc.footnotes = vec![Footnote::plain("a note", Color::Gray { v: 0.0 })];
+        doc.content.push(Block::body_runs(
+            vec![Run::plain("a claim"), Run::footnote(BlockId(0))],
+            Color::Gray { v: 0.0 },
+        ));
+        doc.assign_missing_block_ids().expect("ids");
+        let note = doc.footnotes[0].id;
+        if let Some(Block::Body { runs, .. }) = doc.content.last_mut() {
+            runs[1] = Run::footnote(note);
+        }
+        let json = doc.to_json().expect("save");
+        let back = Document::from_json(&json).expect("load");
+        assert_eq!(back, doc, "a document with a footnote must equal itself");
+        assert_eq!(
+            back.content.last().expect("anchoring block").runs()[1]
+                .source
+                .note(),
+            Some(note)
+        );
+
+        // An anchor naming a note the document does not hold round-trips as readily: a dangling
+        // anchor is a state the model can hold, not an error it refuses.
+        let mut dangling = Document::sample();
+        dangling.content = vec![Block::body_runs(
+            vec![Run::footnote(BlockId(999))],
+            Color::Gray { v: 0.0 },
+        )];
+        dangling.assign_missing_block_ids().expect("ids");
+        assert_eq!(
+            Document::from_json(&dangling.to_json().expect("save")).expect("load"),
+            dangling
+        );
+    }
+
+    #[test]
+    fn a_footnote_shares_the_one_id_space_and_a_collision_is_refused() {
+        let mut doc = Document::sample();
+        doc.footnotes = vec![
+            Footnote::plain("one", Color::Gray { v: 0.0 }),
+            Footnote::plain("two", Color::Gray { v: 0.0 }),
+        ];
+        doc.assign_missing_block_ids().expect("ids");
+        let ids: BTreeSet<u64> = doc
+            .content
+            .iter()
+            .map(|b| b.id().0)
+            .chain(doc.footnotes.iter().map(|f| f.id.0))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            doc.content.len() + doc.footnotes.len(),
+            "every block and every note has its own id"
+        );
+
+        // And a collision is refused rather than repaired, exactly as two blocks are: a shared
+        // identity means an anchor can resolve to the wrong thing.
+        let clash = doc.content[0].id();
+        doc.footnotes[0].id = clash;
+        assert!(matches!(
+            doc.assign_missing_block_ids(),
+            Err(LoadError::DuplicateBlockId(n)) if n == clash.0
+        ));
+    }
+
+    #[test]
+    fn a_note_block_is_synthesised_once_and_carries_its_own_number() {
+        // One synthesis site, read by the engine and by the font-subset collector alike. What it
+        // produces is the assertion, because everything downstream is derived from it.
+        let mut doc = Document::sample();
+        doc.content = vec![Block::body_runs(
+            vec![Run::plain("a claim"), Run::footnote(BlockId(0))],
+            Color::Gray { v: 0.0 },
+        )];
+        doc.footnotes = vec![Footnote::plain("the note", Color::Gray { v: 0.0 })];
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("ids");
+        let note = doc.footnotes[0].id;
+        if let Some(Block::Body { runs, .. }) = doc.content.last_mut() {
+            runs[1] = Run::footnote(note);
+        }
+
+        let blocks = doc.footnote_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id(), note, "the note block carries the note's id");
+        let runs = blocks[0].runs();
+        assert_eq!(
+            runs[0].source,
+            RunSource::Footnote { note },
+            "the note opens with the same generated run its anchor carries"
+        );
+        assert_eq!(runs[1].text, FOOTNOTE_NUMBER_SUFFIX);
+        assert_eq!(runs[2].text, "the note");
+        assert_eq!(
+            doc.footnote_numbers().get(&note).map(String::as_str),
+            Some("1")
+        );
+
+        // A note nothing anchors is not synthesised and is not numbered: it is not an error, it is
+        // simply not placed.
+        doc.footnotes
+            .push(Footnote::plain("orphan", Color::Gray { v: 0.0 }));
+        doc.assign_missing_block_ids().expect("ids");
+        assert_eq!(doc.footnote_blocks().len(), 1);
+        assert_eq!(doc.footnote_numbers().len(), 1);
+    }
+
+    #[test]
+    fn a_footnote_anchor_stores_the_marker_rather_than_a_number() {
+        // Spec 0041's rule, applied to the second generated run. A stored number is stale the moment
+        // a note is inserted above it, and it is what an older build would print — plausibly and
+        // wrongly — where `[?]` reads as unfinished.
+        let run = Run::footnote(BlockId(7));
+        assert_eq!(run.text, UNRESOLVED_REFERENCE);
+        assert_eq!(run.source.note(), Some(BlockId(7)));
+        assert_eq!(run.source.target(), None, "a note is not a link target");
+        assert_eq!(run.source.referent(), Some(BlockId(7)));
+    }
+
+    #[test]
+    fn a_footnote_number_contributes_its_own_alphabet_and_not_the_folios() {
+        // Property 4 of spec 0076's class, applied honestly rather than by copying: there is one
+        // answer to what a *folio* can draw and one answer to what a *note number* can draw, and
+        // they are different questions. Tying the note's alphabet to the book's page numbering would
+        // let roman front matter change what a footnote can print.
+        let mut doc = Document::sample();
+        doc.sections = vec![Section {
+            name: "Front".into(),
+            start: doc.content[0].id(),
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        let note = RunSource::Footnote { note: BlockId(1) }.contributes(&doc);
+        assert_eq!(note.chars, NumberFormat::Decimal.alphabet());
+        assert!(
+            !note.chars.contains(&'v'),
+            "a roman folio must not widen what a footnote number can draw"
+        );
+        assert_eq!(note.runs, vec![UNRESOLVED_REFERENCE.to_string()]);
+
+        // …while a cross-reference in the same document does carry the roman alphabet, which is what
+        // makes the two genuinely different answers rather than an oversight.
+        let reference = RunSource::Reference { target: BlockId(1) }.contributes(&doc);
+        assert!(reference.chars.contains(&'v'));
     }
 
     // --- Cross-references (spec 0076) ---------------------------------------------------------
