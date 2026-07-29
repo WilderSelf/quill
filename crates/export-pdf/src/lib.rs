@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use quill_color::within_ink_limit_pct;
 use quill_core_model::{
-    page_geom, Asset, Block, Color, Document, FieldValue, PageGeom, PageSetup, Rect,
+    page_geom, Asset, Block, Color, Document, FieldValue, MasterStatic, PageGeom, PageSetup, Rect,
 };
 use quill_fonts::FaceKey;
 
@@ -48,7 +48,7 @@ pub fn lay_out_for_press(
 /// out with `NoHyphenator` — screen and press then broke lines differently. The re-export keeps the
 /// old path working for anything that named it.
 pub use quill_fonts::HypherHyphenator;
-use quill_layout_engine::{LaidOutPage, PlacedBlock};
+use quill_layout_engine::{InkSite, LaidOutPage, PlacedBlock};
 use thiserror::Error;
 
 mod fonts;
@@ -350,28 +350,35 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
     // that reaches the page exactly as the block's does, and a preflight that read one and not the
     // other would pass a document with an over-inked word in it — the silent-corruption failure
     // this crate exists to prevent.
+    //
+    // **This pass is deliberately a subset of `preflight_pages`, which is authoritative** (spec
+    // 0081). It runs before layout, so it can only see what the *model* declares; the exhaustive
+    // enumeration of what actually reaches the page is `PlacedBlock::inks`, and `export` runs that
+    // one too. What this pass owes is that it never reports a colour that is legal and never stays
+    // silent about one a `Document` alone is enough to condemn — because `quill preflight` lays
+    // nothing out, and "no findings" over a document the exporter is about to refuse is a false
+    // pass of exactly the shape spec 0052 built `Skipped` to avoid.
     for (i, block) in doc.content.iter().enumerate() {
         if let Block::Heading { runs, .. } | Block::Body { runs, .. } = block {
             for (ri, run) in runs.iter().enumerate() {
-                let Some(color) = run.style.color.as_ref() else {
+                // The **resolved** treatment, not the direct override (spec 0081). What reaches the
+                // page is the run's named character style folded with its own overrides, and a
+                // check that read `run.style.color` alone passed a document whose named style was
+                // RGB — defect (B). Resolved through `StyleSheet::resolve_run`, the same function
+                // the layout engine derives `run_colors` from, so the two cannot disagree about
+                // precedence.
+                //
+                // Still skipped when the resolved treatment states no colour of its own: the run
+                // then takes the paragraph's, which the block arm below checks. Reporting it here
+                // as well would answer one over-inked paragraph with one finding per word in it.
+                let Some(color) = doc.styles.resolve_run(run).color else {
                     continue;
                 };
-                if matches!(color, Color::Rgb { .. }) {
+                if let Some(check) = ink_check(&color, preset) {
                     push_error(
                         &mut report,
-                        CheckId::ColorSpace,
-                        format!(
-                            "block {i} run {ri} uses RGB; press output must be CMYK or grayscale"
-                        ),
-                    );
-                } else if !within_ink_limit_pct(color, preset.max_ink_pct) {
-                    push_error(
-                        &mut report,
-                        CheckId::InkCoverage,
-                        format!(
-                            "block {i} run {ri} exceeds {}% total ink coverage",
-                            preset.max_ink_pct
-                        ),
+                        check,
+                        colour_message(check, preset, &format!("block {i} run {ri}")),
                     );
                 }
             }
@@ -387,21 +394,53 @@ pub fn preflight(doc: &Document, opts: &ExportOptions) -> PreflightReport {
             Block::Image { .. } => None,
         };
         let Some(color) = color else { continue };
-        if matches!(color, Color::Rgb { .. }) {
+        if let Some(check) = ink_check(color, preset) {
             push_error(
                 &mut report,
-                CheckId::ColorSpace,
-                format!("block {i} uses RGB; press output must be CMYK or grayscale"),
+                check,
+                colour_message(check, preset, &format!("block {i}")),
             );
-        } else if !within_ink_limit_pct(color, preset.max_ink_pct) {
-            push_error(
-                &mut report,
-                CheckId::InkCoverage,
-                format!(
-                    "block {i} exceeds {}% total ink coverage",
-                    preset.max_ink_pct
-                ),
-            );
+        }
+    }
+
+    // A master page's furniture is ink too, and until spec 0081 nothing checked it: this function
+    // walks `doc.content`, which never reaches a master. A running head at CMYK 90/90/90/90 —
+    // **360% ink** — is stamped on every page its master governs, and it passed with zero findings.
+    //
+    // Reachable in practice rather than theoretically: statics are authored in `document.json`,
+    // user-authored templates carry `master_pages` and validate versions and trims but never
+    // colours, and a `.qpack` carries templates.
+    //
+    // Exhaustive over `MasterStatic` with no `..`, for `PlacedBlock::inks`' reason: a new furniture
+    // variant, or a colour field on an existing one, must not compile until it says what ink it
+    // draws.
+    for master in &doc.master_pages {
+        for (si, stat) in master.statics.iter().enumerate() {
+            let color = match stat {
+                MasterStatic::Text {
+                    rect: _,
+                    text: _,
+                    color,
+                    style: _,
+                    align: _,
+                    mirror: _,
+                } => Some(*color),
+                // Placed pixels, not an authored colour — checked where they are converted and
+                // clamped (`images.rs`, spec 0006), exactly as a `Block::Image` is.
+                MasterStatic::Image { rect: _, asset: _ } => None,
+            };
+            let Some(color) = color else { continue };
+            if let Some(check) = ink_check(&color, preset) {
+                push_error(
+                    &mut report,
+                    check,
+                    colour_message(
+                        check,
+                        preset,
+                        &format!("master '{}' static {si}", master.name),
+                    ),
+                );
+            }
         }
     }
 
@@ -668,11 +707,17 @@ fn under_dpi(asset: &Asset, frame: &Rect, preset: &PodPreset) -> Option<(f32, f3
 /// Press checks that can only be made against laid-out geometry (spec 0037).
 ///
 /// [`preflight`] walks the document, which is the right place for everything a *block* declares.
-/// Decoration is different: a [`PlacedBlock::Rect`] is produced by the layout engine, carries its
-/// own colours, and reaches the page without ever having been a `Block`. Nothing in the model-level
-/// checks would ever see it, so a panel tinted at 280% total ink would go straight to a print shop
-/// — exactly the silent-press-corruption class `CLAUDE.md` forbids, and invisible to every test
-/// that only looks at text and images.
+/// Placed geometry is different: a [`PlacedBlock::Rect`] is produced by the layout engine, carries
+/// its own colours, and reaches the page without ever having been a `Block`. Nothing in the
+/// model-level checks would ever see it, so a panel tinted at 280% total ink would go straight to a
+/// print shop — exactly the silent-press-corruption class `CLAUDE.md` forbids, and invisible to
+/// every test that only looks at text and images.
+///
+/// **This is the authoritative colour check** (spec 0081). It is exhaustive over
+/// [`PlacedBlock::inks`], which is exhaustive over what the writer draws, so every colour that
+/// reaches the page is checked here — including the two that reached it unchecked before: a master
+/// page's static text, and a run's *named* character style. [`preflight`]'s colour pass is the
+/// pre-layout early warning over the same rules, deliberately a subset of this one.
 ///
 /// Kept public so the same checks can be run against a page set the caller already has, and so this
 /// can be tested directly rather than only through a full export.
@@ -688,6 +733,8 @@ pub fn preflight_pages(
     let mut findings = Vec::new();
     let by_id: std::collections::HashMap<&str, &Asset> =
         assets.iter().map(|a| (a.id.as_str(), a)).collect();
+    // Colour findings already reported, document-wide — see the loop that fills it.
+    let mut colour_reported: std::collections::BTreeSet<String> = Default::default();
 
     for page in pages {
         // Two checks that need a *placed* page and a preset, and can be answered from nothing less
@@ -747,40 +794,119 @@ pub fn preflight_pages(
             }
         }
 
-        for block in page.statics.iter().chain(page.blocks.iter()) {
-            let PlacedBlock::Rect { fill, stroke, .. } = block else {
-                continue;
-            };
-            let colors = [
-                fill.as_ref().map(|c| ("fill", *c)),
-                stroke.as_ref().map(|s| ("stroke", s.color)),
-            ];
-            for (what, color) in colors.into_iter().flatten() {
-                if matches!(color, Color::Rgb { .. }) {
-                    findings.push(Finding {
-                        check: CheckId::ColorSpace,
-                        severity: Severity::Error,
-                        message: format!(
-                            "page {}: a decoration {what} uses RGB; press output must be CMYK or \
-                             grayscale",
-                            page.index + 1
-                        ),
-                    });
-                } else if !within_ink_limit_pct(&color, preset.max_ink_pct) {
-                    findings.push(Finding {
-                        check: CheckId::InkCoverage,
-                        severity: Severity::Error,
-                        message: format!(
-                            "page {}: a decoration {what} exceeds {}% total ink coverage",
-                            page.index + 1,
-                            preset.max_ink_pct
-                        ),
-                    });
+        // Every colour on the page, from the one enumeration that is exhaustive over what the
+        // writer draws (spec 0081). `statics` first so a master's furniture is reported before the
+        // content it sits behind, and because that ordering keeps the pre-0081 decoration messages
+        // in the position they were in.
+        for (from_master, block) in page
+            .statics
+            .iter()
+            .map(|b| (true, b))
+            .chain(page.blocks.iter().map(|b| (false, b)))
+        {
+            for ink in block.inks() {
+                let Some(check) = ink_check(&ink.color, preset) else {
+                    continue;
+                };
+                let what = ink_phrase(ink.site, from_master, ink_owner(block));
+                // One finding per distinct (check, site, colour) across the whole document, not per
+                // page. A running head is stamped on every page its master governs, so reporting per
+                // page would answer a single authoring mistake with 500 copies of one sentence — the
+                // same argument the safe-area and dpi checks above already make, and one that only
+                // became load-bearing when furniture entered this loop. The page named is the first
+                // the colour was seen on.
+                //
+                // The site is identified by the phrase, which carries the *block id* for content and
+                // nothing for furniture — so two over-inked paragraphs are two findings while one
+                // running head on 500 pages is one, which is what each of them actually is.
+                if !colour_reported.insert(format!("{check:?}|{what}|{:?}", ink.color)) {
+                    continue;
                 }
+                findings.push(Finding {
+                    check,
+                    severity: Severity::Error,
+                    message: colour_message(
+                        check,
+                        preset,
+                        &format!("page {}: {what}", page.index + 1),
+                    ),
+                });
             }
         }
     }
     findings
+}
+
+/// Which colour check `color` fails, or `None` when it is press-legal at `preset`'s limit.
+///
+/// The two checks are ordered, not independent: RGB has no ink coverage to speak of
+/// (`ink_coverage_pct` returns `None` for it), so reporting it as *also* over the limit would be
+/// two findings for one mistake and the second would be meaningless. One statement of the rule,
+/// read by both the model pass and the placed pass, so they cannot disagree about what is legal.
+fn ink_check(color: &Color, preset: &PodPreset) -> Option<CheckId> {
+    if matches!(color, Color::Rgb { .. }) {
+        Some(CheckId::ColorSpace)
+    } else if !within_ink_limit_pct(color, preset.max_ink_pct) {
+        Some(CheckId::InkCoverage)
+    } else {
+        None
+    }
+}
+
+/// The sentence a failed colour check reads, for a `subject` naming where the colour was found.
+///
+/// One statement of the wording, so the model pass cannot phrase the same defect differently from
+/// the placed one. The two strings are the pre-0081 wording exactly — a message an author has
+/// learned to search for is part of the interface.
+fn colour_message(check: CheckId, preset: &PodPreset, subject: &str) -> String {
+    match check {
+        CheckId::ColorSpace => {
+            format!("{subject} uses RGB; press output must be CMYK or grayscale")
+        }
+        _ => format!(
+            "{subject} exceeds {}% total ink coverage",
+            preset.max_ink_pct
+        ),
+    }
+}
+
+/// What a press finding calls the place a colour sits (spec 0081).
+///
+/// The two decoration phrasings are the pre-0081 wording exactly, because a message an author has
+/// learned to search for is part of the interface.
+///
+/// `owner` names the content block the ink belongs to, or `None` for master furniture — which has
+/// no identity by construction ([`PlacedBlock::Text::source`] is `BlockId::UNASSIGNED` for it, spec
+/// 0040). That absence is what makes one running head on 500 pages *one* finding: see the dedupe in
+/// [`preflight_pages`].
+fn ink_phrase(
+    site: InkSite,
+    from_master: bool,
+    owner: Option<quill_core_model::BlockId>,
+) -> String {
+    let owner = match owner.filter(|_| !from_master) {
+        Some(id) => format!("block id {}", id.0),
+        None => "a master static".to_string(),
+    };
+    match site {
+        InkSite::Text => owner,
+        InkSite::Run(i) => format!("{owner}'s run {i}"),
+        InkSite::Fill => "a decoration fill".to_string(),
+        InkSite::Stroke => "a decoration stroke".to_string(),
+    }
+}
+
+/// The content block a placed block came from, or `None` when it has no identity.
+fn ink_owner(block: &PlacedBlock) -> Option<quill_core_model::BlockId> {
+    match block {
+        PlacedBlock::Text { source, .. }
+        | PlacedBlock::Image { source, .. }
+        | PlacedBlock::Link { source, .. } => {
+            (*source != quill_core_model::BlockId::UNASSIGNED).then_some(*source)
+        }
+        // Decoration is synthesized geometry with no block behind it (spec 0037).
+        PlacedBlock::Rect { .. } => None,
+    }
 }
 
 /// Every character the font must carry: the document's text-block chars (headings + body) plus a

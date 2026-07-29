@@ -21,7 +21,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **complete** — specs 0072–0079 shipped plus the closeout **0080**; **0075 went out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature. 0079 closed the feature list by *not* breaking the one-`Document` assumption in four crates: a book composes to one `Document`, and the fixpoint cost the audit feared measures 3 passes and is indifferent to chapter count. 0080 then closed the milestone's one recurring absence — a forced page break, named as a non-goal by 0072, 0073 and 0079 — so a chapter opens a page, and opens it on the recto if the book asks |
-| **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | **decomposed** into specs 0081–0089; none built. 0081/0082 fix four defects the audit found in the colour and image paths |
+| **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | **decomposed** into specs 0081–0089. **0081 shipped** (every colour that reaches the page is checked, at one exhaustive enumeration); 0082 fixes the two remaining defects the audit found, both in the image path |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
 application second.** Game books are the flagship use case; every mechanism must be one a cookbook,
@@ -3067,9 +3067,16 @@ changes what conformance quill can claim, and that deserves to be argued on its 
 Deliberately short. A decomposition nine deep is one whose later entries will be wrong; what belongs
 here is the ordering argument and the constraint each increment must respect.
 
-#### 0081 every colour that reaches the page is checked
+#### 0081 every colour that reaches the page is checked — **shipped**
 
-Closes known issues A and B below. Small, and it is press-correctness rather than a feature.
+Closed known issues A and B. Small, and press-correctness rather than a feature. `spec 0081` took
+the structural answer rather than two more arms: `PlacedBlock::inks` is one enumeration of every
+colour a placed page can put on paper, exhaustive over variants **and** over fields (no `..`), so a
+new colour-bearing site fails to compile (`E0004`/`E0027`) until it says what ink it draws — spec
+0074's treatment at a fourth site. `preflight_pages` is now the authoritative colour check;
+`preflight`'s is the pre-layout early warning over the same rules, extended to master statics and to
+resolved run colours so `quill preflight` cannot report "no findings" about a document `export` will
+refuse. `FORMAT_VERSION` stays 10 (no model surface) and `SAMPLE_EXPORT_DIGEST` did not move.
 
 #### 0082 what the image path gets wrong
 
@@ -3133,38 +3140,11 @@ defect — which is why the four entries M3 opened with are gone, and why both e
 gone too: specs 0059 and 0060 shipped them, and why the collector's token entry is gone — spec 0074
 closed it structurally rather than narrowing it a second time, and why the chapter-run-on entry is
 gone — spec 0080 shipped the forced page break all three of its sightings were asking for. The
-entries below are what M4 and M6 found in their place, plus the four M7's audit found — **all of
-them in the colour and image paths, which have had the least attention since M0, and three of them
-press-correctness**. Sequenced as specs 0081 and 0082, ahead of every M7 feature.
-
-- **(A) A master static's colour is never checked, so an over-inked folio prints on every page.**
-  `preflight()` walks `doc.content` and nothing else, so master pages are never visited.
-  `preflight_pages()` — added by spec 0037 precisely because "colour checks on the model cannot see
-  geometry the engine synthesized" — does walk `statics.chain(blocks)`, but its colour loop opens by
-  `continue`-ing on anything that is not a `PlacedBlock::Rect`, and a `MasterStatic::Text` becomes a
-  `PlacedBlock::Text`.
-
-  So a running head at CMYK 90/90/90/90 — **360% ink** — passes preflight with zero findings and is
-  emitted at 360% on every page its master governs. That is the exact scenario spec 0037 was written
-  to prevent, one variant over. The RGB case is milder and worse-documented: the writer turns it
-  silently black under a comment saying "preflight rejects RGB before export, so `Rgb` is unreachable
-  here", **which is false for a master static**.
-
-  Reachable in practice, not theoretically: master statics are authored in `document.json`,
-  user-authored templates carry `master_pages` and validate versions and trims but never colours, and
-  a `.qpack` carries templates. No test in the repo gives a master static an illegal colour.
-
-- **(B) A character style's colour is never checked, and this falsifies a claim in `CLAUDE.md`.** The
-  run half of the colour check reads each run's *direct* override and skips runs that have none — but
-  the colour that reaches the page is the *resolved* one, folding the named character style. None of
-  the four bundled styles carries a colour, so no shipped document trips it; a document, template or
-  pack that defines one escapes preflight entirely.
-
-  `CLAUDE.md` says "`DefColor` has no RGB family at all, so a pack cannot even express a colour space
-  PDF/X-1a forbids." True of `DefColor` — but a `.qpack` also carries a `StyleSheet`, whose character
-  map holds full `Color` including RGB, and templates whose master statics do too. **A pack can
-  express RGB by two routes, and (A) means one of them reaches the press file.** The sentence in
-  `CLAUDE.md` is corrected when 0081 makes it true again.
+entries below are what M4 and M6 found in their place, plus what remains of the four M7's audit
+found — **all of them in the colour and image paths, which have had the least attention since M0**.
+Two are gone already: spec 0081 shipped (A) and (B), the unchecked master static and the unchecked
+character style, and closed both structurally at one exhaustive enumeration rather than narrowing
+each. (C) and (D) are spec 0082, ahead of every M7 feature.
 
 - **(C) Editing an `Asset` invalidates nothing, so a relinked image serves stale pages.**
   `image_size` reads `px_w`/`px_h`/`dpi`, and those set the placed height and therefore every page

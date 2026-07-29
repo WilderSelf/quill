@@ -1892,6 +1892,26 @@ impl StyleSheet {
             .or_else(|| builtin_character_styles().get(name).copied())
     }
 
+    /// The treatment a run is actually set in: its named character style with its own overrides
+    /// folded on top, field by field (spec 0065).
+    ///
+    /// **One function, because its consumers must not be able to disagree about precedence.** The
+    /// layout engine derives a run's ink, format and baseline shift from this; preflight derives the
+    /// colour it has to check from it (spec 0081). A preflight that resolved a run's colour its own
+    /// way could read `run.style.color` and miss the named style's — which is exactly the defect
+    /// 0081 fixed, and exactly the reason a second implementation of this may not exist.
+    ///
+    /// A name that resolves to nothing is not an error: the run lays out with the paragraph's
+    /// treatment and its own overrides still apply, which is the posture specs 0028 and 0054 both
+    /// take.
+    pub fn resolve_run(&self, run: &Run) -> CharacterStyle {
+        run.character
+            .as_deref()
+            .and_then(|name| self.character(name))
+            .unwrap_or(CharacterStyle::EMPTY)
+            .with(run.style)
+    }
+
     pub fn resolve(&self, block: &Block) -> ParagraphStyle {
         let named = match block {
             Block::Heading { style, level, .. } => {

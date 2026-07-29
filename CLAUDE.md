@@ -52,8 +52,13 @@ moves. `FORMAT_VERSION` stays **3** throughout: every model change is additive.
 will find it — `docs/pack-authoring.md` states it and why. A pack is *declarative* — templates, styles,
 component definitions and assets, no code — because an executable extension that emits geometry can emit
 geometry that is wrong, and every mechanism M3 built to make press errors visible assumes quill produced
-the geometry. `DefColor` has no RGB family at all, so a pack cannot even express a colour space PDF/X-1a
-forbids.
+the geometry. `DefColor` has no RGB family at all, so a **component definition** cannot express a colour
+space PDF/X-1a forbids — but a `.qpack` also carries a `StyleSheet`, whose `character` map holds a full
+`Color`, and templates whose master statics do too, so a *pack* can express RGB by two routes that
+`DefColor` does not govern. What makes that safe is not the model's vocabulary but the checker's reach:
+since spec 0081 every colour that reaches the page is checked at one exhaustive enumeration
+(`PlacedBlock::inks`), so an illegal colour arriving by any route — authored, styled, packed or
+templated — is a preflight error rather than a silently blackened glyph.
 
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before

@@ -89,6 +89,7 @@ Numbering is sequential (`NNNN-short-slug.md`). Status is one of: `draft`, `acce
 | 0078 | [The index: marked terms, collated, page-ranged](0078-index.md) | M6 | implemented |
 | 0079 | [A book: several chapters, one press file](0079-book.md) | M6 | implemented |
 | 0080 | [The forced page break: a chapter opens a page, and opens it on the right one](0080-page-breaks.md) | M6 | implemented |
+| 0081 | [Every colour that reaches the page is checked](0081-colour-preflight.md) | M7 | implemented |
 
 Related: the open file-format specification lives in [`../docs/format-spec.md`](../docs/format-spec.md),
 and the content-pack authoring guide in [`../docs/pack-authoring.md`](../docs/pack-authoring.md).
