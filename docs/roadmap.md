@@ -21,7 +21,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
 | **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **complete** — specs 0072–0079 shipped plus the closeout **0080**; **0075 went out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature. 0079 closed the feature list by *not* breaking the one-`Document` assumption in four crates: a book composes to one `Document`, and the fixpoint cost the audit feared measures 3 passes and is indifferent to chapter count. 0080 then closed the milestone's one recurring absence — a forced page break, named as a non-goal by 0072, 0073 and 0079 — so a chapter opens a page, and opens it on the recto if the book asks |
-| **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
+| **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | **decomposed** into specs 0081–0089; none built. 0081/0082 fix four defects the audit found in the colour and image paths |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
 application second.** Game books are the flagship use case; every mechanism must be one a cookbook,
@@ -2960,6 +2960,171 @@ master, prints its folio and its running head, and **consumes a page number**, w
 folio after it would be one out. `BOOK_VERSION` 2 is the document chain's rule applied to the book
 envelope, and it fills the first arm of the chain 0079 left empty.
 
+## M7 increments
+
+Decomposed 2026-07-28 by the audit method that set M5's and M6's contents. It re-priced two of the
+six in opposite directions, found that M7 has **no single load-bearing gap** — which is itself the
+finding — and turned up **four defects that ship today**, all in the colour and image paths, which
+have had the least attention since M0.
+
+| # | Increment | Size |
+|---|---|---|
+| 0081 | every colour that reaches the page is checked | small |
+| 0082 | what the image path gets wrong | small |
+| 0083 | named colours and spot separations | medium |
+| 0084 | image-format breadth | medium |
+| 0085 | frame fitting and transforms | large |
+| 0086 | anchored objects | medium |
+| 0087 | vector primitives | medium |
+| 0088 | text runaround | large |
+| 0089 | gradients, transparency, blend modes, and PDF/X-4 | large |
+
+### What the audit found
+
+**M7 has no single load-bearing gap, and that is a structural difference from M5 and M6.** Each of
+those had one absence with most of the milestone downstream — no styled run, no section. M7 has
+**three independent axes**, each load-bearing for two of the six:
+
+1. **`Color` cannot name anything.** Blocks spot colours entirely and the colour half of gradients.
+   The enum change is small; what it gates is the **page resource dictionary, which can hold only
+   fonts and XObjects**. That is the closest thing M7 has to a shared gap, and it is a *writer* gap,
+   not a model gap — which is why 0083 comes before 0089 and hands it over built.
+2. **There is no placed object independent of the flow, for content.** There is one for *furniture*
+   (`MasterStatic`, page-anchored) and two block-anchored side-tables (`Section`, `PageBreak`). What
+   does not exist is the union: geometry anchored to a **block** and placed **absolutely**. Both
+   halves already exist separately, so this is a composition, not an invention.
+3. **Nothing carries a transform.** And adding one is *not* additive to spec 0069's contract: "the
+   frame is the ink" is a rectangle in page space, and a rotated object's ink box is its rotated
+   bounds. So either `PlacedBlock` grows a matrix *and* `frame` becomes the transformed bounds —
+   keeping `intrudes` and `under_dpi` honest — or the transform folds into the geometry at placement.
+   **That decision must be made once, up front**, because both press checks read `frame`.
+
+**Spot colours are cheaper than this file assumed.** Ranked fourth of six by "how often its absence
+stops a real book", and `CLAUDE.md` implies the colour model is a fortress. A fourth `Color` variant
+has a **six-site, entirely compiler-enforced blast radius**; it touches no measurement, no
+fingerprint and no flow term, and `Measured`/`PlacedBlock`/`PaintOp` need no new variants at all,
+because a spot colour *is* a `Color` and every producer already carries one. The real work is one
+writer feature plus one written-down decision about ink accounting.
+
+**Text runaround is far more expensive than this file assumed**, and the sentence that got it wrong
+is *"this changes the flow model rather than adding to it"*. It is not a flow-model change; it is a
+**measurement-model** change, and it breaks four gates, three of them checked exactly:
+
+- it puts vertical position into what a paragraph measures, which `Measured::break_items` says
+  "would make the measurement cache wrong";
+- it converts Knuth-Plass from one node per start item to one node per (start, line-count) pair,
+  invalidating the substructure argument;
+- it invalidates spec 0051's pruning monotonicity — the change that took a 20,000-word paragraph
+  from 49.7 s to 4.4 ms, gated by `length_scaling_ratio` and `pathological_20k_words_ms`;
+- it breaks `incremental_blocks_measured`, whose comment names this failure by name.
+
+**Anchored objects were grouped with it and must be priced separately and far lower** — they are a
+`Section`-shaped anchor plus a `MasterStatic`-shaped placement, and both shipped already.
+
+**A footnote band is NOT the same mechanism as a runaround**, and this is the audit's sharpest single
+answer. A band reduces **one scalar, at the frame's foot, after measurement** — spec 0077's own doc
+comment says so in as many words, and the whole of its contact with the flow is one subtraction. A
+runaround reduces **the measure, as a function of vertical position, before and during measurement**.
+They reduce usable space in the same English sentence and in nothing else. **Anything reasoning
+"footnotes already changed the flow, so runaround is the same kind of change" is reaching for the
+wrong precedent** — 0077 went to considerable lengths (the band, the throwaway-copy reserve, the
+carry) specifically *to avoid* becoming what a runaround is.
+
+**Three of the six look new and are not.** Vector primitives: `PlacedBlock::Rect` and béziers via
+`PathCmd` already ship; what is new is the *stroker* and the ink-box rule for a stroked path — the
+index's shape exactly, mostly existing parts with one genuinely new pure piece. Anchored objects: a
+composition of two shipped patterns. Fit modes: **two different fit rules already ship**, so naming
+them is partly a rationalisation, and the master-static stretch is arguably a bug being formalised.
+
+**What has no analogue anywhere:** a per-line variable measure; a transform; a colour that is not a
+device colour; a stroked path; **a source colour space that is neither sRGB nor the OutputIntent**
+(`RgbToCmyk::from_output_profile` hardcodes sRGB, and TIFF/PSD bring embedded profiles — the one
+nobody had named); and a version-conditional press check.
+
+### M7 sequencing rationale
+
+**0081 and 0082 first, because they fix what already ships**, and because they are in the two paths
+every later increment builds on. This is 0075's precedent: a live defect outranks a new feature.
+
+**0083 before 0089**, because the two share the missing page-resource-dictionary machinery and spot
+colours are the cheaper way to build it. Gradients then inherit a resource category that already
+works, rather than inventing one alongside a conformance change.
+
+**0085 before 0086 and 0087**, because the transform decision (axis 3) is read by two press checks
+and must be made once. An anchored object or a stroked path landing first would force the answer by
+accident.
+
+**0086 before 0088**, because runaround needs something to flow around, and because pricing them
+apart is the audit's finding — bundling them would hide a cheap increment inside the milestone's most
+expensive one.
+
+**0088 late**, and it owes explicit answers to all four gates above, plus the three doc-comment
+defences that now point at `incremental_blocks_measured`. **0089 last**, because it is the item that
+changes what conformance quill can claim, and that deserves to be argued on its own.
+
+### M7 increment detail
+
+Deliberately short. A decomposition nine deep is one whose later entries will be wrong; what belongs
+here is the ordering argument and the constraint each increment must respect.
+
+#### 0081 every colour that reaches the page is checked
+
+Closes known issues A and B below. Small, and it is press-correctness rather than a feature.
+
+#### 0082 what the image path gets wrong
+
+Closes C and D. The asset-invalidation half is one entry in `context_fingerprint`'s argument list —
+the cheapest correctness fix in the audit — and it matters for M7 specifically, because every fit
+mode, crop and transform makes more of the page geometry a function of asset metadata.
+
+#### 0083 named colours and spot separations
+
+A named swatch resolving at export to a separation, with ink coverage accounting for it. Builds the
+page resource dictionary's `/ColorSpace` category and a tint-transform function object. **The ink
+decision is the written-down part**: a spot is not process ink, so what it contributes to the 240%
+limit is a policy, not an arithmetic.
+
+#### 0084 image-format breadth
+
+TIFF and PSD are what art arrives as; SVG is what a logo arrives as and is a different mechanism —
+say whether it is in scope. **Each decoder must respect spec 0012's posture**: a colour space that
+cannot be disambiguated is skipped loudly, never guessed. This is the increment that meets the
+embedded-profile gap, since `RgbToCmyk` hardcodes sRGB as its source.
+
+#### 0085 frame fitting and transforms
+
+Fill, fit, centre, crop; rotate and scale. **Make the axis-3 decision first and state it**, because
+`intrudes` and `under_dpi` both read `frame`. Two fit rules already ship and one of them stretches a
+master static without preserving aspect — decide whether that is a rule or a defect. Likely the first
+change since spec 0047 to move `TEMPLATE_VERSION`.
+
+#### 0086 anchored objects
+
+The pull-quote and the figure that travels with its paragraph. `PageBreak`'s doc comment is a
+ready-made argument for where it lives and why it must not be a field on `Block` — it inherits the
+dangling-anchor posture and the `context_fingerprint` home. `BreakKind::{Recto, Verso}` already
+answers "this plate must face its opener" with no new mechanism.
+
+#### 0087 vector primitives
+
+Lines, polygons and béziers, with spec 0037's rules for rectangles. The new machinery is the
+**stroker** — `stroke_rect` deliberately avoids it today and no join/cap/miter policy exists on
+either side — and the ink-box rule for a stroked path, which spec 0069 makes a real question.
+
+#### 0088 text runaround
+
+Text that flows around an anchored object. Owes an explicit answer to each of the four gates above,
+and must not reach for the footnote band as precedent. If the honest answer is that the measurement
+cache cannot survive it as designed, **that is a finding and belongs in the spec**, not a workaround.
+
+#### 0089 gradients, transparency, blend modes, and PDF/X-4
+
+Last, because it changes what conformance quill can claim: PDF/X-1a requires flattening, so live
+transparency implies the X-4 path. The identification half is already a parameterised seam
+(`build_xmp` takes an `Option<PdfxVersion>`), but it is not independently shippable from the content
+half. Introduces the first **version-conditional** press check — `preflight` has never matched on
+`PdfxVersion`.
+
 ## Known issues
 
 Found by the work, not yet fixed. Recorded so they are decided on rather than forgotten. An entry
@@ -2968,7 +3133,63 @@ defect — which is why the four entries M3 opened with are gone, and why both e
 gone too: specs 0059 and 0060 shipped them, and why the collector's token entry is gone — spec 0074
 closed it structurally rather than narrowing it a second time, and why the chapter-run-on entry is
 gone — spec 0080 shipped the forced page break all three of its sightings were asking for. The
-entries below are what M4 and M6 found in their place.
+entries below are what M4 and M6 found in their place, plus the four M7's audit found — **all of
+them in the colour and image paths, which have had the least attention since M0, and three of them
+press-correctness**. Sequenced as specs 0081 and 0082, ahead of every M7 feature.
+
+- **(A) A master static's colour is never checked, so an over-inked folio prints on every page.**
+  `preflight()` walks `doc.content` and nothing else, so master pages are never visited.
+  `preflight_pages()` — added by spec 0037 precisely because "colour checks on the model cannot see
+  geometry the engine synthesized" — does walk `statics.chain(blocks)`, but its colour loop opens by
+  `continue`-ing on anything that is not a `PlacedBlock::Rect`, and a `MasterStatic::Text` becomes a
+  `PlacedBlock::Text`.
+
+  So a running head at CMYK 90/90/90/90 — **360% ink** — passes preflight with zero findings and is
+  emitted at 360% on every page its master governs. That is the exact scenario spec 0037 was written
+  to prevent, one variant over. The RGB case is milder and worse-documented: the writer turns it
+  silently black under a comment saying "preflight rejects RGB before export, so `Rgb` is unreachable
+  here", **which is false for a master static**.
+
+  Reachable in practice, not theoretically: master statics are authored in `document.json`,
+  user-authored templates carry `master_pages` and validate versions and trims but never colours, and
+  a `.qpack` carries templates. No test in the repo gives a master static an illegal colour.
+
+- **(B) A character style's colour is never checked, and this falsifies a claim in `CLAUDE.md`.** The
+  run half of the colour check reads each run's *direct* override and skips runs that have none — but
+  the colour that reaches the page is the *resolved* one, folding the named character style. None of
+  the four bundled styles carries a colour, so no shipped document trips it; a document, template or
+  pack that defines one escapes preflight entirely.
+
+  `CLAUDE.md` says "`DefColor` has no RGB family at all, so a pack cannot even express a colour space
+  PDF/X-1a forbids." True of `DefColor` — but a `.qpack` also carries a `StyleSheet`, whose character
+  map holds full `Color` including RGB, and templates whose master statics do too. **A pack can
+  express RGB by two routes, and (A) means one of them reaches the press file.** The sentence in
+  `CLAUDE.md` is corrected when 0081 makes it true again.
+
+- **(C) Editing an `Asset` invalidates nothing, so a relinked image serves stale pages.**
+  `image_size` reads `px_w`/`px_h`/`dpi`, and those set the placed height and therefore every page
+  break after it. But `content_fingerprint`'s image arm hashes only the id string, `doc.assets` is
+  absent from `context_fingerprint`'s argument list, and `doc.revision` is never consulted — so
+  correcting a dpi or relinking to a differently-shaped file reads as "nothing changed" and
+  `relayout` returns the previous pages verbatim. The three session tests that touch assets all
+  *clear* them; nothing exercises mutation.
+
+  The fix is one entry in a `format!` — the cheapest correctness fix in the audit — and it matters
+  most for M7, because every fit mode, crop and transform makes more of the page geometry a function
+  of asset metadata, and this is the invalidation path all of it flows through.
+
+- **(D) Image alpha is discarded rather than flattened, and the warning text says the opposite.** The
+  preflight string promises the asset "will be flattened to opaque for PDF/X". What happens is that
+  the alpha channel is dropped and the RGB *underneath* it is converted — no composite against white,
+  no matte, no `/SMask`. PNG places no constraint on the colour stored under `alpha = 0` and many
+  encoders write `(0,0,0,0)`, which converts to **solid black**. So a logo with a transparent surround
+  plausibly exports as a black rectangle, in a press file, under a *Warning* whose text asserts the
+  opposite behaviour.
+
+  The behaviour is consistently *described* as "alpha is dropped" in specs 0005, 0007 and 0010, so it
+  is deliberate — but no spec states the resulting colour, no test asserts it, and the string promises
+  compositing. Whichever way 0082 resolves it, the warning text is wrong today. It also only fires
+  when the author sets `has_alpha` by hand.
 
 - **A composite whose single authored *run* wraps taller than a frame is still placed whole and
   overflows.** Spec 0075's named residual, and the floor of the mechanism rather than a miss: a
