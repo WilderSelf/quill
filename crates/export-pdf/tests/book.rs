@@ -11,9 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use quill_core_model::{
-    install, Block, BlockId, Book, BookChapter, Color, Document, Folio, MasterPage, MasterStatic,
-    Metadata, NumberFormat, PackManifest, PackRequirement, PageOverride, ParagraphStyle, Qpack,
-    Rect, Run, Section, TextAlign,
+    install, Block, BlockId, Book, BookChapter, BreakKind, Color, Document, Folio, MasterPage,
+    MasterStatic, Metadata, NumberFormat, PackManifest, PackRequirement, PageOverride,
+    ParagraphStyle, Qpack, Rect, Run, Section, TextAlign,
 };
 use quill_export_pdf::{export, lay_out_for_press, ExportOptions};
 use quill_layout_engine::{heading_index, section_starts, LaidOutPage, LayoutSession, PlacedBlock};
@@ -91,6 +91,7 @@ fn book(names: &[&str]) -> Book {
                 name: (*n).to_string(),
                 folio: None,
                 master: None,
+                break_before: BreakKind::default(),
             })
             .collect(),
     }
@@ -163,22 +164,32 @@ fn two_chapters_compose_into_one_page_vector_with_continuous_folios() {
         .compose(&[one, two.clone()])
         .expect("compose");
     let pages = lay_out_for_press(&composed.document, &ExportOptions::default()).expect("layout");
-    // A chapter does **not** start on a new page: the model has no forced page break anywhere, which
-    // specs 0072 and 0073 both named as a non-goal and which this increment names as its principal
-    // residual. So the book is at most its chapters' pages and may be one fewer per boundary, where
-    // chapter 2 begins on the page chapter 1 ended on.
-    assert!(
-        pages.len() <= alone_one.len() + alone_two.len()
-            && pages.len() >= alone_one.len() + alone_two.len() - 1,
-        "{} pages from {} + {}",
+    // **A chapter starts on a new page** (spec 0080). This was spec 0079's principal residual and
+    // is no longer true of the composed book: `compose` gives every chapter a `PageBreak`, so the
+    // book is exactly its chapters' pages — no boundary page is shared, and none is inserted, this
+    // book asking for `Page` rather than `Recto`.
+    assert_eq!(
         pages.len(),
+        alone_one.len() + alone_two.len(),
+        "a chapter that opens a page neither shares one nor invents one"
+    );
+
+    // …and chapter 2 has that page to itself: nothing of chapter 1 is on it.
+    let first_of_two = page_of(&pages, composed.chapter_anchors[1].expect("anchor"));
+    assert_eq!(
+        first_of_two,
         alone_one.len(),
-        alone_two.len()
+        "chapter 2 opens on the page after chapter 1's last"
+    );
+    assert!(
+        body_text(&pages[first_of_two]).starts_with("The Sunken Vault"),
+        "the chapter opener is the first thing on its page, not the tail of the chapter before \
+         it: {:?}",
+        body_text(&pages[first_of_two])
     );
 
     // The claim: chapter 2's opening page carries the number the page before it implies — its
     // numbering continues chapter 1's rather than restarting.
-    let first_of_two = page_of(&pages, composed.chapter_anchors[1].expect("anchor"));
     assert!(first_of_two > 0, "chapter 2 is not on page one of the book");
     let implied: usize = statics_text(&pages[first_of_two - 1])[0]
         .parse::<usize>()
@@ -519,6 +530,71 @@ fn a_book_exports_one_pdf_with_one_output_intent() {
         "one catalogue, therefore one document"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **A book whose chapters open on the recto** (spec 0080): the blank page a parity break inserts
+/// is a real page — it takes its master's furniture and it consumes a page number.
+///
+/// The folio assertion is the one that would be a printed defect rather than a cosmetic one: an
+/// inserted page that did not consume a number would leave every folio after it one out, for the
+/// whole book, with nothing to say so.
+#[test]
+fn a_recto_opener_inserts_a_blank_page_that_still_carries_its_folio() {
+    let mut b = book(&["one", "two"]);
+    b.chapters[1].break_before = BreakKind::Recto;
+    let one = chapter("The Ruined Keep", 40);
+    let two = chapter("The Sunken Vault", 40);
+    let alone_one = lay_out_for_press(&one, &ExportOptions::default()).expect("layout");
+    let composed = b.compose(&[one, two]).expect("compose");
+    let pages = lay_out_for_press(&composed.document, &ExportOptions::default()).expect("layout");
+
+    let opener = page_of(&pages, composed.chapter_anchors[1].expect("anchor"));
+    assert!(
+        quill_core_model::is_recto(opener, true),
+        "a chapter that asks for a recto gets one: {opener}"
+    );
+
+    assert!(
+        body_text(&pages[opener]).starts_with("The Sunken Vault"),
+        "and has that page to itself: {:?}",
+        body_text(&pages[opener])
+    );
+
+    // The fixture must actually exercise the insertion rather than happen to land right.
+    if opener > alone_one.len() {
+        assert_eq!(opener, alone_one.len() + 1, "exactly one page inserted");
+        let blank = &pages[opener - 1];
+        assert!(
+            blank.blocks.is_empty(),
+            "the inserted page carries no content"
+        );
+        assert_eq!(
+            statics_text(blank),
+            vec![opener.to_string()],
+            "…and prints the folio its position implies"
+        );
+    }
+
+    // Whether or not a page was inserted: every folio, once, in order. A blank page that consumed
+    // no number would repeat one here.
+    let printed: Vec<String> = pages.iter().flat_map(statics_text).collect();
+    assert_eq!(
+        printed,
+        (1..=pages.len()).map(|n| n.to_string()).collect::<Vec<_>>(),
+    );
+
+    // And it still exports as one press file.
+    let dir = tmp_dir("recto");
+    let icc = dir.join("out.icc");
+    fs::write(&icc, quill_export_pdf::synth_cmyk_profile()).expect("icc");
+    let opts = ExportOptions {
+        output_intent_icc: icc.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    export(&composed.document, &opts, &mut bytes).expect("export");
+    assert!(bytes.starts_with(b"%PDF-"));
     let _ = fs::remove_dir_all(&dir);
 }
 

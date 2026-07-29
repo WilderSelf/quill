@@ -1966,7 +1966,24 @@ mod tests {
     /// `DocumentID`/`InstanceID` (offsets 1510..1542 and 1588..1620) or the trailer `/ID`
     /// (8361..8393 and 8396..8428) — the same four regions 0076 and 0077 moved. Zero differing
     /// bytes outside them, so no content stream, font, ICC or metadata stream moved.
-    const SAMPLE_EXPORT_DIGEST: u64 = 0x9afe_bed8_dc72_2a3e;
+    /// Changed again by spec 0080, **identifier-only** a fifth time, and this one has exactly one
+    /// candidate cause — which is stated so the shape is checked rather than pattern-matched off
+    /// 0078. `FORMAT_VERSION` became 10, so `doc.to_json()` differs by one character and the `/ID`
+    /// hashed from it moves. Nothing else spec 0080 added can reach this file: the sample states no
+    /// break, so `breaks` is `skip_serializing_if`-omitted from the manifest entirely, the flow's
+    /// break index is empty and is consulted once per block to no effect, no page is inserted, the
+    /// collector is untouched (an inserted page draws furniture the collector already carries, and
+    /// there is no inserted page here anyway), and the flow takes the single pass it always did.
+    /// `StyleSheet::default()` did **not** gain an entry this time, which is the one difference from
+    /// 0077's and 0078's moves.
+    ///
+    /// Verified rather than accepted, on the same pair of files the ledger always uses — the sample
+    /// exported against the committed parity ICC on a build of `main` (743ea77) and on this one.
+    /// **8454 bytes both sides**, 128 differing bytes in **4 runs**, and every run inside the XMP
+    /// `DocumentID`/`InstanceID` (offsets 1510..1542 and 1588..1620) or the trailer `/ID`
+    /// (8361..8393 and 8396..8428) — the same four regions 0076, 0077 and 0078 moved. Zero
+    /// differing bytes outside them, so no content stream, font, ICC or metadata stream moved.
+    const SAMPLE_EXPORT_DIGEST: u64 = 0x67f4_3eff_e797_f120;
 
     /// Byte offsets of the ICC header's `dateTimeNumber` field (ICC.1 spec, header bytes 24..36).
     const ICC_DATETIME: std::ops::Range<usize> = 24..36;
@@ -2740,6 +2757,116 @@ mod tests {
                 "{ch:?} is printed by a master static but was never collected"
             );
         }
+    }
+
+    /// **A blank page is still a page, and it still draws furniture** (spec 0080).
+    ///
+    /// The subset question this increment owes. A page inserted to reach a recto carries no content
+    /// at all, and yet its master prints a folio, a section name and a running head on it — so the
+    /// honest question is whether an inserted page is a *new path* to the collector, in the sense
+    /// specs 0076, 0077 and 0078 each found one. It is not, and the reason is structural:
+    /// `StaticToken::contributes` is deliberately not conditioned on where anything landed, so it
+    /// already carries every section name and every folio alphabet whether or not a given page
+    /// exists. This asserts the consequence end to end rather than the argument — an inserted page
+    /// is laid out through the real press path and every character it prints is checked against what
+    /// the collector carried.
+    #[test]
+    fn a_page_inserted_for_a_recto_break_draws_only_characters_the_collector_carried() {
+        use quill_core_model::{
+            Block, BreakKind, Folio, MasterPage, MasterStatic, NumberFormat, PageBreak,
+            Rect as MRect, Section,
+        };
+
+        let mut doc = Document::sample();
+        doc.assets.clear();
+        doc.content = vec![Block::heading(1, "Þorn ß Œ Ð", Color::Gray { v: 0.0 })];
+        doc.content.extend((0..40).map(|i| {
+            Block::body(
+                format!("paragraph {i} with enough words in it to occupy a line or so of text"),
+                Color::Gray { v: 0.0 },
+            )
+        }));
+        doc.content
+            .push(Block::heading(1, "Ħǽþ Ŋ", Color::Gray { v: 0.0 }));
+        doc.content.extend((0..40).map(|i| {
+            Block::body(
+                format!("second chapter paragraph {i}, of much the same length as the others"),
+                Color::Gray { v: 0.0 },
+            )
+        }));
+        doc.next_block_id = 0;
+        doc.assign_missing_block_ids().expect("fresh ids");
+        let second = doc.content[41].id();
+        doc.sections = vec![Section {
+            name: "Æther Ø".into(),
+            start: second,
+            master: None,
+            folio: Some(Folio {
+                format: NumberFormat::LowerRoman,
+                restart_at: Some(1),
+            }),
+        }];
+        doc.breaks = vec![PageBreak {
+            before: second,
+            kind: BreakKind::Recto,
+        }];
+        let base = doc.master_pages.first().cloned();
+        doc.master_pages = vec![MasterPage {
+            name: "body".into(),
+            columns: base.as_ref().map_or(1, |m| m.columns),
+            gutter_pt: base.as_ref().map_or(0.0, |m| m.gutter_pt),
+            margins: base.map(|m| m.margins).unwrap_or_default(),
+            statics: vec![MasterStatic::Text {
+                rect: MRect {
+                    x_pt: 0.0,
+                    y_pt: 0.0,
+                    w_pt: 400.0,
+                    h_pt: 12.0,
+                },
+                text: "{section} · {heading:1} · {page}".into(),
+                color: Color::Gray { v: 0.0 },
+                style: None,
+                align: Default::default(),
+                mirror: false,
+            }],
+        }];
+        doc.default_master = Some("body".into());
+        doc.pages.clear();
+
+        let carried: BTreeSet<char> = collect_doc_faces(&doc)
+            .into_values()
+            .flat_map(|t| t.chars())
+            .collect();
+        let pages = lay_out_for_press(&doc, &ExportOptions::default()).expect("press layout");
+        let blank: Vec<&quill_layout_engine::LaidOutPage> =
+            pages.iter().filter(|p| p.blocks.is_empty()).collect();
+        assert_eq!(
+            blank.len(),
+            1,
+            "the fixture exists to insert exactly one blank page; it inserted {}",
+            blank.len()
+        );
+
+        let mut printed = String::new();
+        for stat in &blank[0].statics {
+            if let quill_layout_engine::PlacedBlock::Text { lines, .. } = stat {
+                for line in lines {
+                    printed.push_str(&line.text);
+                }
+            }
+        }
+        assert!(
+            !printed.is_empty(),
+            "a blank page still takes its master's furniture; this one drew nothing"
+        );
+        for ch in printed.chars() {
+            assert!(
+                carried.contains(&ch),
+                "{ch:?} is printed on an inserted blank page but was never collected"
+            );
+        }
+        // And the glyphs really draw: `drawn_gids` panics on any `.notdef`.
+        assert_eq!(drawn_gids(&carried, &printed), printed.chars().count());
     }
 
     /// A latent instance of the same class, found by spec 0076 while auditing every site that draws

@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::container::safe_relative_path;
 use crate::{
-    Block, BlockId, Document, Folio, LoadError, MasterStatic, Metadata, PackRequirement, PageSetup,
-    RunSource, Section, Tpub,
+    Block, BlockId, BreakKind, Document, Folio, LoadError, MasterStatic, Metadata, PackRequirement,
+    PageBreak, PageSetup, RunSource, Section, Tpub,
 };
 
 /// The book-file format version.
@@ -41,7 +41,13 @@ use crate::{
 /// [`crate::TEMPLATE_VERSION`] and [`crate::PACK_VERSION`], and deliberately gated by a function
 /// written arm for arm with the other two — `version.rs` already says why a third differently-shaped
 /// gate would be a third thing to get wrong, and a fourth is worse.
-pub const BOOK_VERSION: u32 = 1;
+///
+/// **2** since spec 0080 gave a chapter a [`BookChapter::break_before`]. The bump is the same rule
+/// the document chain follows, applied to the book envelope: a v1 build handed a book that says
+/// `"break_before": "recto"` drops the key as unknown, opens every chapter on whichever side the
+/// flow happened to reach, and says nothing. Refusing the file is loud; setting the book wrongly is
+/// not. The migration is a structural no-op — see `migrate_book`.
+pub const BOOK_VERSION: u32 = 2;
 
 /// One chapter of a book: a `.tpub` and what the book says about it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +79,26 @@ pub struct BookChapter {
     /// every document built from a bundled template carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master: Option<String>,
+    /// The page this chapter opens on (spec 0080).
+    ///
+    /// **Defaults to [`BreakKind::Page`], and that default is the increment's payoff**: a book
+    /// composed from chapters reads as a book without stating anything, where before spec 0080 every
+    /// chapter began halfway down the page the previous one ended on. `Recto` is the house style a
+    /// printed book usually wants and is what "start this section on the next recto" asks for;
+    /// `None` declines the break, for a book whose parts genuinely run on.
+    ///
+    /// It is stated per chapter rather than once for the book because a book's front matter, its
+    /// body chapters and its appendices routinely differ — and because the book file is where a
+    /// chapter's other *positional* decisions (its folio, its opening master) are already stated.
+    ///
+    /// The first chapter's break costs nothing whatever it says: page 0 has received no content, and
+    /// a break at the top of a page the flow has not written to is a no-op.
+    #[serde(default, skip_serializing_if = "is_page_break")]
+    pub break_before: BreakKind,
+}
+
+fn is_page_break(kind: &BreakKind) -> bool {
+    *kind == BreakKind::Page
 }
 
 /// A book file (spec 0079): plain JSON naming the chapters that compose into one press file.
@@ -308,6 +334,7 @@ impl Book {
             pages: Vec::new(),
             sections: Vec::new(),
             footnotes: Vec::new(),
+            breaks: Vec::new(),
             components: BTreeMap::new(),
             requires: self.requires.clone(),
         };
@@ -386,14 +413,31 @@ impl Book {
             // Used deliberately: a chapter that restarts its own numbering on its own first page
             // would print a second page 1 inside a book.
             out.sections.append(&mut ch.sections);
+            // The chapter's own breaks travel with it, rebased like every other anchor; the book's
+            // break for the chapter's opening block is appended after them, so a book that states
+            // `recto` wins over a chapter that states `page` for its own first block by the same
+            // "later authored wins" tie-break the sections use.
+            out.breaks.append(&mut ch.breaks);
             let anchor = ch.content.first().map(|b| b.id());
             match anchor {
-                Some(start) => out.sections.push(Section {
-                    name: entry.name.clone(),
-                    start,
-                    master: opener,
-                    folio: entry.folio,
-                }),
+                Some(start) => {
+                    out.sections.push(Section {
+                        name: entry.name.clone(),
+                        start,
+                        master: opener,
+                        folio: entry.folio,
+                    });
+                    // **The chapter opens a page** (spec 0080) — the residual spec 0079 named, and
+                    // the reason a composed book now reads as a book rather than as one long run of
+                    // text. Anchored to the same block the section is, because "the chapter's
+                    // opening page" is one statement and it should not be expressible two ways.
+                    if entry.break_before.is_break() {
+                        out.breaks.push(PageBreak {
+                            before: start,
+                            kind: entry.break_before,
+                        });
+                    }
+                }
                 None => notes.push(BookNote::EmptyChapter { chapter: i }),
             }
             anchors.push(anchor);
@@ -511,6 +555,13 @@ fn rebase_block_ids(doc: &mut Document, base: u64) -> u64 {
     for section in &mut doc.sections {
         shift(&mut section.start);
     }
+    // A break is anchored to a block exactly as a section is, so it shifts with it (spec 0080).
+    // Missing this would not be silent — the break would name a block another chapter now owns, and
+    // the page would start in the wrong place — but it is the same class of hazard as an unrebased
+    // cross-reference, which is why it sits directly beside the sections it mirrors.
+    for br in &mut doc.breaks {
+        shift(&mut br.before);
+    }
     // The chapter's own high-water mark matters as much as the ids in use: an id handed out and then
     // deleted must not be handed out again by the book, for `BlockId`'s stated reason — reusing the
     // id of a deleted block would hand a stale cache entry to a new one.
@@ -598,6 +649,7 @@ mod tests {
                     name: format!("Chapter {i}"),
                     folio: None,
                     master: None,
+                    break_before: BreakKind::default(),
                 })
                 .collect(),
         }
@@ -885,6 +937,123 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The payoff of spec 0080, at the composition site**: a chapter opens a page.
+    ///
+    /// The `Section` says where the chapter is and what master opens it; the `PageBreak` says the
+    /// page is the chapter's own. Both anchored to the same block, because "the chapter's opening
+    /// page" is one statement.
+    #[test]
+    fn each_chapter_gets_a_break_anchored_to_the_block_its_section_is() {
+        let composed = book_of(3)
+            .compose(&[chapter(&["One"]), chapter(&["Two"]), chapter(&["Three"])])
+            .expect("compose");
+        let breaks: Vec<BlockId> = composed.document.breaks.iter().map(|b| b.before).collect();
+        let anchors: Vec<BlockId> = composed.chapter_anchors.iter().flatten().copied().collect();
+        assert_eq!(breaks, anchors, "one break per chapter, on its first block");
+        assert!(composed
+            .document
+            .breaks
+            .iter()
+            .all(|b| b.kind == BreakKind::Page));
+        for (section, br) in composed
+            .document
+            .sections
+            .iter()
+            .zip(&composed.document.breaks)
+        {
+            assert_eq!(section.start, br.before);
+        }
+    }
+
+    #[test]
+    fn a_book_may_ask_for_a_recto_opener_or_decline_the_break() {
+        let mut book = book_of(3);
+        book.chapters[1].break_before = BreakKind::Recto;
+        book.chapters[2].break_before = BreakKind::None;
+        let composed = book
+            .compose(&[chapter(&["One"]), chapter(&["Two"]), chapter(&["Three"])])
+            .expect("compose");
+        let third = composed.chapter_anchors[2].expect("anchor");
+        assert_eq!(
+            composed
+                .document
+                .breaks
+                .iter()
+                .map(|b| (b.before, b.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    composed.chapter_anchors[0].expect("anchor"),
+                    BreakKind::Page
+                ),
+                (
+                    composed.chapter_anchors[1].expect("anchor"),
+                    BreakKind::Recto
+                ),
+            ],
+            "a declined break is not written as a `None` entry, it is not written at all"
+        );
+        assert!(composed.document.breaks.iter().all(|b| b.before != third));
+    }
+
+    /// A chapter's *own* breaks are rebased with its ids, exactly as its sections and its
+    /// cross-references are. Missing this would point a break at a block another chapter owns.
+    #[test]
+    fn a_chapters_own_breaks_are_rebased_with_its_blocks() {
+        let mut a = chapter(&["One", "Two"]);
+        a.breaks = vec![PageBreak {
+            before: a.content[1].id(),
+            kind: BreakKind::Verso,
+        }];
+        let mut b = chapter(&["Three", "Four"]);
+        b.breaks = vec![PageBreak {
+            before: b.content[1].id(),
+            kind: BreakKind::Verso,
+        }];
+        let composed = book_of(2).compose(&[a, b]).expect("compose");
+        let ids: Vec<BlockId> = composed.document.content.iter().map(Block::id).collect();
+        let versos: Vec<BlockId> = composed
+            .document
+            .breaks
+            .iter()
+            .filter(|br| br.kind == BreakKind::Verso)
+            .map(|br| br.before)
+            .collect();
+        assert_eq!(versos.len(), 2, "one from each chapter");
+        assert_ne!(versos[0], versos[1], "and they cannot have collided");
+        for id in &versos {
+            assert!(
+                ids.contains(id),
+                "every break must name a block of the book"
+            );
+        }
+        // The second chapter's break names the *second* chapter's second block — index 5 of the
+        // composed content, four blocks of chapter one having gone before it — not the first
+        // chapter's, which is what an unrebased anchor would have named.
+        assert_eq!(versos[1], ids[5]);
+        assert_eq!(versos[0], ids[1]);
+    }
+
+    /// A book file written before spec 0080 loads, and its chapters get the break the default
+    /// states — which is what makes the increment reach books that already exist.
+    #[test]
+    fn a_v1_book_file_loads_and_its_chapters_open_a_page() {
+        let text = r#"{"book_version": 1, "chapters": [
+            {"path": "a.tpub", "name": "One"}, {"path": "b.tpub", "name": "Two"}]}"#;
+        let book = Book::from_json(text).expect("a v1 book must still load");
+        assert_eq!(book.book_version, BOOK_VERSION);
+        assert!(book
+            .chapters
+            .iter()
+            .all(|c| c.break_before == BreakKind::Page));
+        // …and it re-serializes without the key, so a book file's bytes do not move either.
+        let json = book.to_json().expect("serialize");
+        assert!(
+            !json.contains("break_before"),
+            "the default must not reach the file: {json}"
+        );
     }
 
     #[test]

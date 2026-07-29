@@ -353,6 +353,7 @@ mod tests {
                     name: format!("Chapter {i}"),
                     folio: None,
                     master: None,
+                    break_before: quill_core_model::BreakKind::default(),
                 })
                 .collect(),
         };

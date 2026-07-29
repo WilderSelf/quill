@@ -20,7 +20,7 @@ why the order is what it is. When an increment ships, its row moves to `implemen
 | **M3** | Pro polish + POD presets | **complete** — specs 0044–0053 shipped |
 | **M4** | Ecosystem — shareable component definitions and content packs | **complete** — specs 0054–0061 shipped |
 | **M5** | The general typographic core — the neutral core, inline runs, character styles, lists, tabs | **complete** — specs 0062–0071 shipped, the closeout 0068–0070 being the increments its two known issues turned into once they were measured. 0071 (compress content streams) was added by a measurement 0068 took, and shipped: the 500-page export is 9.5% of its pre-0068 size, and export size is now budget-gated |
-| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **complete** — specs 0072–0079 shipped; **0075 went out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature. 0079 closed it by *not* breaking the one-`Document` assumption in four crates: a book composes to one `Document`, and the fixpoint cost the audit feared measures 3 passes and is indifferent to chapter count |
+| **M6** | The long document — sections and folios, running heads, footnotes, cross-references, an index, a book | **complete** — specs 0072–0079 shipped plus the closeout **0080**; **0075 went out of sequence**, because it was the one increment that fixed defects already shipping rather than adding a feature. 0079 closed the feature list by *not* breaking the one-`Document` assumption in four crates: a book composes to one `Document`, and the fixpoint cost the audit feared measures 3 passes and is indifferent to chapter count. 0080 then closed the milestone's one recurring absence — a forced page break, named as a non-goal by 0072, 0073 and 0079 — so a chapter opens a page, and opens it on the recto if the book asks |
 | **M7** | Graphics and colour — image-format breadth, fitting and transforms, anchored objects and runaround, spot colours, vector primitives | named, not decomposed |
 
 **Quill is a general-purpose desktop publishing application first, and a TTRPG publishing
@@ -2496,8 +2496,10 @@ six features turned out to be priced wrongly in both directions.
 | 0077 | footnotes | large |
 | 0078 | the index | medium |
 | 0079 | a book | large |
+| 0080 | the forced page break (closeout) | medium |
 
-All eight shipped; the milestone is complete.
+All eight shipped, plus the closeout increment 0080 they turned out to owe; the milestone is
+complete.
 
 ### What the audit found
 
@@ -2881,10 +2883,82 @@ has no forced page break anywhere — specs 0072 and 0073 both named it a non-go
 reason — so chapter 2 begins on the page chapter 1 ended on. The numbering is still continuous and
 correct, and the contents list still sends a reader to the right page; what is missing is the recto
 opener, and with it the chapter-opener master landing on a page that no longer carries the previous
-chapter's tail. It is in known issues below. Also out of scope and stated: editing a book back out to
+chapter's tail. **Closed by the closeout increment 0080 below**, which is why it is no longer in
+known issues. Also out of scope and stated: editing a book back out to
 its chapters (a save path, needing the id rebase undone), and a per-chapter incremental session —
 which would be *less* incremental than what shipped, since one session resumes from the edited
 chapter's checkpoint and reuses every page before it.
+
+## M6 closeout increment (0080)
+
+One increment, added after 0072–0079 shipped, and it exists for the reason M5's closeout did: the
+milestone recorded a *consequence* as a known issue rather than building it, and the entry turned out
+to be the same entry three times.
+
+**0072 named it, 0073 named it again, 0079 named it as its principal residual.** "Start this section
+on the next recto" is a forced page break; so is "a chapter starts on a new page"; and so is the
+recto opener a printed book expects. One mechanism, three recorded requests — which is exactly the
+test this file applies to whether a thing is one increment or a patch. Building it inside
+`Book::compose`, where the symptom was most visible, would have been the first of two
+implementations.
+
+### 0080 page-breaks — **SHIPPED**
+
+Content resumes on a new page rather than in the current frame. `specs/0080-page-breaks.md`.
+`FORMAT_VERSION` **10**, `BOOK_VERSION` **2**.
+
+**A break is a property of a block, anchored to it — not a `Block` variant, and not a field on the
+block.** The variant was rejected because it expresses the wrong relation: a break belongs to the
+seam *in front of* a block, and a sibling block left behind by a deleted heading breaks the page in
+front of whatever moves up. The *field* was rejected on a sharper ground, and it is the one worth
+carrying: `MeasureKey` hashes a block's content, and **a break changes where a block goes, never what
+it measures** — so a field would re-break a paragraph, at the same width, to the identical line list,
+every time an author moved a chapter opener. Anchoring makes that unrepresentable rather than merely
+avoided. It is spec 0066's finding at a second site (a list is a paragraph property, not a block
+type), with the storage question answered the way `sections` and `footnotes` already answer it.
+
+**The `Section` deliberately gains no field**, even though 0072 and 0073 phrase the request as a
+section's. A section is a *named* thing — `Section::name` prints in a running head — so routing "this
+table starts a page" through one would force an author to invent a name for a break and then print
+it. "This section starts on a new page" is a break anchored to the block the section already anchors
+to: one statement, one place, and exactly what `Book::compose` synthesises.
+
+Four things worth carrying beyond the spec:
+
+- **What bounds a break, since spec 0044's invariants do not.** 0044 bounds a *cut* (non-empty
+  fragment, strictly increasing offset) and 0075 made those runtime assertions; a break is a **new
+  way to advance without consuming content**, and a blank page inserted for parity consumes none at
+  all. The bound is two page advances per break, asserted: each turn either reaches a page that has
+  received nothing or flips parity, and parity alternates. The break is evaluated once per block,
+  outside the placement loop, so the flow adds at most two pages per marked block — bounded by the
+  content, as the cut is.
+- **`FlowState` grew by nothing, and that is a design choice rather than luck.** The obvious rule —
+  "this break has been taken, do not take it again" — needs a field, and would have made resuming
+  from an inserted blank page's checkpoint *fill that page in*. Making the rule parity-aware instead
+  of stateful removes the need: resuming at a blank verso with a recto break finds the page
+  unsatisfying, advances one, and leaves it blank, which is what the full pass produced. Spec 0077's
+  question asked and answered with a zero.
+- **The two findings came from the defect-reintroduction pass, not from writing the code.** The
+  multi-column fixture was first written with the mark in the *second* column of a two-column page —
+  which sounds like the harder case and is the one arrangement that cannot tell a frame-advance from
+  a page-advance, and it passed against a deliberately frame-advancing build. And the
+  continuation guard (`split_at == 0`) is invisible to every test but the flow contract one: within a
+  pass the break is evaluated once per block, so the guard only bites on a **resume** into a
+  mid-block checkpoint, which a session never has to choose. Removing it left the whole suite green
+  until the resume-parity fixture grew a block tall enough to be cut *and* carrying a break. Spec
+  0077's lesson, repeating exactly: test the contract, not the chooser.
+- **It costs the fixpoint nothing**, because a break is forward-only rather than derived:
+  `layout.fixpoint_iterations` and `layout.book_fixpoint_iterations` both still measure **3**,
+  `book_chapter_ratio` still 1.0. A break in fact steadies the section fixpoint — 0072's oscillation
+  needs an anchor sitting between two masters' page capacities, and an anchor at the top of its own
+  page cannot be pushed off it.
+
+`Book::compose` gives every chapter a break, defaulting to `Page`, so a book that states nothing
+reads as a book; `break_before: "recto"` is the printed-book opener and inserts a blank page where
+one is needed; `"none"` declines it. A blank page is a page in every other respect — it takes its
+master, prints its folio and its running head, and **consumes a page number**, without which every
+folio after it would be one out. `BOOK_VERSION` 2 is the document chain's rule applied to the book
+envelope, and it fills the first arm of the chain 0079 left empty.
 
 ## Known issues
 
@@ -2892,8 +2966,9 @@ Found by the work, not yet fixed. Recorded so they are decided on rather than fo
 whose increment ships is deleted in that increment's PR, not left here as a fixed-but-still-listed
 defect — which is why the four entries M3 opened with are gone, and why both entries M3 *found* are
 gone too: specs 0059 and 0060 shipped them, and why the collector's token entry is gone — spec 0074
-closed it structurally rather than narrowing it a second time. The entries below are what M4 and M6
-found in their place.
+closed it structurally rather than narrowing it a second time, and why the chapter-run-on entry is
+gone — spec 0080 shipped the forced page break all three of its sightings were asking for. The
+entries below are what M4 and M6 found in their place.
 
 - **A composite whose single authored *run* wraps taller than a frame is still placed whole and
   overflows.** Spec 0075's named residual, and the floor of the mechanism rather than a miss: a
@@ -2905,19 +2980,6 @@ found in their place.
   is a different change from 0075's and was recorded rather than half-built.
   `a_stat_block_of_one_oversized_run_is_placed_whole` pins it, as its predecessor pinned the case
   0075 fixed.
-
-- **A chapter of a book does not start on a new page.** Spec 0079's named residual, and the milestone's
-  third sighting of the same absence: the model has no **forced page break** anywhere, which specs
-  0072 and 0073 each named as a non-goal when they met it. So a composed book numbers continuously and
-  correctly, its contents list sends a reader to the right page, and chapter 2 nevertheless begins
-  halfway down the page chapter 1 ended on — which also means a chapter-opener master is applied to a
-  page still carrying the previous chapter's tail.
-
-  Fixing it is a **flow-loop** change of spec 0077's risk class, not a composition one: the flow would
-  have to advance the page before a marked block when the current page is not empty, which touches
-  `FlowState`, the checkpoint/resume contract, fragmentation and the `frame_empty` guard at once. It
-  is also the mechanism "start this section on the next recto" needs, so it is one increment serving
-  three recorded requests rather than a patch for this one.
 
 - **A running head drops the inline emphasis inside a chapter title.** Spec 0074's named residual.
   `HeadingEntry::text` is flattened by `Block::plain_text`, so "The *Ruined* Keep" reaches a

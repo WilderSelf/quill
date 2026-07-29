@@ -19,7 +19,7 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M6 complete (specs 0072–0079 shipped).** M0 (headless PDF/X export) is
+**Status: M0–M6 complete (specs 0072–0080 shipped).** M0 (headless PDF/X export) is
 code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
 remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
 IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
@@ -205,6 +205,21 @@ otherwise have put a wrong page number in a press file silently. The fixpoint co
 `FORMAT_VERSION` stays **9** because there is no *document* an older build could be wrong about. The
 residual is named: the model still has no forced page break, so a chapter begins on the page the
 previous one ended on.
+**0080 then closed the milestone** as a closeout: the model had no **forced page break** anywhere, and
+0072, 0073 and 0079 had each named the same absence — "start this section on the next recto", and a
+chapter beginning halfway down the page the previous one ended on. A break is a **property of a
+block, anchored to it** (`Document::breaks`), not a `Block` variant and not a field on the block:
+`MeasureKey` hashes a block's content, and a break changes *where* a block goes and never *what it
+measures*, so a field would re-break a paragraph to the identical line list every time an opener
+moved. `Section` gains nothing — it is a *named* thing, so a break routed through one would force an
+author to name a break and then print that name in a running head. One rule ("advance pages until
+the flow is at the top of a page the break's kind accepts") gives the parity break, the multi-column
+case and the no-op at the top of an untouched page; parity goes through the existing `is_recto`.
+**`FlowState` grew by nothing**, deliberately: the stateful rule ("this break is already taken")
+would have made a resume from an inserted blank page's checkpoint fill that page in, where the
+parity-aware rule re-derives the same decision. A break is forward-only, so the fixpoint still
+measures 3, and `Book::compose` now gives every chapter one. `FORMAT_VERSION` is **10** — the silence
+half of the rule at its plainest — and `BOOK_VERSION` **2**.
 `TEMPLATE_VERSION` stays 1 throughout.
 M7 is named, not decomposed.
 
