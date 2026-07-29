@@ -44,6 +44,13 @@ indexed/16-bit PNG are explicit non-goals.
 4. **Grayscale path unchanged & byte-stable.** `Grayscale`/`GrayscaleAlpha` PNGs (alpha dropped)
    still decode to one byte/pixel and emit `/DeviceGray`, identical bytes to before this spec. Only
    `Rgb`/`Rgba` (alpha dropped) route through `RgbToCmyk` and emit `/DeviceCMYK`, 4 components.
+
+   > **Superseded in part by [spec 0082](0082-image-path.md).** "Alpha dropped" was this spec's
+   > intent and it was implemented literally: the channel was discarded and the colour stored
+   > *underneath* it converted, which for the `(0,0,0,0)` most encoders write is solid black. Alpha
+   > is now **composited onto paper white** before conversion. The two arms and the two colour
+   > spaces are otherwise exactly as described here, and an image with no alpha channel is still
+   > byte-identical.
 5. **Unsupported inputs still skip, not fail.** Indexed, non-8-bit, missing, or undecodable assets
    return `None` and are skipped by the writer (unchanged), so the default sample still exports.
 6. **No preflight/CLI signature change.** Color *images* are already permitted (only RGB *content
@@ -89,5 +96,6 @@ pub fn decode(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage>;
 - **ICC-accurate numeric conversion validated in CI** — no free tool certifies PDF/X and CI has no
   B2A-equipped profile, so numeric fidelity is proven via the project's periodic real-profile/POD
   uploads; CI proves structural correctness (`/DeviceCMYK`, 4 components) and fallback numerics.
-- **Alpha / `/SMask`** (dropped, preserving the no-transparency invariant), **indexed** and
-  **16-bit** PNG, **spot color**.
+- **Alpha / `/SMask`** (dropped, preserving the no-transparency invariant — **the *dropping* is
+  superseded by [spec 0082](0082-image-path.md), which composites onto paper instead**; `/SMask` and
+  live transparency remain out of scope), **indexed** and **16-bit** PNG, **spot color**.

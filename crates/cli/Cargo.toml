@@ -15,6 +15,12 @@ path = "src/main.rs"
 # (spec 0053). `quill-cli` has no lib target, so an integration test can only reach the model
 # through a dev-dependency.
 quill-core-model = { workspace = true }
+# Screen/press parity for image alpha (spec 0082): the fixture is synthesized in-memory rather than
+# committed (per `CLAUDE.md`, `png` is already a workspace dependency), the press pixels are read
+# back out of the finished PDF's `/FlateDecode`d image XObject, and the two are compared in sRGB.
+png = { workspace = true }
+flate2 = { workspace = true }
+quill-color = { workspace = true }
 
 [dependencies]
 clap = { workspace = true }

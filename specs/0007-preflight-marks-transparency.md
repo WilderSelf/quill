@@ -42,6 +42,14 @@ Transparency is detected from a declared `Asset.has_alpha` flag — the same aut
 pattern as the existing `Asset.dpi` and `Asset.line_art`. Preflight does **not** decode image
 bytes; it stays file-free and independently testable.
 
+> **Superseded by [spec 0082](0082-image-path.md) on both counts.** *"Export flattens it (alpha is
+> dropped)"* described two different things as one: what shipped discarded the channel and converted
+> the colour underneath, so the warning's own promise was false. Alpha is now composited onto paper
+> white, which makes it true. And the declared flag is no longer the detector — `probe_alpha_at`
+> reads the linked file's **header** (no image data) and reports what it actually carries, falling
+> back to `has_alpha` only when the link does not resolve. The severity, the conformance argument
+> and the `Warning`-not-`Error` classification here are unchanged.
+
 ## Public surface (delta)
 
 ```text
@@ -64,7 +72,10 @@ enum CheckId { …, Marks, Transparency }
 ## Non-goals
 
 - **Auto-probing** image files for an alpha channel at ingest — `has_alpha` is author-declared for
-  M0, exactly like `dpi`. Populating it by decoding assets is future work.
+  M0, exactly like `dpi`. Populating it by decoding assets is future work. **[Spec
+  0082](0082-image-path.md) took the probe** (header-only, at preflight rather than at ingest, and
+  it reports rather than populates — the declared field is never rewritten). `dpi` deliberately did
+  *not* follow it: it is not in a PNG header at all.
 - Any CLI flag or new dependency; `quill preflight` / `quill export` pick the checks up unchanged.
 - Post-export byte-level assertion that the PDF contains no marks (preflight is pre-export and
   document-level).

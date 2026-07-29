@@ -37,8 +37,8 @@ use quill_core_model::{Block, BlockId, Document};
 use quill_text_layout::{Hyphenator, RunMetrics};
 
 use crate::{
-    flow, heading_index, measure_block, BlockContext, DocumentTemplate, FixpointStatus, FlowState,
-    HeadingEntry, IndexEntry, LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
+    flow, heading_index, measure_block, AssetIndex, BlockContext, DocumentTemplate, FixpointStatus,
+    FlowState, HeadingEntry, IndexEntry, LaidOutPage, Measured, Measurer, PageTemplate, StyleSheet,
 };
 
 /// What a relayout actually did.
@@ -344,13 +344,19 @@ impl LayoutSession {
         //
         // All three are folded into the same `u64` rather than added as tuple elements, because the
         // diff only ever asks whether two entries differ.
+        //
+        // An image block's entry covers the **asset record its id resolves to** as well (spec
+        // 0082), which is why the index is built here: the diff and the measurement key have to
+        // read the same thing, or a relinked image would dirty the block and then be served its
+        // previous height out of the cache.
+        let asset_index: AssetIndex<'_> = doc.assets.iter().map(|a| (a.id.as_str(), a)).collect();
         let current: Vec<(BlockId, u64)> = doc
             .content
             .iter()
             .map(|b| {
                 (
                     b.id(),
-                    content_fingerprint(b)
+                    content_fingerprint(b, &asset_index)
                         ^ generated_fingerprint(b, resolved)
                         ^ note_fingerprint(b, doc),
                 )
@@ -660,7 +666,7 @@ impl Measurer for CachingMeasurer<'_> {
     ) -> Option<(Measured, f32)> {
         let key = MeasureKey {
             block: block.id(),
-            content: content_fingerprint(block),
+            content: content_fingerprint(block, ctx.assets),
             width_bits: width.to_bits(),
             marker: marker_fingerprint(ctx.markers.get(&block.id())),
             // Off the same `ctx` the measurement itself resolves from, so the key and the
@@ -686,7 +692,7 @@ impl Measurer for CachingMeasurer<'_> {
 /// The same construction the PDF `/ID` uses. Not cryptographic — a collision would serve a stale
 /// measurement — but the inputs here are a document's own paragraphs, not adversarial input, and a
 /// 64-bit collision across one document's blocks is not a realistic risk.
-fn content_fingerprint(block: &Block) -> u64 {
+fn content_fingerprint(block: &Block, assets: &AssetIndex<'_>) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     // A run's *text* changes a measurement; its colour does not, and joins the colour tail below so
     // a colour-only edit invalidates the placed result without forcing a re-measure. Keeping that
@@ -743,8 +749,34 @@ fn content_fingerprint(block: &Block) -> u64 {
             eat(style.as_deref().unwrap_or("").as_bytes());
         }
         Block::Image { asset, .. } => {
+            // The id **and the asset record it resolves to** (spec 0082). Hashing the id alone was
+            // defect (C): `image_size` reads `px_w`/`px_h`/`dpi`, so those set the placed height
+            // and therefore every page break after it — and correcting a dpi, or relinking to a
+            // differently-shaped file, left this fingerprint identical. `doc.revision` is never
+            // consulted and `doc.assets` was in no fingerprint at all, so the whole edit read as
+            // "nothing changed" and `relayout` handed back the previous pages verbatim.
+            //
+            // It belongs **here**, in the per-block key, and not in `context_fingerprint` — see the
+            // argument there. It has to be in `content_fingerprint` specifically rather than XOR'd
+            // into the diff like a footnote's text (`note_fingerprint`), because this *is* what the
+            // block measures: `content_fingerprint` is a `MeasureKey` field, and a term that only
+            // dirtied the block would let the measurement cache serve back the stale height.
+            //
+            // `Debug` over the whole `Asset` rather than the three fields layout reads today, for
+            // `context_fingerprint`'s reason and with M7 immediately ahead of it: fit modes, crops
+            // and transforms each make more of the placed geometry a function of asset metadata,
+            // and a hand-written list silently stops covering a field the moment one is added. The
+            // cost of covering `line_art` and `has_alpha` too is one re-measure of one image block
+            // when a preflight-only flag is corrected, which returns the identical height.
             eat(b"i");
             eat(asset.as_bytes());
+            match assets.get(asset.as_str()) {
+                // A distinguished byte for an id that resolves to nothing, so that adding the
+                // missing asset is itself a change (the block is placed as a square placeholder
+                // until it does — spec 0009).
+                None => eat(b"\x00unresolved"),
+                Some(record) => eat(format!("{record:?}").as_bytes()),
+            }
         }
         Block::Toc {
             title, max_level, ..
@@ -896,6 +928,19 @@ fn context_fingerprint(
     // Routing it through `MeasureKey` instead would also have been *wrong* rather than merely
     // expensive: a `MeasureKey` term is a property of the block being measured, and the index's
     // entries are derived from marks scattered through every other block in the document.
+    // **`doc.assets` deliberately does NOT belong here** (spec 0082), and it is the one entry on
+    // this list that was argued and then declined. An asset's `px_w`/`px_h`/`dpi` do change page
+    // geometry, which is the test everything above passes — but they change it *through the blocks
+    // that place that asset* and through nothing else, so the whole-document reflow this list buys
+    // is not what the change costs. The two precedents point opposite ways and the arithmetic
+    // decides between them exactly as it did for spec 0076: there is **one** index block and one
+    // contents list, so 0078's whole-document route costs one reflow; an art-heavy 500-page book —
+    // the document this product exists for — has *hundreds* of assets, which is the company a
+    // cross-reference keeps, not the company a master page keeps. The other half of 0078's argument
+    // fails here too: it routed the index this way partly because a `MeasureKey` term must be a
+    // property of the block being measured and the index's entries are derived from marks scattered
+    // through every other block. An asset's dimensions are exactly a property of the block that
+    // places it. So the fix went into `content_fingerprint`'s image arm — see the note there.
     // `doc.breaks` belongs here for `doc.sections`' reason and with more force (spec 0080): a
     // break moves every page after it without touching a single block, so a fingerprint blind to it
     // would call "this chapter now opens recto" nothing-changed and hand back pages laid out the
@@ -1050,7 +1095,7 @@ fn style_fingerprint(styles: &StyleSheet, block: &Block) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quill_core_model::{Color, Document, Margins, MasterPage, PageOverride};
+    use quill_core_model::{Asset, Color, Document, Margins, MasterPage, PageOverride};
     use quill_text_layout::{MonospaceRunMetrics, NoHyphenator};
 
     const MONO: MonospaceRunMetrics = MonospaceRunMetrics { em_ratio: 0.6 };
@@ -1513,7 +1558,11 @@ mod tests {
             ],
             Color::Gray { v: 0.0 },
         );
-        assert_ne!(content_fingerprint(&one), content_fingerprint(&two));
+        let no_assets = AssetIndex::new();
+        assert_ne!(
+            content_fingerprint(&one, &no_assets),
+            content_fingerprint(&two, &no_assets)
+        );
     }
 
     #[test]
@@ -2996,5 +3045,129 @@ mod tests {
             crate::lay_out(&changed, &MONO, &NoHyphenator),
             "and must move them to where a cold pass puts them"
         );
+    }
+
+    // ----- spec 0082: editing an `Asset` invalidates the blocks that place it -------------------
+
+    /// A document that places one image between paragraphs, so the asset's metadata sets the placed
+    /// height and therefore every page break after it (spec 0009's `image_size`).
+    fn imaged_doc(before: usize, after: usize) -> Document {
+        let mut doc = Document::sample();
+        doc.assets = vec![Asset {
+            id: "plate".into(),
+            path: "plate.png".into(),
+            px_w: 600,
+            px_h: 600,
+            dpi: 300.0,
+            line_art: false,
+            has_alpha: false,
+        }];
+        doc.content =
+            (0..before)
+                .map(|i| {
+                    Block::body(
+                        format!("before {i} with enough words to occupy a line"),
+                        INK,
+                    )
+                })
+                .chain(std::iter::once(Block::image("plate")))
+                .chain((0..after).map(|i| {
+                    Block::body(format!("after {i} with enough words to occupy a line"), INK)
+                }))
+                .collect();
+        doc.assign_missing_block_ids().expect("ids");
+        doc
+    }
+
+    #[test]
+    fn correcting_an_assets_dpi_re_lays_the_pages_it_affects() {
+        // The defect: `content_fingerprint`'s image arm hashed only the id string, `doc.assets` was
+        // in no fingerprint at all, and `doc.revision` is never consulted — so halving an image's
+        // dpi (doubling its placed height, and moving every page break after it) read as "nothing
+        // changed" and `relayout` handed back the previous pages verbatim.
+        let doc = imaged_doc(40, 60);
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).pages.clone();
+
+        let mut changed = doc.clone();
+        changed.assets[0].dpi = 72.0; // 600 px at 72 dpi is 600 pt tall, not 144
+        changed.bump_revision();
+        let after = session.relayout(&changed, &MONO, &NoHyphenator);
+
+        assert_ne!(after.pages, before, "a corrected dpi must move the pages");
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&changed, &MONO, &NoHyphenator),
+            "and must move them to where a cold pass puts them"
+        );
+    }
+
+    #[test]
+    fn relinking_to_a_differently_shaped_file_re_lays_the_pages() {
+        // The other half of the same defect: the id is unchanged, so the only thing that moved is
+        // the asset record the id resolves to.
+        let doc = imaged_doc(40, 60);
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).pages.clone();
+
+        let mut changed = doc.clone();
+        changed.assets[0].path = "plate-tall.png".into();
+        changed.assets[0].px_h = 1800;
+        changed.bump_revision();
+        let after = session.relayout(&changed, &MONO, &NoHyphenator);
+
+        assert_ne!(after.pages, before, "a relinked image must move the pages");
+        assert_eq!(
+            after.pages,
+            crate::lay_out(&changed, &MONO, &NoHyphenator),
+            "and must move them to where a cold pass puts them"
+        );
+    }
+
+    #[test]
+    fn an_untouched_asset_costs_nothing() {
+        // The other direction, and the reason this fix belongs per-block rather than in
+        // `context_fingerprint`: a relayout of a document whose assets did not move must still see
+        // "nothing changed" and reuse every page.
+        let doc = imaged_doc(40, 60);
+        let mut session = LayoutSession::new();
+        let first = session.relayout(&doc, &MONO, &NoHyphenator);
+        let again = session.relayout(&doc, &MONO, &NoHyphenator);
+        assert_eq!(again.pages, first.pages);
+        assert_eq!(again.stats.blocks_measured, 0, "nothing re-measured");
+        assert_eq!(again.stats.pages_reused, first.pages.len());
+    }
+
+    #[test]
+    fn editing_one_of_many_assets_reuses_the_pages_before_it() {
+        // The per-block route's whole claim: only the pages from the edited image onward move.
+        // `context_fingerprint` would have set `dirty_from = Some(0)` and reflowed all of them.
+        let mut doc = imaged_doc(40, 60);
+        doc.assets.push(Asset {
+            id: "late".into(),
+            path: "late.png".into(),
+            px_w: 600,
+            px_h: 600,
+            dpi: 300.0,
+            line_art: false,
+            has_alpha: false,
+        });
+        doc.content.push(Block::image("late"));
+        doc.assign_missing_block_ids().expect("ids");
+
+        let mut session = LayoutSession::new();
+        let before = session.relayout(&doc, &MONO, &NoHyphenator).pages.clone();
+
+        let mut changed = doc.clone();
+        changed.assets[1].dpi = 72.0; // the *late* image, near the end of the document
+        changed.bump_revision();
+        let after = session.relayout(&changed, &MONO, &NoHyphenator);
+
+        assert_ne!(after.pages, before);
+        assert!(
+            after.stats.pages_reused > 0,
+            "pages before the edited image must be reused, not reflowed from page 0"
+        );
+        assert_eq!(after.pages, crate::lay_out(&changed, &MONO, &NoHyphenator));
     }
 }

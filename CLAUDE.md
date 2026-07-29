@@ -60,6 +60,21 @@ since spec 0081 every colour that reaches the page is checked at one exhaustive 
 (`PlacedBlock::inks`), so an illegal colour arriving by any route — authored, styled, packed or
 templated — is a preflight error rather than a silently blackened glyph.
 
+**M7 is under way, and its two press-correctness increments have shipped first.** After 0081, **spec
+0082 fixed the image path's two shipped defects**. Image alpha was *discarded* rather than flattened
+— the channel dropped and the colour stored underneath it converted, which for the `(0,0,0,0)` most
+PNG encoders write is solid black, under a preflight `Warning` promising the opposite. It is now
+**composited onto paper white**, by **one function in `quill-color` that the press and the screen
+both call at the same point in their pipelines** — the one-shaper rule at a fourth site, and the
+argument that settled the decision: the screen has always composited, so flattening removes a
+screen/press divergence where rewording the warning would have ratified it. The order is
+composite → convert → clamp, which keeps `RgbToCmyk::convert` the single ink-clamp chokepoint spec
+0006 built. Preflight now asks the **decoder** what a file carries instead of trusting the
+author-declared `has_alpha`. And editing an `Asset` finally invalidates something: the asset record
+joins **`content_fingerprint`'s image arm** — not `context_fingerprint` — because `image_size` *is*
+what an image block measures and a 500-page art book has hundreds of assets, so 0076's per-block
+arithmetic applies and 0078's whole-document route does not.
+
 The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
 reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
 making architectural decisions. This file holds architecture, constraints and conventions; the

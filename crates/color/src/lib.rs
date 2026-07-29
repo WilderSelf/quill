@@ -79,6 +79,71 @@ pub fn clamp_cmyk_u8(c: u8, m: u8, y: u8, k: u8) -> [u8; 4] {
     [s(c), s(m), s(y), k]
 }
 
+/// The backdrop an image's transparency is flattened onto: white paper, one 8-bit sample per
+/// channel (spec 0082).
+///
+/// PDF/X-1a:2001 and PDF/X-3:2002 both forbid live transparency, so an alpha-bearing image has to be
+/// made opaque before it is embedded, and *something* has to be chosen as the backdrop. It is the
+/// paper, because that is what is physically under the ink everywhere the artwork does not cover —
+/// there is no other honest answer for a press file, and it is what the screen already shows.
+pub const PAPER_SAMPLE: u8 = 255;
+
+/// Composite one 8-bit colour sample over [`PAPER_SAMPLE`] at coverage `alpha` (spec 0082).
+///
+/// `alpha = 255` returns `sample` **byte-identically**, which is what makes flattening a no-op for
+/// every opaque pixel and therefore for every image that carries no alpha channel at all.
+/// `alpha = 0` returns paper, regardless of what colour was stored underneath — the whole point,
+/// since PNG places no constraint on that colour and most encoders write black there.
+///
+/// Integer throughout and exactly round-half-up: `(v + 127) / 255` rounds `v/255` to nearest for
+/// every `v` a `u8 × u8` product can take, so screen and press cannot disagree by a rounding mode.
+pub fn flatten_sample_over_paper(sample: u8, alpha: u8) -> u8 {
+    let a = alpha as u32;
+    let v = sample as u32 * a + PAPER_SAMPLE as u32 * (255 - a);
+    ((v + 127) / 255) as u8
+}
+
+/// Composite packed 8-bit colour-plus-alpha pixels onto paper white, dropping the alpha channel
+/// (spec 0082).
+///
+/// `src` is `channels + 1` bytes per pixel — colour samples then one alpha — and the result is
+/// `channels` bytes per pixel. That covers both shapes the PNG decoder produces: `channels = 1` for
+/// `GrayscaleAlpha` and `channels = 3` for `Rgba`, which is also what `tRNS` normalizes into
+/// (spec 0010's `EXPAND`).
+///
+/// **This runs before conversion, never after**, and the ordering is not a preference. Alpha means
+/// "fraction of the source colour", so the composite is only defined in the space the source states
+/// its colour in; compositing in CMYK would be a blend of *ink amounts* against a paper of
+/// `(0,0,0,0)`, which is a different operation and not the one the author saw on screen. Running it
+/// here also leaves [`RgbToCmyk::convert`] as the single ink-clamp chokepoint spec 0006 built —
+/// every pixel that reaches it is already opaque, so the ≤240% guarantee still describes the bytes
+/// that are actually embedded.
+///
+/// # Panics
+/// If `channels` is 0, or `src.len()` is not a multiple of `channels + 1`.
+pub fn flatten_over_paper(src: &[u8], channels: usize) -> Vec<u8> {
+    assert!(
+        channels > 0,
+        "an image must carry at least one colour channel"
+    );
+    let stride = channels + 1;
+    assert_eq!(
+        src.len() % stride,
+        0,
+        "input length must be a multiple of {stride} ({channels} colour samples plus alpha)"
+    );
+    let mut out = Vec::with_capacity(src.len() / stride * channels);
+    for px in src.chunks_exact(stride) {
+        let alpha = px[channels];
+        out.extend(
+            px[..channels]
+                .iter()
+                .map(|&s| flatten_sample_over_paper(s, alpha)),
+        );
+    }
+    out
+}
+
 /// Which conversion path a [`RgbToCmyk`] is using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvMode {
@@ -310,6 +375,44 @@ mod tests {
         );
         // M and Y scaled equally by budget/(c+m+y) = 383/510, floored.
         assert_eq!(out[1], out[2]);
+    }
+
+    #[test]
+    fn flattening_is_a_no_op_on_an_opaque_pixel() {
+        // The claim every "nothing without alpha moves" assertion downstream rests on.
+        for s in [0u8, 1, 127, 128, 254, 255] {
+            assert_eq!(flatten_sample_over_paper(s, 255), s);
+        }
+        assert_eq!(flatten_over_paper(&[9, 8, 7, 255], 3), vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn a_fully_transparent_pixel_becomes_paper_whatever_is_under_it() {
+        for s in [0u8, 42, 200, 255] {
+            assert_eq!(flatten_sample_over_paper(s, 0), PAPER_SAMPLE);
+        }
+        // The exact bytes most PNG encoders write under a transparent region.
+        assert_eq!(flatten_over_paper(&[0, 0, 0, 0], 3), vec![255, 255, 255]);
+        assert_eq!(flatten_over_paper(&[0, 0], 1), vec![255]);
+    }
+
+    #[test]
+    fn partial_coverage_lands_between_the_colour_and_the_paper() {
+        assert_eq!(flatten_sample_over_paper(0, 128), 127);
+        assert_eq!(flatten_sample_over_paper(0, 127), 128);
+        // Monotone in alpha, and bounded by its two endpoints at every step.
+        let mut previous = 255;
+        for a in 0..=255u8 {
+            let v = flatten_sample_over_paper(0, a);
+            assert!(v <= previous, "not monotone at alpha {a}");
+            previous = v;
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 4")]
+    fn flatten_rejects_a_ragged_buffer() {
+        flatten_over_paper(&[0, 0, 0], 3);
     }
 
     #[test]

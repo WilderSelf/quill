@@ -26,11 +26,18 @@ pub use raster::{rasterize, to_png, Raster};
 
 /// A decoded, downsampled screen proxy: RGBA8 pixels at the proxy dimensions. The GPU renderer
 /// uploads `rgba` as a texture; nothing here touches full-resolution art after generation.
+///
+/// **Always opaque** since spec 0082: source alpha is composited onto paper white at decode, by the
+/// same `quill-color` function and at the same point in the pipeline as the press path. A proxy is a
+/// preview of a page quill can *print*, and a PDF/X page carries no live transparency, so showing
+/// one would show something the product cannot produce. The alpha byte is kept in the layout so the
+/// texture format and the blitter do not change, and so a later increment that gains real
+/// transparency (spec 0089's PDF/X-4 path) has somewhere to put it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proxy {
     pub width: u32,
     pub height: u32,
-    /// `width * height * 4` bytes, row-major, non-premultiplied RGBA8.
+    /// `width * height * 4` bytes, row-major, non-premultiplied RGBA8. Every alpha byte is 255.
     pub rgba: Vec<u8>,
 }
 
@@ -54,7 +61,8 @@ pub fn proxy_size(src_w: u32, src_h: u32) -> (u32, u32) {
 /// recoverable (skip and show nothing), unlike a press export, so we never panic here.
 ///
 /// The PNG is normalized to 8-bit (`normalize_to_color8` expands indexed→RGB and strips 16-bit),
-/// then any of Grayscale / GrayscaleAlpha / RGB / RGBA is widened to RGBA8 before an area-average
+/// then any of Grayscale / GrayscaleAlpha / RGB / RGBA is widened to **opaque** RGBA8 — alpha
+/// composited onto paper white, as the press path does (spec 0082) — before an area-average
 /// downscale to [`proxy_size`].
 pub fn decode_png_proxy(bytes: &[u8]) -> Option<Proxy> {
     let src = decode_png_rgba(bytes)?;
@@ -87,18 +95,29 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<Rgba8> {
     let px = (w as usize) * (h as usize);
     let data = &buf[..info.buffer_size()];
 
-    // Widen whatever channels the PNG carries to non-premultiplied RGBA8.
+    // Widen whatever channels the PNG carries to non-premultiplied RGBA8, flattening alpha onto
+    // paper white on the way (spec 0082) — the same `quill-color` function, at the same point in
+    // the pipeline, as `export-pdf`'s decode. Screen and press must agree about what a transparent
+    // pixel looks like, and the only way they cannot drift is if there is one definition of it.
+    //
+    // It happens **before** `downsample_rgba` deliberately. Averaging non-premultiplied RGBA mixes
+    // the colour stored under `alpha = 0` into its neighbours, so a red logo on a `(0,0,0,0)`
+    // surround acquired a dark fringe — the screen's own version of the press defect, and one that
+    // survives however the page underneath is painted.
     let pixels: Vec<u8> = match info.color_type {
         ColorType::Grayscale => data[..px].iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        ColorType::GrayscaleAlpha => data
-            .chunks_exact(2)
-            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+        ColorType::GrayscaleAlpha => quill_color::flatten_over_paper(data, 1)
+            .into_iter()
+            .flat_map(|g| [g, g, g, 255])
             .collect(),
         ColorType::Rgb => data
             .chunks_exact(3)
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
-        ColorType::Rgba => data[..px * 4].to_vec(),
+        ColorType::Rgba => quill_color::flatten_over_paper(data, 3)
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
         ColorType::Indexed => return None, // defensive: EXPAND already turned palette into RGB(A).
     };
     debug_assert_eq!(pixels.len(), px * 4);
@@ -405,8 +424,14 @@ mod tests {
         let proxy = decode_png_proxy(&png).expect("decodes");
         assert_eq!((proxy.width, proxy.height), (2048, 1024));
         assert_eq!(proxy.rgba.len(), (2048 * 1024 * 4) as usize);
-        // A uniform source averages to the same uniform value.
-        assert!(proxy.rgba.iter().all(|&b| b == 128));
+        // A uniform source averages to the same uniform value. Since spec 0082 that value is the
+        // *flattened* one: a uniform half-covered mid-grey composites onto paper at 191 and comes
+        // out opaque, and the point of the assertion — that the kernel does not disturb a uniform
+        // field — is unchanged.
+        assert!(proxy
+            .rgba
+            .chunks_exact(4)
+            .all(|p| p == [191, 191, 191, 255]));
     }
 
     #[test]
@@ -424,6 +449,54 @@ mod tests {
         // Identity (no downscale) preserves pixels: i=0 → (0,0,0,255); i=1 → (1,2,3,255).
         assert_eq!(&proxy.rgba[0..4], &[0, 0, 0, 255]);
         assert_eq!(&proxy.rgba[4..8], &[1, 2, 3, 255]);
+    }
+
+    // --- Alpha is flattened onto paper here too (spec 0082) --------------------------------------
+
+    #[test]
+    fn a_transparent_proxy_pixel_is_paper_white_and_opaque() {
+        // A proxy is a preview of a page quill can print, and a PDF/X page has no live transparency
+        // — so the screen flattens onto the same paper the press does, at the same point in the
+        // pipeline. Without this the proxy carried (0,0,0,0) and only *looked* right because the
+        // page beneath it happened to be white.
+        let png = encode_png(2, 1, png::ColorType::Rgba, &[0, 0, 0, 0, 255, 0, 0, 255]);
+        let proxy = decode_png_proxy(&png).expect("decodes");
+        assert_eq!(&proxy.rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&proxy.rgba[4..8], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_transparent_grayscale_alpha_proxy_pixel_is_paper_white() {
+        let png = encode_png(2, 1, png::ColorType::GrayscaleAlpha, &[0, 0, 0, 255]);
+        let proxy = decode_png_proxy(&png).expect("decodes");
+        assert_eq!(&proxy.rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&proxy.rgba[4..8], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn downsampling_a_transparent_edge_does_not_darken_it() {
+        // The reason the composite happens *before* the downscale rather than after it. Averaging
+        // non-premultiplied RGBA mixes the colour stored under alpha = 0 into its neighbours, so a
+        // red logo on a (0,0,0,0) surround downsampled to a fringe of dark red — a defect the
+        // screen path carried independently of the press one.
+        let w = 4096u32;
+        let mut rgba = vec![0u8; (w * 4) as usize];
+        for x in 0..w {
+            let i = (x * 4) as usize;
+            if x >= w / 2 {
+                rgba[i] = 255; // opaque red
+                rgba[i + 3] = 255;
+            }
+            // the left half stays (0,0,0,0): transparent, with black stored underneath
+        }
+        let png = encode_png(w, 1, png::ColorType::Rgba, &rgba);
+        let proxy = decode_png_proxy(&png).expect("decodes");
+        assert_eq!(proxy.width, 2048);
+        // Deep inside the transparent half: paper, not the black stored under it.
+        assert_eq!(&proxy.rgba[0..4], &[255, 255, 255, 255]);
+        // Deep inside the opaque half: the red it was drawn in.
+        let last = ((proxy.width - 1) * 4) as usize;
+        assert_eq!(&proxy.rgba[last..last + 4], &[255, 0, 0, 255]);
     }
 
     #[test]
