@@ -574,9 +574,9 @@ fn render_page(
                 // two would put text in the wrong place, or overset a frame that measured as fitting.
                 let base_name = fonts::EmbeddedFamily::resource_name(base_slot);
                 content.set_font(Name(base_name.as_bytes()), *font_size_pt);
-                // Emit the authored press-legal fill color. Preflight rejects RGB before export,
-                // so `Rgb` is unreachable here; fall back to black (rather than panicking) so a
-                // `--force` export can never abort mid-stream.
+                // Emit the authored press-legal fill color. `Rgb` falls back to black rather than
+                // panicking, so a `--force` export can never abort mid-stream. See `set_fill` for
+                // why that fallback is reachable and why it is silent.
                 match color {
                     Color::Gray { v } => content.set_fill_gray(*v),
                     Color::Cmyk { c, m, y, k } => content.set_fill_cmyk(*c, *m, *y, *k),
@@ -827,8 +827,17 @@ impl OutlineTree {
 
 /// Set the non-stroking colour in the authored space.
 ///
-/// `Rgb` is unreachable — preflight rejects it before export — but falls back to black rather than
-/// panicking, so a `--force` export can never abort mid-stream. Same posture as the text path.
+/// `Rgb` falls back to solid black rather than panicking, so a `--force` export can never abort
+/// mid-stream. Same posture as the text path.
+///
+/// **This used to say `Rgb` was unreachable because "preflight rejects RGB before export", and that
+/// was false.** Preflight walked `doc.content` and placed rectangles, and reached neither a master
+/// page's static text nor a run's named character style — so an RGB running head arrived here and
+/// was turned silently black, in a press file, under a comment asserting it could not happen. Spec
+/// 0081 closed both holes (`PlacedBlock::inks`), and the claim would now be *true* for an
+/// un-forced export. It is not restated, deliberately: `--force` exists precisely to write a file
+/// preflight refused, so this arm is reachable by design, and a comment asserting an invariant that
+/// does not hold is worse than no comment at all — which is how the first one cost a silent defect.
 fn set_fill(content: &mut Content, color: &Color) {
     match color {
         Color::Gray { v } => content.set_fill_gray(*v),

@@ -242,6 +242,109 @@ pub enum PlacedBlock {
     },
 }
 
+/// Where on a placed block a colour sits — the label a press finding names it by (spec 0081).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InkSite {
+    /// The block's own ink: a paragraph's colour, a master static's colour. The fallback every
+    /// span with no run of its own is drawn in.
+    Text,
+    /// The resolved ink of one authored run, indexed as [`PlacedBlock::Text::run_colors`] is.
+    Run(usize),
+    /// A decoration's fill.
+    Fill,
+    /// A decoration's stroke.
+    Stroke,
+}
+
+/// One colour a placed block puts on paper, and where on the block it sits. See
+/// [`PlacedBlock::inks`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedInk {
+    pub site: InkSite,
+    pub color: Color,
+}
+
+impl PlacedBlock {
+    /// **Every colour this block puts on paper.** The single enumeration the press colour checks
+    /// read (spec 0081).
+    ///
+    /// This exists because the two colour checks each had a hole the other did not cover, and both
+    /// holes were the same thing: *a producer of ink the checker did not know about.* `preflight`
+    /// walks `doc.content`, so it never visits a master page; `preflight_pages` walked placed
+    /// geometry but opened its colour loop by `continue`-ing on anything that was not a
+    /// [`PlacedBlock::Rect`] — and a `MasterStatic::Text` becomes a [`PlacedBlock::Text`]. A running
+    /// head at CMYK 90/90/90/90 (**360% ink**) therefore passed preflight with zero findings and was
+    /// emitted on every page its master governed.
+    ///
+    /// Fixing that by adding one more arm would have left the next colour-bearing site in exactly
+    /// the same position. So the answer is spec 0074's, at a third site: **one enumeration, and the
+    /// compiler holds it closed.** Three properties, and all three are load-bearing:
+    ///
+    /// 1. `PlacedBlock` is the *only* thing the writer draws. `write_pdf` matches on it and on
+    ///    nothing else, so a colour that is not reachable from here cannot reach the page — which is
+    ///    what makes "every colour" a provable claim rather than a hopeful one.
+    /// 2. The `match` is **exhaustive over variants**, so a new kind of placed geometry does not
+    ///    compile until it says what ink it draws (`E0004`).
+    /// 3. Every arm destructures **every field by name, with no `..`**, so *adding a field* to an
+    ///    existing variant does not compile either (`E0027`). That is the half a plain exhaustive
+    ///    match would miss, and it is the half that matters here: the defect was a new field
+    ///    (`Text::color`) on a variant the loop already skipped, not a new variant.
+    ///
+    /// A block's own `color` is reported *and* each entry of `run_colors`, because both are drawn:
+    /// a span whose run index has no entry falls back to `color` (see `writer::single_ink`). Runs
+    /// that resolve to the paragraph's ink therefore appear twice, which costs a duplicate finding
+    /// and never a missed one — the right side to err on.
+    #[must_use]
+    pub fn inks(&self) -> Vec<PlacedInk> {
+        let at = |site, color| PlacedInk { site, color };
+        match self {
+            PlacedBlock::Text {
+                frame: _,
+                source: _,
+                lines: _,
+                color,
+                run_colors,
+                run_formats: _,
+                run_shifts: _,
+                weight: _,
+                italic: _,
+                font_size_pt: _,
+                leading_pt: _,
+            } => std::iter::once(at(InkSite::Text, *color))
+                .chain(
+                    run_colors
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| at(InkSite::Run(i), *c)),
+                )
+                .collect(),
+            // An image's ink is its pixels, and those are checked where they are converted and
+            // clamped (`images.rs`, spec 0006) rather than as a `Color`. There is no authored
+            // colour on a placed image to enumerate.
+            PlacedBlock::Image {
+                frame: _,
+                source: _,
+                asset_id: _,
+            } => Vec::new(),
+            PlacedBlock::Rect {
+                frame: _,
+                fill,
+                stroke,
+            } => fill
+                .map(|c| at(InkSite::Fill, c))
+                .into_iter()
+                .chain(stroke.map(|s| at(InkSite::Stroke, s.color)))
+                .collect(),
+            // A link draws nothing — not on screen, not on press. See the variant's own docs.
+            PlacedBlock::Link {
+                frame: _,
+                source: _,
+                target_page: _,
+            } => Vec::new(),
+        }
+    }
+}
+
 /// A rectangle's outline.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stroke {
@@ -1876,17 +1979,14 @@ fn resolve_run_texts(
 /// One function, because the three consumers — ink, format and baseline shift — must not be able to
 /// disagree about precedence. Field by field, so a run naming `strong` and overriding only its
 /// colour stays bold.
+///
+/// **The function itself moved to `StyleSheet::resolve_run` in spec 0081**, and this is now a
+/// forwarder rather than a copy: preflight has to resolve a run's colour the same way the engine
+/// does, and a second implementation living in `export-pdf` is precisely how a named style's colour
+/// went unchecked. This stays as the engine's private spelling of it because three call sites read
+/// better without the receiver.
 fn resolved_style(run: &quill_core_model::Run, styles: &StyleSheet) -> CharacterStyle {
-    // A name that resolves to nothing is not an error: the run lays out with the paragraph's
-    // treatment and its own overrides still apply. Losing text because a style was renamed — or
-    // because the pack that defined it is missing — would be far worse than setting it plainly,
-    // which is the posture specs 0028 and 0054 both take.
-    let named = run
-        .character
-        .as_deref()
-        .and_then(|name| styles.character(name))
-        .unwrap_or(CharacterStyle::EMPTY);
-    named.with(run.style)
+    styles.resolve_run(run)
 }
 
 /// Each run's resolved ink: its named style, its own override, or the paragraph's (specs 0063,
