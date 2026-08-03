@@ -19,66 +19,18 @@ fields could not express a game system whose creatures are set differently, and 
 declarations could. Apply this test to every new type, field, style name and template slug. The
 argument and the audit behind it are in `docs/roadmap.md` under "M5 increments".
 
-**Status: M0–M6 complete (specs 0072–0080 shipped).** M0 (headless PDF/X export) is
-code-complete and green — specs 0001–0013 and 0015, indexed in `specs/README.md`. The one
-remaining M0 item is manual and non-automatable: a real POD upload (DriveThruRPG/Lulu/
-IngramSpark) validated with a B2A-equipped CMYK profile (CI's synthesized ICC has no B2A
-tables). The **M1** arc (shaping → Knuth-Plass justification → hyphenation → text frames/threading
-→ master pages → incremental layout → perf harness → screen render) is well underway: shaping
-(0016), Knuth-Plass justification (0017), hyphenation (0018), text frames/threading (0019),
-multi-column threads (0020), linked-image proxy pixels (0021–0023), incremental proxy-cache
-invalidation (0024), the `.tpub` container and versioned load contract (0025), block identity
-(0026), the perf harness (0027), paragraph styles (0028), master pages (0029–0030,
-`FORMAT_VERSION` 2), incremental dependency-tracked layout (0031), the shared fonts crate (0032),
-screen render (0033) and the app shell (0034) have all shipped. **The M1 arc is complete.** **M2 — the beginner on-ramp — is COMPLETE**: specs 0035–0043 shipped (per-page masters → document templates →
-decoration primitive → stat blocks → tables → heading index → generated TOC → PDF outline →
-authoring import). A `.md` source now imports to a templated book with stat blocks, tables, a
-generated contents list and PDF bookmarks, and exports press-clean. **M3 (pro polish + POD presets) is
-COMPLETE** — specs 0044–0053: block fragmentation → table and stat-block continuation →
-master-static alignment → hanging indent → POD presets → geometry preflight → line-break pruning →
-the screen export profile → user-authored templates. A block now splits across frames, furniture
-sits where a bound book puts it, preflight checks the printer's numbers against placed geometry, and
-a second export profile carries clickable links while the press file stays provably annotation-free.
-`FORMAT_VERSION` is 3. **M4 — the ecosystem — is COMPLETE**: specs 0054–0061 shipped. A component is
-now a *declaration* rather than a Rust type, and one interpreter lays any of them out; a `.qpack`
-carries templates, styles, definitions and assets with mandatory provenance; a document names the
-packs it needs and **refuses to lay out** rather than falling back when one is missing; `quill pack
-extract` turns a finished book into a reusable pack. The two defects M3 found are fixed — screen and
-press now share one hyphenator as they share one shaper (0059), and no line, ragged or last, is drawn
-past its measure (0060) — and the baseline grid finally exists (0058), opt-in so no existing book
-moves. `FORMAT_VERSION` stays **3** throughout: every model change is additive.
+**Status: M0–M6 complete, M7 under way.** Specs 0001–0080 shipped the six milestones. M7 is
+decomposed into specs 0081–0089, and its two press-correctness increments shipped first: 0081
+(exhaustive colour preflight at `PlacedBlock::inks`) and 0082 (image alpha composited onto paper
+white, decoder-verified). `FORMAT_VERSION` is **10**, `BOOK_VERSION` **2**, `TEMPLATE_VERSION` **1**.
+The one open M0 item is manual and non-automatable: a real POD upload validated with a
+B2A-equipped CMYK profile (CI's synthesized ICC has no B2A tables).
 
-**M4 deliberately does not build executable plugins**, and that decision is now written where an author
-will find it — `docs/pack-authoring.md` states it and why. A pack is *declarative* — templates, styles,
-component definitions and assets, no code — because an executable extension that emits geometry can emit
-geometry that is wrong, and every mechanism M3 built to make press errors visible assumes quill produced
-the geometry. `DefColor` has no RGB family at all, so a **component definition** cannot express a colour
-space PDF/X-1a forbids — but a `.qpack` also carries a `StyleSheet`, whose `character` map holds a full
-`Color`, and templates whose master statics do too, so a *pack* can express RGB by two routes that
-`DefColor` does not govern. What makes that safe is not the model's vocabulary but the checker's reach:
-since spec 0081 every colour that reaches the page is checked at one exhaustive enumeration
-(`PlacedBlock::inks`), so an illegal colour arriving by any route — authored, styled, packed or
-templated — is a preflight error rather than a silently blackened glyph.
-
-**M7 is under way, and its two press-correctness increments have shipped first.** After 0081, **spec
-0082 fixed the image path's two shipped defects**. Image alpha was *discarded* rather than flattened
-— the channel dropped and the colour stored underneath it converted, which for the `(0,0,0,0)` most
-PNG encoders write is solid black, under a preflight `Warning` promising the opposite. It is now
-**composited onto paper white**, by **one function in `quill-color` that the press and the screen
-both call at the same point in their pipelines** — the one-shaper rule at a fourth site, and the
-argument that settled the decision: the screen has always composited, so flattening removes a
-screen/press divergence where rewording the warning would have ratified it. The order is
-composite → convert → clamp, which keeps `RgbToCmyk::convert` the single ink-clamp chokepoint spec
-0006 built. Preflight now asks the **decoder** what a file carries instead of trusting the
-author-declared `has_alpha`. And editing an `Asset` finally invalidates something: the asset record
-joins **`content_fingerprint`'s image arm** — not `context_fingerprint` — because `image_size` *is*
-what an image block measures and a 500-page art book has hundreds of assets, so 0076's per-block
-arithmetic applies and 0078's whole-document route does not.
-
-The authoritative sequenced plan — milestones, the M1 increment order (specs 0025–0034), and the
-reasoning behind that order — is **`docs/roadmap.md`**, tracked in this repository. Read it before
-making architectural decisions. This file holds architecture, constraints and conventions; the
-roadmap holds what gets built, in what order, and what "done" means.
+The authoritative sequenced plan — milestones, increment order, and the reasoning behind that
+order — is **`docs/roadmap.md`**, tracked in this repository. `specs/README.md` indexes the
+shipped specs. Read the roadmap before making architectural decisions. This file holds
+architecture, constraints and conventions; the roadmap holds what gets built, in what order, and
+what "done" means.
 
 ## Non-negotiable constraints (these drive every design choice)
 
@@ -139,122 +91,26 @@ Rust workspace, layered as crates so the **PDF/X pipeline is buildable and testa
   validate the *same* `page_setup.bleed_pt` the BleedBox is built from; one source of truth per
   checked property). A dropped image or a preflight error is recoverable; a mis-colored file
   already uploaded to POD is not.
+- **A pack is declarative — no executable plugins.** Templates, styles, component definitions and
+  assets, never code: an extension that emits geometry can emit geometry that is wrong, and every
+  mechanism that makes press errors visible assumes quill produced the geometry. The colour gate is
+  preflight, not the model's vocabulary: an illegal colour arriving by any route — authored, styled,
+  packed or templated — is a preflight error, never a silently blackened glyph. Stated for authors
+  in `docs/pack-authoring.md`.
 
 ## Milestone order (build the risky/differentiating part first)
 
-**M0** press-output spike (headless PDF/X export, proven with a Ghostscript preflight + a real POD upload) →
-**M1** editing core + 500-page performance → **M2** beginner on-ramp (templates, stat blocks,
-TOC) → **M3** pro polish + POD presets → **M4** ecosystem (shareable component definitions and
-content packs) → **M5** the general typographic core (the neutral core, inline runs, character
-styles, lists, tabs) → **M6** the long document (sections and folios, footnotes, cross-references,
-an index, a book) → **M7** graphics and colour.
-**M0–M6 done**; M0's sole open item is the manual POD upload. **M5 shipped specs 0062–0070**: the
-typographic core (0062–0067) plus a three-increment closeout — the writer draws the shaped glyph run
-rather than the characters (0068), a placed part reports the ink it draws rather than the slot it was
-given (0069), and the contents list is re-expressed through the tab mechanism (0070). They ran in a
-hard order: 0069 would have traded preflight false positives for false *negatives* until 0068 made
-measured and drawn the same number, and 0070 was not expressible until 0069 settled that `w_pt` is
-ink. **Spec 0071 then compressed the content streams** — added by a measurement 0068 took rather
-than assumed, and the last stream in the file that was not `FlateDecode`'d: the 500-page synthetic
-export is now 1.31 MB against the 13.76 MB it was *before* 0068, and export size is budget-gated in
-`benches/budgets.toml` rather than unwatched. **M6 is decomposed into specs 0072–0079** (the section
-is the load-bearing gap, and four of its six features are downstream of it). **0075 shipped first and
-out of sequence**, because it was the one M6 increment that fixed defects already shipping rather
-than adding a feature: a contents list taller than its frame overflowed the page, a composite could
-not cut inside a section, and — found while proving the first — a contents list laid out through
-`LayoutSession`, the path the app uses, had *always* been empty but for its own title. **0072 then
-landed the milestone's load-bearing increment**: a section anchored to a `BlockId`, *generating* the
-per-page master assignment rather than replacing it, so a chapter opener survives repagination —
-the defect spec 0035 recorded and could not fix. Master assignment joins the contents list's fixpoint
-(one shared loop, `FIXPOINT_MAX_ITERATIONS`, `converged: false` reported rather than guessed), and
-`FORMAT_VERSION` went to **5**, bumped on its own and argued in the spec: an older build would drop
-`sections` and set every chapter opener in the body master, silently. **0073 and 0074 then made the
-section visible** — per-section folio formats and a restart (`FORMAT_VERSION` **6**, owed to v5, which
-reads `sections` and ignores `folio`), then `{section}` and `{heading:N}` running heads beside
-`{page}`. 0074 turned the layout-time tokens into one enum the resolver and the font-subset collector
-both read, so **adding a token without teaching the collector does not compile** — the class behind two
-`.notdef`-in-a-press-file near-misses — and moved furniture to a post-pass over the finished page
-vector, which is what stopped a reused tail page printing the previous chapter's running head.
-`FORMAT_VERSION` stays 6 there: an older build prints the literal `{section}`, which is wrong but
-*loud*, and the bump rule turns on silence. **0076 then shipped cross-references**, the milestone's
-design problem: a resolved "see page 42" goes in **`MeasureKey`**, not `context_fingerprint`, because
-a book has hundreds of them and the latter is a whole-document reflow — spec 0066's `marker` pattern
-at scale, proved with a counter (4 blocks re-measured of 400, against 6 and no reused pages the other
-way). It also landed the fixpoint-iteration budget the M6 audit found missing, the first derived
-quantity that provably *oscillates* (roman numerals are not monotone in width), and a second
-exhaustive `contributes` match for the font subset — a body run's generated characters are a new path,
-so they owe 0074's structural treatment rather than a special case. `FORMAT_VERSION` is **7**: the
-older build's output is loud, but `source` is authored intent and is destroyed on save-back, which is
-the half of the rule 0074 did not have to answer to. **0077 then shipped footnotes**, the milestone's
-riskiest increment and the only one that changes the flow loop: a note band reduces the
-`bottom`/available-height term and *only* that term, so `MeasureKey` gains no height dimension and
-`incremental_blocks_measured` is still 1 — the guard spec 0044 wrote for exactly this. `FlowState`
-grew by one field (a part-set note carried into the next frame's band) and that was the whole of it,
-because a checkpoint only ever sits at a page boundary where the band is empty; the second
-0072-shaped defect was there, in the *flow* rather than in the session. Numbering is
-document-sequential and argued: per-page restart is neither of the engine's two dependency shapes and
-would be a fixpoint inside `flow`, so a footnote is not a fourth derived quantity and the iteration
-budget did not move. The band cannot oscillate — the flow is forward-only and a discarded reservation
-is discarded — but a *carry* can fail to make progress, so three runtime guards bound it.
-`FORMAT_VERSION` is **8**: loud again, but a note is prose rather than intent and one save deletes it.
-**0078 then shipped the index**, whose derivation, mark and rendering were `Block::Toc`,
-`Run::character` and the tab mechanism — so its only new machinery was **collation** and
-**page-range coalescing**, both pure and both previously absent from the workspace entirely.
-Collation is an in-house four-level rule (`core-model/src/collate.rs`), argued against the real
-crates (`icu_collator` needs Rust 1.86 against the workspace's 1.75 and 34 transitive crates;
-`feruca` costs 10 for a root order that is still not language-tailored); its limits are stated
-non-goals with a lifting path, and the two exceptions a book states for itself — an article list and
-a per-entry `sort_as` — are declared *data*, so the mechanism is not English-shaped. Ranges coalesce
-**folios**, not page indices, so a section boundary never prints `ix–1`. The index takes the contents
-list's cache route (`context_fingerprint` + eviction), not 0076's `MeasureKey`, because there is one
-of it; the fixpoint gained a fourth quantity and still measures 3 passes. `FORMAT_VERSION` is **9**,
-decided by the quiet half of the rule: an older build refuses the index *block* loudly but drops
-every *mark* in silence. **0079 then closed the milestone with a book**, and closed it by *not*
-breaking the one-`Document` assumption the audit named in four crates: a book is a new artifact
-(`.qbook`, `BOOK_VERSION` 1, a fourth gate written arm for arm with the other three) whose
-`compose` is a **pure function to one `Document`** — content concatenated, block ids rebased, assets
-namespaced, one `Section` per chapter — so `export`, `AppState`, `OpenedTpub` and `LayoutSession` are
-untouched and the press file takes the path that has been tested since M0. Continuous pagination
-needs no page-number offset at all, which is what makes a stale folio unrepresentable: the offset
-*is* a `Section`'s `Folio`, and `doc.sections` has been in `context_fingerprint` since 0072. Rebasing
-shifts a chapter's ids and its references by the same amount, so a cross-reference always means the
-block it meant and cannot reach another chapter — which is the answer to the collision that would
-otherwise have put a wrong page number in a press file silently. The fixpoint cost the audit feared
-(up to 80 chapter layouts per relayout) measures **3 passes, indifferent to chapter count**
-(`layout.book_chapter_ratio` = 1.0 over ten chapters against five of the same total size), and
-`FORMAT_VERSION` stays **9** because there is no *document* an older build could be wrong about. The
-residual is named: the model still has no forced page break, so a chapter begins on the page the
-previous one ended on.
-**0080 then closed the milestone** as a closeout: the model had no **forced page break** anywhere, and
-0072, 0073 and 0079 had each named the same absence — "start this section on the next recto", and a
-chapter beginning halfway down the page the previous one ended on. A break is a **property of a
-block, anchored to it** (`Document::breaks`), not a `Block` variant and not a field on the block:
-`MeasureKey` hashes a block's content, and a break changes *where* a block goes and never *what it
-measures*, so a field would re-break a paragraph to the identical line list every time an opener
-moved. `Section` gains nothing — it is a *named* thing, so a break routed through one would force an
-author to name a break and then print that name in a running head. One rule ("advance pages until
-the flow is at the top of a page the break's kind accepts") gives the parity break, the multi-column
-case and the no-op at the top of an untouched page; parity goes through the existing `is_recto`.
-**`FlowState` grew by nothing**, deliberately: the stateful rule ("this break is already taken")
-would have made a resume from an inserted blank page's checkpoint fill that page in, where the
-parity-aware rule re-derives the same decision. A break is forward-only, so the fixpoint still
-measures 3, and `Book::compose` now gives every chapter one. `FORMAT_VERSION` is **10** — the silence
-half of the rule at its plainest — and `BOOK_VERSION` **2**.
-`TEMPLATE_VERSION` stays 1 throughout.
-M7 is named, not decomposed.
-
-**Why M5 existed: quill could not bold a word.** `Block::Body` and `Block::Heading` each carried one
-`String` and one `Color`, so there was no styled run anywhere in the workspace — which is why the
-importer refused emphasis on purpose. Spec 0063 gave the paragraph runs and spec 0064 gave the
-workspace a font family, four bundled faces, and per-run size, tracking and baseline shift, so a word
-can now be bolded and imported as bold. Character styles, drop caps, small caps and OpenType feature
-control are the rest of that list, and are what 0065 onward are for. M4 shipped a mechanism for
-sharing a look before the look could include an italic.
+**M0** press-output spike (headless PDF/X export) → **M1** editing core + 500-page performance →
+**M2** beginner on-ramp (templates, stat blocks, TOC) → **M3** pro polish + POD presets →
+**M4** ecosystem (shareable component definitions and content packs) → **M5** the general
+typographic core → **M6** the long document (sections and folios, footnotes, cross-references,
+an index, a book) → **M7** graphics and colour. Per-milestone content, status and the reasoning
+live in `docs/roadmap.md`.
 
 **Not scheduled, and deliberately so:** the direct-manipulation authoring surface (move, resize,
 rotate, group, guides, snap, layers, undo/redo). The `app` crate opens a document, scrolls it and
 edits the text of a block; a WYSIWYG object editor is a milestone in its own right and needs the
-content model to carry inline formatting, sections and anchored objects first — which is M5–M7.
+content model to carry inline formatting, sections and anchored objects first.
 
 ## Planning: spec-driven development
 
@@ -266,15 +122,7 @@ and PRs should reference the spec they implement.
 
 ## Commands
 
-**Toolchain (install once — Rust is not preinstalled in this environment):**
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-```
-
-> The cargo commands below are the intended workflow; several only become meaningful once the
-> M0 workspace is scaffolded. Standard cargo workspace:
+Standard cargo workspace. Rust comes from rustup on the host; the repo's toolchain pin is enforced.
 
 ```bash
 cargo build                      # build all crates
