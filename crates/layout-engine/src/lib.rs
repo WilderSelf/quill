@@ -30,7 +30,7 @@ use quill_text_layout::{
 /// top-to-bottom; a block that would pass the frame's bottom edge overflows — to the next page in
 /// this increment, to the next frame in a thread once threading lands (spec 0019 incr. 2).
 ///
-/// Introduced as a seam **at parity**: the frame [`lay_out`] uses is [`Frame::full_page`] (the whole
+/// Introduced as a seam **at parity**: the frame [`lay_out`] uses is `Frame::full_page` (the whole
 /// trim area at the origin), so the produced pages — and every export golden test — are byte-identical
 /// to the pre-frame implicit column. A frame with a non-zero origin, a narrower width, or a shorter
 /// height is the new capability, exercised via [`lay_out_in_frame`].
@@ -73,12 +73,12 @@ pub struct Thread {
 impl Thread {
     /// A left-to-right chain of `count` equal-width columns spanning the trim area, separated by
     /// `gutter_pt` of horizontal space, each the full trim height at `y = 0` (spec 0020). Content
-    /// laid into the returned thread via [`lay_out_in_thread`] fills the leftmost column
+    /// laid into the returned thread via `lay_out_in_thread` fills the leftmost column
     /// top-to-bottom, then the next column, and onto a new page once the last column fills.
     ///
-    /// A single column (`count == 1`) is the whole trim area — identical to [`Frame::full_page`]
+    /// A single column (`count == 1`) is the whole trim area — identical to `Frame::full_page`
     /// (the gutter is then irrelevant, there being no interior gutter). Derived from `PageSetup`
-    /// like [`Frame::full_page`]: no authored field, no serialized-model change. Panics if
+    /// like `Frame::full_page`: no authored field, no serialized-model change. Panics if
     /// `count == 0` (a thread must have at least one frame — loud failure over a silent empty
     /// thread).
     pub fn columns(page_setup: &PageSetup, count: usize, gutter_pt: f32) -> Thread {
@@ -946,7 +946,7 @@ impl PageTemplate for UniformTemplate {
 /// from the master governing each page, and that master's statics are stamped onto the page with
 /// `{page}` resolved.
 ///
-/// With no master and zero margins it produces exactly [`Frame::full_page`], so a document that
+/// With no master and zero margins it produces exactly `Frame::full_page`, so a document that
 /// declares neither lays out as it always did.
 ///
 /// The master is resolved **per page** rather than once, because spec 0035 lets a document assign a
@@ -1243,7 +1243,7 @@ impl PageTemplate for DocumentTemplate<'_> {
 }
 
 /// Lay a document out into pages, flowing its content into the whole-page frame
-/// ([`Frame::full_page`]). Paginates: starts a new page when a block would pass the frame's bottom
+/// (`Frame::full_page`). Paginates: starts a new page when a block would pass the frame's bottom
 /// edge (the full trim height here). Returns at least one page (even if the document is empty).
 ///
 /// Text is broken to fit the frame width using the caller-supplied `metrics` (the embedded font in
@@ -1295,7 +1295,7 @@ pub fn lay_out(
 }
 
 /// Flow `content` into a single [`Frame`], paginating vertically. Equivalent to
-/// [`lay_out_in_thread`] over a one-frame thread: text wraps to the frame width, blocks are
+/// `lay_out_in_thread` over a one-frame thread: text wraps to the frame width, blocks are
 /// positioned at the frame origin, and a block overflows to a new page (repeating the same frame
 /// geometry) when it would pass the frame's bottom edge — see spec 0019.
 ///
@@ -1308,16 +1308,18 @@ pub fn lay_out_in_frame(
     metrics: &impl RunMetrics,
     hyphenator: &impl Hyphenator,
 ) -> Vec<LaidOutPage> {
-    lay_out_in_thread(
+    lay_out_with_library(
         content,
         assets,
         styles,
-        &Thread {
+        &builtin_components(),
+        &UniformTemplate::new(Thread {
             frames: vec![*frame],
-        },
+        }),
         metrics,
         hyphenator,
     )
+    .0
 }
 
 /// An id → [`Asset`] lookup, built once per layout pass. Borrows the document's assets rather than
@@ -1797,7 +1799,7 @@ pub(crate) struct PanelPart {
 /// Break/size `block` against a frame of `width` points, returning the placement payload and its
 /// height. `None` means "skip this block" — currently only an unresolved [`Block::Image`] id.
 ///
-/// Called once per candidate frame in [`lay_out_in_thread`]'s placement loop so a block that
+/// Called once per candidate frame in `lay_out_in_thread`'s placement loop so a block that
 /// advances into a different-width frame re-wraps (text) / re-fits (image) to that frame's width.
 /// The ambient inputs every block measurement needs, other than the block and its width.
 ///
@@ -2655,6 +2657,7 @@ fn measure_index(
 /// skipping forever — the same "already has content" guard incr. 1 used, now measured per frame. A
 /// single-frame thread is exactly [`lay_out_in_frame`] (parity). `assets` resolves [`Block::Image`]
 /// ids; unknown ids are skipped. A thread must have at least one frame.
+#[cfg(test)]
 pub fn lay_out_in_thread(
     content: &[Block],
     assets: &[Asset],
@@ -2676,11 +2679,12 @@ pub fn lay_out_in_thread(
 /// Flow `content` through pages whose geometry and static content come from `template`
 /// (spec 0029).
 ///
-/// This is [`lay_out_in_thread`] generalized: instead of one frame list repeated on every page, each
+/// This is `lay_out_in_thread` generalized: instead of one frame list repeated on every page, each
 /// page asks the template what its frames are. With a [`UniformTemplate`] the two are identical.
 ///
 /// Panics if the template hands back a page with no frames — a page with nowhere to put content
 /// would silently drop it, and losing content is exactly the class of failure `CLAUDE.md` forbids.
+#[cfg(test)]
 pub fn lay_out_with_template(
     content: &[Block],
     assets: &[Asset],
@@ -2692,7 +2696,7 @@ pub fn lay_out_with_template(
     lay_out_with_fixpoint_status(content, assets, styles, template, metrics, hyphenator).0
 }
 
-/// [`lay_out_with_fixpoint_status`] over an explicit component library (spec 0054).
+/// `lay_out_with_fixpoint_status` over an explicit component library (spec 0054).
 ///
 /// The frame-level entry points above deliberately do not take one: a frame primitive lays out the
 /// *bundled* components, which is what every one of its callers wants, and threading a library
@@ -2758,7 +2762,7 @@ pub struct FixpointStatus {
 /// the only thing that bounds it. See spec 0076 for the counter the bench file is owed.
 pub const FIXPOINT_MAX_ITERATIONS: usize = 8;
 
-/// [`lay_out_with_template`], reporting how the layout fixpoint resolved.
+/// `lay_out_with_template`, reporting how the layout fixpoint resolved.
 ///
 /// A table of contents lists page numbers, its own length changes where every later page break
 /// falls, and that changes the numbers it lists. So layout runs to a fixpoint: lay out, read where
@@ -2771,6 +2775,7 @@ pub const FIXPOINT_MAX_ITERATIONS: usize = 8;
 ///
 /// Documents that derive neither take exactly one pass. The loop is entered but exits on its first
 /// comparison, so nothing about the cost or the behaviour of every other document changes.
+#[cfg(test)]
 pub fn lay_out_with_fixpoint_status(
     content: &[Block],
     assets: &[Asset],

@@ -198,7 +198,7 @@ impl LayoutSession {
     /// [`Self::pass`]: the loop is entered but exits on its first comparison, so nothing about the
     /// incremental behaviour of a document with neither changes.
     ///
-    /// Deliberately the same loop as [`crate::lay_out_with_fixpoint_status`]'s, arm for arm — two
+    /// Deliberately the same loop as `crate::lay_out_with_fixpoint_status`'s, arm for arm — two
     /// fixpoints over the same two quantities, converging by different rules, would be a way for
     /// the app's pages and the exporter's to disagree.
     pub fn relayout_with_template(
