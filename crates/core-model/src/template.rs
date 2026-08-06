@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     heading_style_name, version, Color, Document, LoadError, Margins, MasterPage, MasterStatic,
-    PageOverride, PageSetup, ParagraphStyle, Pt, Rect, Size, StaticAlign, StyleSheet, TextAlign,
+    PageOverride, PageSetup, ParagraphStyle, Rect, Size, StaticAlign, StyleSheet, TextAlign,
     BODY_STYLE, DEFAULT_BLEED_PT, FORMAT_VERSION, PAGE_TOKEN,
 };
 use crate::{Indent, Weight};
@@ -79,22 +79,6 @@ pub struct Template {
     pub pages: Vec<PageOverride>,
 }
 
-/// Page geometry offered to a template from outside it — a POD preset (spec 0049) is the intended
-/// source, and `quill new --preset` the intended caller.
-///
-/// Carries only the two numbers a preset and a template can both claim. Everything else a preset
-/// states (ink limits, dpi floors, the PDF/X level) is an export-time concern that never touches a
-/// template.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PageGeometrySeed {
-    pub trim: Size,
-    pub bleed_pt: Pt,
-}
-
-/// Trims closer than this are the same trim. Sizes are `f32` points; a printer's 6×9 is 432×648
-/// however it was arrived at, and an exact float compare would call two of them different.
-const TRIM_EPSILON_PT: Pt = 0.01;
-
 impl Template {
     /// The built-in templates.
     pub fn bundled() -> &'static [Template] {
@@ -148,43 +132,6 @@ impl Template {
             serde_json::from_str(s).map_err(|e| LoadError::TemplateParse(e.to_string()))?;
         version::migrate_template(&mut value)?;
         serde_json::from_value(value).map_err(|e| LoadError::TemplateParse(e.to_string()))
-    }
-
-    /// Compose an outside page geometry with this template's own (spec 0053).
-    ///
-    /// The precedence, in two halves, each with its own reason:
-    ///
-    /// - **Trim: the template wins.** A template's masters, margins and furniture are authored
-    ///   *against* a specific trim — the bundled ones compute a folio's `y_pt` from the page height
-    ///   and its rect width from the trim width. Re-trimming from underneath moves every one of
-    ///   those numbers without moving the geometry authored for them, so the folio lands on the last
-    ///   line or past the trim, and nothing at layout time catches it because furniture does not
-    ///   participate in the flow. That is the silent press failure `CLAUDE.md` forbids.
-    /// - **Bleed: the larger wins.** Bleed is a floor, not a design choice — the distance art must
-    ///   extend past the trim so the guillotine cannot cut white. A seed asking for more is stating
-    ///   a press requirement and costs the design nothing, because bleed lives entirely outside the
-    ///   trim box; a seed asking for less would cost something, so it is not honored either.
-    ///
-    /// A disagreement about the trim is *reported*, not swallowed — see [`Template::disagrees_on_trim`].
-    pub fn seeded_with(&self, seed: PageGeometrySeed) -> Template {
-        Template {
-            page_setup: PageSetup {
-                baseline_grid: None,
-                bleed_pt: self.page_setup.bleed_pt.max(seed.bleed_pt),
-                ..self.page_setup
-            },
-            ..self.clone()
-        }
-    }
-
-    /// Whether a seed's trim differs from this template's, so a caller can say so.
-    ///
-    /// A warning rather than a refusal, matching spec 0049's own severity choice for a trim outside
-    /// a preset's list: an unusual trim is a conversation with the printer, not a corrupt file.
-    pub fn disagrees_on_trim(&self, seed: PageGeometrySeed) -> bool {
-        let t = self.page_setup.trim;
-        (t.w_pt - seed.trim.w_pt).abs() > TRIM_EPSILON_PT
-            || (t.h_pt - seed.trim.h_pt).abs() > TRIM_EPSILON_PT
     }
 }
 
@@ -954,62 +901,12 @@ mod tests {
         );
     }
 
-    /// A stand-in for what spec 0049's `PodPreset` will hand `quill new --preset`.
-    fn seed(w_pt: f32, h_pt: f32, bleed_pt: f32) -> PageGeometrySeed {
-        PageGeometrySeed {
-            trim: Size { w_pt, h_pt },
-            bleed_pt,
-        }
-    }
-
     #[test]
-    fn a_geometry_seed_never_retrims_a_template() {
-        // The precedence spec 0053 fixes, and the half with teeth: a template's folio `y_pt` is
-        // derived from the page height and its rect from the trim width, so re-trimming from
-        // underneath would move the page without moving the furniture authored for it — furniture
-        // does not participate in the flow, so nothing at layout time would catch the collision.
-        let t = Template::by_name("reference").expect("bundled");
-        let seeded = t.seeded_with(seed(LETTER.w_pt, LETTER.h_pt, DEFAULT_BLEED_PT));
-        assert_eq!(
-            seeded.page_setup.trim, DIGEST,
-            "the template's trim must win"
-        );
-        // And everything else the template carries is untouched by a seed.
-        assert_eq!(seeded.master_pages, t.master_pages);
-        assert_eq!(seeded.styles, t.styles);
-        assert_eq!(seeded.pages, t.pages);
-    }
-
-    #[test]
-    fn a_geometry_seed_raises_a_templates_bleed_but_never_lowers_it() {
-        // The other half: bleed is a press floor, not a design choice, and it lives entirely
-        // outside the trim box — so honoring a stricter requirement costs the design nothing while
-        // lowering it would cost something.
+    fn a_bundled_template_carries_the_default_bleed() {
+        // Kept from the deleted seed-precedence tests: the only claim they made about surviving
+        // code. Bleed is a press floor, so a bundled template must not ship under it.
         let t = Template::by_name("digest").expect("bundled");
         assert_eq!(t.page_setup.bleed_pt, DEFAULT_BLEED_PT);
-
-        let stricter = t.seeded_with(seed(DIGEST.w_pt, DIGEST.h_pt, DEFAULT_BLEED_PT + 3.0));
-        assert_eq!(stricter.page_setup.bleed_pt, DEFAULT_BLEED_PT + 3.0);
-
-        let looser = t.seeded_with(seed(DIGEST.w_pt, DIGEST.h_pt, 0.0));
-        assert_eq!(
-            looser.page_setup.bleed_pt, DEFAULT_BLEED_PT,
-            "a seed must not lower a template's bleed"
-        );
-    }
-
-    #[test]
-    fn a_trim_disagreement_is_reportable_rather_than_silent() {
-        // A warning rather than a refusal, matching spec 0049's own severity choice: an unusual
-        // trim is a conversation with the printer, not a corrupt file. But it must be *sayable*,
-        // or the precedence above becomes the confusing-by-default behavior the spec exists to
-        // prevent.
-        let t = Template::by_name("reference").expect("bundled");
-        assert!(t.disagrees_on_trim(seed(LETTER.w_pt, LETTER.h_pt, DEFAULT_BLEED_PT)));
-        assert!(!t.disagrees_on_trim(seed(DIGEST.w_pt, DIGEST.h_pt, DEFAULT_BLEED_PT)));
-        // Two trims that differ only below the epsilon are the same trim: 432x648 is 6x9 however
-        // it was arrived at, and an exact float compare would report a disagreement that is not one.
-        assert!(!t.disagrees_on_trim(seed(DIGEST.w_pt + 0.005, DIGEST.h_pt, DEFAULT_BLEED_PT)));
     }
 
     #[test]

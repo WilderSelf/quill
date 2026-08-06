@@ -58,13 +58,6 @@ pub struct LayoutStats {
     pub pages_reused: usize,
 }
 
-impl LayoutStats {
-    /// Total pages in the resulting document.
-    pub fn pages_total(&self) -> usize {
-        self.pages_reflowed + self.pages_reused
-    }
-}
-
 /// The result of an incremental pass.
 #[derive(Debug, Clone)]
 pub struct LayoutResult {

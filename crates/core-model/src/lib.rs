@@ -42,9 +42,7 @@ pub use resolve::{
     install, install_dir, installed, pack_root, resolve, version_matches, InstalledPack,
     PackRequirement, ResolvedPacks,
 };
-pub use template::{
-    PageGeometrySeed, Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER, TEMPLATE_VERSION,
-};
+pub use template::{Template, BODY_MASTER, FOLIO_STYLE, OPENER_MASTER, TEMPLATE_VERSION};
 pub use version::LoadError;
 
 /// Typographic points (1/72 inch) — the internal unit throughout Quill.
