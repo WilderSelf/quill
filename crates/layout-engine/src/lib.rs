@@ -39,6 +39,7 @@ pub struct Frame {
     pub rect: Rect,
 }
 
+#[cfg(test)]
 impl Frame {
     /// The whole-page content frame: the entire trim area at the origin. This is the frame
     /// [`lay_out`] uses, so its output is identical to the pre-frame implicit column. Margins/insets
@@ -68,6 +69,7 @@ pub struct Thread {
     pub frames: Vec<Frame>,
 }
 
+#[cfg(test)]
 impl Thread {
     /// A left-to-right chain of `count` equal-width columns spanning the trim area, separated by
     /// `gutter_pt` of horizontal space, each the full trim height at `y = 0` (spec 0020). Content
@@ -686,6 +688,7 @@ pub struct StaticContext<'a> {
 
 impl StaticContext<'_> {
     /// The context a template with no content-derived furniture needs.
+    #[cfg(test)]
     pub const EMPTY: StaticContext<'static> = StaticContext { headings: &[] };
 
     /// The text of the last heading of level ≤ `level` at or before `page_index` — what
