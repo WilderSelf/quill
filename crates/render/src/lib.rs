@@ -111,11 +111,15 @@ fn decode_png_rgba(bytes: &[u8]) -> Option<Rgba8> {
             .flat_map(|g| [g, g, g, 255])
             .collect(),
         ColorType::Rgb => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         ColorType::Rgba => quill_color::flatten_over_paper(data, 3)
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         ColorType::Indexed => return None, // defensive: EXPAND already turned palette into RGB(A).
@@ -169,7 +173,9 @@ fn decode_jpeg_rgba(bytes: &[u8]) -> Option<Rgba8> {
     let pixels: Vec<u8> = match info.pixel_format {
         PixelFormat::L8 => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         PixelFormat::RGB24 => data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
         // CMYK JPEGs are ambiguous (see spec 0012) and 16-bit gray is uncommon; both are deferred to
@@ -430,8 +436,10 @@ mod tests {
         // field — is unchanged.
         assert!(proxy
             .rgba
-            .chunks_exact(4)
-            .all(|p| p == [191, 191, 191, 255]));
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [191, 191, 191, 255]));
     }
 
     #[test]
@@ -547,7 +555,7 @@ mod tests {
         let proxy = decode_png_proxy(&png).expect("decodes");
         assert_eq!((proxy.width, proxy.height), (2048, 1));
 
-        let reds: Vec<u8> = proxy.rgba.chunks_exact(4).map(|p| p[0]).collect();
+        let reds: Vec<u8> = proxy.rgba.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
         assert!(
             reds.windows(2).all(|w| w[0] <= w[1]),
             "a monotone gradient stays monotone through the area-average"
@@ -583,7 +591,7 @@ mod tests {
         let png = encode_png(8, 8, png::ColorType::Grayscale, &gray);
         let proxy = decode_png_proxy(&png).expect("decodes");
         assert_eq!((proxy.width, proxy.height), (8, 8));
-        for px in proxy.rgba.chunks_exact(4) {
+        for px in proxy.rgba.as_chunks::<4>().0.iter() {
             assert_eq!(px[0], px[1], "R==G");
             assert_eq!(px[1], px[2], "G==B");
             assert_eq!(px[3], 255, "opaque");
@@ -620,7 +628,7 @@ mod tests {
         let proxy = decode_jpeg_proxy(TEST_JPEG_RGB).expect("decodes rgb jpeg");
         assert_eq!((proxy.width, proxy.height), (8, 8)); // < 2048 → native size
         assert_eq!(proxy.rgba.len(), 8 * 8 * 4);
-        for px in proxy.rgba.chunks_exact(4) {
+        for px in proxy.rgba.as_chunks::<4>().0.iter() {
             assert_eq!(px[3], 255, "opaque");
         }
     }
@@ -629,7 +637,7 @@ mod tests {
     fn grayscale_jpeg_widens_to_opaque_rgba() {
         let proxy = decode_jpeg_proxy(TEST_JPEG_GRAY).expect("decodes gray jpeg");
         assert_eq!((proxy.width, proxy.height), (8, 8));
-        for px in proxy.rgba.chunks_exact(4) {
+        for px in proxy.rgba.as_chunks::<4>().0.iter() {
             assert_eq!(px[0], px[1], "R==G");
             assert_eq!(px[1], px[2], "G==B");
             assert_eq!(px[3], 255, "opaque");

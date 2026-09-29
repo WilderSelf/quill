@@ -8,7 +8,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/WilderSelf/quill"
 authors = ["Daniel Foster <danielfoster25@gmail.com>"]
-rust-version = "1.75"
+rust-version = "1.88"
 
 # Shared dependency versions. Every dependency here is permissive (MIT/Apache-2.0 or compatible)
 # and carries an inline note saying which spec brought it in and why. The PDF/X export stack landed

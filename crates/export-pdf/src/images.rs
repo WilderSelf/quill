@@ -193,7 +193,9 @@ fn decode_jpeg(bytes: &[u8], cmyk: &RgbToCmyk) -> Option<DecodedImage> {
         // Only Adobe transform-0 CMYK is unambiguous true-ink CMYK; anything else is skipped.
         PixelFormat::CMYK32 if adobe_transform(bytes) == Some(0) => {
             let clamped = data
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| clamp_cmyk_u8(p[0], p[1], p[2], p[3]))
                 .collect();
             Pixels::Cmyk(clamped)
@@ -429,7 +431,7 @@ mod tests {
         let img = decode(&png, &naive_converter()).expect("decode rgb png");
         match img.pixels {
             Pixels::Cmyk(c) => {
-                for px in c.chunks_exact(4) {
+                for px in c.as_chunks::<4>().0.iter() {
                     let sum: u16 = px.iter().map(|&v| v as u16).sum();
                     assert!(sum <= 612, "image pixel exceeds 240% ink: {px:?} = {sum}");
                 }
@@ -600,7 +602,7 @@ mod tests {
         match img.pixels {
             Pixels::Cmyk(c) => {
                 assert_eq!(c.len(), 8 * 8 * 4, "four bytes per pixel");
-                for px in c.chunks_exact(4) {
+                for px in c.as_chunks::<4>().0.iter() {
                     let sum: u16 = px.iter().map(|&v| v as u16).sum();
                     assert!(sum <= 612, "jpeg pixel exceeds 240% ink: {px:?} = {sum}");
                 }
@@ -633,10 +635,12 @@ mod tests {
             Pixels::Cmyk(c) => {
                 assert_eq!(c.len(), 8 * 8 * 4, "four bytes per pixel");
                 let sums = || {
-                    c.chunks_exact(4)
+                    c.as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|px| px.iter().map(|&v| v as u16).sum::<u16>())
                 };
-                for (s, px) in sums().zip(c.chunks_exact(4)) {
+                for (s, px) in sums().zip(c.as_chunks::<4>().0.iter()) {
                     assert!(s <= 612, "cmyk jpeg pixel exceeds 240% ink: {px:?} = {s}");
                 }
                 // The rich-black quadrant (encoded 255,255,255,255 = 1020 pre-clamp) proves the
