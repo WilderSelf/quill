@@ -163,30 +163,10 @@ fixture in-memory in the test instead.
 
 ## Automation & learning (Claude Code)
 
-- **`/ship <task>`** — autonomous plan→merge cycle: plan → `feat/<slug>` branch → implement →
-  validate (fmt/clippy/build/test, bounded to 5 attempts) → `reviewer` subagent → PR →
-  auto-merge deferring to CI. Blocked ⇒ draft PR, never a forced merge. Merge gate = GitHub
-  branch protection + CI, not the permission list. Reviewer/planner live in `.claude/agents/`.
-- **Workflow kit + profile.** This repo uses the shared user-scope workflow kit; its per-repo
-  profile is `.claude/workflow.json` (`validate` commands, `merge_model: pr-gated`, `main_branch`,
-  and `plan_path` → the tracked plan `docs/roadmap.md`). `/ship`
-  reads it for the validate gate and merge model. **`/advance`** (user-scope) is the Layer-0
-  self-driving unit: reconcile → select ONE atomic increment from the approved plan → ship inline
-  → wrap tail → exit with a `STATUS:` token. This repo keeps its own `planner`/`reviewer` in
-  `.claude/agents/` (domain-specific overrides of the generic user-scope agents).
-- **`/reflect`** — after a session or `/ship` cycle, promotes learnings into the right home
-  (this file, `.claude/rules/`, a skill, an agent, or a hook), one human-approved change at a
-  time. **`/curate`** — dedupe/condense this file (200-line budget), flag contradictions,
-  archive stale skills. User-scope config, the permission model, and a disabled reflection Stop
-  hook are documented in `~/.claude/settings.reference.md`.
-- **`/handoff`** — writes/refreshes the untracked `HANDOFF.md` session-bridge doc for resuming
-  work in a fresh session; re-verifies live external state (repo/CI/GitHub settings) rather
-  than restating the previous handoff's claims. User-scoped: `~/.claude/skills/handoff/`
-  (promoted from project scope so `/wrap` is portable across all repos, not just this one).
-- **`/wrap [task]`** — chains `/ship` (if `task` given) → `/reflect` → `/curate` → `/handoff` as
-  one invocation instead of four, loading shared config once instead of per-phase. Keeps each
-  phase's own approval gates. User-scoped: `~/.claude/skills/wrap/`.
-- **Merge behavior — any PR in this repo, not just `/ship`'s**: the branch-protection gate on
+- **Loop.** The overnight loop `/home/dfoster/.claude/harness/loop.sh` drives this repo through
+  the user-scope `/advance`. The repo profile is `.claude/workflow.json`. The merge gate is
+  GitHub branch protection plus auto-merge, not the permission list.
+- **Merge behavior — any PR in this repo**: the branch-protection gate on
   `main` is confirmed live (**4** required CI contexts — all of CI's emitted check-runs, i.e. the
   three `fmt + clippy + test (<os>)` legs plus `PDF preflight (Ghostscript)` — `allow_auto_merge`,
   admin token; see PR #4, 4th context added 2026-07-27). Every PR opened here auto-enables
