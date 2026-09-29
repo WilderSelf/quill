@@ -1530,9 +1530,9 @@ mod tests {
             .into_iter()
             .find(|s| s.len() == 2 * 2 * 4)
             .expect("an image XObject of four CMYK pixels");
-        for (i, px) in pixels.chunks_exact(4).take(3).enumerate() {
+        for (i, px) in pixels.as_chunks::<4>().0.iter().take(3).enumerate() {
             assert_eq!(
-                px,
+                *px,
                 [0, 0, 0, 0],
                 "transparent pixel {i} printed ink: {px:?} (solid K is the shipped defect)"
             );

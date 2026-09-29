@@ -208,12 +208,17 @@ impl RgbToCmyk {
                 t.transform_pixels(rgb, &mut out);
                 // A well-behaved profile respects the ink limit; clamp anyway so the guarantee
                 // holds for any profile the caller supplies.
-                for dst in out.chunks_exact_mut(4) {
-                    dst.copy_from_slice(&clamp_cmyk_u8(dst[0], dst[1], dst[2], dst[3]));
+                for dst in out.as_chunks_mut::<4>().0 {
+                    *dst = clamp_cmyk_u8(dst[0], dst[1], dst[2], dst[3]);
                 }
             }
             None => {
-                for (src, dst) in rgb.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+                for (src, dst) in rgb
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(out.as_chunks_mut::<4>().0)
+                {
                     let (r, g, b) = (
                         src[0] as f32 / 255.0,
                         src[1] as f32 / 255.0,
